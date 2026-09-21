@@ -3,12 +3,12 @@
 | Field | Value |
 |---|---|
 | Document | ATLAS_FRAMEWORK_REVIEW.md |
-| Version | 0.2.1 — engine watch-list added, FLUX.1 variant pinned |
+| Version | 0.3 — baseline closed: workbook returned complete |
 | Date | 2026-09-21 |
-| Supersedes | v0.2 (2026-09-21, same day); v0.1 (2026-09-18) |
+| Supersedes | v0.2.1 and v0.2 (2026-09-21, same day); v0.1 (2026-09-18) |
 | Scope | Everything agreed in the design conversation, through the Principal's completed confirmation workbook and the September hardware change |
 | Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions resolved, risks, and what Day 1 must prove before anything is trusted |
-| Status of this document | Build baseline. Every decision is closed. Nothing has been executed; the Day 1 script is written against this document. |
+| Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21. Nothing has been executed; the Day 1 script is written against this document. |
 
 ## How to read this document
 
@@ -1024,17 +1024,17 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 
 ## 22. Pre-execution checklist
 
-Nothing runs until every box is ticked.
+Nothing runs until every box is ticked. **All boxes were ticked in the workbook returned 2026-09-21.** The list is kept as the record of what was required.
 
 **Principal's actions — what is genuinely left**
 
 - [x] Answer D1 through D14. **Done**, all fourteen closed in Section 19.
 - [x] Decide where the LUKS recovery key and restic passphrase live (D3). **Done**: node plus external USB.
 - [x] Confirm the Sentinel feed list (D6), the director alias pattern (D14), and the Apple build path (D11, removed).
-- [ ] **Store the USB recovery drive away from the node**, not beside it (R16).
-- [ ] **Create the Google Cloud OAuth client** for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). This one step cannot be automated: Google requires the account owner to click Allow.
-- [ ] **Source reference recordings** for Alaric's gravelly voice and, if the British male presets collide, Gideon's. Until then both fall back to the nearest Kokoro preset and V7 is recorded as deferred, not failed.
-- [ ] Have a monitor and keyboard available for Phase 1 only, in case first boot needs a hand.
+- [x] Store the USB recovery drive away from the node, not beside it (R16). **Done.**
+- [x] Create the Google Cloud OAuth client for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). **Client created.** The consent click itself still happens during Phase 2; Google requires the account owner to click Allow.
+- [x] Source reference recordings for Alaric's gravelly voice and, if the British male presets collide, Gideon's. **Sourced.** The Day 1 script names the directory they are copied into before Phase 2; if absent, both fall back to the nearest Kokoro preset and V7 is recorded as deferred, not failed.
+- [x] Have a monitor and keyboard available for Phase 1 only, in case first boot needs a hand. **Done.**
 
 **Automated on the Principal's instruction, no action needed**
 
@@ -1043,16 +1043,16 @@ Nothing runs until every box is ticked.
 
 **Build-side preconditions**
 
-- [ ] Ubuntu Server 26.04.1 installed on the 4 TB drive; 8 TB drive unpartitioned.
-- [ ] BIOS: UMA minimum, IOMMU on, fTPM on, Secure Boot disabled (D2).
-- [ ] LAN address reserved for the node on the router, over Wi-Fi; UDP 51820 forward confirmed to that address.
-- [ ] Internet bandwidth known, so the ~690 GB Phase 3 download can be planned.
+- [x] Ubuntu Server 26.04.1 installed on the 4 TB drive; 8 TB drive unpartitioned. **Done.**
+- [x] BIOS: UMA minimum, IOMMU on, fTPM on, Secure Boot disabled (D2). **Done.**
+- [x] LAN address reserved for the node on the router, over Wi-Fi; UDP 51820 forward confirmed to that address. **Done.**
+- [x] Internet bandwidth known, so the ~690 GB Phase 3 download can be planned. **Done**; the figure was not recorded in the workbook, so the 100 Mbps planning assumption in 15.4 stands until stated.
 
 **Accepted resolutions**
 
 - [x] C1 through C20 accepted in the returned workbook. C19 was reopened and re-decided in the Principal's favour.
-- [ ] **C21 through C26 are new in v0.2 and await an answer** on sheet 2 of the workbook: the Ubuntu and amd64v3 rejections, the quantisation rise, the closed reserve list, the vision consolidation, and the residency-versus-generation reading.
-- [ ] **R9, R16, R19, R20 and R21 await acknowledgement** on sheet 3: two changed wording in v0.2, three are new.
+- [x] C21 through C26, new in v0.2, **accepted** in the returned workbook: the Ubuntu and amd64v3 rejections, the quantisation rise, the closed reserve list, the vision consolidation, and the residency-versus-generation reading.
+- [x] R9, R16, R19, R20 and R21 **acknowledged** in the returned workbook: two changed wording in v0.2, three were new.
 
 ---
 
