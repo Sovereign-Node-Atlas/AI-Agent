@@ -3,11 +3,12 @@
 | Field | Value |
 |---|---|
 | Document | ATLAS_FRAMEWORK_REVIEW.md |
-| Version | 0.1 — pre-execution baseline |
-| Date | 2026-09-18 |
-| Scope | Everything agreed in the design conversation from hardware selection through the multimodal engine roster and voice casting |
-| Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions found and resolved, gaps, open decisions, risks, and what Day 1 must prove before anything is trusted |
-| Status of this document | Review baseline. Nothing in it has been executed. No script exists yet. |
+| Version | 0.2 — decisions closed, hardware revised |
+| Date | 2026-09-21 |
+| Supersedes | v0.1 (2026-09-18) |
+| Scope | Everything agreed in the design conversation, through the Principal's completed confirmation workbook and the September hardware change |
+| Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions resolved, risks, and what Day 1 must prove before anything is trusted |
+| Status of this document | Build baseline. Every decision is closed. Nothing has been executed; the Day 1 script is written against this document. |
 
 ## How to read this document
 
@@ -17,7 +18,7 @@ Every item carries one of these markers:
 |---|---|
 | **AGREED** | Settled in the brief. Build to this. |
 | **RESOLVED** | A contradiction or ambiguity was found during the sweep and is resolved here. Read these; they change earlier text. |
-| **DECISION** | Needs the Principal's answer before or during Day 1. Numbered D1…Dn, listed in Section 19. |
+| **CLOSED** | A decision the Principal has answered. The answer is stated; no further input needed. Section 19 lists all fourteen. |
 | **VERIFY** | Cannot be confirmed from the desk. Day 1 must prove it. Numbered V1…Vn, listed in Section 21. |
 | **RISK** | A known risk with a mitigation. Numbered R1…Rn, listed in Section 20. |
 
@@ -27,26 +28,26 @@ Sections 1–17 are the consolidated framework. Sections 18–22 are the audit. 
 
 ## 0. Executive summary
 
-**Verdict.** The framework is coherent and buildable on the chosen hardware. The design decisions that matter most were made correctly: MoE models over dense, sequential engine loading, prompt-cache-first orchestration, a hard approval gate in code rather than in prompts, and a headless Linux node. The brief is ready to become a Day 1 script once the decisions in Section 19 are answered and the resolutions in Section 18 are accepted.
+**Verdict.** The framework is coherent, fully decided, and buildable. All fourteen open decisions are closed, all twenty original contradictions accepted, and six further resolutions have been added since v0.1. The Day 1 script is now written against this document.
 
-**The ten findings that matter most, in priority order:**
+**What changed since v0.1, in order of consequence:**
 
-1. **Inference backend must be decided (D1).** The brief drifted between llama.cpp, Ollama, and llama-server. On Ubuntu 26.04, where AMD's ROCm does not yet install cleanly on the host kernel, the LLM layer depends on the Vulkan backend. llama-server's Vulkan path is the validated one on this chip. Ollama's Vulkan path is newer and less proven. Recommendation: llama-server primary, Ollama optional. See Section 5 and Section 18 C1.
-2. **The PyTorch engine layer needs ROCm, and the host cannot supply it on 26.04 (RESOLVED, Section 3.4).** The resolution is to run every PyTorch engine inside a container that carries its own ROCm userspace, which is exactly how the working Strix Halo image/video toolboxes are built. The host provides only the kernel driver.
-3. **No component was ever named as the single memory arbiter (RESOLVED, Section 4.2).** With four LLMs, a router model, speech, and a dozen PyTorch engines all wanting the same unified memory, one service must own every load and unload. It is defined here as the Engine Arbiter and is a hard requirement of the orchestrator.
-4. **The vault and the estate memory design conflicted (RESOLVED, Section 10.5).** An earlier version put Arthur's estate memory inside the vault; the vault was later simplified to "top-secret files only, locked when not in use." Estate memory cannot live in a folder that is locked most of the time. Resolution: estate memory lives on the always-mounted encrypted data volume; the vault is a separate, on-demand encrypted folder.
-5. **Disk encryption was never specified (GAP, Section 3.5).** A node holding medical, legal, and financial data with no encryption at rest is a gap. LUKS2 on both drives, auto-unlocked at boot by the AMD firmware TPM, with a recovery key stored off-node.
-6. **Domain injection must be size-bounded (Section 8.4).** Thirty domain profiles with seven fields each cannot be injected freely. Prompt processing is this machine's weakest capability; a bloated system prompt on every dispatch costs a minute of prefill. Hard limits: three domains per dispatch, compact form of each, stable-prefix ordering to preserve the KV cache.
-7. **The Cloudflare API token must move (Section 12.3).** It is currently in a plain-text file. Scoped token, restricted permissions, outside any backup or repository path.
-8. **Two governance inputs are still missing (D8, D9).** The list of actions ATLAS may never take without the Principal, and the retention rule for chats and logs. Proposed defaults are in Section 16 and become binding unless changed.
-9. **Fictitious directors corresponding externally under their own names, combined with the "never disclose AI nature" rule, is a legal exposure that belongs in the risk register (R12).** The approval gate is the control; Gideon's tier check is the mitigation. The brief keeps the rule; the risk is recorded, not argued.
-10. **Day 1 is four phases, not one script (Section 17).** Platform, services, core LLM pull, multimodal engine build. Each phase ends with a printed pass/fail table. Phases 3 and 4 run detached and resumable.
+1. **The machine changed (Section 2).** GMKtec EVO-X5 Pro replaces the MINISFORUM MS-S1 Max: 192 GB of memory instead of 128 GB, 273 GB/s instead of ~256, and both NVMe slots at four lanes instead of one fast and one slow. The GPU reports the same `gfx1151` identifier, confirmed by the Principal, so every piece of community ROCm and Vulkan work carries over unchanged and risks R1 and R3 stand exactly as written.
+2. **Quantisation rises across the board (Section 5.1).** The extra memory buys accuracy. Nemotron 3 Super and Qwen3.5-122B move from 4-bit to `Q8_0`; Qwen2.5-VL-72B and Meditron run at `Q8_0`. The two gpt-oss engines stay at MXFP4 because that is their native released form, not a compromise.
+3. **A fifth core engine joins (Section 5.1).** DeepSeek V4 Flash, 284B total and 13B active, at `UD-Q4_K_XL`, 155 GB. It is the Apex engine: fewer active parameters than Nemotron, so it is both larger and faster, reserved for Deep Think's deep tier, TF_OMEGA, and strong cross-checks.
+4. **Two engines may now be resident, but only one ever generates (Section 4.2).** The extra memory removes the swap between a text engine and the vision engine. Simultaneous generation is not adopted at all: the memory bandwidth is shared, so two streams would each run at half speed. The Celery GPU queue keeps its single worker.
+5. **The node gets a graphical desktop (Section 3.1).** Ubuntu Server 26.04.1 stays the base, with XFCE added on top and xrdp for remote graphical access from the Principal's Windows PC. This is not the full Ubuntu Desktop image; XFCE costs roughly 300 to 500 MB idle against GNOME's 1 to 1.5 GB, and the AI system itself remains browser-served and independent of any desktop session.
+6. **Six domains added, bringing the roster to thirty-six (Section 8.2).** Five further areas the Principal named are folded into existing domains as explicit subspecialties rather than duplicated as new cards.
+7. **The vision layer narrowed to one engine (Section 15.2).** GLM-4.6V-Flash and Qwen2.5-VL-7B and -32B are all dropped. Qwen2.5-VL-72B at `Q8_0` is the sole vision engine, chosen for quality with its roughly 3 tokens per second accepted.
+8. **Apple `.ipa` builds removed entirely (Section 15.1).** The Principal owns no Mac and rules out a cloud runner. Android and Windows builds stay; iOS source is still written, but compiled elsewhere whenever Mac access exists.
+9. **Ubuntu 24.04.5 evaluated and rejected (Section 3.1).** Its September point release backports the same kernel 7.0 and Mesa 26.0 stack, so hardware support is identical; 26.04.1 wins on two further years of support and a newer toolchain, and its one disadvantage, host ROCm, does not apply to a containerised design.
+10. **amd64v3 and amd64v4 archives rejected (Section 3.1).** The gain lands on CPU-bound distribution packages, not GPU inference, and llama.cpp and the PyTorch containers already compile against this exact chip. Canonical keeps the standard baseline as 26.04's default for good reason.
 
 ---
 
 ## 1. Mission and principles
 
-**AGREED — Identity.** A.T.L.A.S.: a zero-cloud, autonomous AI node on bare metal, serving one user, the Principal, through a single interface, with two personas (Ren Ackerman, Arthur Sterling), an eight-director Shadow Cabinet, thirty domain knowledge profiles, twenty-three cross-domain task forces, and a set of autonomous protocols.
+**AGREED — Identity.** A.T.L.A.S.: a zero-cloud, autonomous AI node on bare metal, serving one user, the Principal, through a single interface, with two personas (Ren Ackerman, Arthur Sterling), an eight-director Shadow Cabinet, thirty-six domain knowledge profiles, twenty-three cross-domain task forces, and a set of autonomous protocols.
 
 **AGREED — Zero-cloud, precisely defined.** After the Sentinel discussion the rule is:
 
@@ -66,20 +67,20 @@ Sections 1–17 are the consolidated framework. Sections 18–22 are the audit. 
 
 ## 2. Hardware baseline
 
-**AGREED — Machine.** MINISFORUM MS-S1 Max.
+**AGREED — Machine.** GMKtec EVO-X5 Pro, "Gorgon Halo" platform. This replaces the MINISFORUM MS-S1 Max named in v0.1.
 
 | Component | Specification | Design consequence |
 |---|---|---|
-| CPU | AMD Ryzen AI Max+ 395, 16 Zen 5 cores, 32 threads | Ample for orchestrator, Celery CPU workers, vector DB, browser automation, CPU-only tools (Radiance, EnergyPlus, KiCad, Docling) |
-| GPU | Radeon 8060S, 40 CUs, RDNA 3.5, ROCm target gfx1151 | Runs all inference. Prompt processing is compute-bound and is the machine's weakest capability |
-| NPU | XDNA 2, ~50 TOPS | Not used. Linux LLM tooling is Windows-first. Zero design dependency |
-| Memory | 128 GB LPDDR5x-8000, 256-bit bus, soldered | ~256 GB/s theoretical, 210–230 GB/s achieved. Decode speed = bandwidth ÷ active weight bytes. Not upgradeable |
-| GPU-addressable memory | ~110–120 GB on Linux via GTT | The reason to buy this machine |
-| Power | 130 W sustained, 160 W peak, 320 W internal PSU | Desktop-class TDP for this chip; sustained inference holds. Expect audible fans |
-| Expansion | PCIe 4.0 x16 slot wired x4 | Future discrete GPU. A CUDA-locked tool (NVIDIA Modulus/PhysicsNeMo) would need an NVIDIA card here |
-| Network | Dual 10GbE, Realtek RTL8127 | **VERIFY V1**: driver present on the 26.04 kernel |
-| Storage 1 | 8 TB NVMe, PCIe 4.0 x4 | Models, engines, agent data, vector stores. All hot-loaded weights live here |
-| Storage 2 | 4 TB NVMe, PCIe 4.0 x1 (~2 GB/s) | Operating system, logs, cold storage archives, restic backups |
+| CPU | AMD Ryzen AI Max+ PRO 495, 16 Zen 5 cores, 32 threads, up to 5.2 GHz, 64 MB cache | Ample for orchestrator, Celery CPU workers, vector DB, browser automation, CPU-only tools (Radiance, EnergyPlus, KiCad, Docling) |
+| GPU | Radeon 8065S, 40 CUs, RDNA 3.5, **ROCm target gfx1151, confirmed by the Principal** | Runs all inference. Same identifier as the previous machine, so every community ROCm, Vulkan and llama.cpp finding carries over unchanged |
+| NPU | XDNA 2, up to 55 TOPS | Not used. Linux LLM tooling is Windows-first. Zero design dependency |
+| Memory | 192 GB LPDDR5X-8533, soldered | 273 GB/s. Decode speed = bandwidth ÷ active weight bytes. Not upgradeable |
+| GPU-addressable memory | ~170–180 GB on Linux via GTT | **VERIFY V3.** The reason to buy this machine, and what makes Q8 quantisation and a 155 GB Apex engine possible |
+| Power | 45–120 W configurable TDP | Principal is adding external cooling (R10) |
+| Expansion | USB4 ports with external GPU dock support; a third M.2 slot unused | A CUDA-locked tool (NVIDIA Modulus/PhysicsNeMo) would need an NVIDIA card via the dock |
+| Network | **Wi-Fi only by Principal's choice** | Wired 10GbE not used. V1 is informational, not a gate. Affects Phase 3 and 4 download time, not the VPN or the port forward |
+| Storage 1 | 8 TB NVMe, PCIe 4.0 x4 | `/srv/atlas`: models, engines, agent data, vector stores, vault. The growing side |
+| Storage 2 | 4 TB NVMe, PCIe 4.0 x4 | Operating system, logs, cold storage archives, restic backups. Both drives are now the same speed, so capacity decides the split, not bandwidth |
 
 **AGREED — Expected inference performance (community benchmarks on this chip).**
 
@@ -90,7 +91,10 @@ Sections 1–17 are the consolidated framework. Sections 18–22 are the audit. 
 | 32B dense, 4-bit | 19 GB | 10–12 tok/s |
 | 70B dense, 4-bit | 40 GB | ~5 tok/s |
 | 120B MoE, 5B active (gpt-oss-120b) | 63 GB | 30–55 tok/s |
-| 120B MoE, 10–12B active (Nemotron 3 Super, Qwen3.5-122B) | 65–70 GB | 18–19 tok/s |
+| 120B MoE, 10–12B active at 4-bit (Nemotron, Qwen3.5-122B) | 65–70 GB | 18–19 tok/s |
+| Same two at `Q8_0` (the adopted setting) | 120–130 GB | 12–17 tok/s, roughly a quarter slower for near-lossless weights |
+| 284B MoE, 13B active (DeepSeek V4 Flash) | 155 GB | 25–32 tok/s. Fewer active parameters than Nemotron, so larger and faster |
+| 72B dense at `Q8_0` (Qwen2.5-VL) | 79 GB | ~3 tok/s. Dense models are bandwidth-bound and slow here; accepted for quality |
 
 Prompt processing: ~350 tok/s stock, ~1,000 tok/s tuned, measured on a 7B model; larger models scale down proportionally. **This number drives the prompt-cache and injection-size rules in Sections 4.4 and 8.4.**
 
@@ -100,8 +104,10 @@ Prompt processing: ~350 tok/s stock, ~1,000 tok/s tuned, measured on a 7B model;
 
 ### 3.1 Operating system — AGREED with one refinement
 
-- **Ubuntu 26.04 LTS Server.** Chosen by the Principal for its newer kernel and compiler. Server, not Desktop: the node is headless and administered from the Principal's Windows PC via SSH and Cockpit. **RESOLVED**: an earlier recommendation of Desktop as a safety net for a Linux novice is withdrawn; Cockpit's in-browser terminal serves that purpose without a desktop session's memory and GPU cost.
+- **Ubuntu Server 26.04.1 LTS**, with **XFCE** installed on top and **xrdp** for remote graphical access. **RESOLVED (C19, reopened and re-decided):** v0.1 specified Server with no graphical layer; the Principal requires a graphics interface. The answer is not the full Ubuntu Desktop image, which ships GNOME and costs 1 to 1.5 GB idle, but Server plus XFCE at roughly 300 to 500 MB. The Principal opens a real desktop session, with a real browser, from the Remote Desktop client already built into Windows. The AI system itself, Open WebUI and Cockpit, remains browser-served and works whether or not a desktop session is open.
 - **Kernel 7.0** ships with 26.04 and includes the amdgpu driver for gfx1151.
+- **RESOLVED (C21): 24.04.5 evaluated and rejected.** Its September 2026 point release backports kernel 7.0 and Mesa 26.0 from 26.04, so hardware support for this chip is identical. 26.04.1 wins on support to April 2031 against April 2029 and a newer toolchain. 24.04's one real advantage, officially supported host ROCm, is irrelevant because ROCm runs only inside containers here (Section 3.4).
+- **RESOLVED (C22): the amd64v3 and amd64v4 archive variants are not adopted.** The benefit falls on CPU-bound distribution packages, not GPU inference, and llama.cpp and the PyTorch containers are already compiled against this exact Zen 5 chip. Canonical kept the standard baseline as 26.04's default after a rollout with known problems; no amd64v4 archive exists. Conversion remains possible post-install if ever wanted.
 
 ### 3.2 BIOS — AGREED
 
@@ -115,10 +121,10 @@ Prompt processing: ~350 tok/s stock, ~1,000 tok/s tuned, measured on a 7B model;
 ### 3.3 Kernel parameters — AGREED, VERIFY V3
 
 ```
-amdgpu.gttsize=131072 ttm.pages_limit=31457280
+amdgpu.gttsize=196608 ttm.pages_limit=50331648
 ```
 
-These expose ~128 GB of GTT and raise the pinned-page limit. They were validated on 6.x kernels; V3 confirms they still apply unchanged on 7.0 and that `llama-cli --list-devices` reports the full budget.
+Sized for 192 GB: `gttsize` is expressed in MiB and `pages_limit` in 4 KiB pages. These were validated on 6.x kernels at 128 GB; **V3** confirms they apply on 7.0 at this capacity, that `rocminfo` reports `gfx1151` as expected, and that `llama-cli --list-devices` sees the full budget. If the reported identifier were ever to differ, the community ROCm wheels would need rebuilding against it before Phase 4 runs; the Principal has confirmed it reads `gfx1151`.
 
 ### 3.4 GPU compute stack — RESOLVED (C2)
 
@@ -140,8 +146,10 @@ Two different stacks serve two different layers, and this is deliberate:
 
 | Drive | Mount | Contents |
 |---|---|---|
-| 4 TB x1 | `/` (OS), `/var/log`, `/srv/cold`, `/srv/backups` | Ubuntu, logs, pruned-memory cold storage, restic repository |
-| 8 TB x4 | `/srv/atlas` | `models/` (GGUF weights), `engines/` (PyTorch weights), `data/` (ChromaDB, graph store, SQLite), `workspace/`, `sandbox/`, `vault/` (encrypted container), `staging/` |
+| 4 TB, PCIe 4.0 x4 | `/` (OS), `/var/log`, `/srv/cold`, `/srv/backups` | Ubuntu, XFCE, logs, pruned-memory cold storage, restic repository |
+| 8 TB, PCIe 4.0 x4 | `/srv/atlas` | `models/` (GGUF weights), `engines/` (PyTorch weights), `data/` (ChromaDB, graph store, SQLite), `workspace/`, `sandbox/`, `vault/` (encrypted container), `staging/` |
+
+**Why this split, now that both drives are the same speed.** The v0.1 reasoning was bandwidth: keep the fast four-lane drive for weights read under load. That argument is gone; both are four-lane. The remaining argument is capacity and blast radius. The model and engine footprint is the side that grows as capability is added, so it gets the 8 TB drive. The operating system, logs and backups are stable in size and fit the 4 TB comfortably, and keeping the OS on a separate device means a full reinstall never touches the encrypted data volume.
 
 **NEW — Encryption at rest (was unspecified).**
 
@@ -157,7 +165,7 @@ Two different stacks serve two different layers, and this is deliberate:
 - `ufw` default deny inbound; allow SSH, Cockpit, Open WebUI, ntfy on LAN and WireGuard; allow UDP 51820 from anywhere. Default deny outbound except the allowlist (Section 12.5).
 - Cockpit for system health and in-browser terminal.
 - Docker with the GPU device nodes passed to containers that need them; the service user in `render` and `video` groups.
-- No desktop environment.
+- XFCE desktop and xrdp, listening on LAN and WireGuard interfaces only, never internet-facing. Firefox installed in the desktop session for the Principal's own use.
 
 ---
 
@@ -165,32 +173,44 @@ Two different stacks serve two different layers, and this is deliberate:
 
 ### 4.1 Budget — AGREED, unified to Linux numbers
 
-**RESOLVED (C3):** the brief carried both Windows (96 GB fixed) and Linux (~120 GB dynamic) numbers. Windows is gone. These are the binding numbers.
+**RESOLVED (C3):** the brief carried both Windows (96 GB fixed) and Linux (~120 GB dynamic) numbers. Windows is gone, and the machine now has 192 GB. These are the binding numbers.
 
 | Consumer | Budget | Notes |
 |---|---|---|
-| Ubuntu Server, Docker, Cockpit | 3 GB | |
+| Ubuntu Server, XFCE, Docker, Cockpit | 4 GB | XFCE adds roughly 0.5 GB over the headless figure in v0.1 |
 | Open WebUI, ChromaDB, graph store, embedding model | 4 GB | |
 | Eleanor's resident router model, 4B class | 4 GB | Always loaded |
 | Kokoro, Whisper Large-v3-Turbo, PyAnnote | 3 GB | Always loaded |
 | Orchestrator, Celery workers, Redis, Sentinel, ntfy, WG-Easy | 1–2 GB | |
-| **Always-resident subtotal** | **~16 GB** | |
-| Largest single LLM engine | 63–70 GB | One at a time |
-| KV cache headroom beside it | 30–40 GB | 8 parallel slots at 32k fits every engine (Section 4.3) |
-| **Or** one or two multimodal engines in place of the LLM | 5–40 GB each | Section 15 sizing |
+| **Always-resident subtotal** | **~17 GB** | |
+| **Usable for engines** | **~170 GB** | **VERIFY V3** on first boot before anything depends on it |
+
+**What fits together, at the adopted quantisations:**
+
+| Combination | Total | Verdict |
+|---|---|---|
+| gpt-oss-120b + Qwen2.5-VL-72B, both resident | 142 GB + caches | Comfortable. The everyday pairing: text and vision with no swap between them |
+| gpt-oss-120b + gpt-oss-120b abliterated | 126 GB + caches | Comfortable |
+| Nemotron `Q8_0` alone | 120–123 GB | Comfortable, ~45 GB spare |
+| Qwen3.5-122B `Q8_0` alone | 130 GB | Comfortable, ~35 GB spare |
+| Nemotron `Q8_0` + gpt-oss-120b, Ren and Arthur together | 186 GB | **Does not fit.** Accepted by the Principal: hemispheres swap rather than co-reside. Nemotron at `Q6_K` (~95 GB) would restore it if ever wanted |
+| DeepSeek V4 Flash `UD-Q4_K_XL` | 155 GB | Runs alone. The Arbiter unloads any co-resident engine first. ~10–15 GB margin, so its context is capped accordingly |
 
 ### 4.2 Engine Arbiter — NEW, hard requirement
 
-Nothing in the earlier brief named the component that enforces "one large engine at a time." It is defined here.
+Nothing in the earlier brief named the component that enforces the residency and generation rules. It is defined here.
 
-**The Engine Arbiter** is a single service inside the orchestrator through which every load and unload of any weight-bearing process passes: the four LLMs, Meditron, every Phase 4 engine, Chatterbox when invoked. Rules:
+**The Engine Arbiter** is a single service inside the orchestrator through which every load and unload of any weight-bearing process passes: the five core LLMs, Meditron, every Phase 4 engine, Chatterbox when invoked. Rules:
 
 1. It holds a ledger of currently resident engines and their measured footprint.
 2. A load request states the engine and the context or batch size. The Arbiter computes the projected footprint against the live budget and either grants, queues, or refuses.
-3. Before loading, it confirms the previous engine's memory has actually been released, by polling the GPU memory counters, not by trusting the process exit. This check is the difference between a stable node and one that crashes on the second swap.
-4. It never preempts an engine mid-generation. A Sentinel job, a Celery task, or a second persona waits for the current generation to finish, then swaps.
-5. Deep Think and any multi-branch job must request their full footprint up front; if it does not fit, the Arbiter downgrades the depth tier (Section 9.1) rather than attempt the load.
-6. Every decision is logged with the task ID from the Celery layer (Section 9.7).
+3. **Two engines may be resident; exactly one may generate at any moment.** This is the settled reading of the Principal's decision and it applies everywhere, including background work. Residency costs memory only, so a resident pair swaps for free. Generation is bandwidth-bound, so two concurrent streams would each run at roughly half speed; that is why simultaneous generation is not adopted at all.
+4. A second generation request queues behind the running one, waiting seconds rather than the 10 to 25 seconds a swap would cost. The Celery `gpu` queue keeps exactly one worker, so a background job simply waits its turn (Section 9.7).
+5. Before loading, it confirms the previous engine's memory has actually been released, by polling the GPU memory counters, not by trusting the process exit. This check is the difference between a stable node and one that crashes on the second swap.
+6. It never preempts an engine mid-generation. A Sentinel job, a Celery task, or a second persona waits for the current generation to finish.
+7. The Apex engine (DeepSeek V4 Flash, 155 GB) is exclusive: requesting it unloads any co-resident engine first, and nothing else loads while it is resident.
+8. Deep Think and any multi-branch job must request their full footprint up front; if it does not fit, the Arbiter downgrades the depth tier (Section 9.1) rather than attempt the load.
+9. Every decision is logged with the task ID from the Celery layer (Section 9.7).
 
 ### 4.3 KV-cache protocol — AGREED, corrected
 
@@ -201,6 +221,8 @@ Nothing in the earlier brief named the component that enforces "one large engine
 | Flash Attention | On | Prerequisite for cache quantisation |
 | KV cache type, Arthur's engines (Nemotron, Qwen3.5) | `q8_0` | Precision-sensitive audit and legal work |
 | KV cache type, Ren's engines (gpt-oss, abliterated) | `q4_0` | More headroom for prose and multi-branch Deep Think |
+| KV cache type, Apex engine (DeepSeek V4 Flash) | `q4_0`, context capped | Only ~10–15 GB of margin remains at 155 GB of weights |
+| KV cache type, vision engine (Qwen2.5-VL-72B) | `q8_0` | Document and drawing reads are precision-sensitive |
 | Per-model quantisation check | Day 1 verification script | **VERIFY V4**: unsupported architectures silently fall back to full precision |
 | Context size | Explicit per model, never the default | Default contexts are small and silently truncate agent history |
 | Context shift with `n_keep` | On; `n_keep` covers system prompt + persona directive + router state | Anchors never evicted; generation never hard-stops |
@@ -228,29 +250,36 @@ Slot-level cache reuse in llama-server keeps layers 1–2 resident across dispat
 
 ## 5. Inference stack
 
-### 5.1 The four core engines — AGREED
+### 5.1 The five core engines and their quantisations — CLOSED
 
-| Engine | Architecture | Disk, 4-bit | Decode | Role |
-|---|---|---|---|---|
-| gpt-oss-120b | 117B MoE, 5.1B active, MXFP4 | 63 GB | 30–55 tok/s | Default resident engine. Ren, Helena, Victor, Gideon, Minerva |
-| gpt-oss-120b abliterated (Huihui, MXFP4 GGUF) | Same weights, refusals removed | 63 GB | Same | Valerie default; Ren on override |
-| Nemotron 3 Super | 120B hybrid Mamba MoE, 12.7B active | 65–70 GB | ~18 tok/s | Arthur default. Silas, Alaric |
-| Qwen3.5-122B-A10B | 122B MoE, 10B active, vision-capable, 256k context, multilingual | 65–70 GB | 18–19 tok/s | Override engine for long documents, images, drawings, future languages |
+**RESOLVED (C23):** v0.1 ran everything at 4-bit because 128 GB forced it. With 192 GB the rule becomes: use the highest quantisation that leaves working headroom, except where a model's native release is already low-bit.
 
-All four are supported by llama.cpp. No two fit together. Swapping is inherent and is managed by the Engine Arbiter, not avoided.
+| Engine | Architecture | Quantisation | File | Decode | Role |
+|---|---|---|---|---|---|
+| gpt-oss-120b | 117B MoE, 5.1B active | **MXFP4, native** | 63 GB | 30–55 tok/s | Default resident engine. Ren, Helena, Victor, Gideon, Minerva |
+| gpt-oss-120b abliterated (Huihui) | Same weights, refusals removed | **MXFP4, native** | 63 GB | Same | Valerie default; Ren and Arthur on explicit override |
+| Nemotron 3 Super | 120B hybrid Mamba MoE, 12.7B active | **`Q8_0`**, raised from 4-bit | 120–123 GB | ~12–14 tok/s | Arthur default. Silas, Alaric |
+| Qwen3.5-122B-A10B | 122B MoE, 10B active, 256k context, multilingual | **`Q8_0`**, raised from 4-bit | 130 GB | ~15–17 tok/s | Override engine for long documents and future languages |
+| **DeepSeek V4 Flash** | 284B MoE, 13B active | **`UD-Q4_K_XL`** | 155 GB | 25–32 tok/s | **NEW. The Apex engine.** Deep Think deep tier, TF_OMEGA, strong cross-checks. Runs alone |
 
-**Optional fifth, Phase 3:** Meditron-70B, dense, ~40 GB at 4-bit, single-digit tok/s. Secondary cross-check for Minerva only. **RESOLVED (C5):** it runs through llama.cpp like the others, not through the PyTorch layer.
+**Why the two gpt-oss engines stay at MXFP4.** Their expert weights were released natively in MXFP4. There is no higher-precision original to return to; a `Q8` build would upcast the same 4-bit values, adding 60 GB and halving the speed for no accuracy. MXFP4 is this model's full-quality form.
 
-### 5.2 Backend — DECISION D1, with recommendation
+**Why DeepSeek V4 Flash is Q4 and not Q8.** Its experts, about 96% of the weights, ship natively low-bit, so `UD-Q4_K_XL` and `UD-Q8_K_XL` carry bit-identical experts and differ only in the remaining 4% of tensors, at a cost of 7 GB. Q8 would total roughly 183 GB against a ~170 GB budget, leaving 2 to 5 GB and requiring the Arbiter to evict speech and the router to fit. Q4 is the adopted setting; Q8 is logged as a post-Day-1 experiment, not a dependency.
+
+**Sixth engine, Phase 3, confirmed included (D12):** Meditron-70B, dense, `Q8_0`, ~74 GB, ~3 tok/s. Secondary cross-check for Minerva only. **RESOLVED (C5):** it runs through llama.cpp like the others, not through the PyTorch layer.
+
+**Seventh, the vision engine (Section 15.2):** Qwen2.5-VL-72B at `Q8_0`, 79 GB, ~3 tok/s. It loads through the same Arbiter and may be co-resident with gpt-oss-120b.
+
+### 5.2 Backend — CLOSED (D1): llama-server
 
 | Option | Vulkan on 26.04 host | Slot-level prompt cache | Nemotron 3 Super GGUF support | Maturity on gfx1151 |
 |---|---|---|---|---|
 | llama-server (llama.cpp) | Mature, validated by multiple Strix Halo builders | Yes, per slot, save/restore | Yes | Highest |
 | Ollama | Vulkan backend introduced as experimental; ROCm backend needs host ROCm, which 26.04 lacks | Coarser | Had loader incompatibilities with this model earlier in 2026 | Lags llama.cpp |
 
-**Recommendation:** llama-server primary. Ollama only if the Principal has a specific reason. Both expose an OpenAI-compatible API, so the orchestrator is identical either way. Appendix B gives the equivalent settings for both.
+**Decision:** llama-server, accepted by the Principal. Ollama is not installed. Both expose an OpenAI-compatible API, so Appendix B retains the Ollama equivalents only as a fallback reference if the primary path ever fails on this hardware.
 
-### 5.3 Resident small models — DECISION D4
+### 5.3 Resident small models — CLOSED (D4)
 
 | Role | Requirement | Candidate |
 |---|---|---|
@@ -258,17 +287,19 @@ All four are supported by llama.cpp. No two fit together. Swapping is inherent a
 | Embeddings | Multilingual-ready, strong retrieval | bge-m3 or nomic-embed-text-v2 |
 | Reranker, optional | Improves RAG precision | bge-reranker-v2-m3 |
 
-D4 asks the Principal to accept these defaults or name alternatives.
+The Principal accepted these as recommended: Qwen3.5 4B-class instruct for routing, bge-m3 for embeddings, bge-reranker-v2-m3 for reranking.
 
 ### 5.4 Model swapping — AGREED
 
-| Step | Linux, from the x4 NVMe |
+| Step | From either NVMe, both now four-lane |
 |---|---|
 | Read 65 GB from disk | 10–15 s |
+| Read 130 GB (a `Q8_0` engine) | 20–30 s |
+| Read 155 GB (the Apex engine) | 25–35 s |
 | Release previous engine and allocate | 5–10 s |
-| Total per swap | 10–25 s |
+| Total per swap | 15–45 s depending on engine size |
 
-Swaps are minimised by grouping work by engine (Section 6.3), never eliminated.
+Swaps grew with the higher quantisations, which is precisely why two-engine residency (Section 4.2) matters: the everyday text-and-vision pairing no longer swaps at all. Swaps are further minimised by grouping work by engine (Section 6.3), never eliminated.
 
 ---
 
@@ -281,25 +312,26 @@ Swaps are minimised by grouping work by engine (Section 6.3), never eliminated.
 | Hemisphere | Offensive, creative, expansive, outward-facing | Defensive, regimented, private, guardian of personal data |
 | Domain mandate | Corporate, Enterprise, Infrastructure, AEC | Estate, Private Health, Logistics, Family |
 | Default engine | gpt-oss-120b | Nemotron 3 Super |
-| Override engine | gpt-oss-120b abliterated, on Principal's order | Qwen3.5-122B-A10B for deep document reasoning |
+| Override engine | gpt-oss-120b abliterated, on Principal's order | Qwen3.5-122B-A10B for deep document reasoning; **and the abliterated engine on the Principal's explicit command (C6 addendum)** |
+| Apex escalation | DeepSeek V4 Flash, on Deep Think deep tier or TF_OMEGA | Same |
 | Sampling | High temperature (0.8) as Deep Think Generator | Low temperature, not zero, as Deep Think Adversary |
 | Deep Think role | Generator: three divergent trajectories | Adversary: rubric-scored verdict, weak concepts killed |
 | Code path | Writes sandbox code | Audits code for memory and safety before execution, as a second layer over the OS-level sandbox cap |
 | Directors | Gideon, Silas, Valerie, Helena, Eleanor | Alaric, Minerva, Victor |
 
-**RESOLVED (C6):** the original brief bound Arthur's override to the abliterated engine "for legal dissection." Abliteration removes refusals and slightly increases errors; it does not improve reasoning. Arthur's override is Qwen3.5 for long-document work. The abliterated engine is reserved for work that refusals actually block.
+**RESOLVED (C6):** the original brief bound Arthur's override to the abliterated engine "for legal dissection." Abliteration removes refusals and slightly increases errors; it does not improve reasoning. Arthur's standing override is therefore Qwen3.5 for long-document work. **Addendum accepted by the Principal:** Arthur may additionally be switched to the abliterated engine on explicit command, mirroring Ren. It is a manual escalation, never a default, and its output passes the same approval gate (R13).
 
 ### 6.2 The Shadow Cabinet — AGREED, final engine map
 
 | Director | Division | Remit | Default engine | Override | Speaks externally |
 |---|---|---|---|---|---|
-| Gideon Vance | Corporate | Legal & Compliance | gpt-oss-120b, high reasoning, retrieval-grounded | Qwen3.5-122B for long contracts | Yes, sensitive tier |
+| Gideon Vance | Corporate | Legal & Compliance | gpt-oss-120b, high reasoning, retrieval-grounded | Qwen3.5-122B for long contracts; Apex engine for TF_OMEGA | Yes, sensitive tier |
 | Silas Thorne | Corporate | CFO: capital, audit, banking | Nemotron 3 Super + code interpreter for all arithmetic | none | Yes, standard tier |
-| Valerie Cross | Corporate | Infrastructure, DevOps, AEC, cyber, AEGIS Sandbox | gpt-oss-120b abliterated | Qwen3.5-122B for drawings and images | Yes, standard tier |
+| Valerie Cross | Corporate | Infrastructure, DevOps, AEC, cyber, AEGIS Sandbox | gpt-oss-120b abliterated | Qwen2.5-VL-72B for drawings and images | Yes, standard tier |
 | Helena Frost | Corporate | Communications, brand, PR, crisis | gpt-oss-120b | none | Yes, standard tier |
 | Eleanor Croft | Corporate | Routing, scheduling, triage; the 4-Way Router's classifier | Resident 4B model | none | Yes, routine tier (scheduling) |
 | Alaric Stone | Estate | Physical assets, security, threat mitigation; Sentinel threat watch | Nemotron 3 Super | none | Yes, sensitive tier |
-| Minerva Hale | Estate | Private health, longevity; medical data | gpt-oss-120b, retrieval-grounded | Qwen3.5-122B for records and scans; Meditron-70B cross-check | Yes, sensitive tier |
+| Minerva Hale | Estate | Private health, longevity; medical data | gpt-oss-120b, retrieval-grounded | Qwen2.5-VL-72B for scans, Qwen3.5-122B for records, Meditron-70B cross-check | Yes, sensitive tier |
 | Victor Vale | Estate | Aviation, transport, concierge | gpt-oss-120b | none | Yes, routine tier |
 
 **RESOLVED (C7):** the original brief bound Gideon and Minerva to the abliterated engine "for zero-hallucination" reasoning. Hallucination is controlled by retrieval over the Principal's own documents, mandatory citations, and a verifier pass, not by model choice. Both use the standard engine. The brief's "Silas runs exclusively on Nemotron for absolute mathematical precision" is retained with the correction that precision comes from the code interpreter; Nemotron orchestrates and audits.
@@ -347,9 +379,9 @@ On one machine with sequential engines, the separation between Ren and Arthur is
 
 ### 8.1 Scope — AGREED
 
-All thirty domain profiles and all twenty-three task forces are retained. Nothing was removed. The consolidation proposed during review survives only as **tags**: each domain and task force carries a hemisphere, an owning director, and a JIT priority tier. The tags decide default routing; they delete nothing.
+All original thirty domain profiles and all twenty-three task forces are retained; six domains have been **added**, taking the roster to thirty-six. Nothing was ever removed. The consolidation proposed during review survives only as **tags**: each domain and task force carries a hemisphere, an owning director, and a JIT priority tier. The tags decide default routing; they delete nothing.
 
-### 8.2 The thirty domains — owners and tiers
+### 8.2 The thirty-six domains — owners and tiers
 
 Tier A loads without hesitation. Tier B loads on a clear task-force or keyword match. Tier C loads only on explicit match and is expected to be rare.
 
@@ -385,9 +417,32 @@ Tier A loads without hesitation. Tier B loads on a clear task-force or keyword m
 | 28 | Chief Behavioral Architect & Neuro-Optimizer | Corporate | Helena, with Minerva | C |
 | 29 | Frontier Technologies & Spatial Engineer | Corporate | Valerie | B |
 | 30 | Sovereign Architect & Network State Strategist | Corporate | Ren, tagged to 25 | C |
+| 31 | Embedded Systems & Mobile Security (firmware, bare-metal OS internals, mobile platforms) | Corporate | Valerie | B |
+| 32 | Communications & Telecom Security (cryptographic protocols, network infrastructure, signals) | Corporate | Valerie, with Alaric | B |
+| 33 | Automotive & Vehicle Systems Engineering | Corporate | Valerie | C |
+| 34 | Quantum Computing & Post-Quantum Cryptography | Corporate | Valerie | C |
+| 35 | Materials Science & Computational Chemistry | Corporate | Valerie, with Minerva | C |
+| 36 | Synthetic Biology & Genomic Engineering | Estate | Minerva | C |
 
 
-Items from the earlier draft list that had no home in the thirty: Bioinformatics & Genomic Sequencing is folded into domain 15 as a subspecialty. Psychological Operations & Human Engineering is not added as a domain; its legitimate negotiation and behavioural-economics content already lives in domains 17 and 28, and operations aimed at named individuals are outside what this system builds capability for. Bare-Metal OS Exploitation and Quantum Computing are held in reserve pending a stated need (**DECISION D5**).
+**RESOLVED (C24): the reserve list is closed.** The Principal supplied the operational reasons behind the two held-back areas and nine related fields. Six became standalone domains, 31 to 36 above; five fold into existing domains as named subspecialties rather than duplicate cards:
+
+| Principal's area | Treatment |
+|---|---|
+| Bare-Metal OS Exploitation, Smartphones | Domain 31, Embedded Systems and Mobile Security |
+| Communication Security, Telecom Network | Domain 32, Communications and Telecom Security |
+| Automotive Systems | Domain 33 |
+| Quantum Computing | Domain 34, with post-quantum cryptography |
+| Drug Discovery and Materials Design | Domain 35 for materials; drug discovery folds into domain 15's bioinformatics subspecialty |
+| Synthetic Biology Innovation | Domain 36 |
+| Industrial SCADA Systems | Subspecialty of domain 9, Industrial and Energy Engineer, made explicit |
+| Rapid Data Analysis | Subspecialty of domain 4, Data Scientist and AI Engineer |
+| Financial Fraud and Risk Modeling | Subspecialty of domains 5 and 21 |
+| Logistics Optimization | Subspecialty of domains 16 and 18 |
+
+Bioinformatics and Genomic Sequencing remains folded into domain 15. Psychological Operations and Human Engineering is still **not** added: its legitimate negotiation and behavioural-economics content lives in domains 17 and 28, and operations aimed at named individuals stay outside what this system builds capability for.
+
+**Posture for the security-adjacent additions.** Domains 31, 32 and 34 inherit the framing already set for domain 1: defensive architecture, authorised testing of systems the Principal owns or is engaged to test, vulnerability research, and standards compliance. They do not exist to act against third-party systems, and the approval gate treats anything they produce as sensitive tier.
 
 ### 8.3 The twenty-three task forces — owners
 
@@ -423,7 +478,7 @@ Original codes are retained. The grouping column is a tag, not a merge.
 
 Domains are knowledge, not agents. A domain never spawns a model. It is injected into the running director's system prompt for one dispatch. Because prompt processing is this machine's weakest capability, injection is bounded:
 
-1. Each domain profile is stored in two forms: the full seven-field profile (reference, retrievable) and a compact card of roughly 300 to 500 tokens (injected). The card carries the strategic frame, the compliance list for Australia, the cognitive method, and the tooling names.
+1. Each of the thirty-six domain profiles is stored in two forms: the full seven-field profile (reference, retrievable) and a compact card of roughly 300 to 500 tokens (injected). The card carries the strategic frame, the compliance list for Australia, the cognitive method, and the tooling names.
 2. At most three domain cards per dispatch. A task force preset names which cards it pulls; a request that would need more than three is split into a relay (Section 8.5).
 3. Cards are appended after the static persona and governance layers so the cached prefix survives (Section 4.4).
 4. Tier C cards load only on an explicit match, never speculatively.
@@ -449,7 +504,7 @@ The task-force rule matters operationally: a single-director task force is one l
 
 ### 8.6 Agentic delegation — RESOLVED (C10)
 
-The domain profiles' original line, "Stateless MRTR, dispatch payload and decouple," is replaced in all thirty by:
+The domain profiles' original line, "Stateless MRTR, dispatch payload and decouple," is replaced in all thirty-six by:
 
 > Isolated-context dispatch. Spawns with a clean, task-scoped context; reports completion or failure to the spawning director under a task ID; subject to the same tiered approval and Ouroboros logging as any other action.
 
@@ -467,7 +522,7 @@ Trigger: `[DEEP THINK: problem]` or the router's task-weight estimate. Eleanor's
 |---|---|---|---|
 | Quick | Generator and adversary on the same loaded engine with different role prompts | 0 | 1 to 2 min |
 | Standard | Ren generates three trajectories, Arthur scores on his own engine, Ren refines the winner | 2 | 5 to 8 min |
-| Deep | Standard plus a second expansion and scoring round, Qwen3.5 as third opinion on documents | 3 to 4 | 15 to 25 min |
+| Deep | Standard plus a second expansion and scoring round, **the Apex engine (DeepSeek V4 Flash) delivering the final synthesis**, Qwen3.5 as third opinion on documents | 3 to 4 | 15 to 30 min |
 
 **Corrections adopted:** Nemotron runs at low temperature, not zero, because reasoning models loop at exactly zero. Scores out of 100 are rubric-based judgements with named criteria, not mathematics; where a real figure exists, Silas computes it through the code interpreter and Arthur scores against the computed number. Phases are batched, never round-by-round ping-pong between engines.
 
@@ -656,7 +711,7 @@ Kokoro ships 54 named presets; the English set is 11 American female, 9 American
 
 ### 14.4 Vision — AGREED, policy
 
-ATLAS sees on demand. The Principal, or a defined trigger, says "look now"; one frame is sampled through the resident vision engine (GLM-4.6V-Flash or Qwen2.5-VL, D10). Continuous video inference is not a default: at any real frame rate it would compete for the GPU against everything else and break the sequential design, and an always-on camera feed is a privacy commitment that deserves an explicit decision. Continuous monitoring exists only as a separately enabled capability under Alaric's estate-security domain, tied to specific cameras, with SAM 2 for tracking, and it is logged like any other sensitive action.
+ATLAS sees on demand. The Principal, or a defined trigger, says "look now"; one frame is sampled through the vision engine, Qwen2.5-VL-72B (D10 closed). Continuous video inference is not a default: at any real frame rate it would compete for the GPU against everything else and break the sequential design, and an always-on camera feed is a privacy commitment that deserves an explicit decision. Continuous monitoring exists only as a separately enabled capability under Alaric's estate-security domain, tied to specific cameras, with SAM 2 for tracking, and it is logged like any other sensitive action.
 
 ---
 
@@ -675,8 +730,7 @@ Two categories. **Tools** are CPU-bound or lightweight, always available, instal
 | Python via code interpreter | Voltage drop and other formula engineering, all of Silas's arithmetic | All directors |
 | KiCad CLI | PCB design, DRC, export, driven through its Python API by the coding engine | Domain 29, Valerie |
 | Docling | Document conversion for PDFs, Office files, scans into structured chunks with tables and page provenance | Ingestion for every domain |
-| Cross-platform build service | Android NDK plus Gradle for .apk, MinGW-w64 for .exe, containerised, the "OmniBuild-KVM" capability minus Apple | Domain 1 and 5, Valerie |
-| Apple .ipa builds | Not on this node. Licensed cloud Mac runner or the Principal's own Mac dispatched over the network. DECISION D11 | Domain 1, Valerie |
+| Cross-platform build service | Android NDK plus Gradle for .apk, MinGW-w64 for .exe, containerised. This is the "OmniBuild-KVM" capability, Android and Windows only | Domain 1 and 5, Valerie |
 | Playwright and browser automation | Text-based DOM browsing for platforms without an API | All directors, per tier |
 
 ### 15.2 Phase 4 engines — tiers
@@ -687,8 +741,7 @@ Green: build with confidence. Yellow: attempt with automatic fallback; never blo
 |---|---|---|---|---|
 | Wan2.2 (in place of Wan2.1) | Video generation | Green: validated on gfx1151 by maintained toolboxes | 20 to 40 GB | Domain 12, Helena |
 | FLUX.1 | Image generation, architectural visualisation with LoRA (the "Arch-DiT" imagery use) | Green: validated on gfx1151 | 12 to 24 GB | Domains 8 and 12 |
-| GLM-4.6V-Flash (9B) | Vision-language, documents, drawings, screenshots, 128k context, MIT licence | Green: standard architecture | ~18 GB | General, D10 |
-| Qwen2.5-VL 7B | Vision-language, alternative or cross-check to GLM | Green | 8 to 16 GB | General, D10 |
+| **Qwen2.5-VL-72B at `Q8_0`** | Vision-language: documents, drawings, screenshots, scans. **The sole vision engine** | Green: official Apache-2.0 release, GGUF builds published | 79 GB | General. Valerie for drawings, Minerva for scans, Gideon for scanned contracts |
 | Florence-2 | Lightweight vision, detection, captioning, OCR | Green | under 2 GB | General |
 | TimesFM or Chronos | Time-series forecasting | Green | under 5 GB | Domain 21, Silas |
 | Stable Audio Open | Music and sound generation | Green | under 5 GB | Domain 12, Helena |
@@ -712,7 +765,7 @@ Green: build with confidence. Yellow: attempt with automatic fallback; never blo
 | DeepRoute-AEC | No such model; the real MEP products are Revit-bound SaaS | OpenStudio/EnergyPlus + IfcOpenShell clash detection + Python calculations + Valerie orchestrating routing (15.1) |
 | Lumina-PBR | No such engine | Radiance for physical light + Blender Cycles for the render (15.1, 15.2) |
 | Arch-DiT | No such model | FLUX.1 with an architectural LoRA; parametric IFC via MCP4IFC |
-| OmniBuild-KVM | No such tool; described capability is a build farm | Cross-platform build service (15.1); Apple path per D11 |
+| OmniBuild-KVM | No such tool; described capability is a build farm | Cross-platform build service (15.1), Android and Windows only; Apple removed entirely (D11 closed) |
 | BIM-GPT, LayoutGPT-3D | Real research papers, not installable products | Capability covered by MCP4IFC |
 | RTLLM | A benchmark for grading LLM-written Verilog, not a generator | Coding engine prompted against its structure; KiCad for the physical side |
 
@@ -720,12 +773,17 @@ Green: build with confidence. Yellow: attempt with automatic fallback; never blo
 
 | Set | Size |
 |---|---|
-| Four core LLMs | ~262 GB |
-| Meditron-70B, optional | ~40 GB |
-| Phase 4 engines, green and yellow | ~150 to 250 GB |
-| Total weights | under 600 GB of the 8 TB drive |
+| gpt-oss-120b and its abliterated twin, MXFP4 | 126 GB |
+| Nemotron 3 Super, `Q8_0` | 120–123 GB |
+| Qwen3.5-122B-A10B, `Q8_0` | 130 GB |
+| DeepSeek V4 Flash, `UD-Q4_K_XL` | 155 GB |
+| Qwen2.5-VL-72B, `Q8_0` | 79 GB |
+| Meditron-70B, `Q8_0` | ~74 GB |
+| **Core engine subtotal** | **~690 GB** |
+| Phase 4 engines, green and yellow | ~130 to 210 GB, lower than v0.1 with the vision models consolidated |
+| **Total weights** | **under 900 GB of the 8 TB drive** |
 
-Download time on 100 Mbps: roughly 6 hours for the core set, similar again for engines. Both phases run detached and resumable.
+Download time over the Principal's Wi-Fi at roughly 100 Mbps: about 15 hours for the core set, several more for the Phase 4 engines, and less predictable than a wired link. Both phases run detached and resumable, so this costs time, not attention.
 
 ---
 
@@ -777,7 +835,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 
 - Fictitious directors corresponding externally under their own names, combined with non-disclosure of AI nature, can engage misleading-conduct provisions of the Australian Consumer Law and disclosure expectations in some professional contexts. Gideon's sensitive-tier check and the approval gate are the controls.
 - The Privacy Act 1988 reforms of 2024 to 2026 raise obligations around automated decisions touching individuals; Arthur's division holds family and health data and should treat every external disclosure as sensitive-tier.
-- macOS virtualisation on non-Apple hardware is excluded (D11).
+- macOS virtualisation on non-Apple hardware was considered and is excluded; the Apple build path is removed from the design entirely (D11 closed).
 
 ---
 
@@ -787,14 +845,15 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 
 ### Phase 1 — Platform (reboot in the middle)
 
-1. Pre-flight: confirm Ubuntu 26.04 Server, kernel 7.0, both NVMe drives present, fTPM enabled (V2), RTL8127 link (V1).
+1. Pre-flight: confirm Ubuntu Server 26.04.1, kernel 7.0, both NVMe drives present, fTPM enabled (V2), and **`rocminfo` reporting `gfx1151`** before anything else runs (V3).
 2. LUKS2 on the data volume, TPM2 enrolment, recovery key printed once for off-node storage (D3).
 3. Mount layout per Section 3.5; swap off; tmpfs for `/tmp`.
 4. System update; kernel parameters (V3); firewall baseline; SSH hardening; Cockpit.
-5. Reboot. Post-reboot: `vulkaninfo` shows the Radeon 8060S; `llama-cli --list-devices` reports the expected memory budget.
+5. Reboot. Post-reboot: `vulkaninfo` shows the Radeon 8065S; `llama-cli --list-devices` reports ~170 GB usable (V3).
+5b. XFCE and xrdp installed, bound to LAN and WireGuard only; Firefox in the desktop session; one RDP connection tested from the Principal's Windows PC.
 6. Docker with GPU device passthrough; service account in `render` and `video`.
 7. WG-Easy, Cloudflare dynamic DNS with the relocated scoped token (R7), ntfy.
-8. **Gate:** table of V1, V2, V3, V5 results. Phase 2 does not start on a red row.
+8. **Gate:** table of V2, V3, V5, V19 results. Phase 2 does not start on a red row. V1 is recorded as informational only, since the node runs on Wi-Fi.
 
 ### Phase 2 — Engines and services (fast, no large downloads)
 
@@ -803,7 +862,9 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 3. Open WebUI with offline hardening (12.1); A.T.L.A.S., Ren, Arthur registered as models; the router Filter installed.
 4. ChromaDB, graph store, embedding model (D4); Docling ingestion service.
 5. Kokoro, Chatterbox, Whisper Large-v3-Turbo, PyAnnote 3.1 (V6).
-6. Phase 2 tools (15.1): IfcOpenShell, Bonsai, MCP4IFC, Radiance, OpenStudio/EnergyPlus, KiCad CLI, Playwright, the cross-platform build container.
+6. Phase 2 tools (15.1): IfcOpenShell, Bonsai, MCP4IFC, Radiance, OpenStudio/EnergyPlus, KiCad CLI, Playwright, the cross-platform build container (Android and Windows targets only).
+6b. Relocate the Cloudflare token automatically: scoped token into a mode-600 environment file owned by the updater service, outside `/srv/atlas` and outside restic's include set, then delete `CLOUDFLARE.txt` (R7, D-closed).
+6c. Google OAuth pause: the script prints one authorisation link per account, waits for the Principal to approve in a browser, then continues. Two accounts, roughly five minutes total (V20).
 7. restic repository on the second drive; nightly timer; first backup; first restore test.
 8. Sentinel timer (disabled until D6 confirms feeds), pruning timer.
 9. Windows PC share mount unit, on-demand.
@@ -811,14 +872,15 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 
 ### Phase 3 — Core LLM pull (long, detached, resumable)
 
-1. Pull gpt-oss-120b, gpt-oss-120b abliterated, Nemotron 3 Super (UD-Q4_K_XL class), Qwen3.5-122B-A10B (Strix Halo-tuned GGUF), with checksum verification. Meditron-70B if D12 is taken.
+1. Pull, with checksum verification, at the quantisations fixed in Section 5.1: gpt-oss-120b (MXFP4), gpt-oss-120b abliterated (MXFP4), Nemotron 3 Super (`Q8_0`), Qwen3.5-122B-A10B (`Q8_0`), DeepSeek V4 Flash (`UD-Q4_K_XL`), Qwen2.5-VL-72B (`Q8_0`), Meditron-70B (`Q8_0`). About 690 GB.
 2. For each model, in turn: load through the Engine Arbiter; confirm the quantised KV cache actually applied (V4); measure decode and prefill at 512 and 8k tokens; measure swap time; unload; confirm memory returned.
-3. **Gate:** printed table of load success, KV type, tok/s, swap seconds per model. This is the day-one load test the whole design depends on (V10).
+3. Two-residency test: load gpt-oss-120b and Qwen2.5-VL-72B together, confirm both hold at ~142 GB, and confirm a second generation request queues rather than running concurrently (V14, V21).
+4. **Gate:** printed table of load success, KV type, tok/s, swap seconds per engine. This is the day-one load test the whole design depends on (V10). DeepSeek V4 Flash carries its own row: mainline llama.cpp support for this architecture is newer than the rest, so a failure here downgrades it to deferred without blocking the phase (R19).
 
 ### Phase 4 — Multimodal engines (long, detached, per-engine pass/fail)
 
 1. Self-test the community PyTorch ROCm wheel inside the base container: tensor on GPU, matmul, a small diffusion step (V11).
-2. Build green engines in order of value: GLM-4.6V-Flash, FLUX.1, Wan2.2, Florence-2, TimesFM or Chronos, Whisper-adjacent audio, UI-TARS 2.0, Rad-DINO, SAM 2 with the extension flag, Stable Audio Open, CosyVoice2, OpenVLA.
+2. Build green engines in order of value: FLUX.1, Wan2.2, Florence-2, TimesFM or Chronos, UI-TARS 2.0, Rad-DINO, SAM 2 with the extension flag, Stable Audio Open, CosyVoice2, OpenVLA. The vision engine is not here; Qwen2.5-VL-72B is a GGUF engine pulled in Phase 3.
 3. Attempt yellow engines: TRELLIS, Blender Cycles HIP with CPU fallback. Log pass or fail, never block.
 4. Verify PointLLM (V8) and Clay or Prithvi (V9); mark deferred if they fail.
 5. Register every passing engine with the Engine Arbiter with its measured footprint.
@@ -830,7 +892,7 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 |---|---|
 | 1 | 30 to 60 minutes including reboot |
 | 2 | 30 to 60 minutes |
-| 3 | Download-bound: ~6 hours at 100 Mbps, under 1 hour at gigabit; plus ~20 minutes of load tests |
+| 3 | Download-bound: ~15 hours at 100 Mbps over Wi-Fi for ~690 GB; plus ~30 minutes of load tests |
 | 4 | Download and build-bound: several hours; can run overnight |
 
 ---
@@ -859,27 +921,33 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 | C18 | "Vector Cortex replaces chat logs" versus Open WebUI's own database | Supplements; retention rule under D9 (10.4) |
 | C19 | Desktop recommended for a Linux novice, then Server chosen | Server with Cockpit (3.1) |
 | C20 | Fish Audio requested, then excluded as non-local and research-licensed | Kokoro plus Chatterbox (14.1) |
+| C21 | Ubuntu 24.04.5 versus 26.04.1 left open | 26.04.1. The 24.04.5 point release backports the same kernel 7.0 and Mesa 26.0, so hardware support is identical; 26.04.1 wins on support life and toolchain (3.1) |
+| C22 | Whether to adopt the amd64v3 or amd64v4 optimised archives | Neither. The gain is on CPU-bound distribution packages, not GPU inference (3.1) |
+| C23 | Everything quantised to 4-bit under a 128 GB constraint that no longer exists | Q8_0 for Nemotron, Qwen3.5, Qwen2.5-VL-72B and Meditron; MXFP4 retained for gpt-oss as its native form; Q4_K_XL for the Apex engine (5.1) |
+| C24 | Two domains held in reserve pending a stated need (old D5) | Reserve closed. Six new domains, five subspecialty folds (8.2) |
+| C25 | Vision split across GLM-4.6V-Flash, Qwen2.5-VL-7B and a 32B that v0.1 wrongly said did not exist | One engine: Qwen2.5-VL-72B at Q8_0. The 32B is real and official, but the Principal chose maximum quality (15.2) |
+| C26 | "Two engines at once" ambiguous between residency and generation | Two may be resident; exactly one generates, everywhere, including Celery jobs (4.2) |
 
 ---
 
-## 19. Open decisions for the Principal
+## 19. Decisions — all closed
 
-| # | Decision | Recommendation | Blocks |
+| # | Decision | The Principal's answer | Note |
 |---|---|---|---|
-| D1 | Inference backend: llama-server or Ollama | llama-server | Phase 2 |
-| D2 | Secure Boot: disable, or enrol keys for any DKMS module | Disable on a headless node behind a firewall | Phase 1 |
-| D3 | Where the LUKS recovery key and restic passphrase are kept off-node | Password manager plus a printed copy in a physical safe | Phase 1 |
-| D4 | Router model and embedding model | Qwen3.5 4B-class instruct, bge-m3 embeddings, bge-reranker-v2-m3 | Phase 2 |
-| D5 | Whether Bare-Metal OS Exploitation and Quantum Computing become domains | Hold in reserve until a concrete need | None |
-| D6 | Sentinel feed list | CoinDesk, ASX and US index feed, RSS news, node telemetry | Sentinel enablement |
-| D7 | Graph layer: Microsoft GraphRAG or LightRAG | LightRAG, lighter indexing on this hardware | Phase 2 |
-| D8 | The never-without-the-Principal list (16.3) | Adopt the ten proposed items | Phase 2 |
-| D9 | Retention rule for chats, logs, backups (10.4, 9.5) | Adopt proposed defaults | Phase 2 |
-| D10 | Primary vision engine: GLM-4.6V-Flash or Qwen2.5-VL | Test both in Phase 4, keep the better reader as primary, the other as cross-check | Phase 4 |
-| D11 | Apple .ipa build path | Principal's own Mac if one exists, otherwise a licensed cloud Mac runner, never OSX-KVM on this node | Phase 2 tool |
-| D12 | Meditron-70B: include or skip | Include, optional, low priority | Phase 3 |
-| D13 | Vault idle auto-lock period | 15 minutes | Phase 2 |
-| D14 | Whether external directors get real mailboxes or aliases on the Workspace domain | Aliases on one Workspace mailbox per division, distinct display names and signatures | Phase 2 |
+| D1 | Inference backend: llama-server or Ollama | llama-server, Ollama not installed | Accepted as recommended |
+| D2 | Secure Boot: disable, or enrol keys | Disabled on a headless node behind a firewall | Accepted as recommended |
+| D3 | Where the LUKS recovery key and restic passphrase live | On the node and on an external USB drive | Changed by the Principal. See R16: the USB copy is the one that survives node loss, so it must be stored away from the node |
+| D4 | Router model and embedding model | Qwen3.5 4B-class instruct, bge-m3, bge-reranker-v2-m3 | Accepted as recommended |
+| D5 | Whether the reserve domains are adopted | Adopted now, with nine further areas supplied. Six new domains, five subspecialty folds | Changed by the Principal (8.2, C24) |
+| D6 | Sentinel feed list | CoinDesk, ASX and US index feed, RSS news, node telemetry | Accepted as recommended |
+| D7 | Graph layer: GraphRAG or LightRAG | LightRAG | Accepted as recommended |
+| D8 | The never-without-the-Principal list | The ten items in 16.3 are binding | Accepted as recommended |
+| D9 | Retention rule for chats, logs, backups | Defaults in 10.4 and 9.5 are binding | Accepted as recommended |
+| D10 | Primary vision engine | Qwen2.5-VL-72B at Q8_0, sole vision engine. GLM-4.6V-Flash and the 7B and 32B variants dropped | Changed by the Principal: maximum quality, slow speed accepted (15.2, C25) |
+| D11 | Apple .ipa build path | Removed from the design. No Mac, no cloud runner, no macOS virtualisation. iOS source is still written, compiled elsewhere if Mac access ever exists | Changed by the Principal |
+| D12 | Meditron-70B: include or skip | Included in Phase 3 at Q8_0 | Accepted, with "include now" noted |
+| D13 | Vault idle auto-lock period | 15 minutes | Accepted as recommended |
+| D14 | Director mailboxes or aliases | Aliases auto-generated from each director's name on the Workspace domain, firstname.lastname pattern | Accepted, with automatic generation requested |
 
 ---
 
@@ -895,14 +963,17 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 | R6 | GraphRAG indexing is LLM-heavy and slow here | High | Medium | Idle-time Celery job on the resident small model, D7 LightRAG |
 | R7 | Cloudflare token in a plain-text file | Certain today | High | Scoped token, mode 600, outside backups and repo (12.3) |
 | R8 | Open WebUI phones home by default | Certain unless hardened | High for the zero-cloud rule | Offline hardening in Phase 2 (12.1) |
-| R9 | RTL8127 10GbE driver missing on the 26.04 kernel | Low to medium | Medium | V1, fall back to the second port or a USB adapter |
+| R9 | 10GbE driver unavailable | Not applicable | None | The node runs on Wi-Fi by the Principal's choice; V1 is informational |
+| R19 | DeepSeek V4 Flash llama.cpp support is newer than the other engines | Medium | Medium, Apex tier only | Own row in the Phase 3 gate; a failure defers the engine without blocking the phase or the other six |
+| R20 | Wi-Fi throughput and stability over a ~690 GB download | Medium | Low, time only | Phases 3 and 4 detached and resumable; retries are free |
+| R21 | XFCE and xrdp widen the surface beyond a headless server | Low | Medium | Bound to LAN and WireGuard only, never internet-facing; no desktop autologin |
 | R10 | Sustained thermal load in a small chassis | Medium | Low | Monitor temperatures in Cockpit, the 130 W sustained rating is desktop-class |
 | R11 | CGNAT prevents inbound WireGuard | Low, port forward already succeeded | High for remote access | V5 from mobile data, static IP from the ISP if needed |
 | R12 | Fictitious directors corresponding as humans, AI non-disclosure | Medium | Medium to high, legal | Gideon's sensitive-tier check, approval gate, 16.5 |
 | R13 | Abliterated engine used for external output | Medium | Medium | Abliterated output always passes the same gate, never routine tier |
 | R14 | Chatterbox continuation quirk in production speech | Medium | Low | V7 testing, Kokoro fallback per line |
 | R15 | Prompt bloat from domain injection makes every dispatch slow | High without limits | High, usability | Three-card limit, compact cards, stable-prefix ordering (8.4, 4.4) |
-| R16 | Backup passphrase or LUKS key lost with the node | Low | Catastrophic | D3, off-node storage, quarterly restore test |
+| R16 | Backup passphrase or LUKS key lost with the node | Low | Catastrophic | **Sharpened under D3.** The Principal keeps a copy on the node and on an external USB drive. The on-node copy is convenience only; the USB copy is the one that matters, and it must live away from the node, since a fire or burglary that takes the node takes anything beside it. Quarterly restore test |
 | R17 | PyAnnote gated model not accepted, diarisation silently absent | Medium | Low | V6 |
 | R18 | Continuous vision enabled by drift rather than decision | Low | High, privacy | Separate capability flag under Alaric, logged, D8 item 7 |
 
@@ -912,16 +983,16 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 
 | # | Proof | Where |
 |---|---|---|
-| V1 | RTL8127 10GbE link up on the 26.04 kernel | Phase 1 pre-flight |
+| V1 | Network link up and stable. Informational only: the node runs on Wi-Fi, so this is no longer a gate | Phase 1 pre-flight |
 | V2 | fTPM present and enabled, TPM2 enrolment succeeds | Phase 1 step 2 |
-| V3 | Kernel parameters accepted on 7.0, GPU reports the expected memory budget | Phase 1 post-reboot |
+| V3 | `rocminfo` reports `gfx1151`, kernel parameters accepted on 7.0, and `llama-cli --list-devices` reports ~170 GB usable | Phase 1 pre-flight and post-reboot |
 | V4 | Quantised KV cache actually applied per model, no silent fallback | Phase 3 step 2 |
 | V5 | WireGuard reachable from mobile data via vpn.sovereign-node.link | Phase 1 step 7 |
 | V6 | PyAnnote 3.1 gated model accepted and loading | Phase 2 step 5 |
 | V7 | Voice casting listening test, Alaric and Gideon clones sourced | Phase 2 gate |
 | V8 | PointLLM builds and runs on ROCm in the container | Phase 4 step 4 |
 | V9 | Clay or Prithvi builds and runs | Phase 4 step 4 |
-| V10 | All four core LLMs load, generate, swap, and release memory, measured tok/s within the expected bands | Phase 3 gate |
+| V10 | All seven GGUF engines load, generate, swap, and release memory at their fixed quantisations, measured tok/s within the expected bands | Phase 3 gate |
 | V11 | Community PyTorch ROCm wheel passes tensor, matmul, and diffusion self-tests in the container | Phase 4 step 1 |
 | V12 | Open WebUI makes no outbound connection after hardening (verified with the firewall log) | Phase 2 step 3 |
 | V13 | restic backup completes and a restore verifies by checksum | Phase 2 step 7 |
@@ -930,6 +1001,11 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 | V16 | Router hard rule routes a "medical" message to Arthur even when the classifier disagrees, decision logged | Phase 2 gate |
 | V17 | Sandbox memory cap kills a runaway process without affecting the node | Phase 2 gate |
 | V18 | Vault opens by button, locks on idle, vault-tagged content absent from memory collections afterwards | Phase 2 gate |
+| V19 | XFCE desktop reachable over xrdp from the Principal's Windows PC, and refused from outside LAN and WireGuard | Phase 1 step 5b |
+| V20 | Google OAuth completed for both accounts at the Phase 2 pause; Gmail, Calendar and Drive reachable | Phase 2 step 6c |
+| V21 | Two engines resident together at ~142 GB, and a second generation request queues instead of running concurrently | Phase 3 step 3 |
+| V22 | DeepSeek V4 Flash loads at `UD-Q4_K_XL` and generates; if not, it is deferred without blocking the phase | Phase 3 gate |
+| V23 | Cloudflare token relocated to a mode-600 environment file and `CLOUDFLARE.txt` deleted | Phase 2 step 6b |
 
 ---
 
@@ -937,28 +1013,31 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 
 Nothing runs until every box is ticked.
 
-**Principal's actions**
+**Principal's actions — what is genuinely left**
 
-- [ ] Answer D1 through D14, or accept the recommendations as written.
-- [ ] Relocate the Cloudflare token per 12.3 and delete `CLOUDFLARE.txt`.
-- [ ] Decide where the LUKS recovery key and restic passphrase will live off-node (D3).
-- [ ] Create the Google Cloud OAuth client for Gmail, Calendar, and Drive; be available for the one-time browser authorisations during Phase 2.
-- [ ] Confirm the Sentinel feed list (D6).
-- [ ] Confirm which mailboxes or aliases directors will send from (D14).
-- [ ] Source reference recordings for Alaric's and, if needed, Gideon's cloned voices.
-- [ ] Confirm whether a Mac exists for iOS builds (D11).
+- [x] Answer D1 through D14. **Done**, all fourteen closed in Section 19.
+- [x] Decide where the LUKS recovery key and restic passphrase live (D3). **Done**: node plus external USB.
+- [x] Confirm the Sentinel feed list (D6), the director alias pattern (D14), and the Apple build path (D11, removed).
+- [ ] **Store the USB recovery drive away from the node**, not beside it (R16).
+- [ ] **Create the Google Cloud OAuth client** for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). This one step cannot be automated: Google requires the account owner to click Allow.
+- [ ] **Source reference recordings** for Alaric's gravelly voice and, if the British male presets collide, Gideon's. Until then both fall back to the nearest Kokoro preset and V7 is recorded as deferred, not failed.
 - [ ] Have a monitor and keyboard available for Phase 1 only, in case first boot needs a hand.
+
+**Automated on the Principal's instruction, no action needed**
+
+- [x] Cloudflare token relocation and deletion of `CLOUDFLARE.txt`: Phase 2 step 6b (V23).
+- [x] Director aliases generated from names rather than confirmed one by one (D14).
 
 **Build-side preconditions**
 
-- [ ] Ubuntu 26.04 Server installed on the 4 TB drive; 8 TB drive unpartitioned.
-- [ ] BIOS: UMA minimum, IOMMU on, fTPM on, Secure Boot per D2.
-- [ ] LAN address reserved for the node on the router; UDP 51820 forward confirmed to that address.
-- [ ] Internet bandwidth known, so Phase 3 and 4 durations can be planned.
+- [ ] Ubuntu Server 26.04.1 installed on the 4 TB drive; 8 TB drive unpartitioned.
+- [ ] BIOS: UMA minimum, IOMMU on, fTPM on, Secure Boot disabled (D2).
+- [ ] LAN address reserved for the node on the router, over Wi-Fi; UDP 51820 forward confirmed to that address.
+- [ ] Internet bandwidth known, so the ~690 GB Phase 3 download can be planned.
 
 **Accepted resolutions**
 
-- [ ] C1 through C20 in Section 18 are accepted; where the Principal disagrees, the item returns to the decision list.
+- [x] C1 through C26 in Section 18 are accepted. C19 was reopened and re-decided in the Principal's favour; the rest stand as written.
 
 ---
 
@@ -989,11 +1068,13 @@ Open WebUI Filter  --relay-->  Orchestrator
 
 ## Appendix B — Configuration reference
 
-**Kernel (GRUB):** `amdgpu.gttsize=131072 ttm.pages_limit=31457280`
+**Kernel (GRUB):** `amdgpu.gttsize=196608 ttm.pages_limit=50331648`
 
-**llama-server, Arthur's engines:** `-fa on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size <explicit> --parallel 8 --keep <n_keep> --slot-save-path /srv/atlas/data/slots`
+**llama-server, Arthur's engines (Nemotron `Q8_0`, Qwen3.5 `Q8_0`) and the vision engine (Qwen2.5-VL-72B `Q8_0`):** `-fa on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size <explicit> --parallel 8 --keep <n_keep> --slot-save-path /srv/atlas/data/slots`
 
-**llama-server, Ren's engines:** same with `--cache-type-k q4_0 --cache-type-v q4_0`
+**llama-server, Ren's engines (gpt-oss MXFP4 and its abliterated twin) and the Apex engine (DeepSeek V4 Flash `UD-Q4_K_XL`):** same with `--cache-type-k q4_0 --cache-type-v q4_0`. The Apex engine additionally runs with a reduced `--ctx-size`, since only 10 to 15 GB remain beside 155 GB of weights.
+
+**Desktop:** XFCE with xrdp bound to the LAN and WireGuard interfaces, no autologin, session started on demand.
 
 **Ollama equivalents, if D1 chooses Ollama:** `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0|q4_0` (global, so per-persona asymmetry needs two daemons), `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_NUM_PARALLEL=8`, `OLLAMA_MODELS=/srv/atlas/models`, `num_ctx` set per Modelfile. Note the q-cache allowlist fallback (V4).
 
@@ -1016,6 +1097,6 @@ Open WebUI Filter  --relay-->  Orchestrator
 
 ## Appendix D — Sources relied on during review
 
-Hardware: MINISFORUM MS-S1 MAX product page and VideoCardz specification report. Platform: AMD ROCm Strix Halo system-optimisation guide; community Strix Halo local-LLM guides; LucRoot known-good ROCm llama.cpp recipe; llama.cpp discussion on the known-good Strix Halo stack; Phoronix Ubuntu 26.04 Strix Halo benchmarks. Models: Unsloth Nemotron 3 Super guide; Beinsezii Qwen3.5-122B-A10B Strix Halo GGUF; Huihui gpt-oss-120b abliterated MXFP4 GGUF; gpt-oss model card. KV cache: Ollama FAQ and environment reference; llama.cpp server README on `n_keep` and context shift; StreamingLLM paper. Engines: kyuz0 and matthewhand Strix Halo ComfyUI toolboxes; TRELLIS.2 ROCm forks; Evo2StrixHalo port; SAM 2 ROCm issues; MCP4IFC project page and paper; Radiance at LBNL; Genusys and Auto BIM Route for the MEP market. Voice: Kokoro-82M VOICES.md; Trelis and Pinggy 2026 TTS comparisons; Qwen3-TTS repository; Fish Audio S2 licence page. Legal: Apple EULA analyses of OSX-KVM.
+Hardware: GMKtec EVO-X5 Pro announcement and VideoCardz and T3 specification reports for the Ryzen AI Max+ PRO 495 "Gorgon Halo" platform; Notebookcheck's processor page. Quantisation sizes: Unsloth's DeepSeek V4 and Qwen3.5 run guides, bartowski's Nemotron 3 Super GGUF listing, ggml-org's Qwen2.5-VL-72B GGUF. Ubuntu: OMG Ubuntu and Phoronix on the 24.04.5 point release and the amd64v3 archive experiments. The v0.1 hardware sources for the MS-S1 Max are superseded. Platform: AMD ROCm Strix Halo system-optimisation guide; community Strix Halo local-LLM guides; LucRoot known-good ROCm llama.cpp recipe; llama.cpp discussion on the known-good Strix Halo stack; Phoronix Ubuntu 26.04 Strix Halo benchmarks. Models: Unsloth Nemotron 3 Super guide; Beinsezii Qwen3.5-122B-A10B Strix Halo GGUF; Huihui gpt-oss-120b abliterated MXFP4 GGUF; gpt-oss model card. KV cache: Ollama FAQ and environment reference; llama.cpp server README on `n_keep` and context shift; StreamingLLM paper. Engines: kyuz0 and matthewhand Strix Halo ComfyUI toolboxes; TRELLIS.2 ROCm forks; Evo2StrixHalo port; SAM 2 ROCm issues; MCP4IFC project page and paper; Radiance at LBNL; Genusys and Auto BIM Route for the MEP market. Voice: Kokoro-82M VOICES.md; Trelis and Pinggy 2026 TTS comparisons; Qwen3-TTS repository; Fish Audio S2 licence page. Legal: Apple EULA analyses of OSX-KVM.
 
 *End of document.*
