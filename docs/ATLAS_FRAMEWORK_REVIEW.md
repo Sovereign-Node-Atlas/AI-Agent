@@ -3,9 +3,9 @@
 | Field | Value |
 |---|---|
 | Document | ATLAS_FRAMEWORK_REVIEW.md |
-| Version | 0.2 — decisions closed, hardware revised |
+| Version | 0.2.1 — engine watch-list added, FLUX.1 variant pinned |
 | Date | 2026-09-21 |
-| Supersedes | v0.1 (2026-09-18) |
+| Supersedes | v0.2 (2026-09-21, same day); v0.1 (2026-09-18) |
 | Scope | Everything agreed in the design conversation, through the Principal's completed confirmation workbook and the September hardware change |
 | Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions resolved, risks, and what Day 1 must prove before anything is trusted |
 | Status of this document | Build baseline. Every decision is closed. Nothing has been executed; the Day 1 script is written against this document. |
@@ -742,7 +742,7 @@ Green: build with confidence. Yellow: attempt with automatic fallback; never blo
 | Engine | Job | Tier and evidence | Footprint | Owner |
 |---|---|---|---|---|
 | Wan2.2 (in place of Wan2.1) | Video generation | Green: validated on gfx1151 by maintained toolboxes | 20 to 40 GB | Domain 12, Helena |
-| FLUX.1 | Image generation, architectural visualisation with LoRA (the "Arch-DiT" imagery use) | Green: validated on gfx1151 | 12 to 24 GB | Domains 8 and 12 |
+| **FLUX.1-dev** | Image generation, architectural visualisation with LoRA (the "Arch-DiT" imagery use). The **dev** variant, chosen for quality over the Apache-licensed schnell variant; the Principal accepts the dev non-commercial licence (15.5) | Green: validated on gfx1151 | 12 to 24 GB | Domains 8 and 12 |
 | **Qwen2.5-VL-72B at `Q8_0`** | Vision-language: documents, drawings, screenshots, scans. **The sole vision engine** | Green. Official Apache-2.0 release with GGUF builds published, so it is **pulled in Phase 3 as a GGUF engine, not built here** | 79 GB | General. Valerie for drawings, Minerva for scans, Gideon for scanned contracts |
 | Florence-2 | Lightweight vision, detection, captioning, OCR | Green | under 2 GB | General |
 | TimesFM or Chronos | Time-series forecasting | Green | under 5 GB | Domain 21, Silas |
@@ -766,7 +766,7 @@ Green: build with confidence. Yellow: attempt with automatic fallback; never blo
 |---|---|---|
 | DeepRoute-AEC | No such model; the real MEP products are Revit-bound SaaS | OpenStudio/EnergyPlus + IfcOpenShell clash detection + Python calculations + Valerie orchestrating routing (15.1) |
 | Lumina-PBR | No such engine | Radiance for physical light + Blender Cycles for the render (15.1, 15.2) |
-| Arch-DiT | No such model | FLUX.1 with an architectural LoRA; parametric IFC via MCP4IFC |
+| Arch-DiT | No such model | FLUX.1-dev with an architectural LoRA; parametric IFC via MCP4IFC |
 | OmniBuild-KVM | No such tool; described capability is a build farm | Cross-platform build service (15.1), Android and Windows only; Apple removed entirely (D11 closed) |
 | BIM-GPT, LayoutGPT-3D | Real research papers, not installable products | Capability covered by MCP4IFC |
 | RTLLM | A benchmark for grading LLM-written Verilog, not a generator | Coding engine prompted against its structure; KiCad for the physical side |
@@ -786,6 +786,17 @@ Green: build with confidence. Yellow: attempt with automatic fallback; never blo
 | **Total weights** | **under 900 GB of the 8 TB drive** |
 
 Download time over the Principal's Wi-Fi at roughly 100 Mbps: about 15 hours for the core set, several more for the Phase 4 engines, and less predictable than a wired link. Both phases run detached and resumable, so this costs time, not attention.
+
+### 15.5 Engine watch-list — considered, not adopted
+
+Engines the Principal has asked about that fail a standing rule today. Each carries the rule it fails and the single event that would bring it in. Nothing on this list is built on Day 1; ATLAS re-checks the list when a later phase adds engines.
+
+| Engine | What it does | Why not now | What would change the answer | Would replace |
+|---|---|---|---|---|
+| Qwen3.8-LiveTranslate (19 Sep 2026) | Real-time simultaneous interpretation: 60 languages understood, 29 spoken, about 2.3 s lag | **Hosted API only** (Alibaba Cloud Model Studio, QwenCloud, WebSocket). No open weights. Fails the zero-cloud rule (Section 1) on inference off-node and audio leaving the machine | An open-weights release. Qwen has released weights for Qwen3-Omni, so this is plausible | Nothing. Live interpretation is an open gap; the Whisper to engine to Kokoro pipeline (14.1) does consecutive translation only, and only in Kokoro's eight languages |
+| Qwen-Image-2.1 (20 Sep 2026) | Image generation and editing in one 7B checkpoint: native RGBA, 2K, up to ten reference images, strongest text-in-image of its class; about 14 GB BF16, GGUF available, plain BF16 path on gfx1151 | **Qwen Research License, non-commercial only.** Same restriction that excluded Fish Audio S2 (C20). Not a peer of Qwen2.5-VL-72B, which reads images; this one makes them | Re-licensing to Apache-2.0 (Qwen did this for Qwen2.5 within months) or a commercial licence obtained by the Principal | FLUX.1-dev outright: half the footprint, generate and edit in one model |
+
+**Decision recorded 2026-09-21:** the Principal keeps **FLUX.1-dev** as the image engine, quality being the deciding factor, and accepts that FLUX.1-dev itself carries a non-commercial licence (the Apache-2.0 variant is schnell, which trades quality for speed). The commercial-use exposure is therefore the same for FLUX.1-dev and Qwen-Image-2.1; the licence is not what separates them, quality and maturity on gfx1151 are. This is noted so that the two watch-list rows are read consistently: Qwen-Image-2.1 stays off the list because FLUX.1-dev is the better-validated engine today, not because its licence is worse.
 
 ---
 
@@ -882,7 +893,7 @@ Four phases. One entry command per phase. Every phase is idempotent: re-running 
 ### Phase 4 — Multimodal engines (long, detached, per-engine pass/fail)
 
 1. Inside the base ROCm container, confirm `rocminfo` reports `gfx1151`, then self-test the community PyTorch wheel: tensor on GPU, matmul, a small diffusion step (V11). This is the first and only place ROCm runs.
-2. Build green engines in order of value: FLUX.1, Wan2.2, Florence-2, TimesFM or Chronos, UI-TARS 2.0, Rad-DINO, SAM 2 with the extension flag, Stable Audio Open, CosyVoice2, OpenVLA. The vision engine is not here; Qwen2.5-VL-72B is a GGUF engine pulled in Phase 3.
+2. Build green engines in order of value: FLUX.1-dev, Wan2.2, Florence-2, TimesFM or Chronos, UI-TARS 2.0, Rad-DINO, SAM 2 with the extension flag, Stable Audio Open, CosyVoice2, OpenVLA. The vision engine is not here; Qwen2.5-VL-72B is a GGUF engine pulled in Phase 3.
 3. Attempt yellow engines: TRELLIS, Blender Cycles HIP with CPU fallback. Log pass or fail, never block.
 4. Verify PointLLM (V8) and Clay or Prithvi (V9); mark deferred if they fail.
 5. Register every passing engine with the Engine Arbiter with its measured footprint.
@@ -1101,6 +1112,6 @@ Open WebUI Filter  --relay-->  Orchestrator
 
 ## Appendix D — Sources relied on during review
 
-Hardware: GMKtec EVO-X5 Pro announcement and VideoCardz and T3 specification reports for the Ryzen AI Max+ PRO 495 "Gorgon Halo" platform; Notebookcheck's processor page. Quantisation sizes: Unsloth's DeepSeek V4 and Qwen3.5 run guides, bartowski's Nemotron 3 Super GGUF listing, ggml-org's Qwen2.5-VL-72B GGUF. Ubuntu: OMG Ubuntu and Phoronix on the 24.04.5 point release and the amd64v3 archive experiments. The v0.1 hardware sources for the MS-S1 Max are superseded. Platform: AMD ROCm Strix Halo system-optimisation guide; community Strix Halo local-LLM guides; LucRoot known-good ROCm llama.cpp recipe; llama.cpp discussion on the known-good Strix Halo stack; Phoronix Ubuntu 26.04 Strix Halo benchmarks. Models: Unsloth Nemotron 3 Super guide; Beinsezii Qwen3.5-122B-A10B Strix Halo GGUF; Huihui gpt-oss-120b abliterated MXFP4 GGUF; gpt-oss model card. KV cache: Ollama FAQ and environment reference; llama.cpp server README on `n_keep` and context shift; StreamingLLM paper. Engines: kyuz0 and matthewhand Strix Halo ComfyUI toolboxes; TRELLIS.2 ROCm forks; Evo2StrixHalo port; SAM 2 ROCm issues; MCP4IFC project page and paper; Radiance at LBNL; Genusys and Auto BIM Route for the MEP market. Voice: Kokoro-82M VOICES.md; Trelis and Pinggy 2026 TTS comparisons; Qwen3-TTS repository; Fish Audio S2 licence page. Legal: Apple EULA analyses of OSX-KVM.
+Hardware: GMKtec EVO-X5 Pro announcement and VideoCardz and T3 specification reports for the Ryzen AI Max+ PRO 495 "Gorgon Halo" platform; Notebookcheck's processor page. Quantisation sizes: Unsloth's DeepSeek V4 and Qwen3.5 run guides, bartowski's Nemotron 3 Super GGUF listing, ggml-org's Qwen2.5-VL-72B GGUF. Ubuntu: OMG Ubuntu and Phoronix on the 24.04.5 point release and the amd64v3 archive experiments. The v0.1 hardware sources for the MS-S1 Max are superseded. Platform: AMD ROCm Strix Halo system-optimisation guide; community Strix Halo local-LLM guides; LucRoot known-good ROCm llama.cpp recipe; llama.cpp discussion on the known-good Strix Halo stack; Phoronix Ubuntu 26.04 Strix Halo benchmarks. Models: Unsloth Nemotron 3 Super guide; Beinsezii Qwen3.5-122B-A10B Strix Halo GGUF; Huihui gpt-oss-120b abliterated MXFP4 GGUF; gpt-oss model card. KV cache: Ollama FAQ and environment reference; llama.cpp server README on `n_keep` and context shift; StreamingLLM paper. Engines: kyuz0 and matthewhand Strix Halo ComfyUI toolboxes; TRELLIS.2 ROCm forks; Evo2StrixHalo port; SAM 2 ROCm issues; MCP4IFC project page and paper; Radiance at LBNL; Genusys and Auto BIM Route for the MEP market. Watch-list: Qwen3.8-LiveTranslate announcement and Model Studio API page; Qwen-Image-2.1 model card, Hugging Face licence file and GGUF listing; Black Forest Labs FLUX.1-dev and FLUX.1-schnell licence pages. Voice: Kokoro-82M VOICES.md; Trelis and Pinggy 2026 TTS comparisons; Qwen3-TTS repository; Fish Audio S2 licence page. Legal: Apple EULA analyses of OSX-KVM.
 
 *End of document.*
