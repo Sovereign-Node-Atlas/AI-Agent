@@ -1,0 +1,371 @@
+{
+  "task_forces": [
+    {
+      "code": "TF_ALPHA",
+      "name": "Corporate Mergers & Acquisitions",
+      "group": "CORP-DEALS",
+      "hemisphere": "corporate",
+      "owners": ["Gideon"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 6, "why": "General Counsel: deal documents, due-diligence law, AU corporations and competition rules."},
+        {"domain": 23, "why": "Venture Partner & PE Director: transaction structuring, term sheets, earn-outs and exit mechanics."},
+        {"domain": 5, "why": "CFO & Controller: valuation inputs and financial due diligence that Gideon must frame before any relay to Silas."}
+      ],
+      "relay": [],
+      "triggers": ["merger", "acquisition", "acquire", "m&a", "buyout", "takeover", "due diligence", "share purchase", "asset purchase", "deal structure", "earn-out"]
+    },
+    {
+      "code": "TF_BETA",
+      "name": "Geopolitical Tariff & Tax / Regulatory Arbitrage",
+      "group": "CORP-LEGAL",
+      "hemisphere": "corporate",
+      "owners": ["Gideon", "Silas"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 6, "why": "General Counsel: the legal boundary of arbitrage, treaty positions and AU compliance obligations."},
+        {"domain": 25, "why": "Geopolitical Strategist: tariff regimes, sanctions and cross-border policy shifts that create or close the opportunity."},
+        {"domain": 5, "why": "CFO & Controller: Australian tax treatment and the modelled after-tax effect Silas verifies in the relay."}
+      ],
+      "relay": ["Gideon", "Silas"],
+      "triggers": ["tariff", "tax arbitrage", "regulatory arbitrage", "jurisdiction", "transfer pricing", "customs duty", "withholding tax", "double tax", "treaty", "sanctions", "trade policy"]
+    },
+    {
+      "code": "TF_GAMMA",
+      "name": "Capital Deployment & Wealth Allocation",
+      "group": "CORP-CAPITAL",
+      "hemisphere": "corporate",
+      "owners": ["Silas"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 21, "why": "Chief Investment Officer: allocation models, risk budgeting and portfolio construction."},
+        {"domain": 5, "why": "CFO & Controller: liquidity, cash-flow constraints and the fraud/risk lens on every deployment."},
+        {"domain": 23, "why": "Venture Partner & PE Director: private-market sleeves that compete with public allocation for the same capital."}
+      ],
+      "relay": [],
+      "triggers": ["capital deployment", "allocate capital", "asset allocation", "portfolio", "wealth allocation", "investment strategy", "rebalance", "deploy funds", "liquidity", "risk budget"]
+    },
+    {
+      "code": "TF_DELTA",
+      "name": "Banking & Institutional Leverage",
+      "group": "CORP-CAPITAL",
+      "hemisphere": "corporate",
+      "owners": ["Silas"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 5, "why": "CFO & Controller: banking relationships, covenants, serviceability and audit-grade arithmetic."},
+        {"domain": 21, "why": "Chief Investment Officer: cost of leverage against expected return and the risk model behind it."},
+        {"domain": 6, "why": "General Counsel: facility agreements, security interests and PPSR obligations that bind the borrower."}
+      ],
+      "relay": [],
+      "triggers": ["bank", "banking", "loan", "credit facility", "leverage", "refinance", "debt", "lender", "covenant", "line of credit", "mortgage", "interest rate"]
+    },
+    {
+      "code": "TF_EPSILON",
+      "name": "Venture & Seed Investments",
+      "group": "CORP-CAPITAL",
+      "hemisphere": "corporate",
+      "owners": ["Silas", "Gideon"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 23, "why": "Venture Partner & PE Director: sourcing, screening, term sheets and portfolio construction for early-stage bets."},
+        {"domain": 21, "why": "Chief Investment Officer: sizing the venture sleeve and the return model Silas runs through the interpreter."},
+        {"domain": 6, "why": "General Counsel: SAFE, convertible note and shareholder agreement terms Gideon reviews in the relay."}
+      ],
+      "relay": ["Silas", "Gideon"],
+      "triggers": ["venture", "seed round", "startup investment", "angel", "term sheet", "safe note", "convertible note", "cap table", "series a", "pre-seed", "founder"]
+    },
+    {
+      "code": "TF_ZETA",
+      "name": "Corporate Structuring & Holding Entities",
+      "group": "CORP-DEALS",
+      "hemisphere": "corporate",
+      "owners": ["Gideon"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 6, "why": "General Counsel: entity law, directors' duties, ASIC obligations and constitution drafting."},
+        {"domain": 5, "why": "CFO & Controller: consolidation, tax grouping and the accounting consequences of each structure."},
+        {"domain": 23, "why": "Venture Partner & PE Director: holdco/opco patterns, ownership waterfalls and investor-facing structures."}
+      ],
+      "relay": [],
+      "triggers": ["holding company", "holdco", "corporate structure", "restructure", "subsidiary", "entity", "incorporate", "shareholding", "group structure", "asic", "constitution", "unit trust"]
+    },
+    {
+      "code": "TF_ETA",
+      "name": "Global Liability & Litigation Defense",
+      "group": "CORP-LEGAL",
+      "hemisphere": "corporate",
+      "owners": ["Gideon"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 6, "why": "General Counsel: claims, defences, discovery, limitation periods and AU court procedure."},
+        {"domain": 17, "why": "High-Stakes Negotiator: settlement strategy and leverage when a dispute is better resolved than fought."},
+        {"domain": 5, "why": "CFO & Controller: quantifying exposure, insurance recovery and provisioning for the matter."}
+      ],
+      "relay": [],
+      "triggers": ["litigation", "lawsuit", "sued", "claim against", "liability", "dispute", "court", "statement of claim", "indemnity", "legal defense", "legal defence", "settlement"]
+    },
+    {
+      "code": "TF_THETA",
+      "name": "Regulatory Compliance & Audit",
+      "group": "CORP-LEGAL",
+      "hemisphere": "corporate",
+      "owners": ["Gideon", "Silas"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 6, "why": "General Counsel & CHRO: the regulatory map, licences, workplace and strata obligations."},
+        {"domain": 5, "why": "CFO & Controller: audit preparation, controls and the financial-statement side Silas verifies."},
+        {"domain": 16, "why": "COO & Process Architect: the operating procedures and evidence trail an audit actually inspects."}
+      ],
+      "relay": ["Gideon", "Silas"],
+      "triggers": ["compliance", "audit", "regulator", "regulatory", "licence", "license renewal", "reporting obligation", "asic filing", "ato", "fair work", "whs", "policy review"]
+    },
+    {
+      "code": "TF_IOTA",
+      "name": "Intellectual Property & Licensing",
+      "group": "CORP-CONTRACTS",
+      "hemisphere": "corporate",
+      "owners": ["Gideon"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 6, "why": "General Counsel: trade marks, patents, copyright, IP assignment and licence drafting under AU law."},
+        {"domain": 12, "why": "Creative Director: the creative assets and brand works whose ownership and licensing are in question."},
+        {"domain": 29, "why": "Frontier Technologies: technical inventions and software where patentability and licensing scope need engineering context."}
+      ],
+      "relay": [],
+      "triggers": ["intellectual property", "ip", "trademark", "trade mark", "patent", "copyright", "licensing", "licence agreement", "royalty", "ip assignment", "infringement"]
+    },
+    {
+      "code": "TF_KAPPA",
+      "name": "Contract & Vendor Negotiation",
+      "group": "CORP-CONTRACTS",
+      "hemisphere": "corporate",
+      "owners": ["Gideon", "Ren"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 6, "why": "General Counsel: contract terms, risk allocation, termination and AU consumer/commercial law."},
+        {"domain": 17, "why": "High-Stakes Negotiator: BATNA, concessions and the negotiation plan Ren drives in the relay."},
+        {"domain": 16, "why": "COO & Process Architect: vendor performance, SLAs and the operational needs the contract must serve."}
+      ],
+      "relay": ["Gideon", "Ren"],
+      "triggers": ["contract", "vendor", "supplier", "negotiate", "negotiation", "terms and conditions", "sla", "procurement", "quote", "tender", "agreement review", "counter-offer"]
+    },
+    {
+      "code": "TF_LAMBDA",
+      "name": "AEC Oversight",
+      "group": "CORP-AEC",
+      "hemisphere": "corporate",
+      "owners": ["Valerie"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 8, "why": "AEC Computational Designer: drawings, BIM, visualisation and design review."},
+        {"domain": 7, "why": "Development Director: programme, cost, approvals and the property outcome the build serves."},
+        {"domain": 9, "why": "Industrial & Energy Engineer: services, plant and SCADA where the project has engineering systems."}
+      ],
+      "relay": [],
+      "triggers": ["architecture", "construction", "building", "aec", "bim", "site", "engineering drawing", "council approval", "da", "builder", "contractor", "structural"]
+    },
+    {
+      "code": "TF_MU",
+      "name": "Software DevOps & Infrastructure",
+      "group": "CORP-INFRA",
+      "hemisphere": "corporate",
+      "owners": ["Valerie"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 1, "why": "Systems Architect & Cybersecurity: infrastructure design, hardening and operational security."},
+        {"domain": 4, "why": "Data Scientist & AI Engineer: pipelines, data systems and the analysis tooling the stack carries."},
+        {"domain": 20, "why": "Chief AI Officer: agentic systems and ATLAS's own tooling, with self-modification gated under 16.3."}
+      ],
+      "relay": [],
+      "triggers": ["devops", "deploy", "deployment", "server", "docker", "kubernetes", "ci/cd", "pipeline", "infrastructure", "code", "repository", "software"]
+    },
+    {
+      "code": "TF_NU",
+      "name": "Hardware & Cryptographic Security",
+      "group": "CORP-INFRA",
+      "hemisphere": "corporate",
+      "owners": ["Valerie"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 1, "why": "Systems Architect & Cybersecurity: the defensive framing and key-management baseline."},
+        {"domain": 31, "why": "Embedded Systems & Mobile Security: firmware, secure boot, TPM and bare-metal attack surface."},
+        {"domain": 34, "why": "Quantum Computing & Post-Quantum Cryptography: algorithm choice and migration for long-lived secrets."}
+      ],
+      "relay": [],
+      "triggers": ["encryption", "cryptography", "crypto keys", "hardware security", "tpm", "hsm", "firmware", "secure boot", "key management", "post-quantum", "luks", "yubikey"]
+    },
+    {
+      "code": "TF_XI",
+      "name": "Data Privacy & Zero-Trust Networks",
+      "group": "CORP-INFRA",
+      "hemisphere": "corporate",
+      "owners": ["Valerie", "Alaric"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 1, "why": "Systems Architect & Cybersecurity: zero-trust architecture, segmentation and identity."},
+        {"domain": 32, "why": "Communications & Telecom Security: cryptographic protocols, network infrastructure and signals exposure."},
+        {"domain": 22, "why": "Director of OSINT & Executive Protection: the data-exposure and threat view Alaric applies in the relay."}
+      ],
+      "relay": ["Valerie", "Alaric"],
+      "triggers": ["privacy", "data breach", "zero trust", "zero-trust", "vpn", "network security", "data protection", "gdpr", "privacy act", "exfiltration", "surveillance", "intrusion"]
+    },
+    {
+      "code": "TF_OMICRON",
+      "name": "Public Relations & Crisis Management",
+      "group": "CORP-BRAND",
+      "hemisphere": "corporate",
+      "owners": ["Helena"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 2, "why": "Growth Executive: PR, media handling and message discipline."},
+        {"domain": 25, "why": "Geopolitical Strategist & Public Affairs: stakeholder mapping and the public-affairs dimension of a crisis."},
+        {"domain": 27, "why": "Director of Digital Influence: platform dynamics and how a story spreads or is contained online."}
+      ],
+      "relay": [],
+      "triggers": ["press", "media", "journalist", "crisis", "pr", "public relations", "reputation", "statement", "press release", "scandal", "backlash", "damage control"]
+    },
+    {
+      "code": "TF_PI",
+      "name": "Brand Strategy & Sales Architecture",
+      "group": "CORP-BRAND",
+      "hemisphere": "corporate",
+      "owners": ["Helena"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 2, "why": "Growth Executive: marketing, sales funnel, SEO and go-to-market."},
+        {"domain": 3, "why": "Customer Success & Experience: retention, onboarding and the post-sale experience the brand promises."},
+        {"domain": 12, "why": "Creative Director: brand narrative, identity and campaign creative."}
+      ],
+      "relay": [],
+      "triggers": ["brand", "branding", "marketing", "sales", "campaign", "seo", "go-to-market", "positioning", "funnel", "pricing page", "website copy", "customer acquisition"]
+    },
+    {
+      "code": "TF_RHO",
+      "name": "Executive Scheduling & Strategic Routing",
+      "group": "CORP-ROUTING",
+      "hemisphere": "corporate",
+      "owners": ["Eleanor"],
+      "default_tier": "routine",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 16, "why": "COO & Process Architect: calendar logic, prioritisation and triage; one card keeps the resident 4B classifier fast."}
+      ],
+      "relay": [],
+      "triggers": ["schedule", "calendar", "meeting", "reschedule", "appointment", "availability", "book a time", "triage", "prioritise", "agenda", "reminder"]
+    },
+    {
+      "code": "TF_SIGMA",
+      "name": "Physical Estate & Asset Management",
+      "group": "EST-ASSET",
+      "hemisphere": "estate",
+      "owners": ["Alaric"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 18, "why": "Global Asset Guardian & HNW Concierge: the asset register, custody and logistics of physical holdings."},
+        {"domain": 14, "why": "Private Family Advisor & Estate Guardian: ownership, succession and the family context around each asset."},
+        {"domain": 26, "why": "Cultural Asset & Fine Art Curator: provenance, insurance and conservation for collectible assets."}
+      ],
+      "relay": [],
+      "triggers": ["property maintenance", "estate management", "residence", "house", "asset register", "insurance", "vehicle fleet", "art collection", "storage", "caretaker", "renovation", "valuables"]
+    },
+    {
+      "code": "TF_TAU",
+      "name": "Private Security & Threat Mitigation",
+      "group": "EST-SECURITY",
+      "hemisphere": "estate",
+      "owners": ["Alaric"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 22, "why": "Director of OSINT & Executive Protection: threat assessment, exposure reduction and protective planning."},
+        {"domain": 18, "why": "Global Asset Guardian: the physical assets and movements that need protecting."},
+        {"domain": 32, "why": "Communications & Telecom Security: secure communications and signals hygiene for the household."}
+      ],
+      "relay": [],
+      "triggers": ["security", "threat", "stalker", "harassment", "protection", "bodyguard", "alarm", "cctv", "doxxing", "osint", "surveillance detected", "break-in"]
+    },
+    {
+      "code": "TF_UPSILON",
+      "name": "Private Medical & Longevity Protocols",
+      "group": "EST-HEALTH",
+      "hemisphere": "estate",
+      "owners": ["Minerva"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 10, "why": "Chief Medical Officer & Risk Underwriter: clinical interpretation, referrals and medical risk."},
+        {"domain": 15, "why": "Chief Longevity Officer: performance physiology, protocols, bioinformatics and genomics."},
+        {"domain": 36, "why": "Synthetic Biology & Genomic Engineering: only when the request is explicitly genomic; Tier C, explicit match."}
+      ],
+      "relay": [],
+      "triggers": ["medical", "health", "doctor", "specialist", "blood test", "diagnosis", "medication", "longevity", "supplement", "scan results", "genomic", "fitness protocol"]
+    },
+    {
+      "code": "TF_PHI",
+      "name": "Global Aviation & Transport Logistics",
+      "group": "EST-MOBILITY",
+      "hemisphere": "estate",
+      "owners": ["Victor"],
+      "default_tier": "standard",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 19, "why": "Travel, Leisure & Global Hospitality Director: routing, carriers, charters and ground handling."},
+        {"domain": 18, "why": "Global Asset Guardian: logistics optimisation for moving people and assets together."},
+        {"domain": 16, "why": "COO & Process Architect: multi-leg planning and contingency sequencing."}
+      ],
+      "relay": [],
+      "triggers": ["flight", "charter", "jet", "aviation", "airport", "transport", "freight", "shipping", "itinerary", "transfer", "multi-leg", "logistics"]
+    },
+    {
+      "code": "TF_CHI",
+      "name": "Concierge & Frictionless Travel",
+      "group": "EST-MOBILITY",
+      "hemisphere": "estate",
+      "owners": ["Victor"],
+      "default_tier": "routine",
+      "dual_sign_off": false,
+      "domain_cards": [
+        {"domain": 19, "why": "Travel, Leisure & Global Hospitality Director: hotels, dining, reservations and travel preferences."},
+        {"domain": 18, "why": "HNW Concierge: standing preferences and service arrangements around the Principal's movements."}
+      ],
+      "relay": [],
+      "triggers": ["hotel", "reservation", "restaurant", "concierge", "booking", "travel", "trip", "villa", "lounge", "visa", "car service", "table for"]
+    },
+    {
+      "code": "TF_OMEGA",
+      "name": "Absolute Apex Contingency",
+      "group": "APEX",
+      "hemisphere": "both",
+      "owners": ["Ren", "Arthur"],
+      "trigger": "principal-only",
+      "engine": "deepseek-v4-flash",
+      "default_tier": "sensitive",
+      "dual_sign_off": true,
+      "domain_cards": [
+        {"domain": 22, "why": "Director of OSINT & Executive Protection: an apex contingency is first a threat to the Principal; protection framing leads."},
+        {"domain": 14, "why": "Private Family Advisor & Estate Guardian: the family and estate consequences Arthur must weigh."},
+        {"domain": 6, "why": "General Counsel: the legal exposure and obligations that bound every option on the table."}
+      ],
+      "relay": ["Ren", "Arthur"],
+      "triggers": []
+    }
+  ]
+}

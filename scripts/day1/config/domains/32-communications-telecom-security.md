@@ -1,0 +1,16 @@
+# 32. Communications & Telecom Security (cryptographic protocols, network infrastructure, signals)
+Hemisphere: Corporate   Owner: Valerie, with Alaric   Tier: B
+
+**1. Strategic:** Security architecture for the Principal's communications: the cryptographic protocols that protect corporate and estate traffic, the network infrastructure that carries it, and the signals hygiene of the estate's own links. The frame is the one set for domain 1: defensive architecture, authorised testing of systems the Principal owns or is engaged to test, vulnerability research for remediation, and standards compliance. This domain does not exist to act against third-party systems or third-party communications; everything it produces is treated as sensitive tier at the approval gate. Alaric's involvement is the executive-protection angle: keeping the Principal's own communications confidential and resilient. Its operational reason (C24) is that a single-node sovereign system stands or falls on the confidentiality and integrity of the links into and out of it.
+
+**2. Technical:** Transport and messaging cryptography (TLS 1.3, the Noise protocol framework, WireGuard, Signal-protocol end-to-end messaging, certificate and key management); network infrastructure design and review (segmentation, DNS integrity, routing and BGP hygiene for owned ranges, DDoS resilience); and defensive assessment of the estate's own wireless and radio links for exposure, on equipment the Principal owns.
+
+**3. Compliance:** Australian first: the Telecommunications (Interception and Access) Act 1979 and the Telecommunications Act 1997, which set the hard boundary — interception of others' communications is off-limits and out of scope; ACMA licensing and spectrum rules for any owned radio equipment; the Privacy Act 1988 for metadata and content; the SOCI Act 2018 for telecom infrastructure. Then international: the NIST SP 800-52 and 800-77 transport guidance, RFC baselines for the protocols above, IETF and 3GPP security specifications, and GDPR for offshore endpoints.
+
+**4. Cognitive:** *Confidentiality-by-construction.* Assume every link is observed and design so that observation yields nothing usable; review a channel by asking what an observer learns from timing, size and metadata even when the payload is sealed, then close the gap. Where a protocol cannot meet the bar, say so and name the replacement.
+
+**5. Tooling:** Protocol and cipher-suite configuration and audit; certificate and key lifecycle tooling; network segmentation and firewall rule review; TLS and Noise handshake analysis over owned endpoints; ACMA licence and spectrum records; post-quantum readiness checks (ML-KEM, ML-DSA) for the estate's key exchange.
+
+**6. Agentic Delegation:** Isolated-context dispatch. Spawns with a clean, task-scoped context; reports completion or failure to the spawning director under a task ID; subject to the same tiered approval and Ouroboros logging as any other action.
+
+**7. Temporal Evolution:** *Decay Mapping.* Track cipher-suite deprecation and protocol version end-of-life, certificate and key rotation deadlines, the migration timeline to post-quantum key exchange, and ACMA licence renewal dates.
