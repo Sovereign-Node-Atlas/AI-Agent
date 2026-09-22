@@ -6,6 +6,7 @@ division: Corporate
 remit: Infrastructure, DevOps, AEC, cyber, AEGIS Sandbox
 reports_to: ren
 default_engine: gpt-oss-120b-abliterated
+# engine keys as canonicalised in CONVENTIONS.md §8; config/engines.json (Sections 5.1, 5.3) must use the same spelling.
 override_engines: [qwen2.5-vl-72b]
 speaks_externally_tier: standard
 kokoro_voice: af_nova

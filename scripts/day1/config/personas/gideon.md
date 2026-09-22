@@ -9,8 +9,10 @@ default_engine: gpt-oss-120b
 engine_settings: high reasoning, retrieval-grounded
 override_engines: [qwen3.5-122b, deepseek-v4-flash]
 speaks_externally_tier: sensitive
-kokoro_voice: bm_george
-kokoro_alternate: am_onyx
+# 14.3 is conditional (bm_george only if Arthur takes bm_daniel); Arthur holds bm_george and Ren holds am_onyx,
+# so no primary is free. Null pending the V7 listening test; see voice-casting.json kokoro_note.
+kokoro_voice: null
+kokoro_alternate: bm_george
 chatterbox_clone: if-needed
 ---
 # Gideon Vance — Director, Legal & Compliance

@@ -44,9 +44,9 @@
       "name": "Gideon Vance",
       "key": "gideon",
       "description": "Measured, meticulous, deep, litigator in absolute facts",
-      "kokoro_primary": "bm_george",
-      "kokoro_alternate": "am_onyx",
-      "kokoro_note": "bm_george if Arthur takes bm_daniel, else am_onyx reassigned",
+      "kokoro_primary": null,
+      "kokoro_alternate": "bm_george",
+      "kokoro_note": "14.3 is conditional: bm_george only if Arthur takes bm_daniel, else am_onyx reassigned. Arthur holds bm_george and Ren holds am_onyx, so no free preset is Gideon's by right; primary is null pending V7, with bm_george as the alternate if Arthur moves to bm_daniel and the Chatterbox clone from gideon.wav as the separation path.",
       "path": "Kokoro preset or Chatterbox clone to separate from Arthur"
     },
     {

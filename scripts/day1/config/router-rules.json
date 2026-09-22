@@ -17,7 +17,7 @@
     "[REN:UNCENSORED]": "ren-abliterated",
     "[ARTHUR:LONG]": "arthur-qwen",
     "[ARTHUR:UNCENSORED]": "arthur-abliterated",
-    "[DEEP THINK]": "deep-think",
+    "[DEEP THINK:": "deep-think",
     "[DEEP THINK:QUICK]": "deep-think:quick",
     "[DEEP THINK:STANDARD]": "deep-think:standard",
     "[DEEP THINK:DEEP]": "deep-think:deep",

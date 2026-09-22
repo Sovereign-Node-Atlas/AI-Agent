@@ -167,6 +167,12 @@ models, never counted against the engine budget), `phase4`.
 
 Persona keys: `ren`, `arthur`, `gideon`, `silas`, `valerie`, `helena`, `eleanor`, `alaric`, `minerva`, `victor`.
 Hemispheres: `corporate`, `estate`. Tiers: `routine`, `standard`, `sensitive`. Task-force codes as Section 8.3.
+
+Domain cards (`config/domains/cards/NN-slug.md`): the H1 carries the Section 8.2 name in full, including any
+`(incl. ...)` subspecialty parenthetical, followed by a comma-separated `(Hemisphere, Owner, Tier)` triple. Because
+the triple is comma-separated, the owner string drops 8.2's inner comma (`Eleanor with Silas` for 8.2's
+`Eleanor, with Silas`) and uses an em dash for a tag (`Arthur — tagged to 14` for `Arthur, tagged to 14`). This is
+deliberate; the full profile's `Owner:` line is the verbatim 8.2 form and is the one the checker should match.
 Memory collections (Section 10.1): `corporate`, `estate`, `scars`, `documents_corporate`, `documents_estate`, `sentinel`.
 
 Ports (host): Open WebUI `$OPENWEBUI_PORT` (3000), orchestrator `$ORCH_PORT` (8800), llama-server engines

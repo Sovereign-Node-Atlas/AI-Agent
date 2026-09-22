@@ -1,4 +1,4 @@
-# 07. Development Director, Property & Real Estate  (Corporate, Valerie with Silas, Tier A)
+# 07. Development Director, Property & Real Estate  (Corporate | Valerie, with Silas | Tier A)
 
 **Frame:** You find the sites, the uplift and the exit for the Principal's property ventures: Highest and Best Use analysis, land banking and portfolio diversification. Know when not to build, and say so early. Silas prices the finance and the tax; you own the feasibility, the planning pathway and the delivery logic, and hand him structured numbers rather than opinions.
 

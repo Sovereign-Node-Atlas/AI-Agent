@@ -94,7 +94,7 @@
         {"domain": 23, "why": "Venture Partner & PE Director: holdco/opco patterns, ownership waterfalls and investor-facing structures."}
       ],
       "relay": [],
-      "triggers": ["holding company", "holdco", "corporate structure", "restructure", "subsidiary", "entity", "incorporate", "shareholding", "group structure", "asic", "constitution", "unit trust"]
+      "triggers": ["holding company", "holdco", "corporate structure", "restructure", "subsidiary", "entity", "incorporate", "shareholding", "group structure", "asic", "constitution"]
     },
     {
       "code": "TF_ETA",
@@ -126,7 +126,7 @@
         {"domain": 16, "why": "COO & Process Architect: the operating procedures and evidence trail an audit actually inspects."}
       ],
       "relay": ["Gideon", "Silas"],
-      "triggers": ["compliance", "audit", "regulator", "regulatory", "licence", "license renewal", "reporting obligation", "asic filing", "ato", "fair work", "whs", "policy review"]
+      "triggers": ["compliance", "audit", "regulator", "regulatory", "licence", "license renewal", "reporting obligation", "asic filing", "tax office", "fair work", "whs", "policy review"]
     },
     {
       "code": "TF_IOTA",
@@ -142,7 +142,7 @@
         {"domain": 29, "why": "Frontier Technologies: technical inventions and software where patentability and licensing scope need engineering context."}
       ],
       "relay": [],
-      "triggers": ["intellectual property", "ip", "trademark", "trade mark", "patent", "copyright", "licensing", "licence agreement", "royalty", "ip assignment", "infringement"]
+      "triggers": ["intellectual property", "ip rights", "trademark", "trade mark", "patent", "copyright", "licensing", "licence agreement", "royalty", "ip assignment", "infringement"]
     },
     {
       "code": "TF_KAPPA",
@@ -174,7 +174,7 @@
         {"domain": 9, "why": "Industrial & Energy Engineer: services, plant and SCADA where the project has engineering systems."}
       ],
       "relay": [],
-      "triggers": ["architecture", "construction", "building", "aec", "bim", "site", "engineering drawing", "council approval", "da", "builder", "contractor", "structural"]
+      "triggers": ["architecture", "construction", "building", "aec", "bim", "construction site", "engineering drawing", "council approval", "development application", "builder", "contractor", "structural"]
     },
     {
       "code": "TF_MU",
@@ -190,7 +190,7 @@
         {"domain": 20, "why": "Chief AI Officer: agentic systems and ATLAS's own tooling, with self-modification gated under 16.3."}
       ],
       "relay": [],
-      "triggers": ["devops", "deploy", "deployment", "server", "docker", "kubernetes", "ci/cd", "pipeline", "infrastructure", "code", "repository", "software"]
+      "triggers": ["devops", "deploy", "deployment", "server", "docker", "kubernetes", "ci/cd", "pipeline", "infrastructure", "source code", "repository", "software release"]
     },
     {
       "code": "TF_NU",
@@ -203,7 +203,7 @@
       "domain_cards": [
         {"domain": 1, "why": "Systems Architect & Cybersecurity: the defensive framing and key-management baseline."},
         {"domain": 31, "why": "Embedded Systems & Mobile Security: firmware, secure boot, TPM and bare-metal attack surface."},
-        {"domain": 34, "why": "Quantum Computing & Post-Quantum Cryptography: algorithm choice and migration for long-lived secrets."}
+        {"domain": 32, "why": "Communications & Telecom Security: cryptographic protocols and key exchange over the network (Tier B); post-quantum work (card 34, Tier C) loads only on an explicit match, never from this preset."}
       ],
       "relay": [],
       "triggers": ["encryption", "cryptography", "crypto keys", "hardware security", "tpm", "hsm", "firmware", "secure boot", "key management", "post-quantum", "luks", "yubikey"]
@@ -238,7 +238,7 @@
         {"domain": 27, "why": "Director of Digital Influence: platform dynamics and how a story spreads or is contained online."}
       ],
       "relay": [],
-      "triggers": ["press", "media", "journalist", "crisis", "pr", "public relations", "reputation", "statement", "press release", "scandal", "backlash", "damage control"]
+      "triggers": ["press", "media", "journalist", "crisis", "pr strategy", "public relations", "reputation", "statement", "press release", "scandal", "backlash", "damage control"]
     },
     {
       "code": "TF_PI",
@@ -281,7 +281,7 @@
       "domain_cards": [
         {"domain": 18, "why": "Global Asset Guardian & HNW Concierge: the asset register, custody and logistics of physical holdings."},
         {"domain": 14, "why": "Private Family Advisor & Estate Guardian: ownership, succession and the family context around each asset."},
-        {"domain": 26, "why": "Cultural Asset & Fine Art Curator: provenance, insurance and conservation for collectible assets."}
+        {"domain": 22, "why": "Director of OSINT & Executive Protection: Alaric's own card; the exposure and protective view every physical holding carries (Tier A). Fine-art provenance (card 26, Tier C) loads only on an explicit match, never from this preset."}
       ],
       "relay": [],
       "triggers": ["property maintenance", "estate management", "residence", "house", "asset register", "insurance", "vehicle fleet", "art collection", "storage", "caretaker", "renovation", "valuables"]
@@ -300,7 +300,7 @@
         {"domain": 32, "why": "Communications & Telecom Security: secure communications and signals hygiene for the household."}
       ],
       "relay": [],
-      "triggers": ["security", "threat", "stalker", "harassment", "protection", "bodyguard", "alarm", "cctv", "doxxing", "osint", "surveillance detected", "break-in"]
+      "triggers": ["physical security", "threat", "stalker", "harassment", "protection", "bodyguard", "alarm", "cctv", "doxxing", "osint", "surveillance detected", "break-in"]
     },
     {
       "code": "TF_UPSILON",
@@ -312,8 +312,7 @@
       "dual_sign_off": false,
       "domain_cards": [
         {"domain": 10, "why": "Chief Medical Officer & Risk Underwriter: clinical interpretation, referrals and medical risk."},
-        {"domain": 15, "why": "Chief Longevity Officer: performance physiology, protocols, bioinformatics and genomics."},
-        {"domain": 36, "why": "Synthetic Biology & Genomic Engineering: only when the request is explicitly genomic; Tier C, explicit match."}
+        {"domain": 15, "why": "Chief Longevity Officer: performance physiology, protocols, bioinformatics and genomic sequencing (folded in per 8.2 C24). Synthetic biology (card 36, Tier C) loads only on an explicit match, never from this preset."}
       ],
       "relay": [],
       "triggers": ["medical", "health", "doctor", "specialist", "blood test", "diagnosis", "medication", "longevity", "supplement", "scan results", "genomic", "fitness protocol"]

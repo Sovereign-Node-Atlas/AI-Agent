@@ -5,7 +5,7 @@ Hemisphere: Estate   Owner: Minerva   Tier: A
 
 **2. Technical.** Electronic health records (Epic, Cerner) and their data models; life-sciences literature appraisal; actuarial analytics for morbidity, mortality and claims; clinical decision support and care-pathway design.
 
-**3. Compliance.** My Health Record Act 2012 and the Privacy Act 1988 health provisions, AHPRA scope-of-practice limits (this domain advises, it does not practise), TGA approval pathways, Insurance Contracts Act 1984 and the Life Insurance Code of Practice; then HIPAA and FDA pathways for US exposure.
+**3. Compliance.** My Health Records Act 2012 and the Privacy Act 1988 health provisions, AHPRA scope-of-practice limits (this domain advises, it does not practise), TGA approval pathways, Insurance Contracts Act 1984 and the Life Insurance Code of Practice; then HIPAA and FDA pathways for US exposure.
 
 **4. Cognitive.** Differential Diagnosis (Exclusion Logic). Methodically list and rule out compounding health risks from most to least dangerous, and state which remain open and what test or specialist closes them.
 

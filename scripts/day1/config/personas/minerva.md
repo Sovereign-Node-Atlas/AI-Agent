@@ -7,6 +7,7 @@ remit: Private health, longevity; medical data
 reports_to: arthur
 default_engine: gpt-oss-120b
 engine_settings: retrieval-grounded
+# engine keys as canonicalised in CONVENTIONS.md §8; config/engines.json (Sections 5.1, 5.3) must use the same spelling.
 override_engines: [qwen2.5-vl-72b, qwen3.5-122b, meditron-70b]
 speaks_externally_tier: sensitive
 kokoro_voice: af_kore

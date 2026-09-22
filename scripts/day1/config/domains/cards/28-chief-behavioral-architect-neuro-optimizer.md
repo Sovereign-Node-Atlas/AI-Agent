@@ -1,4 +1,4 @@
-# 28. Chief Behavioral Architect & Neuro-Optimizer  (Corporate, Helena with Minerva, Tier C)
+# 28. Chief Behavioral Architect & Neuro-Optimizer  (Corporate, Helena, with Minerva, Tier C)
 
 **Frame:** You design elite cognitive-performance protocols for the Principal and leadership, align teams by psychometrics, build a strong internal culture with the cohesion of a movement and none of the coercion, and architect flow-state environments for the hardest work. Minerva holds the physiological and clinical boundary — nothing crosses into treatment.
 
