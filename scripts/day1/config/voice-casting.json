@@ -1,0 +1,90 @@
+{
+  "personas": [
+    {
+      "name": "Arthur",
+      "key": "arthur",
+      "description": "Male. Formal, patient, structured, deep resonance, calming British or Transatlantic cadence",
+      "kokoro_primary": "bm_george",
+      "kokoro_alternate": "bm_daniel",
+      "path": "Kokoro preset"
+    },
+    {
+      "name": "Ren",
+      "key": "ren",
+      "description": "Male. Sharp, direct, fast, aggressive modern executive cadence with expressive pauses",
+      "kokoro_primary": "am_onyx",
+      "kokoro_alternate": "am_michael",
+      "path": "Kokoro preset, Chatterbox for intensity if needed"
+    },
+    {
+      "name": "Alaric Stone",
+      "key": "alaric",
+      "description": "Male. Grounded, authoritative, gravelly veteran security director",
+      "kokoro_primary": null,
+      "kokoro_alternate": null,
+      "path": "Chatterbox clone from a reference recording"
+    },
+    {
+      "name": "Minerva Hale",
+      "key": "minerva",
+      "description": "Female. Calm, analytical, articulate, clinical",
+      "kokoro_primary": "af_kore",
+      "kokoro_alternate": "bf_isabella",
+      "path": "Kokoro preset"
+    },
+    {
+      "name": "Victor Vale",
+      "key": "victor",
+      "description": "Male. Crisp, rapid, flawlessly polite, aviation concierge",
+      "kokoro_primary": "bm_lewis",
+      "kokoro_alternate": "bm_daniel",
+      "path": "Kokoro preset"
+    },
+    {
+      "name": "Gideon Vance",
+      "key": "gideon",
+      "description": "Measured, meticulous, deep, litigator in absolute facts",
+      "kokoro_primary": "bm_george",
+      "kokoro_alternate": "am_onyx",
+      "kokoro_note": "bm_george if Arthur takes bm_daniel, else am_onyx reassigned",
+      "path": "Kokoro preset or Chatterbox clone to separate from Arthur"
+    },
+    {
+      "name": "Silas Thorne",
+      "key": "silas",
+      "description": "Male. Sharp, cold, calculated quant",
+      "kokoro_primary": "am_eric",
+      "kokoro_alternate": "am_echo",
+      "path": "Kokoro preset"
+    },
+    {
+      "name": "Valerie Cross",
+      "key": "valerie",
+      "description": "Female. Direct, brilliant, slightly impatient engineer",
+      "kokoro_primary": "af_nova",
+      "kokoro_alternate": "af_river",
+      "path": "Kokoro preset"
+    },
+    {
+      "name": "Helena Frost",
+      "key": "helena",
+      "description": "Female. Charismatic, persuasive, perfectly modulated PR executive",
+      "kokoro_primary": "af_bella",
+      "kokoro_alternate": "bf_emma",
+      "path": "Kokoro preset, Chatterbox for modulation if needed"
+    },
+    {
+      "name": "Eleanor Croft",
+      "key": "eleanor",
+      "description": "Female. Warm, efficient, observant",
+      "kokoro_primary": "af_sarah",
+      "kokoro_alternate": "af_heart",
+      "path": "Kokoro preset"
+    }
+  ],
+  "known_conflict": "Arthur, Victor, and Gideon all pull toward the same four British male presets. Once heard, expect to spread them apart or move one to a Chatterbox clone, as Alaric is.",
+  "reference_recordings": {
+    "alaric": "/srv/atlas/staging/inbox/voice-references/alaric.wav",
+    "gideon": "/srv/atlas/staging/inbox/voice-references/gideon.wav"
+  }
+}

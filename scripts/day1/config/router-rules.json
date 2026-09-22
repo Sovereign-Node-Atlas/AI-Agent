@@ -1,0 +1,39 @@
+{
+  "hard_keywords": [
+    "family",
+    "medical",
+    "health",
+    "vault",
+    "trust",
+    "estate",
+    "will",
+    "children",
+    "FAMILY_NAMES_PLACEHOLDER"
+  ],
+  "hard_keyword_route": "arthur",
+  "overrides": {
+    "[REN]": "ren",
+    "[ARTHUR]": "arthur",
+    "[REN:UNCENSORED]": "ren-abliterated",
+    "[ARTHUR:LONG]": "arthur-qwen",
+    "[ARTHUR:UNCENSORED]": "arthur-abliterated",
+    "[DEEP THINK]": "deep-think",
+    "[DEEP THINK:QUICK]": "deep-think:quick",
+    "[DEEP THINK:STANDARD]": "deep-think:standard",
+    "[DEEP THINK:DEEP]": "deep-think:deep",
+    "[LOG STRIKE:": "ouroboros-strike",
+    "[EXECUTE AEGIS BACKUP]": "aegis",
+    "[VAULT]": "vault-session"
+  },
+  "routes": {
+    "ren": "gpt-oss-120b",
+    "arthur": "nemotron-3-super",
+    "ren-abliterated": "gpt-oss-120b-abliterated",
+    "arthur-qwen": "qwen3.5-122b",
+    "arthur-abliterated": "gpt-oss-120b-abliterated",
+    "deep-think:deep": "deepseek-v4-flash"
+  },
+  "classifier_engine": "router-qwen3.5-4b",
+  "long_document_tokens": 24000,
+  "max_domain_cards": 3
+}
