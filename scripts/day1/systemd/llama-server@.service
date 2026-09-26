@@ -1,0 +1,53 @@
+# llama-server@.service — one llama.cpp engine per instance, %i = engine key from config/engines.json
+# (CONVENTIONS.md §8: llama-server@gpt-oss-120b ... llama-server@rerank-bge-v2-m3).
+# Installed by phase2/01-llama.sh through render_template with ATLAS_ETC and ATLAS_SRV substituted; %i and $ARGS are
+# systemd syntax and are left untouched. The env file is rendered by phase2/engine-env.py from config/engines.json.
+#
+# Readiness: the HTTP listener starts before the model loads and /health answers 503 until "model loaded", then 200
+# (llama-cpp-vulkan research §7). ExecStartPost polls /health, so `systemctl start` returns only when the engine can
+# serve; TimeoutStartSec bounds a 155 GB load (Section 5.4 says 25-35 s from NVMe, a cold page cache can take minutes).
+# Bind: 127.0.0.1 only (CONVENTIONS.md §8), set twice — in $ARGS (--host) and as the LLAMA_ARG_HOST env var.
+# Logs: the journal (journalctl -u llama-server@<key>) is where Phase 3 reads the V4 proof line
+#       "llama_kv_cache: size = ... K (q8_0): ... V (q8_0): ..." (research conflict h).
+# Control path: the orchestrator runs `sudo systemctl start|stop|restart llama-server@<key>` under
+#       /etc/sudoers.d/atlas-engines (CONVENTIONS.md §8), written by phase2/01-llama.sh.
+
+[Unit]
+Description=A.T.L.A.S. llama-server engine %i
+Documentation=file:${ATLAS_ETC}/engines/%i.env
+After=local-fs.target
+# A missing model file or a refused KV configuration exits immediately; do not loop on it (rule §7.4 fail loudly).
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+SupplementaryGroups=render video
+EnvironmentFile=${ATLAS_ETC}/engines/%i.env
+Environment=LLAMA_ARG_HOST=127.0.0.1
+# RADV writes its shader cache under $XDG_CACHE_HOME; the atlas system user has no usable HOME.
+CacheDirectory=atlas-llama
+Environment=XDG_CACHE_HOME=/var/cache/atlas-llama
+WorkingDirectory=${ATLAS_SRV}/models
+# $ARGS is split on whitespace by systemd (no quoting), which is why engine-env.py refuses tokens with spaces.
+ExecStart=/usr/local/bin/llama-server $ARGS
+ExecStartPost=/bin/sh -c 'until curl -sf -o /dev/null "http://127.0.0.1:${LLAMA_ARG_PORT}/health"; do sleep 2; done'
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=900
+# SIGTERM is handled by llama-server (server.cpp sigaction); a server stuck in a GPU call may need the SIGKILL.
+TimeoutStopSec=120
+KillMode=mixed
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+# Hardening that does not interfere with /dev/dri access or mmap of the model files.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=${ATLAS_SRV}/data/slots
+
+[Install]
+WantedBy=multi-user.target

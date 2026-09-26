@@ -1,0 +1,121 @@
+# A.T.L.A.S. outbound allowlist (Section 12.5, CONVENTIONS.md §7.1). One squid dstdomain per line.
+# A leading dot matches the domain and every subdomain (".ubuntu.com" = archive.ubuntu.com, security.ubuntu.com ...).
+# Lines starting with # and blank lines are stripped by phase1/04-system.sh before the file reaches squid.
+# Everything not listed here is denied by squid (TCP_DENIED/403 in /var/log/squid/access.log) and by ufw
+# (only the squid user may open outbound 80/443). To find a missing host after a failure:
+#   grep TCP_DENIED /var/log/squid/access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head
+# then add it here and run: sudo /opt/atlas/day1/phase1-platform.sh --force 04   (re-renders the proxy config).
+#
+# NOT outbound (never listed): ntfy at http://127.0.0.1:8090 and http://<LAN_IP>:8090 is loopback/LAN; every
+# llama-server, Redis, ChromaDB, Kokoro, Whisper, Open WebUI and orchestrator port is loopback/LAN; WireGuard is
+# UDP 51820 and bypasses the proxy by protocol (ufw allows it explicitly).
+# NEVER listed, by rule §7.1 "nothing cloud": api.openai.com, api.anthropic.com, generativelanguage.googleapis.com
+# (Gemini). Because Gemini lives under googleapis.com, the Google group below names explicit hosts and never the
+# ".googleapis.com" wildcard. api.openwebui.com (Open WebUI update and community checks, R8) also stays out.
+
+# --- Ubuntu archive, security, ESM, changelogs, motd, Launchpad PPAs (apt via Acquire::https::Proxy) ----------------
+.ubuntu.com
+.launchpad.net
+ppa.launchpadcontent.net
+
+# --- Mozilla apt repository: Firefox as a .deb, never the snap stub (adjudicated conflict 5) -------------------------
+packages.mozilla.org
+
+# --- Docker: Docker's own apt repo, Docker Hub registry and blob CDN, GitHub Container Registry ----------------------
+download.docker.com
+registry-1.docker.io
+auth.docker.io
+index.docker.io
+hub.docker.com
+production.cloudflare.docker.com
+# UNVERIFIED: Docker Hub moved layer blobs to a Cloudflare R2 bucket in 2024; this is the host seen in practice.
+docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
+ghcr.io
+pkg-containers.githubusercontent.com
+
+# --- GitHub: source clones (llama.cpp, engines), release assets, raw files --------------------------------------------
+github.com
+api.github.com
+codeload.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+release-assets.githubusercontent.com
+github-releases.githubusercontent.com
+
+# --- Python and Node package indexes ----------------------------------------------------------------------------------
+pypi.org
+files.pythonhosted.org
+registry.npmjs.org
+
+# --- PyTorch and AMD ROCm wheel indexes (Phase 4 container builds; ROCm never on the host, Section 3.4) ---------------
+download.pytorch.org
+stable.repo.amd.com
+nightly.repo.amd.com
+rocm.nightlies.amd.com
+
+# --- Hugging Face hub and its LFS/CDN hosts (model pulls, Phases 2-4) ------------------------------------------------
+huggingface.co
+.hf.co
+
+# --- Build-time tool downloads named by the services research (Phase 2 step 6) ---------------------------------------
+dl.google.com
+services.gradle.org
+plugins.gradle.org
+repo.maven.apache.org
+downloads.rclone.org
+download.blender.org
+extensions.blender.org
+# UNVERIFIED: Playwright browser CDN host names (services research 4.7)
+cdn.playwright.dev
+playwright.azureedge.net
+
+# --- Cloudflare API (dynamic DNS, R7) and public-IP echo services used by the ddns updater ---------------------------
+api.cloudflare.com
+www.cloudflare.com
+cloudflare.com
+one.one.one.one
+api.ipify.org
+icanhazip.com
+
+# --- Google APIs and OAuth endpoints (Gmail, Calendar, Drive; Section 13, V20) ---------------------------------------
+accounts.google.com
+oauth2.googleapis.com
+openidconnect.googleapis.com
+www.googleapis.com
+gmail.googleapis.com
+# UNVERIFIED: hosts a Drive mount (rclone) and the discovery documents may additionally contact
+drive.googleapis.com
+calendar.googleapis.com
+
+# --- Xero (official API and the identity/token endpoint used by the MCP server) --------------------------------------
+api.xero.com
+identity.xero.com
+login.xero.com
+
+# --- Wix (REST API host, account manager, and the static hosts the browser path loads for site design) ---------------
+www.wixapis.com
+manage.wix.com
+.wix.com
+# UNVERIFIED: static asset hosts Wix pages load; needed only for the Playwright/UI-TARS browser path
+.wixstatic.com
+.parastorage.com
+
+# --- Pay.com (developer API; header format UNVERIFIED, see services research 5.3) -------------------------------------
+api.pay.com
+apiref.pay.com
+.pay.com
+
+# --- RewardPay (browser only, no public API found; Sydney) -------------------------------------------------------------
+.rewardpay.com.au
+
+# --- Sentinel feeds (D6, Section 9.3): CoinDesk, an ASX and US index feed, RSS news. ---------------------------------
+# UNVERIFIED: the exact feed hosts are chosen by the Phase 2 Sentinel step (config/sentinel-feeds.json); the writer of
+# that file must keep this group in sync. These are the conventional free endpoints for each D6 item.
+.coindesk.com
+query1.finance.yahoo.com
+query2.finance.yahoo.com
+stooq.com
+.asx.com.au
+feeds.bbci.co.uk
+www.abc.net.au
+www.theguardian.com

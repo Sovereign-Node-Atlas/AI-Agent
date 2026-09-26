@@ -1,0 +1,18 @@
+# /etc/systemd/system/atlas-docker-egress.service — container egress rules in the DOCKER-USER chain.
+# Docker publishes ports and forwards container traffic before ufw sees it (adjudicated conflict 4), so the
+# "default deny outbound except the allowlist" rule of Section 3.6/12.5 is enforced for containers here.
+# DOCKER-USER does not exist until dockerd starts, so this cannot live in /etc/ufw/before.rules.
+# Installed by phase1/06-docker.sh; the rules script is phase1/docker-egress-rules.sh -> /usr/local/sbin/atlas-docker-egress.
+[Unit]
+Description=ATLAS container egress rules (DOCKER-USER chain)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/atlas-docker-egress
+
+[Install]
+WantedBy=docker.service

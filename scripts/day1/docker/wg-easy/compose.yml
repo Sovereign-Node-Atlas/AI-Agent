@@ -1,0 +1,56 @@
+# docker/wg-easy/compose.yml — WG-Easy (Section 12.2; Phase 1 step 7). Image pinned per the platform research (item 8).
+#
+# Every ${VAR} is interpolated by `docker compose --env-file /etc/atlas/secrets/wg-easy.env` (written by
+# phase1/07-remote.sh, mode 600 root). The INIT_* variables perform WG-Easy v15's unattended first-run setup and are
+# ignored on every later start (docs: unattended-setup.md).
+#
+# Network design (adjudicated conflict 4): wg0 lives INSIDE this container. VPN clients reach the host masqueraded
+# as the container address 10.42.42.42 on the bridge br-atlas-wg, so "bound to LAN and WireGuard" for host services
+# means ufw rules on ${LAN_IFACE} and on br-atlas-wg (10.42.42.0/24). The admin UI (51821) is published on the LAN
+# address only, because Docker's published ports bypass ufw; UDP 51820 is published on every address by design.
+services:
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:15
+    container_name: wg-easy
+    environment:
+      - INSECURE=true                # http only; the UI is reachable from LAN/VPN only (published on ${LAN_IP})
+      - DISABLE_VERSION_CHECK=true   # no phone-home (§7.1)
+      - DISABLE_IPV6=true
+      - INIT_ENABLED=true
+      - INIT_USERNAME=${WG_ADMIN_USER}
+      - INIT_PASSWORD=${WG_ADMIN_PASS}
+      - INIT_HOST=${VPN_HOST}
+      - INIT_PORT=${WG_PORT}
+      - INIT_DNS=${LAN_DNS}
+      - INIT_IPV4_CIDR=${WG_CIDR}
+      - INIT_IPV6_CIDR=fdcc:ad94:bacf:61a4::/112
+      - INIT_ALLOWED_IPS=${WG_CIDR},${LAN_CIDR},10.42.42.0/24
+      - TZ=${TZ}
+    networks:
+      wg:
+        ipv4_address: 10.42.42.42
+    volumes:
+      - ${WG_DATA_DIR}:/etc/wireguard     # /srv/atlas/data/wg-easy: client configs survive and are in restic's set
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "${WG_PORT}:${WG_PORT}/udp"
+      - "${LAN_IP}:51821:51821/tcp"
+      - "127.0.0.1:51821:51821/tcp"
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+
+networks:
+  wg:
+    driver: bridge
+    driver_opts:
+      # Fixed bridge name so ufw and the DOCKER-USER rules can name it (UNVERIFIED option page; standard Docker option).
+      com.docker.network.bridge.name: br-atlas-wg
+    ipam:
+      config:
+        - subnet: 10.42.42.0/24
+          gateway: 10.42.42.1

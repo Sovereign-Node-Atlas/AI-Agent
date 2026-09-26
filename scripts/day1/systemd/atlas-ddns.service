@@ -1,0 +1,25 @@
+# /etc/systemd/system/atlas-ddns.service — Cloudflare dynamic DNS for ${VPN_HOST} (Section 12.2, R7).
+# Installed by phase1/07-remote.sh via render_template (ATLAS_ETC, VPN_HOST). Runs as the atlas-ddns service account;
+# the token file is mode 600 atlas-ddns:atlas-ddns inside the root-only secrets directory (CONVENTIONS.md §2) and is
+# read by PID 1 before privileges drop, so the account itself never needs to traverse the directory.
+[Unit]
+Description=ATLAS Cloudflare dynamic DNS for ${VPN_HOST}
+After=network-online.target squid.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=atlas-ddns
+Group=atlas-ddns
+# CF_API_TOKEN, CF_ZONE_NAME, CF_ZONE_ID, CF_RECORD_NAME (Phase 2 step 6b keeps this file; V23)
+EnvironmentFile=${ATLAS_ETC}/secrets/cloudflare.env
+# HTTP_PROXY/HTTPS_PROXY/NO_PROXY: every outbound request goes through the allowlist proxy (§7.1)
+EnvironmentFile=-${ATLAS_ETC}/proxy.env
+StateDirectory=atlas-ddns
+ExecStart=/usr/local/sbin/atlas-ddns
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

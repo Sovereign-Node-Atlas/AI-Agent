@@ -1,0 +1,40 @@
+# /etc/squid/squid.conf — A.T.L.A.S. outbound allowlist proxy (Section 12.5; CONVENTIONS.md §7.1).
+# Rendered by phase1/04-system.sh from config/squid.conf.tmpl; Ubuntu's original is kept as squid.conf.dist.
+# Ubuntu's stock file has "http_access allow localhost" BEFORE its conf.d include, which would let every local
+# client through unfiltered (platform research item 6), so the whole file is replaced rather than extended.
+#
+# No SSL bump: the allow/deny decision is made on the CONNECT host:443 line, which carries the hostname in clear.
+# Listens on every address so containers can reach it at their bridge gateway (172.17.0.1 for docker0); ufw admits
+# port 3128 only from loopback and the Docker bridges, and the "clients" acl below refuses anything else.
+
+http_port 3128
+
+acl SSL_ports port 443
+acl Safe_ports port 80
+acl Safe_ports port 443
+acl allowed dstdomain "${SQUID_ALLOWLIST}"
+acl clients src 127.0.0.1/32 ::1/128 ${SQUID_CLIENT_NETS}
+
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+http_access deny manager
+http_access allow clients allowed
+http_access deny all
+
+# No disk or memory cache: apt, pip and model pulls verify their own checksums and a cache would only hold stale blobs.
+cache deny all
+cache_mem 8 MB
+
+# Per-request log with the hostname of every denied CONNECT (Section 12.5 "everything else denied and logged").
+access_log daemon:/var/log/squid/access.log squid
+cache_log /var/log/squid/cache.log
+logfile_rotate 7
+coredump_dir /var/spool/squid
+
+# Do not leak the node to the sites it talks to.
+forwarded_for delete
+via off
+httpd_suppress_version_string on
+
+# Fast restarts during Phase 1 (default 30 s).
+shutdown_lifetime 3 seconds

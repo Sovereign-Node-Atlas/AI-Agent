@@ -1,0 +1,12 @@
+# /etc/systemd/system/atlas-ddns.timer — "checked every few minutes, updated only on change" (Section 12.2).
+[Unit]
+Description=Run ATLAS dynamic DNS every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
