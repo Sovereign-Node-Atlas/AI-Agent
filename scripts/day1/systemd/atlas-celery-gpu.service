@@ -1,0 +1,34 @@
+# /etc/systemd/system/atlas-celery-gpu.service — Celery worker for the `gpu` queue with EXACTLY ONE process
+# (Section 9.7, C15; Engine Arbiter rule 4 in 4.2: "the Celery gpu queue keeps exactly one worker, so a background
+# job simply waits its turn"). The concurrency is a literal 1 here on purpose: it is not configurable through the env
+# file, because two gpu workers would let two tasks hold engines at once. The task still asks the Engine Arbiter
+# before it loads anything (4.2 rule 2); this unit only guarantees the queue discipline.
+# Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+
+[Unit]
+Description=A.T.L.A.S. Celery worker (gpu queue, concurrency 1)
+After=network-online.target docker.service atlas-orchestrator.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+SupplementaryGroups=docker render video
+WorkingDirectory=${ATLAS_OPT}/orchestrator
+EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=-${ATLAS_ETC}/memory.env
+EnvironmentFile=-${ATLAS_ETC}/proxy.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/atlas
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-celery-gpu: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
+ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app worker -Q gpu -n gpu@%H --loglevel=INFO --concurrency=1 --prefetch-multiplier=1
+Restart=always
+RestartSec=5
+# A GraphRAG indexing pass or a Deep Think round may run long; give it time to finish the current task.
+KillMode=mixed
+TimeoutStopSec=900
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

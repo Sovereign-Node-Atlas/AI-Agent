@@ -7,8 +7,11 @@ EnvironmentFile= and by the Phase 3 driver (sourceable KEY='value' lines). Each 
     ATLAS_ENGINE, ATLAS_MODE, ATLAS_KV_TYPE, ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_N_KEEP, ATLAS_MODEL_FILE,
     ATLAS_MODEL_PRESENT (1/0), ATLAS_KV_PROOF_LINES, LLAMA_ARG_HOST, LLAMA_ARG_PORT, ARGS
 
-ARGS is the complete llama-server command line (the unit runs `llama-server $ARGS`). systemd splits $ARGS on
-whitespace with no quoting, so every token is checked for whitespace, single quotes and backslashes.
+ARGS is the complete llama-server command line (the unit runs `llama-server $ARGS`). systemd splits an unquoted $ARGS
+at whitespace with quotes respected and then REMOVED (systemd.service(5), "Command lines"), so a JSON token such as
+{"reasoning_effort":"high"} would arrive as {reasoning_effort:high}; every token is therefore refused if it contains
+whitespace, a quote of either kind or a backslash. Options whose value is JSON go through their LLAMA_ARG_* env var
+instead, listed per engine under "env" in engines.json and written verbatim after LLAMA_ARG_PORT.
 
 Overrides (the contract Phase 3 relies on): $ATLAS_ETC/engines/overrides.json, an object keyed by engine key with any of
     {"kv_type": "f16|q8_0|q4_0", "ctx_size": N, "parallel": N, "coresident": true|false, "n_keep": N}
@@ -30,6 +33,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -74,9 +78,27 @@ def expected_model_path(model_dir: Path, patterns: str) -> Path:
 
 
 def check_token(token: str, key: str) -> str:
-    if any(ch.isspace() for ch in token) or "'" in token or "\\" in token:
-        die(f"{key}: argument {token!r} contains whitespace, a quote or a backslash; systemd cannot pass it via $ARGS")
+    if any(ch.isspace() for ch in token) or "'" in token or '"' in token or "\\" in token:
+        die(f"{key}: argument {token!r} contains whitespace, a quote or a backslash; systemd cannot pass it via $ARGS "
+            "(use an LLAMA_ARG_* entry under \"env\" in engines.json instead)")
     return token
+
+
+ENV_KEY_RE = re.compile(r"^LLAMA_ARG_[A-Z0-9_]+$")
+
+
+def env_lines(eng: dict[str, Any]) -> list[str]:
+    """Extra KEY='value' lines from the engine's "env" map (JSON-valued llama-server options)."""
+    key = eng["key"]
+    extra = eng.get("env") or {}
+    if not isinstance(extra, dict):
+        die(f"{key}: env must be an object of LLAMA_ARG_* keys")
+    lines: list[str] = []
+    for name, value in extra.items():
+        if not ENV_KEY_RE.match(str(name)):
+            die(f"{key}: env key {name!r} is not an LLAMA_ARG_* variable")
+        lines.append(f"{name}={sh_quote(str(value))}")
+    return lines
 
 
 def build_args(
@@ -130,8 +152,8 @@ def build_args(
 
 
 def sh_quote(value: str) -> str:
-    # Values are single-quoted so both systemd's EnvironmentFile parser and bash `source` read them verbatim;
-    # check_token already refused single quotes and backslashes inside ARGS.
+    # Values are single-quoted so both systemd's EnvironmentFile parser and bash `source` read them verbatim (double
+    # quotes inside single quotes are literal in both); check_token already refused quotes and backslashes inside ARGS.
     if "'" in value or "\\" in value or "\n" in value:
         die(f"cannot quote value {value!r}")
     return f"'{value}'"
@@ -180,6 +202,7 @@ def render(eng: dict[str, Any], ov: dict[str, Any], opts: argparse.Namespace, in
         f"ATLAS_MODEL_PRESENT={1 if present else 0}",
         "LLAMA_ARG_HOST=127.0.0.1",
         f"LLAMA_ARG_PORT={port}",
+        *env_lines(eng),
         f"ARGS={sh_quote(' '.join(args))}",
         "",
     ]

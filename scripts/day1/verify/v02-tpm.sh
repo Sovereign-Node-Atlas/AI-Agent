@@ -19,10 +19,17 @@ token_check() { # token_check DEVICE -> prints "tpm2 pcrs=<list>" or returns 1
   local d="$1" dump
   dump="$(cryptsetup luksDump "$d" 2>&1)" || { echo "luksDump failed on $d"; return 1; }
   grep -q 'systemd-tpm2' <<<"$dump" || { echo "no systemd-tpm2 token on $d"; return 1; }
-  local pcrs
-  # luksDump prints the token plugin's fields as "tpm2-hash-pcrs:   7" (older plugins: "tpm2-pcrs:").
-  pcrs="$(awk '/systemd-tpm2/ {t=1} t && /tpm2-(hash-)?pcrs:/ {sub(/.*pcrs:[[:space:]]*/,""); print; exit}' <<<"$dump")"
-  [[ -n "$pcrs" ]] || pcrs="unknown"
+  local pcrs line
+  # luksDump prints the token plugin's fields as "tpm2-hash-pcrs:   7" (older plugins: "tpm2-pcrs:"). A present but
+  # EMPTY list is systemd 259's default (no PCR binding at all, adjudicated conflict 1) and is a fail; a missing line
+  # (plugin output format unknown) is reported as "unknown" and tolerated.
+  line="$(awk '/systemd-tpm2/ {t=1} t && /tpm2-(hash-)?pcrs:/ {print; exit}' <<<"$dump")"
+  if [[ -z "$line" ]]; then
+    pcrs="unknown"
+  else
+    pcrs="$(sed -E 's/.*pcrs:[[:space:]]*//; s/[[:space:]]+$//' <<<"$line")"
+    [[ -n "$pcrs" ]] || { echo "TPM2 token on $d is bound to NO PCRs (systemd 259 default; enrol with --tpm2-pcrs=7)"; return 1; }
+  fi
   printf 'tpm2 pcrs=%s' "$pcrs"
 }
 

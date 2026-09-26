@@ -31,7 +31,8 @@ Environment=LLAMA_ARG_HOST=127.0.0.1
 CacheDirectory=atlas-llama
 Environment=XDG_CACHE_HOME=/var/cache/atlas-llama
 WorkingDirectory=${ATLAS_SRV}/models
-# $ARGS is split on whitespace by systemd (no quoting), which is why engine-env.py refuses tokens with spaces.
+# $ARGS is split at whitespace by systemd with quotes respected and then removed, which is why engine-env.py refuses
+# tokens with spaces or quotes; JSON-valued options (chat template kwargs) travel as LLAMA_ARG_* variables in the env file.
 ExecStart=/usr/local/bin/llama-server $ARGS
 ExecStartPost=/bin/sh -c 'until curl -sf -o /dev/null "http://127.0.0.1:${LLAMA_ARG_PORT}/health"; do sleep 2; done'
 Restart=on-failure

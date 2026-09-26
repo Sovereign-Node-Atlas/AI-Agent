@@ -1,0 +1,9 @@
+# editable-install and tool artefacts (phase2/02-orchestrator.sh excludes the same set from its rsync)
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/

@@ -1,0 +1,37 @@
+# /etc/systemd/system/atlas-celery-beat.service — Celery beat, the ONE scheduler process inside the orchestrator.
+# Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+#
+# Division of schedules (CONVENTIONS.md §8, last paragraph): Sentinel (hourly), the 72-hour prune and AEGIS nightly
+# are SYSTEMD TIMERS whose only job is to enqueue the Celery task (atlas-sentinel.timer, atlas-prune.timer,
+# atlas-aegis.timer). Beat therefore carries only the schedules the package owns and no timer duplicates:
+#   * chat-retention (D9, Section 10.4): nightly, summarises Open WebUI chats older than 90 days into the Vector
+#     Cortex and deletes them through the admin API (phase2/03-openwebui.sh states the contract).
+#   * any package-internal housekeeping the writer adds.
+# Contract with the `atlas` package: `atlas.celery_app` defines `app.conf.beat_schedule` with the chat-retention entry
+# and NEVER with sentinel, prune or aegis entries (they would run twice). The schedule file lives in the unit's
+# StateDirectory (/var/lib/atlas-celery/celerybeat-schedule); exactly one beat process may run (celery docs).
+
+[Unit]
+Description=A.T.L.A.S. Celery beat (chat-retention and package-owned schedules only)
+After=network-online.target docker.service atlas-celery-cpu.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+WorkingDirectory=${ATLAS_OPT}/orchestrator
+EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=-${ATLAS_ETC}/memory.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/atlas
+StateDirectory=atlas-celery
+StateDirectoryMode=0750
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-celery-beat: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
+ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app beat --loglevel=INFO -s /var/lib/atlas-celery/celerybeat-schedule --pidfile=
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

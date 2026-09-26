@@ -1,0 +1,20 @@
+{
+  "hard_keywords": ["family", "medical", "health", "vault", "trust", "estate", "will", "children", "FAMILY_NAMES_PLACEHOLDER"],
+  "hard_keyword_route": "arthur",
+  "overrides": {
+    "[REN]": "ren",
+    "[ARTHUR]": "arthur",
+    "[DEEP THINK:": "deep-think",
+    "[DEEP THINK:DEEP]": "deep-think:deep"
+  },
+  "routes": {
+    "ren": "gpt-oss-120b",
+    "arthur": "nemotron-3-super",
+    "ren-abliterated": "gpt-oss-120b-abliterated",
+    "arthur-qwen": "qwen3.5-122b",
+    "deep-think:deep": "deepseek-v4-flash"
+  },
+  "classifier_engine": "router-qwen3.5-4b",
+  "long_document_tokens": 24000,
+  "max_domain_cards": 3
+}

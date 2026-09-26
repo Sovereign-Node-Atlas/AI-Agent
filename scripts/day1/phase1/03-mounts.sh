@@ -57,6 +57,9 @@ step_03() {
     useradd -r -m -d /var/lib/atlas -s /bin/bash -U atlas
     log "created system user atlas (home /var/lib/atlas)"
   fi
+  # $ATLAS_STATE (/var/lib/atlas/day1, root 755 per §2) usually exists before the account does, so useradd -m found
+  # the home root-owned; the home directory itself belongs to atlas, day1/ underneath stays root's.
+  chown atlas:atlas /var/lib/atlas; chmod 755 /var/lib/atlas
   getent group render >/dev/null || die "group 'render' does not exist (udev creates it for /dev/dri/renderD*; is amdgpu loaded?)"
   usermod -aG render,video atlas
   if ! id -u atlas-ddns >/dev/null 2>&1; then

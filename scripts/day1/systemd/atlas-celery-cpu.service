@@ -1,0 +1,36 @@
+# /etc/systemd/system/atlas-celery-cpu.service — Celery worker for the `cpu` queue (Section 9.7: "many workers").
+# Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+# Concurrency = nproc - 2 (minimum 1), computed by step 02 and written as CELERY_CPU_CONCURRENCY in orchestrator.env,
+# so a CPU change is one edit. `%H` is systemd's host name specifier (the worker is named cpu@<host>; celery's own
+# `%h` is avoided because systemd would read it as the home directory).
+# Contract with the `atlas` package: `atlas.celery_app` exposes the Celery app as `app`, task_default_queue = "cpu",
+# and routes the GPU-bound tasks to the `gpu` queue (services research S3 pattern). Long tasks: task_acks_late with a
+# visibility_timeout longer than the longest task, both set in the app, not here.
+
+[Unit]
+Description=A.T.L.A.S. Celery worker (cpu queue)
+After=network-online.target docker.service atlas-orchestrator.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+SupplementaryGroups=docker
+WorkingDirectory=${ATLAS_OPT}/orchestrator
+EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=-${ATLAS_ETC}/memory.env
+EnvironmentFile=-${ATLAS_ETC}/proxy.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/atlas
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-celery-cpu: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
+ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app worker -Q cpu -n cpu@%H --loglevel=INFO --concurrency=${CELERY_CPU_CONCURRENCY} --max-tasks-per-child=50
+Restart=always
+RestartSec=5
+# Warm shutdown: let running tasks finish (a Docling ingestion or a backtest can be long), then SIGKILL.
+KillMode=mixed
+TimeoutStopSec=300
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

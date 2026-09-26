@@ -1,0 +1,121 @@
+{
+  "_meta": {
+    "purpose": "The D6 Sentinel feed list (ATLAS_FRAMEWORK_REVIEW.md Section 9.3, D6): CoinDesk, an ASX and a US index feed, RSS news, node telemetry. Read by the orchestrator's Sentinel task (path handed over as SENTINEL_FEEDS in /etc/atlas/orchestrator.env); installed by phase2/08-sentinel.sh, which also proves every host is in config/allowlist.txt and probes each URL once.",
+    "verification": "No feed URL below is VERIFIED by the research (services-tools.md / platform.md never fetched them; config/allowlist.txt marks the Sentinel group UNVERIFIED). Every URL is the conventional free endpoint of that publisher and is marked verified=false. Rule for the task (adjudicated for this file): a feed that is unreachable or unparsable is logged as 'feed unreachable: <id>' in the Sentinel log and the pulse continues; it is never a pulse failure. Once a feed has been seen working on the node, the task may record verified_on_node in its own state; this file stays as written.",
+    "allowlist": "Every host here MUST appear in config/allowlist.txt (Sentinel group). phase2/08-sentinel.sh dies when one is missing. Hosts used: www.coindesk.com (.coindesk.com), query1.finance.yahoo.com, query2.finance.yahoo.com, stooq.com, feeds.bbci.co.uk, www.abc.net.au, www.theguardian.com.",
+    "schema": "feeds[]: id, kind (rss|json|csv), url, fallback_url (optional), owner (persona key), hemisphere, topic, series (for json/csv: how to read the number), thresholds (statistics-first detection, Section 9.3), verified (bool), note. telemetry[]: id, source (paths under /proc and /sys, or a command), thresholds. detection: the rule text. alert: BLUF entry + ntfy push.",
+    "detection_rule": "Section 9.3: statistics first. Each pulse stores the reading; deviations are computed against the last 24 readings (hourly) and the thresholds below; a model (the resident router model or Eleanor's engine) is invoked only when a threshold trips, and escalates to a large engine only on anomaly. Never swaps an engine out from under an active session: the Engine Arbiter queues it (4.2 rule 6).",
+    "poll": "hourly (atlas-sentinel.timer); the task must finish inside the hour; per-feed HTTP timeout 20 s; every request through the allowlist proxy (HTTPS_PROXY from /etc/atlas/proxy.env)."
+  },
+  "version": 1,
+  "feeds": [
+    {
+      "id": "coindesk-news",
+      "kind": "rss",
+      "url": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+      "owner": "silas",
+      "hemisphere": "corporate",
+      "topic": "crypto-news",
+      "thresholds": { "new_items_per_hour_max": 40, "keywords_alert": ["hack", "exploit", "halt", "insolven", "SEC charges", "delist"] },
+      "verified": false,
+      "note": "UNVERIFIED URL: CoinDesk's Arc-hosted RSS endpoint as widely published; the task logs 'feed unreachable' if it moves."
+    },
+    {
+      "id": "btc-usd",
+      "kind": "json",
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/BTC-USD?range=5d&interval=1d",
+      "fallback_url": "https://query2.finance.yahoo.com/v8/finance/chart/BTC-USD?range=5d&interval=1d",
+      "owner": "silas",
+      "hemisphere": "corporate",
+      "topic": "crypto-price",
+      "series": { "path": "chart.result[0].indicators.quote[0].close", "timestamps": "chart.result[0].timestamp", "unit": "USD" },
+      "thresholds": { "abs_pct_change_1h": 3.0, "abs_pct_change_24h": 8.0 },
+      "verified": false,
+      "note": "UNVERIFIED: Yahoo Finance chart JSON (free, no key) used for the CoinDesk price series; CoinDesk's own data API needs a key. The task may need a browser-like User-Agent (UNVERIFIED)."
+    },
+    {
+      "id": "asx200",
+      "kind": "json",
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/%5EAXJO?range=5d&interval=1d",
+      "fallback_url": "https://stooq.com/q/l/?s=%5Eaxjo&f=sd2t2ohlcv&h&e=csv",
+      "fallback_kind": "csv",
+      "owner": "silas",
+      "hemisphere": "corporate",
+      "topic": "asx-index",
+      "series": { "path": "chart.result[0].indicators.quote[0].close", "timestamps": "chart.result[0].timestamp", "unit": "points", "csv_columns": "Symbol,Date,Time,Open,High,Low,Close,Volume" },
+      "thresholds": { "abs_pct_change_1d": 2.0, "abs_pct_change_5d": 5.0 },
+      "verified": false,
+      "note": "UNVERIFIED: S&P/ASX 200 (^AXJO) from Yahoo Finance; stooq daily CSV (^axjo) as fallback. D6 'an index feed for ASX'."
+    },
+    {
+      "id": "sp500",
+      "kind": "json",
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=5d&interval=1d",
+      "fallback_url": "https://stooq.com/q/l/?s=%5Espx&f=sd2t2ohlcv&h&e=csv",
+      "fallback_kind": "csv",
+      "owner": "silas",
+      "hemisphere": "corporate",
+      "topic": "us-index",
+      "series": { "path": "chart.result[0].indicators.quote[0].close", "timestamps": "chart.result[0].timestamp", "unit": "points", "csv_columns": "Symbol,Date,Time,Open,High,Low,Close,Volume" },
+      "thresholds": { "abs_pct_change_1d": 2.0, "abs_pct_change_5d": 5.0 },
+      "verified": false,
+      "note": "UNVERIFIED: S&P 500 (^GSPC) from Yahoo Finance; stooq (^spx) as fallback. D6 'an index feed for US markets'."
+    },
+    {
+      "id": "bbc-world",
+      "kind": "rss",
+      "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+      "owner": "alaric",
+      "hemisphere": "corporate",
+      "topic": "world-news",
+      "thresholds": { "new_items_per_hour_max": 30, "keywords_alert": ["cyberattack", "ransomware", "data breach", "zero-day", "outage"] },
+      "verified": false,
+      "note": "UNVERIFIED URL (BBC's long-standing world feed). Alaric: threat monitoring (9.3 owners)."
+    },
+    {
+      "id": "abc-news-au",
+      "kind": "rss",
+      "url": "https://www.abc.net.au/news/feed/2942460/rss.xml",
+      "owner": "alaric",
+      "hemisphere": "estate",
+      "topic": "australia-news",
+      "thresholds": { "new_items_per_hour_max": 30, "keywords_alert": ["bushfire", "flood", "evacuat", "outage", "recall", "scam"] },
+      "verified": false,
+      "note": "UNVERIFIED feed id (ABC News 'Top Stories'); ABC changes feed ids occasionally, hence 'feed unreachable' rather than a failure."
+    },
+    {
+      "id": "guardian-australia",
+      "kind": "rss",
+      "url": "https://www.theguardian.com/australia-news/rss",
+      "owner": "alaric",
+      "hemisphere": "estate",
+      "topic": "australia-news",
+      "thresholds": { "new_items_per_hour_max": 30, "keywords_alert": ["interest rate", "RBA", "ATO", "ASIC", "cyber"] },
+      "verified": false,
+      "note": "UNVERIFIED URL (Guardian section feeds follow the /<section>/rss pattern)."
+    }
+  ],
+  "telemetry": [
+    { "id": "load", "source": "/proc/loadavg", "thresholds": { "load1_over_nproc": 2.0 } },
+    { "id": "memory", "source": "/proc/meminfo", "thresholds": { "mem_available_pct_min": 5.0 } },
+    { "id": "gtt", "source": "/sys/class/drm/card*/device/mem_info_gtt_used and mem_info_gtt_total (AMD vendor 0x1002; lib/common.sh gpu_gtt_used_mb/gpu_gtt_total_mb)", "thresholds": { "gtt_used_pct_max": 92.0 } },
+    { "id": "thermal", "source": "/sys/class/hwmon/hwmon*/temp*_input (millidegrees; hwmon name amdgpu/k10temp)", "thresholds": { "temp_c_max": 95.0 } },
+    { "id": "disk", "source": "statvfs of /, /srv/atlas, /srv/backups, /srv/cold", "thresholds": { "used_pct_max": 90.0, "srv_atlas_used_pct_max": 85.0 } },
+    { "id": "services", "source": "systemctl is-active atlas-orchestrator atlas-celery-cpu atlas-celery-gpu atlas-celery-beat llama-server@router-qwen3.5-4b llama-server@embed-bge-m3 llama-server@rerank-bge-v2-m3 docker squid atlas-ddns.timer atlas-aegis.timer", "thresholds": { "inactive_alert": true } },
+    { "id": "containers", "source": "docker inspect --format '{{.State.Health.Status}}' atlas-redis atlas-chromadb atlas-openwebui atlas-kokoro atlas-speaches atlas-docling atlas-ntfy wg-easy", "thresholds": { "unhealthy_alert": true } },
+    { "id": "backup", "source": "restic snapshots --latest 1 --json via the ledger of atlas-aegis.service (journalctl -u atlas-aegis), newest snapshot age", "thresholds": { "snapshot_age_hours_max": 36 } },
+    { "id": "firewall", "source": "journalctl -k --since -1h: count of '[UFW BLOCK]' and '[ATLAS docker egress denied]' lines; /var/log/squid/access.log TCP_DENIED per host", "thresholds": { "denied_per_hour_max": 200 } }
+  ],
+  "detection": {
+    "history_window": 24,
+    "rule": "statistics first; thresholds above; a model is invoked only when a threshold trips (Section 9.3)",
+    "escalation": "resident engine (router-qwen3.5-4b) or Eleanor's model first; a large engine only on anomaly, requested through the Engine Arbiter (4.2)"
+  },
+  "alert": {
+    "format": "BLUF",
+    "log": "/srv/atlas/data/sentinel/ (SENTINEL_LOG_DIR; retained 12 months, D9/10.4) and the task ledger",
+    "ntfy": { "url": "http://127.0.0.1:8090", "topic_from_env": "NTFY_TOPIC", "token_file_from_env": "NTFY_TOKEN_FILE", "priority_on_anomaly": "high" },
+    "email_fallback": "through the Google integration (Section 13) when ntfy is down; standard tier, so it queues for approval (16.2)",
+    "owners": { "markets": "silas", "threats": "alaric", "under": "arthur" }
+  }
+}

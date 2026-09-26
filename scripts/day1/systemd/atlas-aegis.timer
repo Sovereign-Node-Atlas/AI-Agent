@@ -1,0 +1,13 @@
+# /etc/systemd/system/atlas-aegis.timer — AEGIS nightly at 02:30 local time (Section 9.5 "Nightly automatic").
+# Installed verbatim by phase2/07-restic.sh. Persistent=true runs a missed night at the next boot.
+[Unit]
+Description=Run the AEGIS restic backup nightly
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=atlas-aegis.service
+
+[Install]
+WantedBy=timers.target

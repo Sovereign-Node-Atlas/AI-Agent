@@ -1,0 +1,16 @@
+# /etc/systemd/system/atlas-prune.timer — every 72 hours (Section 9.6 "A Celery beat job every 72 hours"; the
+# timer enqueues, Celery executes: CONVENTIONS.md §8). Monotonic schedule: first run an hour after boot, then every
+# 72 h of uptime; Persistent=true catches up a run missed while the node was off.
+# Installed verbatim by phase2/08-sentinel.sh.
+[Unit]
+Description=Run the A.T.L.A.S. semantic pruning sweep every 72 hours
+
+[Timer]
+OnBootSec=1h
+OnUnitActiveSec=72h
+RandomizedDelaySec=30min
+Persistent=true
+Unit=atlas-prune.service
+
+[Install]
+WantedBy=timers.target

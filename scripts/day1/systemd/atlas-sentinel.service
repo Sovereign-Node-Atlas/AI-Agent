@@ -1,0 +1,25 @@
+# /etc/systemd/system/atlas-sentinel.service — one Sentinel pulse (Section 9.3): the unit's ONLY job is to enqueue
+# the Celery task; the worker on the `cpu` queue does the fetching, the statistics-first detection and the BLUF
+# alert through ntfy (9.3 names a systemd timer, 9.7 makes Celery the executor; CONVENTIONS.md §8 settles both).
+# Installed by phase2/08-sentinel.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+# Feeds: config/sentinel-feeds.json (D6), path handed over as SENTINEL_FEEDS in /etc/atlas/orchestrator.env.
+# Contract with the `atlas` package: `atlas-admin enqueue sentinel` sends atlas' Sentinel task to the cpu queue and
+# exits 0 once the broker accepted it (it does not wait); `--wait SECONDS` blocks until the task finished and prints
+# the resulting ledger record as one JSON line (used once by step 08 to prove the ledger; not used by the timer).
+# If the orchestrator or Redis is down, the enqueue fails, this unit fails, and the journal says so: nothing silent.
+
+[Unit]
+Description=A.T.L.A.S. Sentinel pulse (enqueue the Celery task, Section 9.3)
+After=atlas-orchestrator.service atlas-celery-cpu.service
+Documentation=file:${ATLAS_ETC}/orchestrator.env
+
+[Service]
+Type=oneshot
+User=atlas
+Group=atlas
+WorkingDirectory=${ATLAS_OPT}/orchestrator
+EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=-${ATLAS_ETC}/memory.env
+Environment=HOME=/var/lib/atlas
+ExecStart=${ATLAS_OPT}/venv/bin/atlas-admin enqueue sentinel
+TimeoutStartSec=120

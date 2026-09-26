@@ -1,0 +1,173 @@
+# docker/core/compose.yml — the Docker core (CONVENTIONS.md §1): redis, chromadb and open-webui here; kokoro, speaches
+# (Whisper) and docling-serve in docker/core/compose.voice.yml (the voice writer's overlay, merged into THIS project by
+# phase2/05-voice.sh with `-f compose.yml -f compose.voice.yml`; it joins the `atlas` network defined below and takes
+# SPEACHES_PRELOAD_MODELS / SPEACHES_HF_HUB_OFFLINE from /etc/atlas/voice.env). ntfy is NOT here: Phase 1 step 7
+# brought it up from docker/ntfy/compose.yml as project "atlas-ntfy" on port 8090 (contract note in that file).
+# WG-Easy likewise lives in docker/wg-easy/compose.yml.
+#
+# Project name is fixed below (`name:`) so that every caller shares one project whatever its working directory:
+#   docker compose -f <this file> --env-file /etc/atlas/core.env up -d <service>
+# /etc/atlas/core.env is written by phase2/02-orchestrator.sh (_core_env_write) as a superset of Phase 1's
+# /etc/atlas/docker.env plus the keys listed under "Interpolation" below. Every ${VAR} has a default so that a bare
+# `docker compose -f <this file> up -d chromadb` (phase2/04-memory.sh's contract) also works from a load_env shell.
+#
+# Network design (adjudicated conflict 4; Section 3.6, 12.5; CONVENTIONS.md §8):
+#   * open-webui runs with network_mode: host. The two host services it must call, the orchestrator ($ORCH_PORT) and
+#     the bge-m3 llama-server ($LLAMA_PORT_BASE+9), listen on 127.0.0.1 only (llama-server@.service, atlas-orchestrator
+#     .service), which a bridged container cannot reach. On the host network Open WebUI listens on 0.0.0.0:$OPENWEBUI_PORT
+#     and ufw (Phase 1 step 4: "allow in on <LAN iface> ... port $OPENWEBUI_PORT" and the same on br-atlas-wg) is what
+#     makes it "bound to LAN, WireGuard and loopback" — exactly the pattern used for SSH, Cockpit and xrdp. Its outbound
+#     traffic is host traffic: ufw's default-deny OUTPUT with the squid-owner match blocks any direct 80/443, and the
+#     proxy variables are blanked below so nothing can leave through squid either. verify/v12-openwebui-offline.sh
+#     attributes packets to the container by its cgroup and must see zero NEW connections beyond loopback.
+#   * redis and chromadb publish on 127.0.0.1 only (loopback is the subset of "loopback, LAN and WireGuard" that
+#     Section 12.1 needs: Open WebUI is the face). The ChromaDB 1.x Rust server has no authentication (services
+#     research 2.1), so it is never published on the LAN. Containers on the project bridge get no proxy environment
+#     unless a service names one, and Phase 1's DOCKER-USER rules drop everything else that leaves a bridge.
+#   * Open WebUI reaches the overlay's services through their loopback publishes (voice-stt research S8.1 /
+#     compose.voice.yml: Kokoro 127.0.0.1:8880, speaches 127.0.0.1:8881, docling 127.0.0.1:5001), not by container
+#     name, because it is on the host network.
+#
+# Interpolation (defaults in brackets): ATLAS_SRV [/srv/atlas], ATLAS_ETC [/etc/atlas], TZ [UTC], OPENWEBUI_PORT [3000],
+#   ORCH_PORT [8800], EMBED_PORT [8109], OPENWEBUI_DATA_DIR, REDIS_DATA_DIR, CHROMA_DATA_DIR. Nothing here needs a
+#   proxy: redis and chromadb never leave the node, open-webui must not (V12).
+#
+# Image pins (services research §0, §1.1, §2.1, §3; all VERIFIED tags):
+#   redis:8.10.2  chromadb/chroma:1.5.9  ghcr.io/open-webui/open-webui:v0.11.4
+
+name: atlas-core
+
+services:
+  # --- Redis: Celery broker and result backend (Section 9.7). Loopback only (CONVENTIONS.md §8). ----------------------
+  redis:
+    image: redis:8.10.2
+    container_name: atlas-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes", "--maxmemory", "2gb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - ${REDIS_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/redis}:/data
+    networks: [atlas]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # --- ChromaDB 1.5.9 (Section 10.1): persist_path "/data" is baked into the image's /config.yaml. ---------------------
+  # No auth exists in the Rust server config, so the port is loopback only; Open WebUI (host network) and the
+  # orchestrator both reach it at http://127.0.0.1:8000. phase2/04-memory.sh brings it up and creates the collections.
+  chromadb:
+    image: chromadb/chroma:1.5.9
+    container_name: atlas-chromadb
+    restart: unless-stopped
+    environment:
+      ANONYMIZED_TELEMETRY: "false"      # UNVERIFIED for the Rust server (it is the Python client's switch); harmless
+    volumes:
+      - ${CHROMA_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/chroma}:/data
+    networks: [atlas]
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v2/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- Open WebUI 0.11.4 (Section 12.1, Appendix B "Open WebUI offline", V12, D9) ------------------------------------
+  # Every ConfigVar is pinned by the environment because ENABLE_PERSISTENT_CONFIG=false makes env always win (services
+  # research 1.2); Admin-UI edits are therefore NOT saved, which is what makes re-runs deterministic.
+  # Secrets (WEBUI_SECRET_KEY, OPENAI_API_KEY) come from /etc/atlas/secrets/openwebui.env (phase2/03-openwebui.sh).
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.11.4
+    container_name: atlas-openwebui
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - path: ${ATLAS_ETC:-/etc/atlas}/secrets/openwebui.env
+        required: false
+    volumes:
+      - ${OPENWEBUI_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/open-webui}:/app/backend/data
+    environment:
+      # listener (host network): 0.0.0.0 so LAN and WireGuard reach it; ufw scopes it (header)
+      HOST: "0.0.0.0"
+      PORT: "${OPENWEBUI_PORT:-3000}"
+      TZ: "${TZ:-UTC}"
+      WEBUI_NAME: "A.T.L.A.S."
+      # --- config ownership: env always wins, Admin-UI edits are not persisted (research 1.2, VERIFIED) --------------
+      ENABLE_PERSISTENT_CONFIG: "false"
+      # --- offline hardening (Section 12.1, Appendix B; research 1.2/1.5, every variable VERIFIED unless noted) -------
+      OFFLINE_MODE: "true"
+      HF_HUB_OFFLINE: "1"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_WEB_SEARCH: "false"                 # ENABLE_RAG_WEB_SEARCH no longer exists (research conflict 3)
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      RAG_RERANKING_MODEL_AUTO_UPDATE: "false"
+      WHISPER_MODEL_AUTO_UPDATE: "false"
+      ENABLE_DIRECT_CONNECTIONS: "false"
+      ENABLE_IMAGE_GENERATION: "false"
+      ENABLE_GOOGLE_DRIVE_INTEGRATION: "false"
+      ENABLE_ONEDRIVE_INTEGRATION: "false"
+      ENABLE_CODE_EXECUTION: "false"             # pyodide/micropip CDN use is UNVERIFIED; the orchestrator has its own sandbox (16.4)
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_EVALUATION_ARENA_MODELS: "false"    # UNVERIFIED variable name (research S1 snippet); harmless if unknown
+      # library-level telemetry switches (UNVERIFIED that any fires in 0.11.4; belt and braces for V12)
+      ANONYMIZED_TELEMETRY: "false"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      SCARF_NO_ANALYTICS: "true"
+      # no path out at all: blank the proxy that /root/.docker/config.json would otherwise inject (Phase 1 step 6)
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+      # --- auth: one Principal; the first user is created by 03-openwebui.sh through POST /api/v1/auths/signup, which
+      #     bypasses ENABLE_SIGNUP=false while the user table is empty (research 1.4, VERIFIED) --------------------------
+      WEBUI_AUTH: "true"
+      ENABLE_SIGNUP: "false"
+      ENABLE_LOGIN_FORM: "true"
+      DEFAULT_USER_ROLE: "pending"
+      ENABLE_API_KEYS: "true"                    # ENABLE_API_KEY is deprecated (research conflict 3)
+      ENABLE_ADMIN_EXPORT: "true"                # the D9 retention task reads /api/v1/chats/all/db
+      ENABLE_ADMIN_CHAT_ACCESS: "true"
+      # --- models: the orchestrator is the only backend; its /v1/models lists atlas, ren, arthur (Section 12.1) -------
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: "http://127.0.0.1:${ORCH_PORT:-8800}/v1"
+      DEFAULT_MODELS: "atlas"
+      # --- retrieval: bge-m3 on llama-server (engine index 9), vectors in the shared ChromaDB (research 1.2, 2.1) ------
+      VECTOR_DB: "chroma"
+      CHROMA_HTTP_HOST: "127.0.0.1"
+      CHROMA_HTTP_PORT: "8000"
+      RAG_EMBEDDING_ENGINE: "openai"
+      RAG_OPENAI_API_BASE_URL: "http://127.0.0.1:${EMBED_PORT:-8109}/v1"
+      RAG_OPENAI_API_KEY: "atlas-local"
+      RAG_EMBEDDING_MODEL: "embed-bge-m3"
+      RAG_EMBEDDING_BATCH_SIZE: "16"
+      CONTENT_EXTRACTION_ENGINE: "docling"       # UNVERIFIED: docs say "Docling 2.0.0+"; docling-serve is 1.34 (research 2.3)
+      DOCLING_SERVER_URL: "http://127.0.0.1:5001"
+      # --- speech: speaches (Whisper large-v3-turbo, CPU int8) and Kokoro, both OpenAI-shaped (voice research 4.4, 2) --
+      AUDIO_STT_ENGINE: "openai"
+      AUDIO_STT_OPENAI_API_BASE_URL: "http://127.0.0.1:8881/v1"
+      AUDIO_STT_OPENAI_API_KEY: "atlas-local"
+      AUDIO_STT_MODEL: "whisper-1"               # alias in speaches' model_aliases.json -> the turbo model (voice research 4.1)
+      AUDIO_TTS_ENGINE: "openai"
+      AUDIO_TTS_OPENAI_API_BASE_URL: "http://127.0.0.1:8880/v1"
+      AUDIO_TTS_OPENAI_API_KEY: "atlas-local"
+      AUDIO_TTS_MODEL: "kokoro"                  # VERIFIED model id (Kokoro-FastAPI openai_mappings.json)
+      AUDIO_TTS_VOICE: "af_heart"                # VERIFIED preset; per-persona voices are set per model after V7 (14.3)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:${OPENWEBUI_PORT:-3000}/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+networks:
+  # The project bridge every bridged core service joins; docker/core/compose.voice.yml (kokoro, speaches, docling)
+  # merges into this project and joins the same network by this name (its header states that contract).
+  atlas: {}

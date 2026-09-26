@@ -1,0 +1,13 @@
+# /etc/systemd/system/atlas-restic-check.timer — quarterly (systemd's "quarterly" = 1 Jan/Apr/Jul/Oct 00:00), with a
+# randomised delay so it never coincides with the 02:30 backup. Installed verbatim by phase2/07-restic.sh.
+[Unit]
+Description=Run the AEGIS restore test and repository check every quarter
+
+[Timer]
+OnCalendar=quarterly
+RandomizedDelaySec=2h
+Persistent=true
+Unit=atlas-restic-check.service
+
+[Install]
+WantedBy=timers.target

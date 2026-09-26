@@ -1,0 +1,42 @@
+# /etc/systemd/system/atlas-aegis.service — AEGIS nightly backup (Section 9.5; V13; D9 retention 30 nightly, 12 monthly).
+# Installed by phase2/07-restic.sh through render_template (ATLAS_ETC, ATLAS_OPT, ATLAS_SRV substituted).
+#
+# How freeze/thaw and the backup fit together (Section 9.5 "Freeze" row; CONVENTIONS.md §8 "AEGIS nightly is the same
+# pattern" as the Sentinel timer, i.e. the timer enqueues the orchestrator's Celery task):
+#   ExecStartPre  enqueues the orchestrator's `aegis-freeze` task and waits for it: the orchestrator pauses the Celery
+#                 queues and has ChromaDB and the LightRAG graph store write consistent snapshots. The leading "-" makes
+#                 a failure NON-FATAL on purpose: this restic unit is the fallback that still runs when the orchestrator
+#                 or Redis is down (a backup of a crash-consistent state beats no backup; the journal records the skip).
+#   ExecStart     restic backup of the Appendix C include set (root: the passphrase and /srv/backups are root-only,
+#                 CONVENTIONS.md §2), then `restic forget --keep-daily 30 --keep-monthly 12 --prune`.
+#   ExecStopPost  enqueues `aegis-thaw` (writes resume) — ExecStopPost runs whether the backup succeeded or failed, so a
+#                 failed backup never leaves the queues paused.
+# The manual `[EXECUTE AEGIS BACKUP]` trigger (9.5) is the same code path: the orchestrator runs
+# `sudo systemctl start atlas-aegis.service` under /etc/sudoers.d/atlas-aegis (written by phase2/07-restic.sh).
+# Contract with the `atlas` package: `atlas-admin enqueue aegis-freeze --wait N` and `atlas-admin enqueue aegis-thaw
+# --wait N` (exit 0 when the task completed within N seconds). The unit loads orchestrator.env so runuser inherits it.
+# Model and engine weights are excluded (Appendix C); a copy of every <models|engines>/<key>/MANIFEST.json is taken
+# into ${ATLAS_SRV}/data/manifests first so "a manifest of exact model versions and checksums is backed up instead".
+
+[Unit]
+Description=AEGIS nightly restic backup with orchestrator freeze/thaw (Section 9.5)
+After=atlas-orchestrator.service atlas-celery-cpu.service
+RequiresMountsFor=${ATLAS_SRV} /srv/backups /srv/cold
+Documentation=file:${ATLAS_ETC}/restic.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=${ATLAS_ETC}/restic.env
+EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+# restic exit 3 = "some source files could not be read" (a path in the include set missing until a later step, or a
+# file changed mid-read): the snapshot exists, restic printed the names; a warning, not a failed backup.
+SuccessExitStatus=3
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStartPre=-/usr/sbin/runuser -u atlas -- ${ATLAS_OPT}/venv/bin/atlas-admin enqueue aegis-freeze --wait 900
+ExecStartPre=/bin/bash -c 'd=${ATLAS_SRV}/data/manifests; mkdir -p "$$d"; find ${ATLAS_SRV}/models ${ATLAS_SRV}/engines -mindepth 2 -maxdepth 2 -name MANIFEST.json 2>/dev/null | while read -r f; do rel=$${f#${ATLAS_SRV}/}; mkdir -p "$$d/$$(dirname "$$rel")"; cp -f "$$f" "$$d/$$rel"; done; true'
+ExecStart=/usr/bin/restic backup --files-from ${ATLAS_ETC}/restic-include.txt --exclude-file ${ATLAS_ETC}/restic-exclude.txt --exclude-caches --one-file-system --tag aegis --tag nightly
+ExecStart=/usr/bin/restic forget --keep-daily 30 --keep-monthly 12 --prune
+ExecStopPost=-/usr/sbin/runuser -u atlas -- ${ATLAS_OPT}/venv/bin/atlas-admin enqueue aegis-thaw --wait 300
+TimeoutStartSec=6h

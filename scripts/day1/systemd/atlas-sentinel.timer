@@ -1,0 +1,14 @@
+# /etc/systemd/system/atlas-sentinel.timer — hourly Sentinel pulse (Section 9.3 "systemd timer, hourly"; C11).
+# Installed verbatim by phase2/08-sentinel.sh. The randomised delay keeps the feed fetches off the exact hour.
+[Unit]
+Description=Run the A.T.L.A.S. Sentinel pulse every hour
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=120
+AccuracySec=1min
+Persistent=true
+Unit=atlas-sentinel.service
+
+[Install]
+WantedBy=timers.target

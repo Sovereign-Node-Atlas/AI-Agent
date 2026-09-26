@@ -1,0 +1,117 @@
+# docker/core/compose.voice.yml — the voice and document services of Phase 2 steps 4/5 (Sections 10, 14.1, 17):
+# Kokoro-FastAPI (TTS, CPU), speaches (Whisper Large-v3-Turbo via faster-whisper, CPU int8) and docling-serve.
+#
+# CONTRACT (CONVENTIONS.md §1 lists these services inside docker/core/compose.yml; the core file is another writer's,
+# so they live here and are merged into the SAME compose project):
+#
+#     docker compose -f docker/core/compose.yml -f docker/core/compose.voice.yml \
+#         --env-file /etc/atlas/docker.env --env-file /etc/atlas/voice.env up -d kokoro speaches docling
+#
+#   * No --project-name is passed (phase2/04-memory.sh does not pass one either), so both files join the core project.
+#   * The core file defines the network `atlas` (the research's name; every service here joins it so Open WebUI reaches
+#     http://kokoro:8880/v1, http://speaches:8000/v1 and http://docling:5001 by container name). The stub below merges
+#     with the core definition; if the core file names its network differently, phase2/05-voice.sh dies at the first
+#     health check with the compose output, it does not guess.
+#   * Interpolation: LAN_IP, ATLAS_UID, ATLAS_GID from /etc/atlas/docker.env (Phase 1 step 6 contract);
+#     SPEACHES_PRELOAD_MODELS and SPEACHES_HF_HUB_OFFLINE from /etc/atlas/voice.env (written by phase2/05-voice.sh:
+#     first start online with [] / 0 to pull the turbo model, then ["<id>"] / 1 for every later start).
+#   * Host ports (CONVENTIONS.md §8): Kokoro 8880, speaches 8881 (container 8000), docling 5001, each on loopback
+#     and the LAN address only (adjudicated conflict 4: every published Docker port is pinned to the LAN IP).
+#
+# Images pinned per voice-stt.md §2.1, §4.1 and services-tools.md §2.3 (all VERIFIED on ghcr.io).
+
+services:
+  kokoro:
+    # voice-stt.md §2.1: the published CPU image carries the Kokoro-82M weights; DOWNLOAD_MODEL=false makes the
+    # "no outbound access at all" property explicit (Section 12.5). The GPU belongs to the LLM engines (§2.4).
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:v0.9.0
+    container_name: kokoro
+    restart: unless-stopped
+    networks: [atlas]
+    ports:
+      - "127.0.0.1:8880:8880"
+      - "${LAN_IP:?LAN_IP from /etc/atlas/docker.env}:8880:8880"
+    environment:
+      - USE_GPU=false
+      - DEVICE_TYPE=cpu
+      - DOWNLOAD_MODEL=false
+      - DEFAULT_VOICE=af_heart
+      - API_LOG_LEVEL=INFO
+      - ENABLE_WEB_PLAYER=true
+      - ALLOW_LOCAL_VOICE_SAVING=true
+      - MODEL_AUTO_UNLOAD_TIMEOUT_SECONDS=0
+      - CORS_ORIGINS=["http://127.0.0.1:8880","http://${LAN_IP}:8880"]
+    healthcheck:
+      # UNVERIFIED: whether curl is in the image; the interpreter that runs uvicorn (entrypoint.sh, VERIFIED) is.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8880/health', timeout=5)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  speaches:
+    # voice-stt.md §4.1 (all keys VERIFIED in speaches config.py / compose.cpu.yaml). The model cache is a NAMED volume
+    # like upstream's compose (hf-hub-cache), so the container's own user owns it whatever its uid is.
+    image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
+    container_name: speaches
+    restart: unless-stopped
+    networks: [atlas]
+    ports:
+      - "127.0.0.1:8881:8000"
+      - "${LAN_IP:?LAN_IP from /etc/atlas/docker.env}:8881:8000"
+    environment:
+      - WHISPER__INFERENCE_DEVICE=cpu
+      - WHISPER__COMPUTE_TYPE=int8
+      - WHISPER__CPU_THREADS=8
+      - WHISPER__NUM_WORKERS=1
+      - STT_MODEL_TTL=-1
+      - VAD_MODEL_TTL=-1
+      - ENABLE_UI=false
+      - LOG_LEVEL=info
+      - HF_HUB_CACHE=/home/ubuntu/.cache/huggingface/hub
+      # [] / 0 on the first start (registry lookup + model download need huggingface.co through the container proxy),
+      # then ["mobiuslabsgmbh/faster-whisper-large-v3-turbo"] / 1 written by phase2/05-voice.sh into /etc/atlas/voice.env.
+      - PRELOAD_MODELS=${SPEACHES_PRELOAD_MODELS:-[]}
+      - HF_HUB_OFFLINE=${SPEACHES_HF_HUB_OFFLINE:-0}
+    volumes:
+      - speaches-hub:/home/ubuntu/.cache/huggingface/hub
+      - ${ATLAS_SRV:-/srv/atlas}/engines/voice/model_aliases.json:/home/ubuntu/speaches/model_aliases.json:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://0.0.0.0:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  docling:
+    # services-tools.md §2.3, S2 (VERIFIED image, env keys). The -cpu image already carries the layout/tableformer/
+    # picture_classifier/rapidocr/easyocr models, so HF_HUB_OFFLINE=1 from the first start (Section 12.5).
+    # The Python library side of Docling is installed by phase2/04-memory.sh into /opt/atlas/venv; this container is
+    # the service Open WebUI calls (CONTENT_EXTRACTION_ENGINE=docling, DOCLING_SERVER_URL=http://docling:5001).
+    image: ghcr.io/docling-project/docling-serve-cpu:v1.34.0
+    container_name: docling
+    restart: unless-stopped
+    networks: [atlas]
+    ports:
+      - "127.0.0.1:5001:5001"
+      - "${LAN_IP:?LAN_IP from /etc/atlas/docker.env}:5001:5001"
+    environment:
+      - DOCLING_SERVE_ENABLE_UI=false
+      - DOCLING_DEVICE=cpu
+      - DOCLING_NUM_THREADS=8
+      - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
+      - HF_HUB_OFFLINE=1
+    healthcheck:
+      # UNVERIFIED: docling-serve documents no /health path; /docs is VERIFIED (services-tools.md "could not verify").
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/docs', timeout=5)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+networks:
+  # Merged with the core file's definition of the same network (compose merges top-level maps by key).
+  atlas: {}
+
+volumes:
+  speaches-hub: {}

@@ -1,0 +1,31 @@
+{
+  "task_forces": [
+    {
+      "code": "TF_ALPHA",
+      "name": "Corporate Mergers & Acquisitions",
+      "group": "CORP-DEALS",
+      "hemisphere": "corporate",
+      "owners": ["Gideon"],
+      "default_tier": "sensitive",
+      "dual_sign_off": false,
+      "domain_cards": [{"domain": 5, "why": "CFO & Controller: valuation inputs."}],
+      "relay": [],
+      "triggers": ["merger", "acquisition"]
+    },
+    {
+      "code": "TF_OMEGA",
+      "name": "Sovereign Strategy",
+      "group": "APEX",
+      "hemisphere": "corporate",
+      "owners": ["Ren", "Arthur"],
+      "default_tier": "sensitive",
+      "dual_sign_off": true,
+      "domain_cards": [{"domain": 5, "why": "CFO"}, {"domain": 14, "why": "Estate"}],
+      "relay": ["Ren", "Arthur"],
+      "triggers": [],
+      "engine": "deepseek-v4-flash",
+      "trigger": "principal-only",
+      "unknown_key_must_be_ignored": true
+    }
+  ]
+}

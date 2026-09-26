@@ -3,6 +3,7 @@
 # separately at the Phase 2 gate". Sends one chat completion to llama-server@router-qwen3.5-4b and passes on a non-empty
 # reply. Contract (CONVENTIONS.md §5): exit 0 pass / 1 fail / 2 deferred / 3 info; exactly one stdout line; no prompts.
 
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 export ATLAS_LOG_TO_STDERR=1

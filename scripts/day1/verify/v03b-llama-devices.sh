@@ -7,6 +7,7 @@
 # "at least 160000 MiB" (the 170 GB budget with tolerance), and the number is recorded rather than asserted equal.
 # Output format (VERIFIED, common/arg.cpp): "  Vulkan0: AMD Radeon Graphics (RADV GFX1151) (NNNNN MiB, MMMMM MiB free)".
 
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 export ATLAS_LOG_TO_STDERR=1

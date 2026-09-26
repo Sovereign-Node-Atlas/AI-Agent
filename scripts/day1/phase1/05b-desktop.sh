@@ -97,7 +97,11 @@ step_05b() {
       warn "display manager $dm was present and has been disabled (no autologin, R21)"
     fi
   done
-  phase1_xrdp_bind "$LAN_IP"
+  # Bind to the LAN address now; step 7 adds the WireGuard bridge gateway. On a re-run after step 7 (--force 05b)
+  # the bridge already exists, so keep its address rather than dropping the VPN path until step 7 runs again.
+  local addrs=("$LAN_IP")
+  if [[ -n "${ATLAS_WG_BRIDGE:-}" ]] && ip link show "$ATLAS_WG_BRIDGE" >/dev/null 2>&1; then addrs+=("$ATLAS_WG_BRIDGE_GW"); fi
+  phase1_xrdp_bind "${addrs[@]}"
   _firefox_deb
 
   # V19: print the instructions here (the verify script's stdout is the one-line evidence), then wait.
@@ -112,6 +116,6 @@ step_05b() {
       sudo $ATLAS_ENTRY phase1 --force 05b
   ===============================================================================
 MSG
-  run_verify V19 v19-xrdp.sh "$PRINCIPAL_USER" 570 "sudo $ATLAS_ENTRY phase1 --force 05b" "$LAN_IP" \
+  run_verify V19 v19-xrdp.sh "$PRINCIPAL_USER" 570 "sudo $ATLAS_ENTRY phase1 --force 05b" "${addrs[@]}" \
     || die "V19 failed: xrdp is not listening only on the bound addresses (see the verify table)"
 }

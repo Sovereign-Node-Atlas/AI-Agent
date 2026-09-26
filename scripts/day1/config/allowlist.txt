@@ -94,15 +94,12 @@ login.xero.com
 
 # --- Wix (REST API host, account manager, and the static hosts the browser path loads for site design) ---------------
 www.wixapis.com
-manage.wix.com
 .wix.com
 # UNVERIFIED: static asset hosts Wix pages load; needed only for the Playwright/UI-TARS browser path
 .wixstatic.com
 .parastorage.com
 
-# --- Pay.com (developer API; header format UNVERIFIED, see services research 5.3) -------------------------------------
-api.pay.com
-apiref.pay.com
+# --- Pay.com (developer API at api.pay.com; header format UNVERIFIED, see services research 5.3) ----------------------
 .pay.com
 
 # --- RewardPay (browser only, no public API found; Sydney) -------------------------------------------------------------

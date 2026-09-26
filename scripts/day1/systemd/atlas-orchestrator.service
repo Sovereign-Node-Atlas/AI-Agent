@@ -1,0 +1,53 @@
+# /etc/systemd/system/atlas-orchestrator.service — the A.T.L.A.S. orchestrator: Engine Arbiter (4.2), 4-Way Router
+# (7.1), approval gate (16.2), task ledger, OpenAI-compatible /v1 for Open WebUI (12.1). Section 17 Phase 2 step 2.
+# Installed by phase2/02-orchestrator.sh through render_template with ATLAS_ETC, ATLAS_OPT and ATLAS_SRV substituted;
+# ${ORCH_HOST} and ${ORCH_PORT} are systemd substitutions from the EnvironmentFile and stay literal in the template.
+#
+# Contract with the `atlas` package (CONVENTIONS.md §1 orchestrator/; not stated there, stated here and in
+# phase2/02-orchestrator.sh): the console script `atlas-orchestrator --host H --port P` serves GET /health (200 when
+# ready), GET /v1/models (ids atlas, ren, arthur) and POST /v1/chat/completions, and reads its settings from the
+# environment (keys listed in phase2/02-orchestrator.sh, written to /etc/atlas/orchestrator.env).
+#
+# Control path (CONVENTIONS.md §8): the process runs as `atlas` and starts/stops engines with `sudo systemctl
+# start|stop|restart llama-server@<key>` under /etc/sudoers.d/atlas-engines, so NoNewPrivileges must stay off here.
+# The sandbox (16.4) needs the docker group. Every outbound request of the integrations goes through the allowlist
+# proxy: proxy.env is loaded last so HTTPS_PROXY is set for the Google/Xero/feed clients (rule §7.1).
+
+[Unit]
+Description=A.T.L.A.S. orchestrator (Engine Arbiter, router, approval gate, ledger)
+Documentation=file:${ATLAS_ETC}/orchestrator.env
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+SupplementaryGroups=docker render video
+WorkingDirectory=${ATLAS_OPT}/orchestrator
+EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=-${ATLAS_ETC}/memory.env
+EnvironmentFile=-${ATLAS_ETC}/proxy.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/atlas
+# Redis is a container (docker/core/compose.yml, restart: unless-stopped); wait for the loopback port rather than
+# crash-loop on the first boot. /dev/tcp is a bash feature, hence /bin/bash.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-orchestrator: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
+ExecStart=${ATLAS_OPT}/venv/bin/atlas-orchestrator --host ${ORCH_HOST} --port ${ORCH_PORT}
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=60
+KillMode=mixed
+LimitNOFILE=65536
+# Only paths the service must write; everything else read-only (weights are read by llama-server, not here).
+ProtectSystem=full
+ReadWritePaths=${ATLAS_SRV} ${ATLAS_ETC}/engines /var/lib/atlas /srv/cold /run/atlas
+RuntimeDirectory=atlas
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

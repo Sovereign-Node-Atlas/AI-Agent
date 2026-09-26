@@ -1,0 +1,17 @@
+# /etc/systemd/system/srv-atlas-winpc.automount — automounts the Windows PC share on first access and unmounts it
+# after 10 minutes idle (Section 12.4 "releases afterwards"). TimeoutIdleSec= is the unit-file form of fstab's
+# x-systemd.idle-timeout= (systemd.automount(5), VERIFIED key). This is the unit phase2/09-windows-share.sh enables;
+# the paired .mount unit is started by it. Rendered with ATLAS_SRV substituted; the installed file name is the
+# systemd-escaped path with the .automount suffix (srv-atlas-winpc.automount for /srv/atlas/winpc).
+
+[Unit]
+Description=Automount the Windows PC share when a task touches ${ATLAS_SRV}/winpc
+After=network-online.target
+
+[Automount]
+Where=${ATLAS_SRV}/winpc
+TimeoutIdleSec=600
+DirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

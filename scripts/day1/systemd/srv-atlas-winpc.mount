@@ -1,0 +1,23 @@
+# /etc/systemd/system/srv-atlas-winpc.mount — the Principal's Windows PC share, mounted on demand (Section 12.4:
+# "a shared folder the node mounts when a task needs it and releases afterwards"). The unit file name MUST be the
+# systemd-escaped mount path (systemd.mount(5)); phase2/09-windows-share.sh computes it with `systemd-escape -p` and
+# installs this file under that name (srv-atlas-winpc.mount for /srv/atlas/winpc).
+# Rendered by phase2/09-windows-share.sh with WINDOWS_SHARE, ATLAS_SRV, ATLAS_ETC, ATLAS_UID, ATLAS_GID substituted.
+# Do NOT enable this unit: enable srv-atlas-winpc.automount, which starts this one on first access and stops it after
+# the idle timeout (the automount's TimeoutIdleSec= is what fstab spells x-systemd.idle-timeout=; a .mount unit file
+# cannot carry x-systemd.* options).
+# Options (services research 4.12, mount.cifs VERIFIED: credentials=, uid=, gid=, file_mode=, dir_mode=, iocharset=,
+# vers=): vers=3.1.1 is the current Windows dialect (value string UNVERIFIED on the page read; step 09 proves it with a
+# directory listing and fails loudly otherwise). _netdev orders the mount after the network.
+
+[Unit]
+Description=Windows PC share ${WINDOWS_SHARE} (on demand, Section 12.4)
+After=network-online.target
+Wants=network-online.target
+
+[Mount]
+What=${WINDOWS_SHARE}
+Where=${ATLAS_SRV}/winpc
+Type=cifs
+Options=credentials=${ATLAS_ETC}/secrets/smb.cred,vers=3.1.1,uid=${ATLAS_UID},gid=${ATLAS_GID},file_mode=0660,dir_mode=0770,iocharset=utf8,_netdev,noserverino
+TimeoutSec=30
