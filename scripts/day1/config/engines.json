@@ -6,10 +6,13 @@
     "files_rule": "files[] is VERBATIM from gguf-models.md §13. sha256 is null unless the research recovered it from an HF blob-page snippet; every hash, verified or not, is re-read from https://huggingface.co/api/models/<repo>/tree/main[/<subdir>] (lfs.oid, lfs.size) at pull time and recorded in <models>/<key>/MANIFEST.json (gguf-models.md §0, §11.1, §12 item 7). verify=unverified means hf_download is called with the tree-API hash only; verify=research-snippet means the tree-API hash is also compared with the snippet value and a mismatch is logged loudly.",
     "enumerate_rule": "When files[] is empty, the pull step lists the tree (subdir when set) and takes every LFS entry whose basename matches enumerate_pattern (fnmatch, case-insensitive). model_file_pattern selects the file passed to --model (first shard); for single-file models it equals the file name.",
     "layout_rule": "Every file lands flat in $ATLAS_SRV/models/<key>/<basename> (shards must share a directory for llama.cpp to find them). join_into names a file that the pull step must cat-join from files[] in order (raw byte splits, gguf-models.md §8) and whose size must equal the sum of the parts.",
-    "kv_rule": "kv_class q8_0 or q4_0 is the Section 4.3 setting; f16 is llama.cpp's default. kv_ladder (Apex engine only) is the Phase 3 order of attempts with a coherence check; the winning type is written to $ATLAS_ETC/engines/overrides.json and engine-env.py re-renders the env file (gguf-models.md §6, §12 item 2).",
+    "kv_rule": "kv_class q8_0 or q4_0 is the Section 4.3 setting; f16 is llama.cpp's default. kv_ladder (Apex engine only) is the Phase 3 order of attempts, BASELINE FIRST: q4_0 (Section 4.3 / Appendix B) -> q8_0 -> f16. See kv_ladder_rule. The winning type is written to $ATLAS_ETC/engines/overrides.json and engine-env.py re-renders the env file (gguf-models.md §6, §12 item 2).",
+    "kv_ladder_rule": "Contract for phase3/loadtest.py ladder_engine (fix round): (1) rungs are tried in list order, so the closed Section 4.3 setting is the first thing loaded; (2) the FIRST rung that loads, prints the kv proof line(s) and answers the coherence prompt wins (winners[0]), never the last; (3) a rung whose load FAILS (llama.cpp errors out at context creation for a refused KV type, research conflict 11; OOM; DeviceLost) is recorded 'load failed' and the ladder CONTINUES with the next rung, it does not break; (4) a rung that loads but is incoherent escalates to the next rung; (5) only the last rung failing ends the ladder, and then V4/V22 are deferred (R19). A win at q4_0 clears the overrides (engines.json is the baseline); a q8_0 or f16 win is a baseline_deviation surfaced in the Phase 3 gate table, and an f16 win also writes ctx_size = ctx_size_f16_cap.",
     "parallel_rule": "parallel is the explicit --parallel (never auto: gguf-models.md §1.3). parallel_coresident and ctx_size_coresident apply when the vision engine is loaded beside gpt-oss-120b (Section 4.1, 4.3).",
-    "extra_args_rule": "extra_args tokens are passed verbatim after the generated flags; no token may contain whitespace, a quote of either kind or a backslash, because systemd splits an unquoted $ARGS at whitespace WITH quotes respected and then removed (systemd.service(5), 'Command lines'), so a JSON token would lose its double quotes (engine-env.py enforces this). --reasoning-format is not passed: its default is auto (VERIFIED) and only none|deepseek|deepseek-legacy are verified as explicit values.",
-    "env_rule": "env is a map of extra KEY=VALUE lines written verbatim into the engine env file for options whose value cannot travel through $ARGS (JSON). Every LLAMA_ARG_* variable is honoured by llama-server itself (llama-cpp-vulkan.md §3). Values may contain double quotes but not single quotes, backslashes or newlines.",
+    "extra_args_rule": "extra_args tokens are passed verbatim after the generated flags; no token may contain whitespace, a quote of either kind or a backslash, because systemd splits an unquoted $ARGS at whitespace WITH quotes respected and then removed (systemd.service(5), 'Command lines'), so a JSON token would lose its double quotes (engine-env.py enforces this). --reasoning-format is not passed: its default is auto (VERIFIED) and only none|deepseek|deepseek-legacy are verified as explicit values. Reserved flags are REFUSED by engine-env.py whatever engines.json says (fix round hardening, Section 16.3 item 8 / CONVENTIONS §8 bind): --host --port -m --model -mu --model-url -hf -hfr --hf-repo -hfd -hfrd --hf-repo-draft -hff --hf-file -hfv -hfrv --hf-repo-v -hffv --hf-file-v --hf-token --api-key --api-key-file --slot-save-path --mmproj --mmproj-url --ssl-key-file --ssl-cert-file --webui --no-webui --alias -a --api-prefix (engine-env.py RESERVED_FLAGS, also in the --flag=value spelling).",
+    "env_rule": "env is a map of extra KEY=VALUE lines written verbatim into the engine env file for options whose value cannot travel through $ARGS (JSON). Every LLAMA_ARG_* variable is honoured by llama-server itself (llama-cpp-vulkan.md §3). Values may contain double quotes but not single quotes, backslashes or newlines. Reserved names are REFUSED by engine-env.py (fix round hardening): LLAMA_ARG_HOST LLAMA_ARG_PORT LLAMA_ARG_MODEL LLAMA_ARG_MMPROJ LLAMA_ARG_HF_REPO LLAMA_ARG_HF_FILE LLAMA_ARG_HF_TOKEN LLAMA_ARG_MODEL_URL LLAMA_ARG_API_KEY LLAMA_ARG_SLOT_SAVE_PATH LLAMA_ARG_SSL_KEY_FILE LLAMA_ARG_SSL_CERT_FILE LLAMA_ARG_WEBUI LLAMA_ARG_ALIAS (engine-env.py RESERVED_ENV).",
+    "slot_rule": "--slot-save-path is Appendix B's /srv/atlas/data/slots ($ATLAS_SRV/data/slots), ONE directory for every chat/vision engine; slot files are namespaced by the orchestrator's file names, not by per-engine subdirectories.",
+    "baseline_deviation_rule": "A `baseline_deviation` field on an engine records a setting that departs from a CLOSED value in ATLAS_FRAMEWORK_REVIEW.md (the document wins over every script, CONVENTIONS preamble). Contract: phase3/loadtest.py prints every engine's baseline_deviation in the Phase 3 gate table and README.md lists them under 'Baseline deviations', so the Principal sees each one in the printed table, never only in this file. Engines without the field run the closed setting.",
     "research": "gguf-models.md (2026-09-22) and llama-cpp-vulkan.md (2026-09-22); llama.cpp pinned at tag v0.4.1 (commit b29c606e28a01b1bc8c1351026a0fa6e616bf6c4) which post-dates every first-support build in gguf-models.md §1.2."
   },
   "engines": [
@@ -37,7 +40,9 @@
       "parallel": 8,
       "n_keep": 4096,
       "extra_args": ["--jinja", "--temp", "1.0", "--top-p", "1.0", "--min-p", "0", "-b", "2048", "-ub", "2048"],
-      "env": {"LLAMA_ARG_CHAT_TEMPLATE_KWARGS": "{\"reasoning_effort\":\"high\"}"},
+      "env": {
+        "LLAMA_ARG_CHAT_TEMPLATE_KWARGS": "{\"reasoning_effort\":\"high\"}"
+      },
       "expected_decode_tok_s": [30, 55],
       "port": 8101,
       "kv_proof_lines": 2,
@@ -54,6 +59,7 @@
       "subdir": null,
       "arch": "gpt-oss",
       "licence": "apache-2.0 (inherited, unverified)",
+      "baseline_deviation": "Section 5.1 / C23 (closed) say 'MXFP4, native' for the abliterated twin; the only abliterated GGUF that exists is noctrex's llama-quantize MXFP4_MOE RE-QUANTISATION of Huihui's BF16 abliteration (same 63 GB and speed, experts not bit-identical to the native release). gguf-models.md §12 item 1. Principal decision: accept, or drop the abliterated engine.",
       "files": [],
       "enumerate_pattern": "*MXFP4_MOE*.gguf",
       "model_file_pattern": "*-00001-of-*.gguf|*.gguf",
@@ -64,7 +70,9 @@
       "parallel": 8,
       "n_keep": 4096,
       "extra_args": ["--jinja", "--temp", "1.0", "--top-p", "1.0", "--min-p", "0", "-b", "2048", "-ub", "2048"],
-      "env": {"LLAMA_ARG_CHAT_TEMPLATE_KWARGS": "{\"reasoning_effort\":\"high\"}"},
+      "env": {
+        "LLAMA_ARG_CHAT_TEMPLATE_KWARGS": "{\"reasoning_effort\":\"high\"}"
+      },
       "expected_decode_tok_s": [30, 55],
       "port": 8102,
       "kv_proof_lines": 2,
@@ -138,7 +146,7 @@
       "arbiter_class": "apex",
       "exclusive": true,
       "kv_class": "q4_0",
-      "kv_ladder": ["f16", "q8_0", "q4_0"],
+      "kv_ladder": ["q4_0", "q8_0", "f16"],
       "kv_types_must_match": true,
       "hf_repo": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
       "subdir": "UD-Q4_K_XL",
@@ -156,16 +164,18 @@
       "footprint_gb": 155,
       "ctx_size": 32768,
       "ctx_per_slot": 32768,
-      "ctx_size_f16_cap": 32768,
+      "ctx_size_f16_cap": 16384,
+      "ctx_size_f16_cap_note": "UNVERIFIED (fix round): the f16 rung runs at half the q4_0 pool because f16 KV is ~3.5x the bytes of q4_0 per token; q4_0 at 32768 is what the 10-15 GB margin of Section 4.3 / Appendix B is written for, so f16 at 16384 costs ~1.75x that and stays inside the margin. Phase 3 measures the real llama_kv_cache sizes; lower this if the f16 rung OOMs.",
       "parallel": 1,
+      "baseline_deviation": "Section 4.3 'Parallel slots: 8, except where noted' and Appendix B ('same ... --parallel 8', reduced --ctx-size) give the Apex engine 8 slots; this file runs it with --parallel 1 and the whole 32768-token pool in one slot. Reason: the engine is exclusive (4.2 rule 7) and serves one Deep Think deep-tier synthesis or one TF_OMEGA cross-check at a time (4.2 rule 3: exactly one generation), and 8 x 32k at q4_0 (~20 GB) does not fit the 10-15 GB margin while 8 x 4k slots cannot hold a deep-tier synthesis. Principal decision: keep 1 x 32k, or 8 x 4096 (ctx_size 32768, parallel 8) to follow the letter.",
       "n_keep": 4096,
       "extra_args": ["--jinja", "--temp", "1.0", "--top-p", "1.0", "--min-p", "0", "-b", "2048", "-ub", "512"],
       "expected_decode_tok_s": [25, 32],
       "port": 8105,
       "kv_proof_lines": 4,
       "min_llama_cpp_tag": "b9840",
-      "known_issue": "Quantised KV on deepseek4 disputed (issues #25382, #26423; PR #25391 unmerged): Phase 3 ladders f16 -> q8_0 -> q4_0 with a coherence prompt at each rung, records V4 as '<type> applied and coherent' for the best rung, writes the winner to overrides.json. An f16-only result caps ctx_size at ctx_size_f16_cap (~10 GB of cache beside 155 GB of weights) and records V22 pass with a note. --parallel MUST be explicit (issue #26654). Kernel 7.x DeviceLost needs amdgpu.lockup_timeout=10000,60000,10000,10000 (issue #25664, Phase 1 GRUB).",
-      "notes": "The 0731 checkpoint supersedes the April preview (research conflict b). Four llama_kv_cache lines (raw, CSA, HCA, indexer) plus f32 compressor states. The optional DSpark drafter at the repo root is NOT pulled on Day 1. Context capped: only 10-15 GB remain beside 155 GB of weights (Section 4.1, 4.3, Appendix B)."
+      "known_issue": "Quantised KV on deepseek4 disputed (issues #25382, #26423; PR #25391 unmerged): Phase 3 ladders BASELINE FIRST q4_0 -> q8_0 -> f16 (kv_ladder_rule) with a coherence prompt at each rung, records V4 as '<type> applied and coherent' for the FIRST coherent rung, writes a q8_0/f16 winner to overrides.json as a baseline_deviation. An f16 result caps ctx_size at ctx_size_f16_cap (16384) and records V22 pass with a note. --parallel MUST be explicit (issue #26654). Kernel 7.x DeviceLost needs amdgpu.lockup_timeout=10000,60000,10000,10000 (issue #25664, Phase 1 GRUB).",
+      "notes": "The 0731 checkpoint supersedes the April preview (research conflict b). Four llama_kv_cache lines (raw, CSA, HCA, indexer) plus f32 compressor states. The optional DSpark drafter at the repo root is NOT pulled on Day 1. Context capped: only 10-15 GB remain beside 155 GB of weights (Section 4.1, 4.3, Appendix B); see baseline_deviation for the slot count."
     },
     {
       "key": "qwen2.5-vl-72b",
@@ -221,12 +231,13 @@
       "ctx_size": 4096,
       "ctx_per_slot": 4096,
       "parallel": 1,
+      "baseline_deviation": "Section 4.3 'Parallel slots: 8, except where noted' notes no exception for Meditron; this file runs it at --parallel 1 with a 4096-token pool. Reason: Meditron-70B is a Llama-2 base with a 4096-token training context (epfLLM/meditron README), so each slot is capped at 4096 tokens whatever the count, and the cross-check is one sequential call from Minerva at a time (Section 6.2), so 8 x 4096 (ctx_size 32768) would only add ~7x the KV bytes (~10 GB at q8_0 for a dense 70B) for slots that never fill. Principal decision: accept 1 x 4096, or set ctx_size 32768 / parallel 8 to follow the letter.",
       "n_keep": 1024,
       "extra_args": ["--jinja", "-b", "2048", "-ub", "512"],
       "expected_decode_tok_s": [2, 4],
       "port": 8107,
       "kv_proof_lines": 1,
-      "notes": "Section 5.1 says ~3 tok/s. Llama-2 base with a 4096 training context (epfLLM/meditron README): --parallel 1 with the whole 4096 pool is the only sensible split (Section 4.3 '8 except where noted'). The two TheBloke files are raw byte splits, not llama.cpp shards: cat-joined in order a,b into meditron-70b.Q8_0.gguf and the joined size must equal the sum (research conflict d)."
+      "notes": "Section 5.1 says ~3 tok/s. Llama-2 base with a 4096 training context (epfLLM/meditron README): --parallel 1 with the whole 4096 pool (recorded as a baseline_deviation from Section 4.3, which notes no exception for Meditron). The two TheBloke files are raw byte splits, not llama.cpp shards: cat-joined in order a,b into meditron-70b.Q8_0.gguf and the joined size must equal the sum (research conflict d)."
     },
     {
       "key": "router-qwen3.5-4b",
@@ -253,7 +264,7 @@
       "expected_decode_tok_s": null,
       "port": 8108,
       "kv_proof_lines": 1,
-      "notes": "Pulled in Phase 2 step 4 and verified at the Phase 2 gate (V10, verify/v10a-router-resident.sh). Thinking off for immediate classification answers (gguf-models.md §9.1). Never counted against the engine budget (Section 4.1 resident set)."
+      "notes": "Pulled in Phase 2 step 4 and verified at the Phase 2 gate (recorded as V10a by verify/v10a-router-resident.sh: the Section 21 V10 half that Section 17 places at the Phase 2 gate). Thinking off for immediate classification answers (gguf-models.md §9.1). Never counted against the engine budget (Section 4.1 resident set)."
     },
     {
       "key": "embed-bge-m3",

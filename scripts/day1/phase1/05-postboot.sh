@@ -28,8 +28,11 @@ step_05() {
     record_v V2 fail "after reboot: /dev/mapper/$mapping not unlocked by the TPM and $ATLAS_SRV not mounted (journalctl -u systemd-cryptsetup@*)"
     die "the data volume did not auto-unlock after the reboot (V2 fail). Unlock it with the recovery key to investigate: cryptsetup open $dev $mapping"
   fi
-  local osdev=""; declare -F _luks_os_device >/dev/null && osdev="$(_luks_os_device)"
-  run_verify V2 v02-tpm.sh "$dev" "$mapping" "${osdev:--}" "$( [[ -n "$osdev" ]] && echo "auto-unlocked at boot" || echo "unencrypted (installer choice)")" \
+  local osdev="" os_note; declare -F _luks_os_device >/dev/null && osdev="$(_luks_os_device)"
+  if [[ -n "$osdev" ]]; then os_note="auto-unlocked at boot"
+  elif [[ "${ATLAS_ALLOW_UNENCRYPTED_OS:-0}" == "1" ]]; then os_note="OS volume UNENCRYPTED, ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 (Section 3.5 deviation, see step 2)"
+  else os_note="OS volume UNENCRYPTED and not acknowledged (Section 3.5)"; fi   # v02 records this as a fail
+  run_verify V2 v02-tpm.sh "$dev" "$mapping" "${osdev:--}" "$os_note" \
     || die "V2 failed post-reboot"
 
   # V3a: kernel parameters and GTT pool; vulkaninfo needs the Vulkan loader, RADV and the tools (llama-cpp research §1).

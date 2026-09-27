@@ -23,7 +23,9 @@ if [[ -z "$bin" ]]; then
 fi
 
 out="$(timeout 300 "$bin" --list-devices 2>&1 || true)"
-line="$(grep -m1 -E '^[[:space:]]*Vulkan0:' <<<"$out" | sed 's/^[[:space:]]*//')"
+# `|| true` inside the substitution: with no Vulkan0 line grep exits 1, and under pipefail + errexit the assignment would
+# abort the script before the diagnostic below could print (fix round, reproduced).
+line="$(grep -m1 -E '^[[:space:]]*Vulkan0:' <<<"$out" | sed 's/^[[:space:]]*//' || true)"
 if [[ -z "$line" ]]; then
   echo "no Vulkan0 device in '$bin --list-devices': $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
   exit 1

@@ -30,6 +30,7 @@ step_03() {
   if [[ -z "$fstype" ]]; then
     log "mkfs.ext4 -L atlas-data on $mdev"
     mkfs.ext4 -q -L atlas-data -m 0 -E lazy_itable_init=0,lazy_journal_init=0 "$mdev"
+    udevadm settle --timeout=30 || true       # the filesystem UUID link and blkid cache follow the change event asynchronously
   elif [[ "$fstype" == ext4 && "$flabel" == atlas-data ]]; then
     log "$mdev already holds our ext4 (label atlas-data); not formatting"
   else
@@ -53,13 +54,20 @@ step_03() {
   log "mounted $ATLAS_SRV from $mdev ($(findmnt -n -o SIZE,AVAIL "$ATLAS_SRV"))"
 
   # --- Service accounts (CONVENTIONS.md §2): atlas (render, video; docker is added in step 6), atlas-ddns ---------
+  # The account's home is /var/lib/atlas/home, NOT /var/lib/atlas: the parent of $ATLAS_STATE (/var/lib/atlas/day1:
+  # done markers, verify.jsonl, the phase1.gate marker that atlas-day1.sh trusts) stays root:root 755, so the
+  # service account can never rename or replace the Day 1 state and audit trail (Section 16.3 item 6).
+  local atlas_home=/var/lib/atlas/home
+  ensure_dir /var/lib/atlas root:root 755
   if ! id -u atlas >/dev/null 2>&1; then
-    useradd -r -m -d /var/lib/atlas -s /bin/bash -U atlas
-    log "created system user atlas (home /var/lib/atlas)"
+    useradd -r -m -d "$atlas_home" -s /bin/bash -U atlas
+    log "created system user atlas (home $atlas_home)"
+  elif [[ "$(getent passwd atlas | cut -d: -f6)" != "$atlas_home" ]]; then
+    usermod -d "$atlas_home" atlas          # earlier layout had the home on /var/lib/atlas itself; no -m: day1/ must not move
+    log "moved the atlas account's home to $atlas_home"
   fi
-  # $ATLAS_STATE (/var/lib/atlas/day1, root 755 per §2) usually exists before the account does, so useradd -m found
-  # the home root-owned; the home directory itself belongs to atlas, day1/ underneath stays root's.
-  chown atlas:atlas /var/lib/atlas; chmod 755 /var/lib/atlas
+  ensure_dir "$atlas_home" atlas:atlas 750
+  chown root:root /var/lib/atlas; chmod 755 /var/lib/atlas
   getent group render >/dev/null || die "group 'render' does not exist (udev creates it for /dev/dri/renderD*; is amdgpu loaded?)"
   usermod -aG render,video atlas
   if ! id -u atlas-ddns >/dev/null 2>&1; then
@@ -83,6 +91,9 @@ step_03() {
   ensure_dir /srv/cold atlas:atlas 750
   ensure_dir /srv/backups root:root 700
   ensure_dir "$ATLAS_STATE" root:root 755
+  # Phase logs carry the Principal's username, addresses, the zone id and quoted compose output: root and adm only.
+  # (lib/common.sh creates log files with the default umask; the 750 directory is what keeps them from other users.)
+  ensure_dir "$ATLAS_STATE/logs" root:adm 750
   ensure_dir "$ATLAS_OPT" root:root 755
   log "tree: $ATLAS_SRV/{models,engines,data,workspace,sandbox,vault,staging} atlas:atlas; staging/inbox $PRINCIPAL_USER:atlas 2770; /srv/cold atlas; /srv/backups root"
 

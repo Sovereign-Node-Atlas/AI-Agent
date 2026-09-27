@@ -41,9 +41,45 @@ CONF
   for a in "${addrs[@]}"; do grep -q "$a:3389" <<<"$l" || die "xrdp is not listening on $a:3389 (got: $l)"; done
 }
 
+# _firefox_policies — enterprise policy written BEFORE the install so the first launch already runs with telemetry,
+# Normandy studies, app-update checks, captive-portal probes, DoH and extension updates OFF (rule §7.1 wants
+# telemetry disabled in the component, not merely denied by squid; DoH would route the Principal's DNS to a resolver
+# the allowlist does not name). /etc/firefox/policies/policies.json is the documented Linux system path (VERIFIED,
+# mozilla/policy-templates README); UNVERIFIED that Mozilla's own .deb reads it rather than only its install
+# directory, so the same file is also placed at /usr/lib/firefox/distribution/policies.json (the .deb's directory).
+_firefox_policies() {
+  local d
+  for d in /etc/firefox/policies /usr/lib/firefox/distribution; do
+    install -d -m 755 "$d"
+    cat >"$d/policies.json" <<'JSON'
+{
+  "policies": {
+    "DisableTelemetry": true,
+    "DisableAppUpdate": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableFeedbackCommands": true,
+    "DisableFirefoxAccounts": true,
+    "DontCheckDefaultBrowser": true,
+    "CaptivePortal": false,
+    "NetworkPrediction": false,
+    "DNSOverHTTPS": { "Enabled": false, "Locked": true },
+    "Proxy": { "Mode": "system", "Locked": true },
+    "ExtensionUpdate": false,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": ""
+  }
+}
+JSON
+    chmod 644 "$d/policies.json"
+  done
+  log "Firefox enterprise policy written (telemetry, studies, updates, captive portal, DoH off; proxy = system)"
+}
+
 _firefox_deb() {
   # Mozilla's apt repository (UNVERIFIED recipe: the KB page was unreachable during research; the key URL and suite
   # are the widely published ones). Every failure stops the step with the fix instead of silently keeping the stub.
+  _firefox_policies
   install -d -m 0755 /etc/apt/keyrings
   if [[ ! -s /etc/apt/keyrings/packages.mozilla.org.asc ]]; then
     proxy_env
@@ -88,7 +124,8 @@ step_05b() {
   sed -i -E 's/^AllowRootLogin=.*/AllowRootLogin=false/' /etc/xrdp/sesman.ini
   sed -i -E 's/^security_layer=.*/security_layer=tls/' /etc/xrdp/xrdp.ini   # mstsc speaks TLS; drop plain RDP crypto
   # Per-user session for the Principal; no display manager means no autologin (Appendix B "no autologin").
-  install -m 644 -o "$PRINCIPAL_USER" -g "$PRINCIPAL_USER" /dev/stdin "/home/$PRINCIPAL_USER/.xsession" <<<'xfce4-session'
+  # phase1_write_file (04-system.sh): `install /dev/stdin` fails on re-runs with resolute's rust-coreutils install.
+  printf 'xfce4-session\n' | phase1_write_file 644 "$PRINCIPAL_USER:$PRINCIPAL_USER" "/home/$PRINCIPAL_USER/.xsession"
   systemctl get-default | grep -qx multi-user.target || systemctl set-default multi-user.target >/dev/null
   local dm
   for dm in lightdm gdm3 sddm; do

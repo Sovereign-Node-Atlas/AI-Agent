@@ -35,7 +35,8 @@ step_01() {
   (( mem_gib >= 180 )) || problems+=("MemTotal ${mem_gib} GiB, expected ~192 GiB (Section 2)")
 
   # --- GPU: vendor 0x1002, display class, driver amdgpu; device id logged and warned, never failed -------------
-  command -v lspci >/dev/null || apt_install pciutils
+  # pciutils is on every Ubuntu Server image; nothing is installed before the proxy exists (rule §7.1, step 4).
+  command -v lspci >/dev/null || die "pre-flight: lspci (pciutils) is missing; install it from the console and re-run (no package is fetched before the allowlist proxy exists)"
   local slot; slot="$(lspci -Dn -d 1002: 2>/dev/null | awk '$2 ~ /^03/ {print $1; exit}')"
   [[ -n "$slot" ]] || die "pre-flight: no AMD (0x1002) display-class PCI device found (lspci -Dn -d 1002:)"
   log "gpu: $(lspci -nn -s "$slot")"
@@ -80,7 +81,24 @@ step_01() {
   else
     die "pre-flight: DATA_DISK $data_dev carries signature '${sig:-partitions}' that is not this script's atlas-data LUKS volume; refusing to touch it. Wipe it deliberately (wipefs -a) only if you are certain, then re-run."
   fi
-  if lsblk -rno TYPE | grep -qx crypt; then log "OS volume: LUKS present (installer choice)"; else warn "OS volume: NOT encrypted (installer choice; Section 3.5 assumed LUKS on both drives; step 2 records this)"; fi
+  # Section 3.5 requires LUKS2 on the OS volume too. An unencrypted OS volume is a recorded decision, never a
+  # footnote: it stops here unless ATLAS_ALLOW_UNENCRYPTED_OS=1 is set in atlas.env (step 2 then wipes the keyfile
+  # slot and keeps no recovery copy on the node; V2 records the acknowledgement). Checked on "/" itself, not on any
+  # crypt mapping (an already-open atlas-data mapping must not count).
+  if lsblk -sno TYPE "$root_src" 2>/dev/null | grep -qx crypt; then
+    log "OS volume: LUKS present (installer choice, Section 3.5)"
+  elif [[ "${ATLAS_ALLOW_UNENCRYPTED_OS:-0}" == "1" ]]; then
+    warn "OS volume: NOT encrypted; deviation from Section 3.5 ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 in $ATLAS_ETC/atlas.env (step 2 leaves nothing on the OS drive that opens the data volume)"
+  else
+    die "pre-flight: the OS volume is NOT encrypted, but Section 3.5 requires LUKS2 on both volumes ('nothing transient touches disk unencrypted'). Either reinstall Ubuntu Server with the encrypted-LVM option, or, to accept the deviation knowingly, add ATLAS_ALLOW_UNENCRYPTED_OS=1 to $ATLAS_ETC/atlas.env and re-run: sudo $ATLAS_ENTRY phase1"
+  fi
+  # SSH, Cockpit and xrdp bind to LAN_IP itself (Section 3.6). A DHCP lease that later changes would leave them on
+  # the stale address (console-only recovery), so a dynamic address is flagged for a router reservation.
+  if ip -o -4 addr show dev "$LAN_IFACE" scope global 2>/dev/null | grep -q ' dynamic '; then
+    warn "pre-flight: $LAN_IP on $LAN_IFACE is a DHCP lease (not static). SSH, Cockpit and xrdp are bound to this address from step 4: reserve it for this node's MAC on the router (or make it static in netplan) so it never changes."
+  else
+    log "network: $LAN_IP on $LAN_IFACE is a static (non-dynamic) address"
+  fi
 
   # --- Things later steps need from the Principal; warn now so they are fixed before the LUKS pause ------------
   local ak="/home/$PRINCIPAL_USER/.ssh/authorized_keys"

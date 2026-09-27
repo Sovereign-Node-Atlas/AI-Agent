@@ -16,6 +16,9 @@
 Description=A.T.L.A.S. llama-server engine %i
 Documentation=file:${ATLAS_ETC}/engines/%i.env
 After=local-fs.target
+# The model files and the slot directory live on the LUKS data volume (Section 3.5): order after, and require, the mount
+# units for those paths, so an enabled resident unit does not burn StartLimitBurst at boot before /srv/atlas is mounted.
+RequiresMountsFor=${ATLAS_SRV}/models ${ATLAS_SRV}/data/slots
 # A missing model file or a refused KV configuration exits immediately; do not loop on it (rule §7.4 fail loudly).
 StartLimitIntervalSec=300
 StartLimitBurst=3
@@ -43,12 +46,25 @@ TimeoutStopSec=120
 KillMode=mixed
 LimitMEMLOCK=infinity
 LimitNOFILE=65536
-# Hardening that does not interfere with /dev/dri access or mmap of the model files.
+# Hardening that does not interfere with /dev/dri access or mmap of the model files. NOT added on purpose:
+# PrivateDevices/DevicePolicy (the engine needs /dev/dri) and MemoryDenyWriteExecute (Mesa/RADV JIT).
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ProtectSystem=full
+# Whole file system read-only for the engine except the slot directory (CacheDirectory stays writable by systemd's own
+# rule); the model files are atlas-owned but the running engine must not be able to alter them.
+ProtectSystem=strict
 ReadWritePaths=${ATLAS_SRV}/data/slots
+ReadOnlyPaths=${ATLAS_SRV}/models
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Network confinement by kernel BPF, independent of ufw and of the proxy variables: the engine (built with an HTTPS
+# client, LLAMA_OPENSSL=ON per conflict 10) may only talk on loopback, where the orchestrator and ExecStartPost reach it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 [Install]
 WantedBy=multi-user.target

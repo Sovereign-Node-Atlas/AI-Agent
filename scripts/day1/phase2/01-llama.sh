@@ -11,8 +11,9 @@
 #      installed under $ATLAS_OPT/llama.cpp/dist; llama-server, llama-cli, llama-bench, llama-quantize symlinked into
 #      /usr/local/bin. The build is skipped when dist/ATLAS_BUILD already names the pinned commit (rule §7.3).
 #   5. llama-server --list-devices must show the Vulkan0 device, also when run as the atlas user (render/video groups).
-#   6. systemd/llama-server@.service installed (render_template), /etc/sudoers.d/atlas-engines written (CONVENTIONS §8),
-#      $ATLAS_ETC/engines/<key>.env rendered for all ten keys by phase2/engine-env.py, slot directories created.
+#   6. systemd/llama-server@.service installed (render_template), /etc/sudoers.d/atlas-engines written (CONVENTIONS §8:
+#      one explicit line per engine key and verb, 30 lines, no wildcard), $ATLAS_ETC/engines/<key>.env rendered for all
+#      ten keys by phase2/engine-env.py, the slot directory created.
 #   7. V3b recorded (llama-cli --list-devices >= 160000 MiB); a fail is recorded, not fatal here: the gate decides.
 #
 # TODO (Section 3.4, optional, NOT Day 1): a ROCm 7.2.2 container build of llama.cpp for tuned prefill
@@ -151,7 +152,7 @@ _llama_device_check() {
   grep -q 'Vulkan0:' <<<"$out" \
     || die "llama-server --list-devices shows no Vulkan0 device. Output: $(tr '\n' ' ' <<<"$out")"
   log "devices (root): $(grep -m1 'Vulkan0:' <<<"$out" | sed 's/^[[:space:]]*//')"
-  out="$(timeout 120 runuser -u atlas -- /usr/local/bin/llama-server --list-devices 2>&1 || true)"
+  out="$(timeout 120 svc_user_run /usr/local/bin/llama-server --list-devices 2>&1 || true)"
   grep -q 'Vulkan0:' <<<"$out" \
     || die "the atlas user cannot see the Vulkan device (is atlas in the render and video groups? Phase 1 step 6). Output: $(tr '\n' ' ' <<<"$out")"
   log "devices (atlas): $(grep -m1 'Vulkan0:' <<<"$out" | sed 's/^[[:space:]]*//')"
@@ -169,20 +170,34 @@ _llama_unit() {
 }
 
 _llama_sudoers() {
-  # CONVENTIONS.md §8 control path: the orchestrator (user atlas) may run exactly start/stop/restart of llama-server@*.
-  # Ubuntu 26.04 ships sudo-rs (conflict 7): the fragment uses only plain sudoers syntax (no aliases, no Defaults).
-  # UNVERIFIED: sudo-rs's handling of a trailing "*" in command arguments — phase2/04-memory.sh starts the resident
-  # units through this exact path as the atlas user, which is the run-time proof; it dies with instructions otherwise.
-  local sc frag=/etc/sudoers.d/atlas-engines tmp
+  # CONVENTIONS.md §8 control path: the orchestrator (user atlas) may run exactly `systemctl start|stop|restart
+  # llama-server@<key>` for the ten keys of config/engines.json and nothing else. sudoers(5) matches command arguments as
+  # ONE space-separated string, so a trailing "*" would also match `stop llama-server@x ufw.service squid.service`
+  # (fix round: blocker). Hence one explicit line per key and verb (30 lines), which every sudo implementation accepts,
+  # including sudo-rs on Ubuntu 26.04 (conflict 7; plain syntax, no aliases, no Defaults). phase2/04-memory.sh
+  # _mem_start_residents proves the positive AND the negative case at run time and dies otherwise. Re-rendered on every
+  # run, so a change to engines.json is picked up.
+  local sc frag=/etc/sudoers.d/atlas-engines tmp key verb
   sc="$(readlink -f "$(command -v systemctl)")"
+  local keys=()
+  mapfile -t keys < <(python3 -c 'import json,sys; [print(e["key"]) for e in json.load(open(sys.argv[1], encoding="utf-8"))["engines"]]' \
+    "$ATLAS_DAY1_DIR/config/engines.json")
+  (( ${#keys[@]} == 10 )) || die "config/engines.json lists ${#keys[@]} engines, CONVENTIONS.md §8 fixes ten; refusing to write $frag"
+  for key in "${keys[@]}"; do
+    # A key becomes part of a sudoers command line and a systemd instance name: keep it to the safe alphabet.
+    [[ "$key" =~ ^[A-Za-z0-9._-]+$ ]] || die "engine key '$key' is not safe for sudoers/systemd instance names"
+  done
   tmp="$(mktemp)"
-  cat >"$tmp" <<SUDO
-# atlas-engines — written by scripts/day1/phase2/01-llama.sh (CONVENTIONS.md §8). The orchestrator's Engine Arbiter
-# starts and stops engines with: sudo systemctl start|stop|restart llama-server@<key>. Nothing else is permitted.
-atlas ALL=(root) NOPASSWD: $sc start llama-server@*
-atlas ALL=(root) NOPASSWD: $sc stop llama-server@*
-atlas ALL=(root) NOPASSWD: $sc restart llama-server@*
-SUDO
+  {
+    echo "# atlas-engines — written by scripts/day1/phase2/01-llama.sh (CONVENTIONS.md §8). The orchestrator's Engine Arbiter"
+    echo "# starts and stops engines with: sudo systemctl start|stop|restart llama-server@<key>. Exact commands only:"
+    echo "# any extra argument (a second unit, --no-block, ...) is refused. Regenerated from config/engines.json."
+    for key in "${keys[@]}"; do
+      for verb in start stop restart; do
+        printf 'atlas ALL=(root) NOPASSWD: %s %s llama-server@%s\n' "$sc" "$verb" "$key"
+      done
+    done
+  } >"$tmp"
   if command -v visudo >/dev/null 2>&1; then
     visudo -c -f "$tmp" >/dev/null || { rm -f "$tmp"; die "sudoers fragment failed visudo -c; not installed"; }
   else
@@ -190,13 +205,13 @@ SUDO
   fi
   install -m 440 -o root -g root "$tmp" "$frag"
   rm -f "$tmp"
-  log "installed $frag"
+  log "installed $frag ($(( ${#keys[@]} * 3 )) explicit command lines, no wildcard)"
 }
 
 _llama_engine_envs() {
   ensure_dir "$ATLAS_ETC/engines" root:atlas 750
   ensure_dir "$ATLAS_SRV/data" atlas:atlas 755
-  ensure_dir "$ATLAS_SRV/data/slots" atlas:atlas 755
+  ensure_dir "$ATLAS_SRV/data/slots" atlas:atlas 755   # Appendix B: --slot-save-path /srv/atlas/data/slots, one dir for all
   ensure_dir "$ATLAS_SRV/models" atlas:atlas 755
   # The seven large engines render with ATLAS_MODEL_PRESENT=0 until Phase 3 pulls them (stderr notes are expected).
   python3 "$ATLAS_DAY1_DIR/phase2/engine-env.py" \

@@ -27,18 +27,24 @@ done
 command -v curl >/dev/null || fail "curl is not installed"
 command -v jq >/dev/null || fail "jq is not installed"
 
-auth=(-H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
+# The token never appears on a command line (/proc/<pid>/cmdline is world-readable): curl reads the Authorization
+# header from a 0600 file (`-H @file`, curl >= 7.55) in the unit's PrivateTmp, removed on exit.
+umask 077
+hdr="$(mktemp)" || fail "mktemp failed"
+trap 'rm -f "$hdr"' EXIT
+printf 'Authorization: Bearer %s\n' "$CF_API_TOKEN" >"$hdr"
+auth=(-H "@$hdr" -H "Content-Type: application/json")
 
-# 1. Public IPv4. Three echo services, all on the allowlist; the first that answers with a plausible IPv4 wins.
+# 1. Public IPv4 from Cloudflare's own trace endpoint (www.cloudflare.com, allowlisted). No third-party echo
+#    services: nothing outside the Section 12.5 enumeration learns the node's address. If it does not answer, the
+#    run fails and the timer retries in five minutes.
 public_ip() {
   local ip
   ip="$(curl -fsS -m 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1=="ip"{print $2}' || true)"
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip="$(curl -fsS -m 10 https://api.ipify.org 2>/dev/null || true)"
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip="$(curl -fsS -m 10 -4 https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
   [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
   printf '%s\n' "$ip"
 }
-ip="$(public_ip)" || fail "could not determine the public IPv4 (proxy down, or www.cloudflare.com/api.ipify.org/icanhazip.com not allowlisted)"
+ip="$(public_ip)" || fail "could not determine the public IPv4 from https://www.cloudflare.com/cdn-cgi/trace (proxy down, www.cloudflare.com not allowlisted, or the node has no IPv4 path)"
 case "$ip" in
   100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*)
     # RFC 6598 shared address space seen from the outside means CGNAT (R11): the port-forward cannot work.
