@@ -2,6 +2,7 @@
 # Celery task on the `cpu` queue sweeps both memory layers, archives temporal data under /srv/cold, and leaves scars
 # (9.4) and permanent facts untouched. Installed by phase2/08-sentinel.sh through render_template (ATLAS_ETC,
 # ATLAS_OPT substituted). Contract with the `atlas` package: `atlas-admin enqueue prune` (see atlas-sentinel.service).
+# The broker URL (with the Redis password) comes from /etc/atlas/secrets/redis.env, read by PID 1.
 
 [Unit]
 Description=A.T.L.A.S. 72-hour semantic pruning sweep (enqueue the Celery task, Section 9.6)
@@ -14,6 +15,7 @@ User=atlas
 Group=atlas
 WorkingDirectory=${ATLAS_OPT}/orchestrator
 EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 Environment=HOME=/var/lib/atlas
 ExecStart=${ATLAS_OPT}/venv/bin/atlas-admin enqueue prune

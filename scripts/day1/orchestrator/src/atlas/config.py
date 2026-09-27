@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import frontmatter
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 log = logging.getLogger("atlas.config")
 
@@ -48,10 +48,20 @@ PERSONA_KEYS: tuple[str, ...] = (
     "ren", "arthur", "gideon", "silas", "valerie", "helena", "eleanor", "alaric", "minerva", "victor",
 )
 ARBITER_CLASSES: frozenset[str] = frozenset({"core", "apex", "vision", "crosscheck", "resident", "phase4"})
-KV_CLASSES: frozenset[str] = frozenset({"q8_0", "q4_0", "f16", "none"})
+# CONVENTIONS.md §8 names q8_0 and q4_0 only; `none` is the embedding/reranker entry (no KV cache to quantise). f16 is
+# NOT a class: Section 4.3 wants a quantised cache on every LLM engine, and V4 exists to catch a silent f16 fallback.
+# (The Arbiter's KV_CLASS_FACTOR still knows f16 for projections passed explicitly, e.g. the DeepSeek KV ladder.)
+KV_CLASSES: frozenset[str] = frozenset({"q8_0", "q4_0", "none"})
+LLM_MODES: frozenset[str] = frozenset({"chat", "vision"})
 HEMISPHERES: tuple[str, ...] = ("corporate", "estate")
 TIERS: tuple[str, ...] = ("routine", "standard", "sensitive")
 FAMILY_NAMES_PLACEHOLDER = "FAMILY_NAMES_PLACEHOLDER"
+# Settings.extra carries these keys and nothing else (orchestrator.env keys per phase2/02-orchestrator.sh; no secrets:
+# the *_FILE values are paths, the tokens themselves stay in the files).
+SETTINGS_EXTRA_KEYS: tuple[str, ...] = (
+    "PRINCIPAL_USER", "TZ", "ORCH_HOST", "ORCH_PORT", "OPENWEBUI_PORT", "NTFY_URL", "NTFY_TOPIC", "DOMAIN",
+    "OPENWEBUI_ADMIN_TOKEN_FILE", "NTFY_TOKEN_FILE", "HF_TOKEN_FILE",
+)
 
 
 class ConfigError(RuntimeError):
@@ -66,7 +76,14 @@ def parse_env_file(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     if not path.is_file():
         return out
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # /etc/atlas/atlas.env is root:atlas 640 (§2): a caller outside group atlas (the Principal running atlas-admin
+        # by hand, a unit with another User=) gets the documented fallback, the process environment only.
+        log.warning("%s not readable (%s); continuing with the process environment only", path, exc)
+        return out
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -101,7 +118,9 @@ class Settings:
     engines_env_dir: Path
     llama_port_base: int
     family_names: tuple[str, ...]
-    env: dict[str, str] = field(default_factory=dict, repr=False)
+    # An allowlisted subset of the merged environment, copied by name. Never the whole environment: the units inherit
+    # proxy.env, memory.env and every later *.env, and asdict()/vars() of this object must not dump them.
+    extra: dict[str, str] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -118,6 +137,7 @@ class Settings:
         except ValueError as exc:
             raise ConfigError(f"LLAMA_PORT_BASE={merged.get('LLAMA_PORT_BASE')!r} is not an integer") from exc
         names = tuple(n for n in merged.get("FAMILY_NAMES", "").replace(",", " ").split() if n)
+        extra = {k: merged[k] for k in SETTINGS_EXTRA_KEYS if merged.get(k)}
         return cls(
             config_dir=cfg,
             etc_dir=etc_dir,
@@ -125,7 +145,7 @@ class Settings:
             engines_env_dir=Path(merged.get("ATLAS_ENGINES_ENV_DIR") or (etc_dir / "engines")),
             llama_port_base=port_base,
             family_names=names,
-            env=merged,
+            extra=extra,
         )
 
 
@@ -192,8 +212,16 @@ class EngineSpec(BaseModel):
     @classmethod
     def _kv_known(cls, v: str) -> str:
         if v not in KV_CLASSES:
-            raise ValueError(f"kv_class {v!r} is not one of {sorted(KV_CLASSES)} (CONVENTIONS.md §8)")
+            raise ValueError(f"kv_class {v!r} is not one of {sorted(KV_CLASSES)} (CONVENTIONS.md §8; f16 is not a "
+                             "class: Section 4.3 quantises the cache of every LLM engine)")
         return v
+
+    @model_validator(mode="after")
+    def _llm_engines_have_a_quantised_cache(self) -> EngineSpec:
+        # Section 4.3: every chat/vision engine runs a quantised KV cache; `none` is for embedding/reranking only.
+        if self.mode in LLM_MODES and self.kv_class == "none":
+            raise ValueError(f"mode {self.mode!r} needs a quantised kv_class (q8_0 or q4_0, Section 4.3), not 'none'")
+        return self
 
     @property
     def is_resident(self) -> bool:
@@ -225,7 +253,7 @@ def load_engines(cfg_dir: Path | None = None, port_base: int | None = None) -> d
         port_base = int(os.environ.get("LLAMA_PORT_BASE") or DEFAULT_LLAMA_PORT_BASE)
     path = cfg_dir / "engines.json"
     data = _read_json(path)
-    entries = data["engines"] if isinstance(data, dict) else data
+    entries = data.get("engines") if isinstance(data, dict) else data
     if not isinstance(entries, list) or not entries:
         raise ConfigError(f"{path}: no engines[] list")
     out: dict[str, EngineSpec] = {}
@@ -319,7 +347,9 @@ def load_task_forces(cfg_dir: Path | None = None, max_cards: int = 3) -> dict[st
     cfg_dir = cfg_dir or config_dir()
     path = cfg_dir / "task-forces.json"
     data = _read_json(path)
-    entries = data["task_forces"] if isinstance(data, dict) else data
+    entries = data.get("task_forces") if isinstance(data, dict) else data
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError(f"{path}: no task_forces[] list")
     out: dict[str, TaskForce] = {}
     for raw in entries:
         try:
@@ -391,12 +421,16 @@ def load_personas(cfg_dir: Path | None = None, engines: dict[str, EngineSpec] | 
 
 # --- domains/cards/NN-slug.md -----------------------------------------------------------------------------------------
 
-# "# NN. Name  (Hemisphere, Owner, Tier X)" — the triple may also be pipe-separated when the owner carries a comma
-# ("(Corporate | Valerie, with Silas | Tier A)"); CONVENTIONS.md §8 "Domain cards". The name may carry its own
+# "# NN. Name  (Hemisphere, Owner, Tier X)" — CONVENTIONS.md §8 "Domain cards": the triple is comma-separated and the
+# owner drops 8.2's inner comma ("Eleanor with Silas", "Arthur — tagged to 14"). Cards that still carry the 8.2 inner
+# comma ("Alaric, with Silas") or a pipe-separated triple ("(Corporate | Valerie, with Silas | Tier A)") are accepted,
+# NORMALISED to the §8 owner spelling and reported with a warning naming the file, so the loader never silently
+# blesses a non-conforming card (raised with the cards writer: 07, 11, 26, 28, 32, 35). The name may carry its own
 # parenthetical ("(incl. ...)") and the triple may nest one ("phrasing softened (Section 18 C9)"), so the split point
 # is the LAST run of two or more spaces before an opening parenthesis, not a regex over parentheses.
 _CARD_H1 = re.compile(r"^#\s+(\d{2})\.\s+(.*\S)\s*$")
 _CARD_SEP = re.compile(r"\s{2,}\(")
+_OWNER_INNER_COMMA = re.compile(r"^([A-Z][a-z]+), (with |and |tagged )")
 
 
 class DomainCard(BaseModel):
@@ -416,21 +450,29 @@ class DomainCard(BaseModel):
         return self.tier == "C"
 
 
-def parse_card_heading(line: str) -> tuple[int, str, str, str, str]:
+def parse_card_heading(line: str, *, source: str = "") -> tuple[int, str, str, str, str]:
+    """(number, name, hemisphere, owner, tier) from a card H1; the owner is returned in the §8 spelling."""
     m = _CARD_H1.match(line.strip())
     seps = list(_CARD_SEP.finditer(m.group(2))) if m else []
     if not m or not seps or not m.group(2).endswith(")"):
         raise ConfigError(f"domain card H1 does not match '# NN. Name  (Hemisphere, Owner, Tier X)': {line!r}")
     rest = m.group(2)
     number, name, triple = int(m.group(1)), rest[:seps[-1].start()].strip(), rest[seps[-1].end():-1]
-    parts = [p.strip() for p in (triple.split("|") if "|" in triple else triple.split(","))]
+    where = source or f"domain card {number}"
+    piped = "|" in triple
+    parts = [p.strip() for p in (triple.split("|") if piped else triple.split(","))]
     if len(parts) < 3:
-        raise ConfigError(f"domain card {number}: triple {triple!r} has fewer than three fields")
+        raise ConfigError(f"{where}: triple {triple!r} has fewer than three fields")
     hemisphere, tier = parts[0], parts[-1]
-    owner = ", ".join(parts[1:-1])
+    raw_owner = ", ".join(parts[1:-1])
+    owner = _OWNER_INNER_COMMA.sub(r"\1 \2", raw_owner)
+    if piped or owner != raw_owner:
+        log.warning("%s: H1 triple is not in the CONVENTIONS.md §8 form (%s); owner read as %r — the card should say "
+                    "'(%s, %s, %s)'", where, "pipe-separated" if piped else "owner carries 8.2's inner comma", owner,
+                    hemisphere, owner, tier)
     tm = re.fullmatch(r"Tier\s+([ABC])", tier)
     if not tm:
-        raise ConfigError(f"domain card {number}: tier field {tier!r} is not 'Tier A|B|C'")
+        raise ConfigError(f"{where}: tier field {tier!r} is not 'Tier A|B|C'")
     return number, name, hemisphere, owner, tm.group(1)
 
 
@@ -443,7 +485,7 @@ def load_domain_cards(cfg_dir: Path | None = None) -> dict[int, DomainCard]:
     for path in sorted(cdir.glob("*.md")):
         text = path.read_text(encoding="utf-8")
         first = next((ln for ln in text.splitlines() if ln.strip()), "")
-        number, name, hemisphere, owner, tier = parse_card_heading(first)
+        number, name, hemisphere, owner, tier = parse_card_heading(first, source=str(path))
         m = re.match(r"^(\d{2})-(.+)$", path.stem)
         if not m or int(m.group(1)) != number:
             raise ConfigError(f"{path}: file number does not match its H1 number {number}")

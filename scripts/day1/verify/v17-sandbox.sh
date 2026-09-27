@@ -4,14 +4,19 @@
 # under 10 minutes; safe to re-run. Must run as root or as a docker-group member.
 # Usage: v17-sandbox.sh [IMAGE=atlas-sandbox:py3.12] [TIMEOUT_S=120]
 #
-# Method: a python one-liner that appends 64 MiB of non-zero bytes to a list forever (non-zero so every page is really
-# touched and charged to the cgroup) runs under
-#   docker run --rm --memory=512m --memory-swap=512m --cpus=1 --pids-limit=64 --network none --read-only ...
-# with GNU timeout. The kernel's OOM killer inside the memory cgroup sends SIGKILL, which docker reports as exit 137
-# (128 + 9; services-tools.md §6: the OOMKilled flag is VERIFIED, the 137 convention is UNVERIFIED by the Docker
-# docs but universal). Before and after, /proc/meminfo MemAvailable and the 1-minute load are compared: the host must
-# not have moved materially (|ΔMemAvailable| <= max(1 GiB, 2 % of MemTotal), Δload1 < 2.0), and any llama-server
-# unit that was active before must still be active after. The exit code and the elapsed seconds are printed.
+# Method, two runs under the run line of docker/sandbox/Dockerfile (--init, --read-only, --cap-drop ALL, nobody, ...):
+#   1. Memory cap: a python one-liner that appends 64 MiB of non-zero bytes to a list forever (non-zero so every page
+#      is really touched and charged to the cgroup) under --memory=512m --memory-swap=512m. The kernel's OOM killer
+#      inside the memory cgroup sends SIGKILL, which docker reports as exit 137 (128 + 9; services-tools.md §6: the
+#      OOMKilled flag is VERIFIED, the 137 convention is UNVERIFIED by the Docker docs but universal). Before and
+#      after, /proc/meminfo MemAvailable and the 1-minute load are compared: the host must not have moved materially
+#      (|ΔMemAvailable| <= max(1 GiB, 2 % of MemTotal), Δload1 < 2.0), and any llama-server unit that was active
+#      before must still be active after.
+#   2. Timeout (fix round): a python script that ignores SIGTERM and sleeps for ever runs with -e SANDBOX_TIMEOUT_S=5.
+#      The image's entrypoint (coreutils `timeout -s KILL`) must SIGKILL it at the deadline (exit 137 within a few
+#      seconds of 5 s) and the container must be gone afterwards, so a program that ignores the host-side signal has
+#      no way to outlive its time bound. The host-side GNU timeout is only the backstop and must not be what fired.
+# The exit codes and the elapsed seconds of both runs are printed, with the image id (python:3.12-slim is unpinned).
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -26,6 +31,9 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   echo "V17 fail: image $image does not exist; build it: docker build -t $image $ATLAS_DAY1_DIR/docker/sandbox (phase2/10-gate.sh does this)"
   exit 1
 fi
+image_id="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null | cut -c8-19 || true)"
+image_ver="$(docker image inspect -f '{{index .Config.Labels "org.atlas.sandbox.version"}}' "$image" 2>/dev/null || true)"
+[[ "$image_ver" == 2 ]] || { echo "V17 fail: $image carries label org.atlas.sandbox.version='${image_ver:-none}', expected 2 (the in-container timeout entrypoint); rebuild: docker build -t $image $ATLAS_DAY1_DIR/docker/sandbox"; exit 1; }
 
 meminfo() { awk -v k="$1" '$1 == k ":" { print $2; exit }' /proc/meminfo; }   # kB
 load1() { cut -d' ' -f1 /proc/loadavg; }
@@ -37,18 +45,25 @@ done
 mem_total_kb="$(meminfo MemTotal)"
 avail_before="$(meminfo MemAvailable)"
 load_before="$(load1)"
-name="atlas-v17-$$-$(date +%s)"
+stamp="$$-$(date +%s)"
+name="atlas-v17-$stamp"
+name2="atlas-v17-timeout-$stamp"
 errf="$(mktemp)"
-trap 'rm -f "$errf"; docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+trap 'rm -f "$errf"; docker rm -f "$name" "$name2" >/dev/null 2>&1 || true' EXIT
 
+# The run line of docker/sandbox/Dockerfile minus the job mount (nothing to mount here).
+run_flags=(--init --cpus=1 --pids-limit=64 --network none --read-only
+  --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=64m" --ulimit fsize=1048576
+  --cap-drop ALL --security-opt no-new-privileges --user 65534:65534)
+
+# --- 1. the memory cap ------------------------------------------------------------------------------------------------
 bomb='a = []
 while True:
     a.append(b"x" * (64 << 20))'
 t0="$(date +%s.%N)"
 rc=0
-timeout -k 5 "$timeout_s" docker run --rm --name "$name" \
-  --memory=512m --memory-swap=512m --cpus=1 --pids-limit=64 --network none --read-only \
-  --tmpfs /tmp:rw,size=64m --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 \
+timeout -k 5 "$timeout_s" docker run --rm --name "$name" --memory=512m --memory-swap=512m \
+  -e "SANDBOX_TIMEOUT_S=$timeout_s" "${run_flags[@]}" \
   "$image" python3 -c "$bomb" >/dev/null 2>"$errf" || rc=$?
 t1="$(date +%s.%N)"
 elapsed="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')"
@@ -95,5 +110,36 @@ if awk -v d="$load_delta" 'BEGIN { exit (d < 2.0) ? 0 : 1 }'; then :; else
   echo "V17 fail: exit 137 after ${elapsed}s but load1 rose by $load_delta: $host"
   exit 1
 fi
-echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); $host (Δload1 $load_delta)$llama_note"
+
+# --- 2. the time bound, against a program that ignores SIGTERM --------------------------------------------------------
+stubborn='import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+while True:
+    time.sleep(1)'
+in_limit=5
+host_limit=40   # the backstop; it must NOT be what ends the run
+t0="$(date +%s.%N)"
+rc2=0
+timeout -k 5 "$host_limit" docker run --rm --name "$name2" --memory=64m --memory-swap=64m \
+  -e "SANDBOX_TIMEOUT_S=$in_limit" "${run_flags[@]}" \
+  "$image" python3 -c "$stubborn" >/dev/null 2>"$errf" || rc2=$?
+t1="$(date +%s.%N)"
+elapsed2="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')"
+left="$(docker ps -q --filter "name=^${name2}$" 2>/dev/null || true)"
+docker rm -f "$name2" >/dev/null 2>&1 || true
+if [[ -n "$left" ]]; then
+  echo "V17 fail: the SIGTERM-ignoring job was still running after the run returned (exit $rc2, ${elapsed2}s): the in-container timeout did not kill it; $host"
+  exit 1
+fi
+if (( rc2 != 137 )); then
+  echo "V17 fail: SIGTERM-ignoring job under SANDBOX_TIMEOUT_S=$in_limit: expected exit 137 (SIGKILL by the entrypoint's timeout), got exit $rc2 after ${elapsed2}s: $(tr '\n' ' ' <"$errf" | cut -c1-200); $host"
+  exit 1
+fi
+if awk -v e="$elapsed2" -v t="$in_limit" 'BEGIN { exit (e < t + 10) ? 0 : 1 }'; then :; else
+  echo "V17 fail: SIGTERM-ignoring job exited 137 only after ${elapsed2}s (in-container limit ${in_limit}s): the host backstop, not the entrypoint, ended it; $host"
+  exit 1
+fi
+
+echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); SIGTERM-ignoring job killed by the in-container timeout: exit 137 after ${elapsed2}s (limit ${in_limit}s), container gone; $host (Δload1 $load_delta)$llama_note; image $image ${image_id:-?} (base python:3.12-slim unpinned)"
 exit 0

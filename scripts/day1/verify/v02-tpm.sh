@@ -45,6 +45,12 @@ os_msg="OS volume: ${osnote:-not checked}"
 if [[ -n "$osdev" && "$osdev" != "-" ]]; then
   os_tok="$(token_check "$osdev")" || { echo "V2 fail on OS volume $osdev: $os_tok"; exit 1; }
   os_msg="OS volume $osdev: $os_tok"
+elif [[ "$osdev" == "-" && "$osnote" != *ACCEPTED* ]]; then
+  # The caller established that "/" is not on LUKS. Section 3.5 requires LUKS2 on the OS volume too, so this is a
+  # fail unless the Principal recorded the deviation (ATLAS_ALLOW_UNENCRYPTED_OS=1 in atlas.env; steps 1/2/5 pass
+  # "ACCEPTED" in the note). A deviation is a recorded decision, never a footnote in a passing row (rule §7.4).
+  echo "V2 fail: OS volume unencrypted and not acknowledged (Section 3.5; ATLAS_ALLOW_UNENCRYPTED_OS=1 in atlas.env records the deviation): ${osnote:-no note}"
+  exit 1
 fi
 echo "fTPM /dev/tpmrm0 seen by systemd; $dev: $data_tok; mapping $mapping active (boot $boot); $os_msg"
 exit 0

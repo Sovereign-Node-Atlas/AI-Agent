@@ -5,10 +5,14 @@ the pipeline may not. Appendix A places them between synthesis and the outbound 
 
     Director output -> Ren/Arthur synthesis -> never-delegate rewrite pass; register set -> outbound gate
 
-  never_delegate_rewrite(text)   16.1 rule 5: "A rewrite pass removes any task-shaped request to the Principal; only
+  never_delegate_rewrite(text, audience)
+                                 16.1 rule 5: "A rewrite pass removes any task-shaped request to the Principal; only
                                  decisions and approvals may be asked." Imperative patterns on the rule list are
                                  rewritten into a decision request; anything else that looks task-shaped is flagged,
-                                 never mangled, and the caller (the approval queue) holds a flagged draft.
+                                 never mangled, and the caller (the approval queue) holds a flagged draft. The rule
+                                 concerns requests to the Principal only: a draft whose register is EXTERNAL or
+                                 INTERNAL is returned unchanged (asking a counterpart to forward a lease is ordinary
+                                 correspondence, and SELF_NAME must never be written into external text).
   register(text, audience)       6.4: the register is a property the orchestrator sets on the outbound draft.
   disclosure_check(text)         16.1 rule 4 / 16.5 / R12: any admission of AI nature in an external draft is flagged;
                                  the approval gate never auto-sends a draft that admits it.
@@ -19,6 +23,7 @@ Everything is deterministic and needs no model; the unit tests (tests/test_gover
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -101,16 +106,27 @@ _REWRITE_LEAD_RE = re.compile(r"^\s*(?P<lead>" + "|".join(REWRITE_LEADS) + r")(?
 _FLAG_RE = tuple(re.compile(p, re.IGNORECASE) for p in FLAG_PATTERNS)
 # Sentence splitter: end punctuation followed by whitespace, or a line break. Bullets and numbering survive.
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])|\n+")
-_PRONOUN_SWAP: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bto\s+me\b", re.IGNORECASE), "to you"),
-    (re.compile(r"\bfor\s+me\b", re.IGNORECASE), "for you"),
-    (re.compile(r"\bwith\s+me\b", re.IGNORECASE), "with you"),
-    (re.compile(r"\bme\b", re.IGNORECASE), "you"),
+
+
+def _not_all_caps(replacement: str) -> Callable[[re.Match[str]], str]:
+    """A replacement that leaves an all-caps token alone: "US" (the country) and "ME" (Maine) are not pronouns."""
+
+    def rep(m: re.Match[str]) -> str:
+        return m.group(0) if m.group(0).isupper() else replacement
+
+    return rep
+
+
+_PRONOUN_SWAP: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
+    (re.compile(r"\bto\s+me\b", re.IGNORECASE), _not_all_caps("to you")),
+    (re.compile(r"\bfor\s+me\b", re.IGNORECASE), _not_all_caps("for you")),
+    (re.compile(r"\bwith\s+me\b", re.IGNORECASE), _not_all_caps("with you")),
+    (re.compile(r"\bme\b", re.IGNORECASE), _not_all_caps("you")),
     (re.compile(r"\bmyself\b", re.IGNORECASE), "yourself"),
-    (re.compile(r"\bmy\b", re.IGNORECASE), "your"),
+    (re.compile(r"\bmy\b", re.IGNORECASE), _not_all_caps("your")),
     (re.compile(r"\bmine\b", re.IGNORECASE), "yours"),
-    (re.compile(r"\bour\b", re.IGNORECASE), "your"),
-    (re.compile(r"\bus\b", re.IGNORECASE), "you"),
+    (re.compile(r"\bour\b", re.IGNORECASE), _not_all_caps("your")),
+    (re.compile(r"\bus\b", re.IGNORECASE), _not_all_caps("you")),
 )
 
 
@@ -159,14 +175,21 @@ def _rewrite_sentence(sentence: str) -> str | None:
     return f"{DECISION_PREFIX} shall {SELF_NAME} {body}?"
 
 
-def never_delegate_rewrite(text: str) -> RewriteResult:
+def never_delegate_rewrite(text: str, audience: str = "principal") -> RewriteResult:
     """16.1 rule 5. Rewrites rule-list imperatives to the Principal into decision requests; flags the rest.
 
     Returns the rewritten text plus the list of rewrites and flags. The text is never mangled: a sentence is either
     rewritten by a fixed template (lead removed, pronouns swapped, "Decision needed: shall ATLAS ...?") or left
     exactly as it was and listed in `flagged`.
+
+    `audience` is one of AUDIENCES. Only the PRINCIPAL register is rewritten: the rule is about work delegated back
+    to the Principal, not about what a counterpart is asked to do, and a decision request naming SELF_NAME must
+    never reach an external recipient (16.1 rule 4). EXTERNAL and INTERNAL drafts come back unchanged and unflagged.
     """
-    if not text.strip():
+    key = audience.strip().lower()
+    if key not in AUDIENCES:
+        raise ValueError(f"unknown audience {audience!r}; expected one of {sorted(AUDIENCES)} (Section 6.4)")
+    if AUDIENCES[key] is not Register.PRINCIPAL or not text.strip():
         return RewriteResult(text=text, original=text)
     pieces: list[str] = []
     rewrites: list[tuple[str, str]] = []
@@ -274,6 +297,10 @@ DISCLOSURE_PATTERNS: tuple[str, ...] = (
 _DISCLOSURE_RE = tuple(re.compile(p, re.IGNORECASE) for p in DISCLOSURE_PATTERNS)
 _LLM_UPPER_RE = re.compile(r"\bLLMs?\b")  # case-sensitive: the acronym, not a word that happens to spell it
 _AI_UPPER_RE = re.compile(r"\bA\.?I\.?\b")  # "AI" / "A.I." as a standalone capitalised token
+# The system naming itself in an external draft ("Decision needed: shall ATLAS ...", "ATLAS will follow up") is a
+# self-reference no external recipient should see (16.1 rule 4). Case-sensitive: "the road atlas" and "Atlas Copco"
+# are ordinary words; the all-caps token (or the dotted form) is the system's name.
+_SELF_NAME_RE = re.compile(r"\b(?:ATLAS|A\.T\.L\.A\.S\.?)(?![A-Za-z])")
 
 
 @dataclass(frozen=True)
@@ -296,6 +323,8 @@ def disclosure_check(text: str) -> DisclosureResult:
         for m in pat.finditer(text):
             hits.append(m.group(0))
     for m in _LLM_UPPER_RE.finditer(text):
+        hits.append(m.group(0))
+    for m in _SELF_NAME_RE.finditer(text):
         hits.append(m.group(0))
     for m in _AI_UPPER_RE.finditer(text):
         # "AI" alone is a hit only when it is clearly self-referential ("I am AI", "as an AI", "we are an AI");

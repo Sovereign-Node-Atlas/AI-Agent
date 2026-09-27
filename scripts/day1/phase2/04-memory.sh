@@ -20,6 +20,9 @@
 #   6. $ATLAS_ETC/memory.env written for the orchestrator (contract below); the venv made root:atlas, not writable
 #      by atlas (Section 16.3 item 6: the orchestrator must not be able to modify its own code).
 #
+# Every python/tool invocation that may write ~/.cache runs with HOME=/var/cache/atlas on that command line only; HOME is
+# never exported, because steps 05-10 run in the same driver process and docker finds /root/.docker/config.json via $HOME.
+#
 # Telemetry (rule §7.1): every python invocation below runs with HF_HUB_DISABLE_TELEMETRY=1 DO_NOT_TRACK=1
 # ANONYMIZED_TELEMETRY=False (huggingface_hub's send_telemetry, docling/posthog) and HF_HUB_DISABLE_IMPLICIT_TOKEN=1
 # HF_TOKEN_PATH=<root-only path> so huggingface_hub can never persist a login token under /srv/atlas (CONVENTIONS §2).
@@ -502,8 +505,10 @@ _mem_py_env() {
   # huggingface_hub persists a login token at $HF_TOKEN_PATH (default $HF_HOME/token); point it into the root-only
   # secrets directory (no such file: nothing is read, and atlas cannot create it), never under /srv/atlas.
   export HF_HUB_DISABLE_IMPLICIT_TOKEN=1 HF_TOKEN_PATH="$ATLAS_ETC/secrets/hf-token"
-  # Tools that write ~/.cache (docling-tools) get a HOME under the cache dir, not under $ATLAS_STATE (CONVENTIONS §2).
-  export HOME="$ATLAS_CACHE_DIR"
+  # HOME is deliberately NOT exported here: the Phase 2 driver runs every step in one process, and steps 05, 06 and 10
+  # rely on /root/.docker/config.json (the container-side proxy injection, phase1/06-docker.sh) which docker finds via
+  # $HOME. Tools that write ~/.cache (docling-tools, docling) get HOME=$ATLAS_CACHE_DIR per invocation instead, never
+  # under $ATLAS_STATE (CONVENTIONS §2).
 }
 
 _pip() {
@@ -536,7 +541,7 @@ _mem_lightrag() {
   # S2). _mem_preflight has already checked that config/allowlist.txt names that host.
   if ! compgen -G "$wd/tiktoken/*" >/dev/null; then
     _mem_py_env
-    TIKTOKEN_CACHE_DIR="$wd/tiktoken" "$VENV/bin/python" -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")' \
+    HOME="$ATLAS_CACHE_DIR" TIKTOKEN_CACHE_DIR="$wd/tiktoken" "$VENV/bin/python" -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")' \
       || die "tiktoken could not cache cl100k_base into $wd/tiktoken through the proxy (squid TCP_DENIED for $TIKTOKEN_HOST? see /var/log/squid/access.log; then re-run)"
     compgen -G "$wd/tiktoken/*" >/dev/null || die "tiktoken reported success but wrote nothing into $wd/tiktoken"
   fi
@@ -568,7 +573,7 @@ _mem_docling() {
   # docling/cli/models.py) so HF_HUB_OFFLINE=1 can be set afterwards (Section 12.5, rule §7.1).
   if [[ ! -f "$artifacts/.atlas-prefetched" ]]; then
     _mem_py_env
-    HF_HOME="$hf_home" "$VENV/bin/docling-tools" models download -o "$artifacts" \
+    HOME="$ATLAS_CACHE_DIR" HF_HOME="$hf_home" "$VENV/bin/docling-tools" models download -o "$artifacts" \
       || die "docling-tools models download failed (huggingface.co through the proxy; re-run to resume)"
     date -Is >"$artifacts/.atlas-prefetched"
   fi
@@ -579,7 +584,7 @@ _mem_docling() {
   tmp="$(mktemp -d)"
   printf '<html><body><h1>ATLAS</h1><p>Docling offline check.</p><table><tr><td>a</td><td>1</td></tr></table></body></html>\n' >"$tmp/check.html"
   _mem_py_env
-  HF_HUB_OFFLINE=1 DOCLING_ARTIFACTS_PATH="$artifacts" "$VENV/bin/python" - "$tmp/check.html" <<'PY' \
+  HOME="$ATLAS_CACHE_DIR" HF_HUB_OFFLINE=1 DOCLING_ARTIFACTS_PATH="$artifacts" "$VENV/bin/python" - "$tmp/check.html" <<'PY' \
     || { rm -rf "$tmp"; die "docling could not convert a trivial HTML file offline from $VENV"; }
 import sys
 from docling.document_converter import DocumentConverter

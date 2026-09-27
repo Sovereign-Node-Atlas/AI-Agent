@@ -1,11 +1,19 @@
 # /etc/systemd/system/atlas-celery-cpu.service — Celery worker for the `cpu` queue (Section 9.7: "many workers").
-# Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+# Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT, ATLAS_SRV substituted).
 # Concurrency = nproc - 2 (minimum 1), computed by step 02 and written as CELERY_CPU_CONCURRENCY in orchestrator.env,
 # so a CPU change is one edit. `%H` is systemd's host name specifier (the worker is named cpu@<host>; celery's own
 # `%h` is avoided because systemd would read it as the home directory).
 # Contract with the `atlas` package: `atlas.celery_app` exposes the Celery app as `app`, task_default_queue = "cpu",
 # and routes the GPU-bound tasks to the `gpu` queue (services research S3 pattern). Long tasks: task_acks_late with a
-# visibility_timeout longer than the longest task, both set in the app, not here.
+# visibility_timeout longer than the longest task, both set in the app, not here. The broker/result URLs (with the
+# Redis password) come from /etc/atlas/secrets/redis.env, read by PID 1.
+#
+# DOCKER GROUP == HOST ROOT (recorded, fix round): this worker runs the AEGIS sandbox (`docker run`, 16.4) and
+# processes untrusted content (RSS feeds, documents, web pages); a parser RCE or prompt injection that reaches a
+# shell here has host root through the docker socket (`docker run --privileged -v /:/host`). CONVENTIONS.md §2 fixes the
+# group membership, so the read-only paths, the sudoers fragments and the allowlist below are advisory for a
+# compromised worker; the alternatives are recorded in atlas-orchestrator.service's header.
+# Self-modification (16.3 items 6 and 8): package, venv, day1 copy and /etc read-only; see atlas-orchestrator.service.
 
 [Unit]
 Description=A.T.L.A.S. Celery worker (cpu queue)
@@ -19,6 +27,7 @@ Group=atlas
 SupplementaryGroups=docker
 WorkingDirectory=${ATLAS_OPT}/orchestrator
 EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 Environment=PYTHONUNBUFFERED=1
@@ -27,10 +36,15 @@ ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/
 ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app worker -Q cpu -n cpu@%H --loglevel=INFO --concurrency=${CELERY_CPU_CONCURRENCY} --max-tasks-per-child=50
 Restart=always
 RestartSec=5
+TimeoutStartSec=300
 # Warm shutdown: let running tasks finish (a Docling ingestion or a backtest can be long), then SIGKILL.
 KillMode=mixed
 TimeoutStopSec=300
 LimitNOFILE=65536
+ProtectSystem=full
+PrivateTmp=true
+ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv ${ATLAS_OPT}/day1 ${ATLAS_ETC}
+ReadWritePaths=${ATLAS_SRV} /var/lib/atlas -/srv/cold -/run/atlas
 
 [Install]
 WantedBy=multi-user.target

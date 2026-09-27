@@ -4,6 +4,14 @@
 #
 #   sudo ./atlas-day1.sh phase1 [--dry-run] [--force STEP] [--status]
 #   sudo /opt/atlas/day1/phase1-platform.sh [--no-reboot] [--dry-run] [--force STEP] [--status]
+#   sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist [FILE]
+#
+# --reload-allowlist is the lightweight path after an allowlist edit (config/allowlist.txt says so): it copies FILE
+# (when given) over this copy's config/allowlist.txt, re-renders /etc/squid/allowlist.txt and reloads squid. Nothing
+# else runs: no ufw reset, no dist-upgrade, no reboot, which is what `--force 04` would do.
+#
+# ATLAS_ENTRY (the command the steps print as "re-run with ...") is exported by atlas-day1.sh; when this driver is run
+# directly it is defaulted to the atlas-day1.sh beside this file, so the step files can expand it under `set -u`.
 #
 # The reboot in the middle (Section 17 step 4 -> 5): step 4 ends by calling phase1_request_reboot (defined here),
 # which writes step 4's done marker, writes $ATLAS_STATE/reboot-pending with the current boot id, and reboots. On
@@ -20,6 +28,8 @@
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
 
 export ATLAS_PHASE=phase1
+: "${ATLAS_ENTRY:=$(readlink -f "$(dirname "$(readlink -f "$0")")/atlas-day1.sh")}"
+export ATLAS_ENTRY
 ATLAS_REBOOT_MARKER="$ATLAS_STATE/reboot-pending"
 : "${ATLAS_NO_REBOOT:=0}"
 export ATLAS_NO_REBOOT
@@ -76,15 +86,28 @@ phase1_check_reboot() {
   log "resumed after the step-4 reboot (boot id $(_boot_id)); continuing from step 5"
 }
 
-# --- arguments: --no-reboot is ours, the rest is parse_common_args ----------------------------------------------------
+# --- arguments: --no-reboot and --reload-allowlist are ours, the rest is parse_common_args ---------------------------
 args=()
-for a in "$@"; do
-  case "$a" in
-    --no-reboot) ATLAS_NO_REBOOT=1; export ATLAS_NO_REBOOT ;;
-    *) args+=("$a") ;;
+reload_allowlist=0
+reload_file=""
+while (( $# > 0 )); do
+  case "$1" in
+    --no-reboot) ATLAS_NO_REBOOT=1; export ATLAS_NO_REBOOT; shift ;;
+    --reload-allowlist)
+      reload_allowlist=1
+      if [[ -n "${2:-}" && "${2:-}" != --* ]]; then reload_file="$2"; shift 2; else shift; fi ;;
+    *) args+=("$1"); shift ;;
   esac
 done
 require_root
+if (( reload_allowlist )); then
+  (( ${#args[@]} == 0 )) || die "--reload-allowlist takes an optional FILE and no other option"
+  # No load_env: the render needs only the allowlist, sentinel-feeds.json and the squid template (no atlas.env key).
+  # shellcheck source=phase1/04-system.sh
+  source "$ATLAS_DAY1_DIR/phase1/04-system.sh"
+  phase1_reload_allowlist "$reload_file"
+  exit 0
+fi
 parse_common_args "${args[@]}"
 
 if [[ "$ATLAS_DRY_RUN" == "1" ]]; then

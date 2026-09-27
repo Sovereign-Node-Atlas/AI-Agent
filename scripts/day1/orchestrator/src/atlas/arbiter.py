@@ -22,6 +22,25 @@ Rule map (the numbers are Section 4.2's):
 Budget (Section 4.1): budget = GTT total - resident set, where the resident set is what the counter shows before any
 engine is loaded (Ubuntu, XFCE, Docker, Open WebUI, the three resident small models, Kokoro/Whisper/PyAnnote, ...),
 measured at startup by `measure_resident_set()` (V3 makes this ~170 GB).
+
+What the projection follows (fix round). `systemctl start llama-server@<key>` runs the flags of
+$ATLAS_ENGINES_ENV_DIR/<key>.env (ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_KV_TYPE, ATLAS_CORESIDENT), rendered by
+phase2/engine-env.py from engines.json plus overrides.json — the orchestrator (user atlas) cannot re-render that
+root-owned file. So when the env file exists the Arbiter projects against exactly those values (the "hard pre-flight,
+the actual OOM backstop" of Section 4.3 then guards the real load) and refuses a request whose explicit ctx/parallel/
+kv/coresident argument disagrees with it; the everyday pairing of Section 4.1 (gpt-oss + the vision engine at 2 slots)
+therefore needs overrides.json to say coresident=true for qwen2.5-vl-72b (Phase 3's coresident step sets it through
+engine-env.py --set-override; that is a root action, never this process). Without an env file (unit tests, an engine
+not rendered yet) the projection comes from engines.json: full profile, or the coresident profile when another engine
+stays resident beside it (evictions are planned first; an engine that ends up alone is projected and loaded at its
+full profile).
+
+Locking (fix round). One state lock (`_cv`, a Condition) guards the ledger; the controller's stop/start and the
+release poll — minutes on a cold load — run OUTSIDE it. A load reserves its budget under the lock by inserting a
+placeholder Resident (`loading=True`, charged at the projection) and marking its victims `unloading=True`, sets `_busy`,
+releases the lock, does the I/O, then re-acquires to finalise. Every other entry point (status, generation lock, the
+FIFO, register/confirm) takes the short state lock only, so /health answers and a generation on the other resident
+engine can finish and release while a swap is in flight. A second load/unload while `_busy` is set is "queued".
 """
 
 from __future__ import annotations
@@ -37,7 +56,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from atlas.config import EngineSpec
+from atlas.config import EngineSpec, parse_env_file
 from atlas.engines import EngineControlError, EngineController
 from atlas.ledger import Ledger
 
@@ -76,7 +95,8 @@ KV_BYTES_PER_TOKEN_F16: dict[str, int] = {
     "rerank-bge-v2-m3": 0,
 }
 # ggml block layouts (VERIFIED, ggml-common.h): q8_0 = 34 bytes per 32 values (8.5 bit), q4_0 = 18 bytes per 32
-# values (4.5 bit).
+# values (4.5 bit). f16/f32 stay here for projections passed explicitly (the DeepSeek KV ladder's f16 result reaches
+# the Arbiter through the unit's env file); config.KV_CLASSES does not admit them in engines.json.
 KV_CLASS_FACTOR: dict[str, float] = {
     "f32": 2.0, "f16": 1.0, "bf16": 1.0, "q8_0": 8.5 / 16, "q4_0": 4.5 / 16, "none": 0.0,
 }
@@ -176,6 +196,40 @@ class Footprint:
         return self.total_bytes / GIB
 
 
+@dataclass(frozen=True)
+class UnitProfile:
+    """What `systemctl start llama-server@<key>` will actually run: the values of <engines_env_dir>/<key>.env."""
+
+    ctx: int
+    parallel: int
+    kv_type: str
+    coresident: bool
+    path: Path
+
+    def describe(self) -> str:
+        return (f"{self.path.name}: ctx {self.ctx} x {self.parallel} slots, kv {self.kv_type}, "
+                f"ATLAS_CORESIDENT={int(self.coresident)}")
+
+
+def read_unit_profile(path: Path) -> UnitProfile | None:
+    """Parse phase2/engine-env.py's env file; None when it does not exist, ArbiterError when it is malformed."""
+    if not path.is_file():
+        return None
+    env = parse_env_file(path)
+    missing = [k for k in ("ATLAS_CTX_SIZE", "ATLAS_PARALLEL", "ATLAS_KV_TYPE") if not env.get(k)]
+    if missing:
+        raise ArbiterError(f"{path}: missing {missing}; not rendered by phase2/engine-env.py? Re-run Phase 2 step 1")
+    try:
+        ctx, parallel = int(env["ATLAS_CTX_SIZE"]), int(env["ATLAS_PARALLEL"])
+    except ValueError as exc:
+        raise ArbiterError(f"{path}: ATLAS_CTX_SIZE/ATLAS_PARALLEL are not integers ({exc})") from exc
+    kv_type = env["ATLAS_KV_TYPE"]
+    if kv_type not in KV_CLASS_FACTOR:
+        raise ArbiterError(f"{path}: ATLAS_KV_TYPE {kv_type!r} has no size factor (known: {sorted(KV_CLASS_FACTOR)})")
+    return UnitProfile(ctx=ctx, parallel=parallel, kv_type=kv_type, coresident=env.get("ATLAS_CORESIDENT", "0") == "1",
+                       path=path)
+
+
 @dataclass
 class Resident:
     key: str
@@ -185,11 +239,17 @@ class Resident:
     last_used: float
     observed_bytes: int = 0  # GTT delta seen when the engine loaded; the release target of rule 5
     measured_bytes: int | None = None
+    loading: bool = False  # placeholder: budget reserved, `systemctl start` in flight outside the lock
+    unloading: bool = False  # stop/release poll in flight; still charged until the counter confirms the release
 
     @property
     def charged_bytes(self) -> int:
         """What the ledger charges against the budget: the measurement when there is one, else the projection."""
         return self.measured_bytes if self.measured_bytes is not None else self.footprint.total_bytes
+
+    @property
+    def serving(self) -> bool:
+        return not self.loading and not self.unloading
 
 
 @dataclass(frozen=True)
@@ -221,6 +281,20 @@ class DeepThinkPlan:
     @property
     def downgraded(self) -> bool:
         return self.requested != self.granted
+
+
+@dataclass(frozen=True)
+class _LoadPlan:
+    """A reserved load: the placeholder is in `resident`, the victims are marked, `_busy` is set."""
+
+    key: str
+    spec: EngineSpec
+    footprint: Footprint
+    victims: tuple[str, ...]
+    task_id: str | None
+    coresident: bool
+    profile: UnitProfile | None
+    resident_small: bool = False
 
 
 DEEP_THINK_TIERS: tuple[str, ...] = ("deep", "standard", "quick")  # Section 9.1, highest first
@@ -255,6 +329,7 @@ class Arbiter:
                  release_tolerance_bytes: int = GIB, poll_interval_s: float = 1.0,
                  resident_set_bytes: int | None = None, headroom_bytes: int = 0,
                  deep_think_engines: dict[str, Sequence[str]] | None = None,
+                 engines_env_dir: Path | None = None,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
         self.engines = engines
         self.controller = controller
@@ -264,18 +339,24 @@ class Arbiter:
         self.release_tolerance_bytes = release_tolerance_bytes  # research §6.3: within ~1 GiB of the baseline
         self.poll_interval_s = poll_interval_s
         self.headroom_bytes = headroom_bytes
+        # $ATLAS_ENGINES_ENV_DIR (Settings.engines_env_dir): the unit env files the projection follows when present.
+        self.engines_env_dir = engines_env_dir
         self._clock = clock
         self._sleep = sleep
         self._resident_set_bytes = resident_set_bytes
         self.resident: dict[str, Resident] = {}  # rule 1, insertion order = load order
         self.measured: dict[str, int] = {}  # measured total footprints by engine key (Phase 3 / Phase 4 step 5)
-        self._cv = threading.Condition(threading.RLock())
+        self._cv = threading.Condition(threading.RLock())  # the state lock; never held across controller I/O
+        self._busy: str | None = None  # "loading <key>" / "unloading <key>" while the I/O runs outside the lock
         self._gen_holder: str | None = None  # task id
         self._gen_engine: str | None = None
         self._gen_queue: deque[str] = deque()  # FIFO tickets (rule 4)
         self._halted: str | None = None  # set by a ReleaseTimeout; every later load is refused with this reason
+        self._warned_no_env: set[str] = set()
         self.deep_think_engines: dict[str, tuple[str, ...]] = {
-            "deep": (APEX_KEY,),  # 9.1: the Apex engine delivers the deep synthesis
+            # 9.1: Standard plus a second expansion and scoring round, the Apex engine delivering the final synthesis,
+            # Qwen3.5 as third opinion on documents — run one at a time, requested up front (rule 8).
+            "deep": ("gpt-oss-120b", "nemotron-3-super", "qwen3.5-122b", APEX_KEY),
             "standard": ("gpt-oss-120b", "nemotron-3-super"),  # 9.1: Ren generates, Arthur scores, swapped in turn
             "quick": (),  # 9.1: the currently loaded engine, no swap
         }
@@ -306,11 +387,18 @@ class Arbiter:
 
     @property
     def charged_bytes(self) -> int:
-        return sum(r.charged_bytes for r in self.resident.values())
+        with self._cv:
+            return sum(r.charged_bytes for r in self.resident.values())
 
     @property
     def free_bytes(self) -> int:
         return self.budget_bytes - self.charged_bytes
+
+    @property
+    def busy(self) -> str | None:
+        """The load/unload whose controller I/O is in flight, or None."""
+        with self._cv:
+            return self._busy
 
     # --- footprints (rule 2) ---------------------------------------------------------------------------------------
 
@@ -320,19 +408,43 @@ class Arbiter:
         except KeyError as exc:
             raise UnknownEngine(f"unknown engine {key!r} (CONVENTIONS.md §8 keys)") from exc
 
+    def _footprint(self, spec: EngineSpec, ctx: int, parallel: int, kv_class: str) -> Footprint:
+        if spec.is_resident:
+            return Footprint(0, 0, ctx, parallel, kv_class)
+        if spec.key in self.measured and (ctx, parallel, kv_class) == (spec.ctx_size, spec.parallel, spec.kv_class):
+            return Footprint(self.measured[spec.key], 0, ctx, parallel, kv_class, measured=True)
+        return Footprint(spec.footprint_bytes, kv_estimate_bytes(spec, ctx, parallel, kv_class), ctx, parallel,
+                         kv_class)
+
     def projected_footprint(self, key: str, ctx: int | None = None, parallel: int | None = None,
                             kv_class: str | None = None, *, coresident: bool = False) -> Footprint:
+        """The engines.json projection: the full profile, or the coresident one (ctx_size_coresident x
+        parallel_coresident) when `coresident` and the engine defines it. See unit_profile() for what the unit runs."""
         spec = self.spec(key)
         if ctx is None:
             ctx = spec.ctx_size_coresident if coresident and spec.ctx_size_coresident else spec.ctx_size
         if parallel is None:
             parallel = spec.parallel_coresident if coresident and spec.parallel_coresident else spec.parallel
-        if spec.is_resident:
-            return Footprint(0, 0, ctx, parallel, spec.kv_class)
-        if key in self.measured and ctx == spec.ctx_size and parallel == spec.parallel and kv_class is None:
-            return Footprint(self.measured[key], 0, ctx, parallel, spec.kv_class, measured=True)
-        kv = kv_estimate_bytes(spec, ctx, parallel, kv_class)
-        return Footprint(spec.footprint_bytes, kv, ctx, parallel, kv_class or spec.kv_class)
+        return self._footprint(spec, ctx, parallel, kv_class or spec.kv_class)
+
+    def unit_profile(self, key: str) -> UnitProfile | None:
+        """<engines_env_dir>/<key>.env as phase2/engine-env.py rendered it, or None (no dir, or not rendered yet)."""
+        spec = self.spec(key)
+        if self.engines_env_dir is None or spec.is_resident:
+            return None
+        profile = read_unit_profile(Path(self.engines_env_dir) / f"{key}.env")
+        if profile is None and key not in self._warned_no_env:
+            self._warned_no_env.add(key)
+            log.warning("arbiter engine=%s no env file under %s; projecting from engines.json (systemctl start will "
+                        "fail until phase2/engine-env.py has rendered it)", key, self.engines_env_dir)
+        return profile
+
+    def unit_footprint(self, key: str) -> tuple[Footprint, UnitProfile] | None:
+        """The projection for what the unit will really run, or None when there is no env file."""
+        profile = self.unit_profile(key)
+        if profile is None:
+            return None
+        return self._footprint(self.spec(key), profile.ctx, profile.parallel, profile.kv_type), profile
 
     def register_measured(self, key: str, total_bytes: int, *, task_id: str | None = None) -> None:
         """Phase 3 step 2 / Phase 4 step 5: replace the estimate with the measured footprint (rule 1)."""
@@ -352,6 +464,9 @@ class Arbiter:
             res = self.resident.get(key)
             if res is None:
                 raise ArbiterError(f"{key} is not resident; nothing to confirm")
+            if not res.serving:
+                what = "loading" if res.loading else "unloading"
+                raise ArbiterError(f"{key} is still {what}; nothing to confirm yet")
             others = sum(r.charged_bytes for k, r in self.resident.items() if k != key)
             measured = max(0, self.probe.gtt_used_bytes() - self.resident_set_bytes - others)
             if measured > res.footprint.total_bytes + self.release_tolerance_bytes:
@@ -368,73 +483,163 @@ class Arbiter:
                      kv_class: str | None = None) -> LoadDecision:
         """Grant, queue or refuse a load. Granted means the engine is resident and serving when this returns.
 
-        wait_s=None returns "queued" immediately when a running generation blocks an eviction (rules 4, 6); a number
-        waits up to that long for the generation to finish and then retries.
+        wait_s=None returns "queued" immediately when a running generation blocks an eviction (rules 4, 6) or another
+        load/unload is in flight; a number waits up to that long and retries.
         """
         deadline = None if wait_s is None else self._clock() + wait_s
-        with self._cv:
-            while True:
-                decision = self._try_load(key, ctx, parallel, task_id, coresident, kv_class)
-                if decision.decision is not Decision.QUEUED or deadline is None:
-                    return decision
-                remaining = deadline - self._clock()
-                if remaining <= 0:
-                    return decision
-                self._cv.wait(timeout=min(remaining, 1.0))
+        while True:
+            with self._cv:
+                outcome = self._plan_load(key, ctx, parallel, task_id, coresident, kv_class)
+                if isinstance(outcome, LoadDecision):
+                    if outcome.decision is not Decision.QUEUED or deadline is None:
+                        return outcome
+                    remaining = deadline - self._clock()
+                    if remaining <= 0:
+                        return outcome
+                    self._cv.wait(timeout=min(remaining, 1.0))
+                    continue
+                plan = outcome
+            # The budget is reserved and _busy is set: the slow part runs with the lock released.
+            return self._execute_load(plan)
 
-    def _try_load(self, key: str, ctx: int | None, parallel: int | None, task_id: str | None,
-                  coresident: bool | None, kv_class: str | None) -> LoadDecision:
+    def _plan_load(self, key: str, ctx: int | None, parallel: int | None, task_id: str | None,
+                   coresident: bool | None, kv_class: str | None) -> LoadDecision | _LoadPlan:
+        """Under the lock: decide, and when the answer is a load, reserve it (placeholder + victims + _busy)."""
         spec = self.spec(key)
         if spec.is_resident:
             # Resident small models are started by systemd at boot and never counted (Section 4.1, 5.3).
-            if not self.controller.is_active(key):
-                self.controller.start(key)
-            return self._decide(Decision.GRANTED, key, task_id, 0, "resident small model; not budgeted (Section 4.1)")
+            if self._busy:
+                return self._decide(Decision.QUEUED, key, task_id, 0, f"arbiter busy: {self._busy}")
+            self._busy = f"starting resident {key}"
+            return _LoadPlan(key, spec, Footprint(0, 0, spec.ctx_size, spec.parallel, spec.kv_class), (), task_id,
+                             False, None, resident_small=True)
         if self._halted:
             return self._decide(Decision.REFUSED, key, task_id, 0, f"arbiter halted: {self._halted}")
-        if coresident is None:
-            coresident = bool(self.resident) and not spec.is_apex and key not in self.resident
-        fp = self.projected_footprint(key, ctx, parallel, kv_class, coresident=coresident)
+        res = self.resident.get(key)
+        if res is not None:
+            if res.loading:
+                return self._decide(Decision.QUEUED, key, task_id, res.footprint.total_bytes,
+                                    f"load of {key} already in progress")
+            if res.unloading:
+                return self._decide(Decision.QUEUED, key, task_id, res.footprint.total_bytes,
+                                    f"unload of {key} in progress; retry when it has released")
+            fp0 = res.footprint
+            mismatch = [f"{name} {want!r} != resident {have!r}" for name, want, have in (
+                ("ctx", ctx, fp0.ctx), ("parallel", parallel, fp0.parallel), ("kv_class", kv_class, fp0.kv_class),
+            ) if want is not None and want != have]
+            if mismatch:
+                # A swap is free only at the profile that is running; a different one needs an unload first.
+                return self._decide(Decision.REFUSED, key, task_id, fp0.total_bytes,
+                                    f"resident at ctx {fp0.ctx} x {fp0.parallel} slots, kv {fp0.kv_class}; requested "
+                                    f"{', '.join(mismatch)}: request_unload() first")
+            res.last_used = self._clock()
+            return self._decide(Decision.GRANTED, key, task_id, res.footprint.total_bytes,
+                                "already resident (swap is free)")
+        if self._busy:
+            return self._decide(Decision.QUEUED, key, task_id, 0, f"arbiter busy: {self._busy}")
         budget = self.budget_bytes
-        if key in self.resident:
-            self.resident[key].last_used = self._clock()
-            return self._decide(Decision.GRANTED, key, task_id, fp.total_bytes, "already resident (swap is free)")
+        # 1. What will actually load: the unit's env file when it exists, else the engines.json profile.
+        unit = self.unit_footprint(key)
+        profile: UnitProfile | None = None
+        auto = coresident is None
+        if unit is not None:
+            fp, profile = unit
+            mismatch = [f"{name} {want!r} != unit {have!r}" for name, want, have in (
+                ("coresident", coresident, profile.coresident), ("ctx", ctx, profile.ctx),
+                ("parallel", parallel, profile.parallel), ("kv_class", kv_class, profile.kv_type),
+            ) if want is not None and want != have]
+            if mismatch:
+                return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
+                                    f"requested {', '.join(mismatch)}: the unit runs {profile.describe()}; change "
+                                    "it with phase2/engine-env.py --set-override (root), the Arbiter cannot")
+            co = profile.coresident
+        else:
+            co = coresident if not auto else (bool(self.resident) and not spec.is_apex)
+            fp = self.projected_footprint(key, ctx, parallel, kv_class, coresident=co)
         if fp.total_bytes > budget:
             return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
                                 f"projected {fp.total_gib:.1f} GiB exceeds the engine budget {budget / GIB:.1f} GiB "
-                                "(Section 4.2 rule 2)")
+                                "(Section 4.2 rule 2)" + (f"; unit runs {profile.describe()}" if profile else ""))
         apex_resident = [k for k, r in self.resident.items() if r.spec.is_apex]
         if apex_resident and not spec.is_apex:
             return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
                                 f"Apex engine {apex_resident[0]} is resident and exclusive (Section 4.2 rule 7)")
-        victims = self._plan_evictions(key, spec, fp)
+        # 2. Evictions, planned against that footprint (rule 3, LRU; rule 6 says queued when a victim generates).
+        victims = self._plan_evictions(spec, fp)
         if victims is None:
             return self._decide(Decision.QUEUED, key, task_id, fp.total_bytes,
                                 f"generation in progress on {self._gen_engine} (task {self._gen_holder}); "
                                 "never preempted (Section 4.2 rule 6)")
+        # 3. No env file and nothing stays beside it: an engine that ends up alone runs its full profile, not a
+        #    quarter of its context (fix round). Re-project and re-check; everything is already being evicted.
+        if profile is None and auto and co and not any(k not in victims for k in self.resident):
+            co = False
+            fp = self.projected_footprint(key, ctx, parallel, kv_class, coresident=False)
+            if fp.total_bytes > budget:
+                return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
+                                    f"projected {fp.total_gib:.1f} GiB (full profile, would run alone) exceeds the "
+                                    f"engine budget {budget / GIB:.1f} GiB (Section 4.2 rule 2)")
+        # 4. Reserve: the placeholder is charged at the projection so nothing else can claim the memory meanwhile.
+        now = self._clock()
+        self.resident[key] = Resident(key=key, spec=spec, footprint=fp, loaded_at=now, last_used=now, loading=True,
+                                      measured_bytes=self.measured.get(key) if fp.measured else None)
+        for victim in victims:
+            self.resident[victim].unloading = True
+        self._busy = f"loading {key}" + (f" (evicting {', '.join(victims)})" if victims else "")
+        return _LoadPlan(key, spec, fp, tuple(victims), task_id, co, profile)
+
+    def _execute_load(self, plan: _LoadPlan) -> LoadDecision:
+        """Outside the lock: stop the victims (rule 5 per victim), start the engine, then finalise under the lock."""
+        key, task_id = plan.key, plan.task_id
+        if plan.resident_small:
+            try:
+                if not self.controller.is_active(key):
+                    self.controller.start(key)
+            finally:
+                with self._cv:
+                    self._busy = None
+                    self._cv.notify_all()
+            return self._decide(Decision.GRANTED, key, task_id, 0, "resident small model; not budgeted (Section 4.1)")
         try:
-            for victim in victims:
-                self._unload(victim, task_id, reason=f"evicted for {key}")
+            for victim in plan.victims:
+                self._stop_and_confirm(victim, task_id, reason=f"evicted for {key}")
             used_before = self.probe.gtt_used_bytes()
             self.controller.start(key)
         except ReleaseTimeout:
+            with self._cv:
+                self.resident.pop(key, None)  # nothing was started; the reservation is void
+                self._busy = None
+                self._cv.notify_all()
             raise
         except EngineControlError as exc:
-            self._decide(Decision.ERROR, key, task_id, fp.total_bytes, f"start failed: {exc}")
+            with self._cv:
+                self.resident.pop(key, None)
+                self._busy = None
+                self._cv.notify_all()
+                self._decide(Decision.ERROR, key, task_id, plan.footprint.total_bytes, f"start failed: {exc}")
             raise
-        now = self._clock()
         # What the counter actually grew by is what rule 5 must see come back after the stop.
         observed = max(0, self.probe.gtt_used_bytes() - used_before)
-        self.resident[key] = Resident(key=key, spec=spec, footprint=fp, loaded_at=now, last_used=now,
-                                      observed_bytes=observed,
-                                      measured_bytes=self.measured.get(key) if fp.measured else None)
-        self._cv.notify_all()
-        return self._decide(Decision.GRANTED, key, task_id, fp.total_bytes,
-                            f"loaded ({'coresident ' if coresident else ''}ctx {fp.ctx} x {fp.parallel} slots, "
-                            f"kv {fp.kv_class})", evicted=tuple(victims))
+        with self._cv:
+            res = self.resident[key]
+            now = self._clock()
+            res.loading = False
+            res.loaded_at = res.last_used = now
+            res.observed_bytes = observed
+            self._busy = None
+            self._cv.notify_all()
+            how = (f"unit env {plan.profile.describe()}" if plan.profile else
+                   f"{'coresident ' if plan.coresident else ''}ctx {plan.footprint.ctx} x {plan.footprint.parallel} "
+                   f"slots, kv {plan.footprint.kv_class}")
+            hint = ""
+            if plan.profile and not plan.profile.coresident and plan.victims and plan.spec.ctx_size_coresident:
+                hint = ("; co-residency needs overrides.json coresident=true for this engine "
+                        "(phase2/engine-env.py --set-override, root)")
+            return self._decide(Decision.GRANTED, key, task_id, plan.footprint.total_bytes, f"loaded ({how}){hint}",
+                                evicted=plan.victims)
 
-    def _plan_evictions(self, key: str, spec: EngineSpec, fp: Footprint) -> list[str] | None:
-        """Which residents must go so `key` fits; None when a needed victim is generating (rule 6)."""
+    def _plan_evictions(self, spec: EngineSpec, fp: Footprint) -> list[str] | None:
+        """Which residents must go so `spec` fits; None when a needed victim is generating (rule 6)."""
         if spec.is_apex:
             victims = list(self.resident)  # rule 7: everything else leaves first
         else:
@@ -457,24 +662,38 @@ class Arbiter:
 
     def request_unload(self, key: str, *, task_id: str | None = None, wait_s: float | None = None) -> LoadDecision:
         deadline = None if wait_s is None else self._clock() + wait_s
-        with self._cv:
-            while True:
-                if key not in self.resident:
+        while True:
+            with self._cv:
+                res = self.resident.get(key)
+                if res is None:
                     return self._decide(Decision.GRANTED, key, task_id, 0, "not resident; nothing to unload")
-                if not self._is_generating(key):
-                    self._unload(key, task_id, reason="unload requested")
-                    self._cv.notify_all()
-                    return self._decide(Decision.GRANTED, key, task_id, 0, "unloaded; memory release confirmed")
+                if self._busy or not res.serving:
+                    decision = self._decide(Decision.QUEUED, key, task_id, 0, f"arbiter busy: {self._busy}")
+                elif self._is_generating(key):
+                    decision = self._decide(Decision.QUEUED, key, task_id, 0,
+                                            f"generating (task {self._gen_holder}); never preempted (rule 6)")
+                else:
+                    res.unloading = True
+                    self._busy = f"unloading {key}"
+                    break
                 if deadline is None or deadline - self._clock() <= 0:
-                    return self._decide(Decision.QUEUED, key, task_id, 0,
-                                        f"generating (task {self._gen_holder}); never preempted (rule 6)")
+                    return decision
                 self._cv.wait(timeout=min(deadline - self._clock(), 1.0))
+        try:
+            self._stop_and_confirm(key, task_id, reason="unload requested")
+        finally:
+            with self._cv:
+                self._busy = None
+                self._cv.notify_all()
+        return self._decide(Decision.GRANTED, key, task_id, 0, "unloaded; memory release confirmed")
 
-    def _unload(self, key: str, task_id: str | None, *, reason: str) -> None:
-        res = self.resident[key]
+    def _stop_and_confirm(self, key: str, task_id: str | None, *, reason: str) -> None:
+        """Stop the unit and poll the counter until the memory is back (rule 5). Runs with the lock RELEASED; the
+        engine stays in `resident` (unloading=True, still charged) until the release is confirmed."""
+        with self._cv:
+            res = self.resident[key]
         before = self.probe.gtt_used_bytes()
         self.controller.stop(key)
-        del self.resident[key]
         # Rule 5: trust the counter, not the process exit. The engine's share is the delta observed at its load (or the
         # measurement when one replaced it); the counter must fall back by that much, within the tolerance.
         share = res.measured_bytes if res.measured_bytes is not None else res.observed_bytes
@@ -483,26 +702,37 @@ class Arbiter:
         used = self.probe.gtt_used_bytes()
         while used > target:
             if self._clock() >= deadline:
-                self._halted = (f"GTT not released after stopping {key}: {used / GIB:.2f} GiB still used, "
-                                f"expected <= {target / GIB:.2f} GiB after {self.release_timeout_s:.0f}s")
-                self._decide(Decision.ERROR, key, task_id, res.charged_bytes, self._halted)
-                raise ReleaseTimeout(self._halted + " (Section 4.2 rule 5; check journalctl -u llama-server@"
+                halted = (f"GTT not released after stopping {key}: {used / GIB:.2f} GiB still used, "
+                          f"expected <= {target / GIB:.2f} GiB after {self.release_timeout_s:.0f}s")
+                with self._cv:
+                    self._halted = halted
+                    del self.resident[key]  # the process is gone; the memory is not, and the Arbiter says so
+                    self._decide(Decision.ERROR, key, task_id, res.charged_bytes, halted)
+                    self._cv.notify_all()
+                raise ReleaseTimeout(halted + " (Section 4.2 rule 5; check journalctl -u llama-server@"
                                      f"{key} and /sys/class/drm/card*/device/mem_info_gtt_used)")
             self._sleep(self.poll_interval_s)
             used = self.probe.gtt_used_bytes()
-        self._decide(Decision.GRANTED, key, task_id, res.charged_bytes,
-                     f"{reason}; release confirmed at {used / GIB:.2f} GiB used", action="unload")
+        with self._cv:
+            del self.resident[key]
+            self._decide(Decision.GRANTED, key, task_id, res.charged_bytes,
+                         f"{reason}; release confirmed at {used / GIB:.2f} GiB used", action="unload")
+            self._cv.notify_all()
 
     # --- generation lock (rules 3, 4, 6) ---------------------------------------------------------------------------
+
+    def _serving(self, key: str) -> bool:
+        res = self.resident.get(key)
+        return res is not None and res.serving
 
     def try_generation(self, key: str, *, task_id: str) -> LoadDecision:
         """Non-blocking: granted (and the lock is now held by task_id) or queued."""
         with self._cv:
-            if self._gen_holder is None and not self._gen_queue and key in self.resident:
+            if self._gen_holder is None and not self._gen_queue and self._serving(key):
                 self._gen_holder, self._gen_engine = task_id, key
                 self.resident[key].last_used = self._clock()
                 return self._decide(Decision.GRANTED, key, task_id, 0, "generation lock acquired", action="generation")
-            if key not in self.resident:
+            if not self._serving(key):
                 return self._decide(Decision.REFUSED, key, task_id, 0, "engine not resident; load it first",
                                     action="generation")
             return self._decide(Decision.QUEUED, key, task_id, 0,
@@ -521,7 +751,7 @@ class Arbiter:
         """Blocking FIFO acquisition of the single generation slot (rule 3/4); raises ArbiterError on timeout."""
         deadline = None if timeout_s is None else self._clock() + timeout_s
         with self._cv:
-            if key not in self.resident:
+            if not self._serving(key):
                 raise ArbiterError(f"{key} is not resident; request_load() first")
             self._gen_queue.append(task_id)
             try:
@@ -532,12 +762,16 @@ class Arbiter:
                                      action="generation")
                         raise ArbiterError(f"task {task_id}: no generation slot within {timeout_s}s")
                     self._cv.wait(timeout=None if remaining is None else min(remaining, 1.0))
+                if not self._serving(key):
+                    # Evicted while queued (rule 6 protects the running generation only): say so, do not run.
+                    raise ArbiterError(f"{key} was unloaded while task {task_id} waited for the generation slot")
                 self._gen_queue.popleft()
                 self._gen_holder, self._gen_engine = task_id, key
                 self.resident[key].last_used = self._clock()
             except BaseException:
                 if task_id in self._gen_queue:
                     self._gen_queue.remove(task_id)
+                self._cv.notify_all()
                 raise
             self._decide(Decision.GRANTED, key, task_id, 0, "generation lock acquired", action="generation")
         try:
@@ -561,13 +795,20 @@ class Arbiter:
     # --- Deep Think (rule 8, Section 9.1) --------------------------------------------------------------------------
 
     def tier_required_bytes(self, tier: str) -> tuple[int, tuple[str, ...]]:
-        """The full footprint a tier pre-requests: its engines run one at a time, so the largest one must fit alone."""
+        """The full footprint a tier pre-requests: its engines run one at a time, so the largest one must fit alone.
+
+        Each engine is projected as its unit will run it (env file) when that is known, else from engines.json.
+        """
         engines = self.deep_think_engines.get(tier)
         if engines is None:
             raise ArbiterError(f"unknown Deep Think tier {tier!r} (Section 9.1: {DEEP_THINK_TIERS})")
         if not engines:
             return 0, ()
-        return max(self.projected_footprint(k).total_bytes for k in engines), engines
+        sizes = []
+        for k in engines:
+            unit = self.unit_footprint(k)
+            sizes.append((unit[0] if unit else self.projected_footprint(k)).total_bytes)
+        return max(sizes), engines
 
     def plan_deep_think(self, tier: str, *, task_id: str | None = None) -> DeepThinkPlan:
         if tier not in DEEP_THINK_TIERS:
@@ -592,6 +833,7 @@ class Arbiter:
     # --- status and logging (rule 9) -------------------------------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
+        """The ledger view; takes the state lock only, so it answers while a load or unload is in flight."""
         with self._cv:
             gen = self.generating
             return {
@@ -604,9 +846,11 @@ class Arbiter:
                 "resident": [
                     {"engine": r.key, "class": r.spec.arbiter_class, "projected_bytes": r.footprint.total_bytes,
                      "measured_bytes": r.measured_bytes, "ctx": r.footprint.ctx, "parallel": r.footprint.parallel,
-                     "kv_class": r.footprint.kv_class, "loaded_at": r.loaded_at, "last_used": r.last_used}
+                     "kv_class": r.footprint.kv_class, "loaded_at": r.loaded_at, "last_used": r.last_used,
+                     "loading": r.loading, "unloading": r.unloading}
                     for r in self.resident.values()
                 ],
+                "busy": self._busy,
                 "generating": None if gen is None else {"engine": gen[0], "task_id": gen[1]},
                 "generation_queue": list(self._gen_queue),
                 "halted": self._halted,
@@ -614,16 +858,18 @@ class Arbiter:
 
     def _decide(self, decision: Decision, key: str | None, task_id: str | None, projected: int, reason: str, *,
                 action: str = "load", evicted: tuple[str, ...] = ()) -> LoadDecision:
-        budget = self.budget_bytes if self._resident_set_bytes is not None else 0
-        free = self.free_bytes if self._resident_set_bytes is not None else 0
-        self._log(action, key, decision, task_id, projected, reason, budget=budget, free=free)
+        with self._cv:
+            budget = self.budget_bytes if self._resident_set_bytes is not None else 0
+            free = self.free_bytes if self._resident_set_bytes is not None else 0
+            self._log(action, key, decision, task_id, projected, reason, budget=budget, free=free)
         return LoadDecision(decision, key or "", task_id, projected, budget, free, reason, evicted)
 
     def _log(self, action: str, key: str | None, decision: Decision, task_id: str | None, projected: int,
              reason: str, *, budget: int | None = None, free: int | None = None) -> None:
-        budget = self.budget_bytes if budget is None and self._resident_set_bytes is not None else budget
-        free = self.free_bytes if free is None and self._resident_set_bytes is not None else free
-        resident = list(self.resident)
+        with self._cv:
+            budget = self.budget_bytes if budget is None and self._resident_set_bytes is not None else budget
+            free = self.free_bytes if free is None and self._resident_set_bytes is not None else free
+            resident = list(self.resident)
         level = logging.INFO if decision in (Decision.GRANTED, Decision.QUEUED) else logging.WARNING
         log.log(level, "arbiter action=%s decision=%s engine=%s task_id=%s projected_gib=%.2f budget_gib=%.2f "
                 "free_gib=%.2f resident=%s reason=%s", action, decision.value, key, task_id, projected / GIB,
@@ -637,15 +883,22 @@ class Arbiter:
                 log.exception("arbiter: ledger write failed (decision above is still logged)")
 
 
-def build_arbiter(engines: dict[str, EngineSpec], *, ledger: Ledger | None = None, **kw: Any) -> Arbiter:
-    """The production wiring: sysfs probe and the systemd controller (CONVENTIONS.md §8)."""
+def build_arbiter(engines: dict[str, EngineSpec], *, ledger: Ledger | None = None,
+                  engines_env_dir: Path | None = None, **kw: Any) -> Arbiter:
+    """The production wiring: sysfs probe, the systemd controller (CONVENTIONS.md §8) and the unit env files
+    (Settings.engines_env_dir = ATLAS_ENGINES_ENV_DIR, phase2/02-orchestrator.sh) the projection follows."""
+    from atlas.config import Settings
     from atlas.engines import SystemdEngineController
 
-    return Arbiter(engines, SystemdEngineController(engines=engines), SysfsMemoryProbe(), ledger=ledger, **kw)
+    if engines_env_dir is None:
+        engines_env_dir = Settings.from_env().engines_env_dir
+    return Arbiter(engines, SystemdEngineController(engines=engines), SysfsMemoryProbe(), ledger=ledger,
+                   engines_env_dir=engines_env_dir, **kw)
 
 
 __all__ = [
-    "APEX_KEY", "GIB", "KV_BYTES_PER_TOKEN_F16", "KV_CLASS_FACTOR", "MAX_RESIDENT", "Arbiter", "ArbiterError",
-    "Decision", "DeepThinkPlan", "Footprint", "LoadDecision", "MemoryProbe", "ReleaseTimeout", "Resident",
-    "StubProbe", "SysfsMemoryProbe", "UnknownEngine", "build_arbiter", "kv_estimate_bytes",
+    "APEX_KEY", "DEEP_THINK_TIERS", "GIB", "KV_BYTES_PER_TOKEN_F16", "KV_CLASS_FACTOR", "MAX_RESIDENT", "Arbiter",
+    "ArbiterError", "Decision", "DeepThinkPlan", "Footprint", "LoadDecision", "MemoryProbe", "ReleaseTimeout",
+    "Resident", "StubProbe", "SysfsMemoryProbe", "UnitProfile", "UnknownEngine", "build_arbiter",
+    "kv_estimate_bytes", "read_unit_profile",
 ]

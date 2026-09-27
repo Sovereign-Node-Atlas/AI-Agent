@@ -86,21 +86,34 @@ def record_strike(
     task_id: str | None = None,
     hemisphere: str | None = None,
     session_id: str | None = None,
+    vault: bool = False,
 ) -> dict[str, Any]:
     """Write the strike row and the scar. Returns {strike_id, scar_id, scar_written, reason}.
 
-    The scar write is a normal memory write: a vault-tagged session's strike is recorded in the ledger (it is an
-    operational fact) but its scar text, which could carry vault content, is dropped by atlas.memory (10.5).
+    Vault rule (10.5, fix round): a strike raised in a vault-tagged session (`vault=True`, or `session_id` that
+    `memory.sessions` marks vault) is recorded in the ledger as the operational fact it is, but its `context` (the
+    Principal's own words or a pasted vault document) is WITHHELD from the ledger description, because the SQLite
+    ledger under /srv/atlas/data is in restic's include set ("not backed up outside the vault itself"), and no scar is
+    written at all (the scar text would carry the same content into the `scars` collection and into later prompts).
+    This is decided here, before any write; it does not rely on atlas.memory's drop.
     """
     if kind not in STRIKE_KINDS:
         raise ValueError(f"strike kind {kind!r} not in {sorted(STRIKE_KINDS)} (Section 9.4 strike input)")
     persona = (persona or "unknown").strip().lower()
     domain = (domain or "general").strip()
-    description = f"{error.strip()[:500]} | {context.strip()[:500]}"
+    vault = bool(vault) or (memory is not None and memory.sessions.is_vault(session_id))
+    if vault:
+        description = f"{error.strip()[:500]} | (vault session: context withheld, Section 10.5)"
+    else:
+        description = f"{error.strip()[:500]} | {context.strip()[:500]}"
     strike_id = ledger.insert_strike(
         task_id=task_id, kind=kind, description=description, source=source, resolution=correction or None
     )
     result: dict[str, Any] = {"strike_id": strike_id, "scar_id": None, "scar_written": False, "reason": ""}
+    if vault:
+        result["reason"] = "vault-tagged session: strike recorded without context, no scar (Section 10.5)"
+        log.warning("strike #%d (%s/%s): %s", strike_id, persona, domain, result["reason"])
+        return result
     if memory is None:
         result["reason"] = "no memory store configured; strike recorded in the ledger only"
         log.warning("strike #%d recorded without a scar: %s", strike_id, result["reason"])
@@ -152,7 +165,12 @@ def retrieve_scars(
     persona: str | None = None,
     domain: str | None = None,
 ) -> list[Scar]:
-    """The closest scars within the distance threshold, optionally narrowed to a persona or domain tag."""
+    """The closest scars within the distance threshold, optionally narrowed to a persona or domain tag.
+
+    The dispatch path (atlas.api._retrieve) passes NO persona filter (fix round): the Principal's own `[LOG STRIKE:]`
+    scars and automatic ones from any persona are the 9.4 injection input ("the closest few scars above a similarity
+    threshold"); similarity, not authorship, decides. The filters remain for callers that want one persona's scars.
+    """
     if not query.strip() or k < 1:
         return []
     where: dict[str, Any] | None = None

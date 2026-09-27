@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,38 @@ def test_init_db_creates_every_table_and_is_idempotent(tmp_path: Path) -> None:
     again = open_ledger(db)
     assert set(again.tables()) == EXPECTED_TABLES
     again.close()
+
+
+def test_ledger_files_are_group_readable_only(tmp_path: Path) -> None:
+    # Sensitive-tier Principal data (approval drafts, payloads, family-name hits): 750 directory, 640 files, whatever
+    # the caller's umask and wherever ATLAS_DB_PATH points (`atlas-admin init-db --db` loses the installer's guard).
+    db = tmp_path / "deep" / "atlas.sqlite3"
+    ledger = Ledger(db)
+    ledger.init_db()
+    ledger.insert_task("chat")  # forces the -wal file into existence
+    assert stat.S_IMODE(db.stat().st_mode) == 0o640
+    assert stat.S_IMODE(db.parent.stat().st_mode) & 0o027 == 0  # no group-write, nothing for others
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(db) + suffix)
+        if side.exists():
+            assert stat.S_IMODE(side.stat().st_mode) == 0o640, suffix
+    ledger.close()
+    db.chmod(0o644)  # a pre-existing file created under a looser umask is tightened on open
+    Ledger(db).close()
+    assert stat.S_IMODE(db.stat().st_mode) == 0o640
+
+
+def test_sql_identifiers_are_guarded() -> None:
+    ledger = Ledger(":memory:")
+    ledger.init_db()
+    with pytest.raises(ValueError, match="not a ledger table"):
+        ledger.record_json("sqlite_master", "x", key_col="name")
+    with pytest.raises(ValueError, match="not a bare identifier"):
+        ledger.record_json("tasks", "x", key_col="id = '' OR 1=1 --")
+    with pytest.raises(ValueError, match="not a ledger table"):
+        ledger._insert("tasks; DROP TABLE tasks", {"id": "x"})
+    with pytest.raises(ValueError, match="not a bare identifier"):
+        ledger._update("tasks", "id", "x", {"status = 'done' --": 1})
 
 
 def test_open_ledger_reads_atlas_db_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

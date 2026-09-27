@@ -1,10 +1,14 @@
 # A.T.L.A.S. outbound allowlist (Section 12.5, CONVENTIONS.md §7.1). One squid dstdomain per line.
-# A leading dot matches the domain and every subdomain (".ubuntu.com" = archive.ubuntu.com, security.ubuntu.com ...).
+# A leading dot matches the domain and every subdomain (".hf.co" = cdn-lfs.hf.co, xet.hf.co ...). Wildcards are
+# used only where a vendor spreads one service over unpredictable subdomains; otherwise hosts are named one by one.
 # Lines starting with # and blank lines are stripped by phase1/04-system.sh before the file reaches squid.
 # Everything not listed here is denied by squid (TCP_DENIED/403 in /var/log/squid/access.log) and by ufw
 # (only the squid user may open outbound 80/443). To find a missing host after a failure:
 #   grep TCP_DENIED /var/log/squid/access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head
-# then add it here and run: sudo /opt/atlas/day1/phase1-platform.sh --force 04   (re-renders the proxy config).
+# then add it here (in the repository copy) and reload the proxy WITHOUT re-running step 4:
+#   sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt
+# (copies the file over /opt/atlas/day1/config/allowlist.txt, re-renders, `systemctl reload squid`; no ufw reset,
+# no dist-upgrade, no reboot). `--force 04` is NOT the way: it resets ufw, repeats the update and ends in a reboot.
 #
 # NOT outbound (never listed): ntfy at http://127.0.0.1:8090 and http://<LAN_IP>:8090 is loopback/LAN; every
 # llama-server, Redis, ChromaDB, Kokoro, Whisper, Open WebUI and orchestrator port is loopback/LAN; WireGuard is
@@ -13,20 +17,26 @@
 # (Gemini). Because Gemini lives under googleapis.com, the Google group below names explicit hosts and never the
 # ".googleapis.com" wildcard. api.openwebui.com (Open WebUI update and community checks, R8) also stays out.
 
-# --- Ubuntu archive, security, ESM, changelogs, motd, Launchpad PPAs (apt via Acquire::https::Proxy) ----------------
-.ubuntu.com
-.launchpad.net
-ppa.launchpadcontent.net
+# --- Ubuntu package mirrors (apt via Acquire::https::Proxy). Named hosts, NOT ".ubuntu.com": the wildcard would also
+# admit motd.ubuntu.com (motd-news/apt-news beacons), daisy/errors.ubuntu.com (apport uploads) and the report/metrics
+# hosts; phase1/04-system.sh disables those senders as well (rule §7.1). ".archive.ubuntu.com" covers the country
+# mirror the installer may have chosen (au.archive.ubuntu.com ...). No Launchpad/PPA host: Section 16.3 item 8 keeps
+# PPAs out; if a script ever needs one, it names that one host here. keyserver.ubuntu.com is not used by any script.
+archive.ubuntu.com
+.archive.ubuntu.com
+security.ubuntu.com
+esm.ubuntu.com
+changelogs.ubuntu.com
 
 # --- Mozilla apt repository: Firefox as a .deb, never the snap stub (adjudicated conflict 5) -------------------------
 packages.mozilla.org
 
 # --- Docker: Docker's own apt repo, Docker Hub registry and blob CDN, GitHub Container Registry ----------------------
+# A pull touches registry-1.docker.io (manifests), auth.docker.io (token) and the blob CDN; index.docker.io (login,
+# search) and hub.docker.com (the website) are not part of a pull and are deliberately absent.
 download.docker.com
 registry-1.docker.io
 auth.docker.io
-index.docker.io
-hub.docker.com
 production.cloudflare.docker.com
 # UNVERIFIED: Docker Hub moved layer blobs to a Cloudflare R2 bucket in 2024; this is the host seen in practice.
 docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
@@ -64,18 +74,19 @@ plugins.gradle.org
 repo.maven.apache.org
 downloads.rclone.org
 download.blender.org
+# Phase 2 step 6 only (the Bonsai add-on from Blender's extension platform, UNVERIFIED API). Blender 4.2+ also polls
+# this host for extension updates, so the Phase 2 writer starts Blender with --offline-mode (contract note; the
+# allowlist cannot be gated per step, it is one file rendered once).
 extensions.blender.org
 # UNVERIFIED: Playwright browser CDN host names (services research 4.7)
 cdn.playwright.dev
 playwright.azureedge.net
 
-# --- Cloudflare API (dynamic DNS, R7) and public-IP echo services used by the ddns updater ---------------------------
+# --- Cloudflare (dynamic DNS, R7): the API, and www.cloudflare.com/cdn-cgi/trace for the node's public IP. No
+# third-party echo services (api.ipify.org, icanhazip.com): nothing outside the Section 12.5 enumeration learns the
+# node's address; phase1/cloudflare-ddns.sh fails loudly and retries in five minutes if the trace endpoint is down.
 api.cloudflare.com
 www.cloudflare.com
-cloudflare.com
-one.one.one.one
-api.ipify.org
-icanhazip.com
 
 # --- Google APIs and OAuth endpoints (Gmail, Calendar, Drive; Section 13, V20) ---------------------------------------
 accounts.google.com
@@ -106,8 +117,10 @@ www.wixapis.com
 .rewardpay.com.au
 
 # --- Sentinel feeds (D6, Section 9.3): CoinDesk, an ASX and US index feed, RSS news. ---------------------------------
-# UNVERIFIED: the exact feed hosts are chosen by the Phase 2 Sentinel step (config/sentinel-feeds.json); the writer of
-# that file must keep this group in sync. These are the conventional free endpoints for each D6 item.
+# config/sentinel-feeds.json names the feeds; this file stays the ONLY allowlist (rule §7.1), so phase1/04-system.sh
+# (_squid_render) checks every host in sentinel-feeds.json against this group and DIES when one is missing, which
+# keeps the two files in sync loudly rather than merging them silently. UNVERIFIED: these are the conventional free
+# endpoints for each D6 item.
 .coindesk.com
 query1.finance.yahoo.com
 query2.finance.yahoo.com

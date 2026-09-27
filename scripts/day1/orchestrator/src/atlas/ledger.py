@@ -18,6 +18,8 @@ WAL mode so the API and the Celery workers can read while one writes.
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
 import threading
 import time
@@ -134,6 +136,13 @@ INDEXES: tuple[str, ...] = (
 )
 
 TASK_STATUSES: frozenset[str] = frozenset({"queued", "running", "done", "failed", "cancelled"})
+# Identifiers interpolated into SQL (table and column names) must match this alphabet AND, for tables, from TABLES.
+_IDENT_RE = re.compile(r"[a-z][a-z0-9_]*")
+# The ledger holds sensitive-tier Principal data (approval drafts, task payloads, family-name hits): the directory is
+# 750, the database and its -wal/-shm files 640, whatever the caller's umask and wherever ATLAS_DB_PATH points.
+DIR_MODE = 0o750
+FILE_MODE = 0o640
+_UMASK = 0o027
 APPROVAL_STATUSES: frozenset[str] = frozenset({"held", "approved", "rejected", "auto-sent", "sent"})
 
 
@@ -151,12 +160,22 @@ class Ledger:
     def __init__(self, path: str | Path, *, timeout_s: float = 30.0) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
-        if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, timeout=timeout_s, check_same_thread=False, isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        if self.path != ":memory:":
-            self._conn.execute("PRAGMA journal_mode=WAL")
+        on_disk = self.path != ":memory:"
+        if on_disk:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+        old_umask = os.umask(_UMASK)  # the main file, -wal and -shm are born 0640 (sqlite creates them lazily)
+        try:
+            self._conn = sqlite3.connect(self.path, timeout=timeout_s, check_same_thread=False, isolation_level=None)
+            self._conn.row_factory = sqlite3.Row
+            if on_disk:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+        finally:
+            os.umask(old_umask)
+        if on_disk:
+            try:
+                os.chmod(self.path, FILE_MODE)  # a pre-existing file created under a looser umask
+            except OSError:
+                pass  # not ours (another owner): the mode is that owner's business, the rows are still readable
         self._conn.execute("PRAGMA foreign_keys=ON")
 
     # --- lifecycle ---------------------------------------------------------------------------------------------------
@@ -197,6 +216,8 @@ class Ledger:
     # --- generic -----------------------------------------------------------------------------------------------------
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        """Run a SELECT written by package code. Internal helper in spirit: NEVER with request-derived SQL; values go
+        in `params`, and table/column names come from literals (the typed helpers below are the normal surface)."""
         with self._lock:
             cur = self._conn.execute(sql, tuple(params))
             try:
@@ -204,8 +225,21 @@ class Ledger:
             finally:
                 cur.close()
 
+    @staticmethod
+    def _ident(name: str, what: str) -> str:
+        if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
+            raise ValueError(f"{what} {name!r} is not a bare identifier ([a-z][a-z0-9_]*)")
+        return name
+
+    @classmethod
+    def _table(cls, table: str) -> str:
+        if table not in TABLES:
+            raise ValueError(f"table {table!r} is not a ledger table ({sorted(TABLES)})")
+        return table
+
     def _insert(self, table: str, row: dict[str, Any]) -> int:
-        cols = ", ".join(row)
+        table = self._table(table)
+        cols = ", ".join(self._ident(c, "column") for c in row)
         marks = ", ".join("?" for _ in row)
         with self.transaction() as cur:
             cur.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", tuple(row.values()))
@@ -214,12 +248,14 @@ class Ledger:
     def _update(self, table: str, key_col: str, key: Any, fields: dict[str, Any]) -> int:
         if not fields:
             return 0
-        sets = ", ".join(f"{c} = ?" for c in fields)
+        table, key_col = self._table(table), self._ident(key_col, "column")
+        sets = ", ".join(f"{self._ident(c, 'column')} = ?" for c in fields)
         with self.transaction() as cur:
             cur.execute(f"UPDATE {table} SET {sets} WHERE {key_col} = ?", (*fields.values(), key))
             return cur.rowcount
 
     def _get(self, table: str, key_col: str, key: Any) -> dict[str, Any] | None:
+        table, key_col = self._table(table), self._ident(key_col, "column")
         rows = self.query(f"SELECT * FROM {table} WHERE {key_col} = ?", (key,))
         return rows[0] if rows else None
 

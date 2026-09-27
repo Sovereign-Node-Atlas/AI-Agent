@@ -4,6 +4,9 @@
 # SPEACHES_PRELOAD_MODELS / SPEACHES_HF_HUB_OFFLINE from /etc/atlas/voice.env). ntfy is NOT here: Phase 1 step 7
 # brought it up from docker/ntfy/compose.yml as project "atlas-ntfy" on port 8090 (contract note in that file).
 # WG-Easy likewise lives in docker/wg-easy/compose.yml.
+# LAYOUT NOTE (fix round): CONVENTIONS.md §1 line 31 lists all six services in this one file. Folding the voice
+# overlay in would mean rewriting compose.voice.yml and phase2/05-voice.sh (other writers' files), so the split stays
+# and CONVENTIONS.md §1 needs the Principal's amendment to name compose.voice.yml and docker/ntfy/compose.yml.
 #
 # Project name is fixed below (`name:`) so that every caller shares one project whatever its working directory:
 #   docker compose -f <this file> --env-file /etc/atlas/core.env up -d <service>
@@ -17,53 +20,90 @@
 #     .service), which a bridged container cannot reach. On the host network Open WebUI listens on 0.0.0.0:$OPENWEBUI_PORT
 #     and ufw (Phase 1 step 4: "allow in on <LAN iface> ... port $OPENWEBUI_PORT" and the same on br-atlas-wg) is what
 #     makes it "bound to LAN, WireGuard and loopback" — exactly the pattern used for SSH, Cockpit and xrdp. Its outbound
-#     traffic is host traffic: ufw's default-deny OUTPUT with the squid-owner match blocks any direct 80/443, and the
-#     proxy variables are blanked below so nothing can leave through squid either. verify/v12-openwebui-offline.sh
-#     attributes packets to the container by its cgroup and must see zero NEW connections beyond loopback.
+#     traffic is host traffic: ufw's default-deny OUTPUT with the squid-owner match blocks any direct 80/443, the proxy
+#     variables are blanked below, AND phase2/03-openwebui.sh installs a permanent cgroup fence
+#     (/usr/local/sbin/atlas-openwebui-egress, unit atlas-openwebui-egress.service): every NEW connection whose socket
+#     belongs to this container's cgroup is dropped unless it goes over lo, and on lo the squid proxy (3128), Redis
+#     (6379) and ChromaDB (8000) are dropped too. verify/v12-openwebui-offline.sh proves the start-up window; the fence
+#     enforces the same rule at run time for the lazy paths (RAG loaders, a malicious document naming a proxy).
 #   * redis and chromadb publish on 127.0.0.1 only (loopback is the subset of "loopback, LAN and WireGuard" that
 #     Section 12.1 needs: Open WebUI is the face). The ChromaDB 1.x Rust server has no authentication (services
-#     research 2.1), so it is never published on the LAN. Containers on the project bridge get no proxy environment
-#     unless a service names one, and Phase 1's DOCKER-USER rules drop everything else that leaves a bridge.
+#     research 2.1), so it is never published on the LAN. Redis REQUIRES a password (fix round): every local process
+#     could otherwise enqueue Celery tasks with chosen arguments; the password lives in /etc/atlas/secrets/redis.env
+#     (phase2/02-orchestrator.sh writes it, the atlas-* units load it with EnvironmentFile=, never in orchestrator.env
+#     which restic backs up). Containers on the project bridge get no proxy environment: the proxy that
+#     /root/.docker/config.json injects (Phase 1 step 6) is blanked for every service here, and Phase 1's DOCKER-USER
+#     rules drop everything else that leaves a bridge.
 #   * Open WebUI reaches the overlay's services through their loopback publishes (voice-stt research S8.1 /
 #     compose.voice.yml: Kokoro 127.0.0.1:8880, speaches 127.0.0.1:8881, docling 127.0.0.1:5001), not by container
 #     name, because it is on the host network.
 #
 # Interpolation (defaults in brackets): ATLAS_SRV [/srv/atlas], ATLAS_ETC [/etc/atlas], TZ [UTC], OPENWEBUI_PORT [3000],
 #   ORCH_PORT [8800], EMBED_PORT [8109], OPENWEBUI_DATA_DIR, REDIS_DATA_DIR, CHROMA_DATA_DIR. Nothing here needs a
-#   proxy: redis and chromadb never leave the node, open-webui must not (V12).
+#   proxy: redis and chromadb never leave the node, open-webui must not (V12). `$$VAR` is a container-shell variable
+#   (compose leaves it alone), used where a secret must not pass through the interpolation file.
 #
 # Image pins (services research §0, §1.1, §2.1, §3; all VERIFIED tags):
 #   redis:8.10.2  chromadb/chroma:1.5.9  ghcr.io/open-webui/open-webui:v0.11.4
 
 name: atlas-core
 
+# Blank the proxy Phase 1 step 6 injects through /root/.docker/config.json: none of these services may leave the node.
+x-no-proxy: &no-proxy
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  http_proxy: ""
+  https_proxy: ""
+  NO_PROXY: "*"
+  no_proxy: "*"
+
 services:
-  # --- Redis: Celery broker and result backend (Section 9.7). Loopback only (CONVENTIONS.md §8). ----------------------
+  # --- Redis: Celery broker and result backend (Section 9.7). Loopback only (CONVENTIONS.md §8), password required. ---
+  # /etc/atlas/secrets/redis.env (REDIS_PASSWORD=..., written by phase2/02-orchestrator.sh) is the container's env_file;
+  # the command re-enters the image's own entrypoint so redis still drops to the `redis` user (gosu) after the shell has
+  # expanded the password. UNVERIFIED: the entrypoint's name inside redis:8.10.2 (`docker-entrypoint.sh` on PATH is the
+  # official image's convention); step 02 proves it with an authenticated PING and a NOAUTH refusal from the host, and
+  # dies otherwise. An EMPTY password would silently disable auth, so the shell refuses to start without one.
   redis:
     image: redis:8.10.2
     container_name: atlas-redis
     restart: unless-stopped
-    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes", "--maxmemory", "2gb", "--maxmemory-policy", "noeviction"]
+    env_file:
+      - path: ${ATLAS_ETC:-/etc/atlas}/secrets/redis.env
+        required: false      # the file is validated by the command below; `required: false` keeps `up -d chromadb` (step 4) loadable
+    command:
+      - sh
+      - -c
+      - >-
+        [ -n "$$REDIS_PASSWORD" ] || { echo "atlas-redis: REDIS_PASSWORD is empty (/etc/atlas/secrets/redis.env, phase2/02-orchestrator.sh)" >&2; exit 78; };
+        exec docker-entrypoint.sh redis-server --requirepass "$$REDIS_PASSWORD" --save 60 1 --appendonly yes --maxmemory 2gb --maxmemory-policy noeviction
+    environment:
+      <<: *no-proxy
     volumes:
       - ${REDIS_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/redis}:/data
     networks: [atlas]
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 30s
       timeout: 5s
       retries: 3
 
   # --- ChromaDB 1.5.9 (Section 10.1): persist_path "/data" is baked into the image's /config.yaml. ---------------------
-  # No auth exists in the Rust server config, so the port is loopback only; Open WebUI (host network) and the
-  # orchestrator both reach it at http://127.0.0.1:8000. phase2/04-memory.sh brings it up and creates the collections.
+  # No auth exists in the Rust server config, so the port is loopback only; the orchestrator reaches it at
+  # http://127.0.0.1:8000. phase2/04-memory.sh brings it up and creates the six Section 10.1 collections. Open WebUI does
+  # NOT share this server (fix round): it keeps its own embedded vector store under its data dir, so its file-<id>
+  # collections never sit beside the Vector Cortex and step 3 does not depend on step 4's container.
   chromadb:
     image: chromadb/chroma:1.5.9
     container_name: atlas-chromadb
     restart: unless-stopped
     environment:
+      <<: *no-proxy
       ANONYMIZED_TELEMETRY: "false"      # UNVERIFIED for the Rust server (it is the Python client's switch); harmless
+      CHROMA_TELEMETRY_ENABLED: "false"  # UNVERIFIED variable name; harmless if unknown. The blanked proxy is the belt:
+                                         # phase2/04-memory.sh treats any TCP_DENIED from this container as a failure.
     volumes:
       - ${CHROMA_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/chroma}:/data
     networks: [atlas]
@@ -79,17 +119,34 @@ services:
   # Every ConfigVar is pinned by the environment because ENABLE_PERSISTENT_CONFIG=false makes env always win (services
   # research 1.2); Admin-UI edits are therefore NOT saved, which is what makes re-runs deterministic.
   # Secrets (WEBUI_SECRET_KEY, OPENAI_API_KEY) come from /etc/atlas/secrets/openwebui.env (phase2/03-openwebui.sh).
+  # Container hardening (fix round): the image runs as UID 0 on the host network, so capabilities are dropped to the
+  # five its start-up needs to own and read its data dir (UNVERIFIED minimal set: CHOWN, SETUID, SETGID, DAC_OVERRIDE,
+  # FOWNER — step 03's 300 s /health wait fails loudly if the image needs more), no-new-privileges, a pid and a memory
+  # ceiling. The network fence is the atlas-openwebui-egress unit (header).
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.11.4
     container_name: atlas-openwebui
     restart: unless-stopped
     network_mode: host
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    pids_limit: 1024
+    mem_limit: 8g
     env_file:
       - path: ${ATLAS_ETC:-/etc/atlas}/secrets/openwebui.env
         required: false
     volumes:
       - ${OPENWEBUI_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/open-webui}:/app/backend/data
     environment:
+      <<: *no-proxy
       # listener (host network): 0.0.0.0 so LAN and WireGuard reach it; ufw scopes it (header)
       HOST: "0.0.0.0"
       PORT: "${OPENWEBUI_PORT:-3000}"
@@ -118,13 +175,6 @@ services:
       HF_HUB_DISABLE_TELEMETRY: "1"
       DO_NOT_TRACK: "1"
       SCARF_NO_ANALYTICS: "true"
-      # no path out at all: blank the proxy that /root/.docker/config.json would otherwise inject (Phase 1 step 6)
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      http_proxy: ""
-      https_proxy: ""
-      NO_PROXY: "*"
-      no_proxy: "*"
       # --- auth: one Principal; the first user is created by 03-openwebui.sh through POST /api/v1/auths/signup, which
       #     bypasses ENABLE_SIGNUP=false while the user table is empty (research 1.4, VERIFIED) --------------------------
       WEBUI_AUTH: "true"
@@ -139,15 +189,18 @@ services:
       ENABLE_OPENAI_API: "true"
       OPENAI_API_BASE_URL: "http://127.0.0.1:${ORCH_PORT:-8800}/v1"
       DEFAULT_MODELS: "atlas"
-      # --- retrieval: bge-m3 on llama-server (engine index 9), vectors in the shared ChromaDB (research 1.2, 2.1) ------
-      VECTOR_DB: "chroma"
-      CHROMA_HTTP_HOST: "127.0.0.1"
-      CHROMA_HTTP_PORT: "8000"
+      # --- retrieval: bge-m3 on llama-server (engine index 9, step 4, used on demand); vectors in Open WebUI's OWN
+      #     embedded store under /app/backend/data/vector_db (inside the data dir, in the restic include set). The
+      #     shared ChromaDB is the orchestrator's Vector Cortex (10.1) and comes up in step 4, after this container
+      #     (fix round: Section 17 order). The token splitter would fetch a tiktoken encoding on first use, so the
+      #     character splitter is pinned and the cache dir is local (research: lazy fetch UNVERIFIED for 0.11.4).
       RAG_EMBEDDING_ENGINE: "openai"
       RAG_OPENAI_API_BASE_URL: "http://127.0.0.1:${EMBED_PORT:-8109}/v1"
       RAG_OPENAI_API_KEY: "atlas-local"
       RAG_EMBEDDING_MODEL: "embed-bge-m3"
       RAG_EMBEDDING_BATCH_SIZE: "16"
+      RAG_TEXT_SPLITTER: "character"
+      TIKTOKEN_CACHE_DIR: "/app/backend/data/cache/tiktoken"
       CONTENT_EXTRACTION_ENGINE: "docling"       # UNVERIFIED: docs say "Docling 2.0.0+"; docling-serve is 1.34 (research 2.3)
       DOCLING_SERVER_URL: "http://127.0.0.1:5001"
       # --- speech: speaches (Whisper large-v3-turbo, CPU int8) and Kokoro, both OpenAI-shaped (voice research 4.4, 2) --

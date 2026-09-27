@@ -7,6 +7,8 @@ Footprints are engines.json's Section 5.1 figures (decimal GB), KV from the Sect
 from __future__ import annotations
 
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -19,10 +21,12 @@ from atlas.arbiter import (
     Decision,
     ReleaseTimeout,
     StubProbe,
+    build_arbiter,
     kv_estimate_bytes,
+    read_unit_profile,
 )
 from atlas.config import EngineSpec
-from atlas.engines import StubController
+from atlas.engines import EngineControlError, StubController
 from atlas.ledger import Ledger
 
 GTT_TOTAL = 196608 * 1024 * 1024  # 206158430208 bytes, the V3 figure
@@ -44,15 +48,24 @@ class FakeClock:
 
 
 def make(engines: dict[str, EngineSpec], *, budget_gib: float = 170.0, leak: bool = False,
-         ledger: Ledger | None = None,
-         release_timeout_s: float = 60.0) -> tuple[Arbiter, StubController, StubProbe, FakeClock]:
+         ledger: Ledger | None = None, release_timeout_s: float = 60.0,
+         engines_env_dir: Path | None = None) -> tuple[Arbiter, StubController, StubProbe, FakeClock]:
     probe = StubProbe(total_bytes=int(RESIDENT_SET + budget_gib * GIB), used_bytes=RESIDENT_SET)
     controller = StubController(engines=engines, probe=probe, leak_on_stop=leak)
     clock = FakeClock()
     arb = Arbiter(engines, controller, probe, ledger=ledger, release_timeout_s=release_timeout_s,
-                  poll_interval_s=1.0, clock=clock, sleep=clock.sleep)
+                  poll_interval_s=1.0, clock=clock, sleep=clock.sleep, engines_env_dir=engines_env_dir)
     arb.measure_resident_set()
     return arb, controller, probe, clock
+
+
+def write_env(env_dir: Path, key: str, *, ctx: int, parallel: int, kv: str, coresident: bool) -> Path:
+    """An env file as phase2/engine-env.py renders it (single-quoted values; the keys the Arbiter reads)."""
+    path = env_dir / f"{key}.env"
+    path.write_text(f"# {key}.env — test\nATLAS_ENGINE='{key}'\nATLAS_MODE='chat'\nATLAS_KV_TYPE='{kv}'\n"
+                    f"ATLAS_CTX_SIZE={ctx}\nATLAS_PARALLEL={parallel}\nATLAS_N_KEEP=4096\n"
+                    f"ATLAS_CORESIDENT={1 if coresident else 0}\nLLAMA_ARG_PORT=8106\nARGS='--ctx-size {ctx}'\n")
+    return path
 
 
 # --- budget and the KV model -------------------------------------------------------------------------------------
@@ -201,6 +214,127 @@ def test_two_resident_limit_evicts_least_recently_used(engines: dict[str, Engine
     assert arb.charged_bytes <= arb.budget_bytes
 
 
+def test_evicted_engine_leaves_the_newcomer_alone_at_its_full_profile(engines: dict[str, EngineSpec]) -> None:
+    """Nemotron resident, the vision engine requested: Nemotron goes (LRU), and the vision engine, now alone, runs
+    its full 262144 x 8 profile, not the 65536 x 2 co-resident one it would run beside gpt-oss (Section 4.1/4.3)."""
+    arb, controller, _, _ = make(engines)
+    assert arb.request_load("nemotron-3-super", task_id="t1").granted
+    d = arb.request_load("qwen2.5-vl-72b", task_id="t2")
+    assert d.granted and d.evicted == ("nemotron-3-super",) and "coresident" not in d.reason
+    res = arb.resident["qwen2.5-vl-72b"]
+    assert (res.footprint.ctx, res.footprint.parallel) == (262144, 8)
+    assert d.projected_bytes == arb.projected_footprint("qwen2.5-vl-72b").total_bytes
+    assert list(arb.resident) == ["qwen2.5-vl-72b"] and controller.calls[-1] == ("start", "qwen2.5-vl-72b")
+    # Beside gpt-oss it is the co-resident profile (the everyday pairing, no eviction).
+    arb2, _, _, _ = make(engines)
+    assert arb2.request_load("gpt-oss-120b", task_id="t3").granted
+    d2 = arb2.request_load("qwen2.5-vl-72b", task_id="t4")
+    assert d2.granted and d2.evicted == () and "coresident" in d2.reason
+    assert (arb2.resident["qwen2.5-vl-72b"].footprint.ctx, arb2.resident["qwen2.5-vl-72b"].footprint.parallel) == (
+        65536, 2)
+
+
+def test_projection_follows_the_unit_env_file(engines: dict[str, EngineSpec], tmp_path: Path) -> None:
+    """What `systemctl start` runs is <ATLAS_ENGINES_ENV_DIR>/<key>.env, not the Arbiter's wish: the projection
+    follows the file, and a request that disagrees with it is refused (the Arbiter cannot re-render a root file)."""
+    write_env(tmp_path, "qwen2.5-vl-72b", ctx=262144, parallel=8, kv="q8_0", coresident=False)
+    write_env(tmp_path, "gpt-oss-120b", ctx=262144, parallel=8, kv="q4_0", coresident=False)
+    arb, controller, _, _ = make(engines, engines_env_dir=tmp_path)
+    assert arb.request_load("gpt-oss-120b", task_id="t1").granted
+    # A co-resident load is REFUSED while the env file says 8 slots (V14a, fix round).
+    refused = arb.request_load("qwen2.5-vl-72b", task_id="t2", coresident=True)
+    assert refused.decision is Decision.REFUSED
+    assert "coresident True != unit False" in refused.reason and "engine-env.py --set-override" in refused.reason
+    assert list(arb.resident) == ["gpt-oss-120b"] and ("start", "qwen2.5-vl-72b") not in controller.calls
+    # Left to itself the Arbiter projects the file's 8-slot footprint (~123 GB), which does not fit beside gpt-oss:
+    # gpt-oss is evicted (LRU) instead of the pair being admitted at a projection the unit would not run.
+    d = arb.request_load("qwen2.5-vl-72b", task_id="t3")
+    assert d.granted and d.evicted == ("gpt-oss-120b",)
+    assert (arb.resident["qwen2.5-vl-72b"].footprint.ctx, arb.resident["qwen2.5-vl-72b"].footprint.parallel) == (
+        262144, 8)
+    assert "ATLAS_CORESIDENT=0" in d.reason and "overrides.json coresident=true" in d.reason
+    assert arb.charged_bytes <= arb.budget_bytes
+    # With the override rendered (what Phase 3's coresident step does through engine-env.py), the pair fits.
+    write_env(tmp_path, "qwen2.5-vl-72b", ctx=65536, parallel=2, kv="q8_0", coresident=True)
+    arb2, _, _, _ = make(engines, engines_env_dir=tmp_path)
+    assert arb2.request_load("gpt-oss-120b", task_id="t4").granted
+    d2 = arb2.request_load("qwen2.5-vl-72b", task_id="t5")
+    assert d2.granted and d2.evicted == () and "ATLAS_CORESIDENT=1" in d2.reason
+    assert len(arb2.resident) == 2 and arb2.resident["qwen2.5-vl-72b"].footprint.parallel == 2
+    assert arb2.request_load("qwen2.5-vl-72b", task_id="t6", ctx=262144).decision is Decision.REFUSED
+    # The DeepSeek KV ladder's f16 result reaches the Arbiter the same way (config.KV_CLASSES stays quantised).
+    write_env(tmp_path, APEX_KEY, ctx=16384, parallel=1, kv="f16", coresident=False)
+    fp, profile = arb2.unit_footprint(APEX_KEY)
+    assert profile.kv_type == "f16" and fp.kv_bytes == 327_680 * 16384
+    # A malformed file fails loudly, never silently projects from engines.json.
+    (tmp_path / "meditron-70b.env").write_text("ATLAS_CTX_SIZE=4096\n")
+    with pytest.raises(ArbiterError, match="missing"):
+        arb2.request_load("meditron-70b", task_id="t7")
+    assert read_unit_profile(tmp_path / "nope.env") is None
+    # No env file for an engine: engines.json projection, with a warning (systemctl start fails until it is rendered).
+    assert arb2.unit_profile("nemotron-3-super") is None
+
+
+def test_build_arbiter_wires_the_engines_env_dir_from_settings(engines: dict[str, EngineSpec], tmp_path: Path,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATLAS_ENGINES_ENV_DIR", str(tmp_path))
+    arb = build_arbiter(engines)
+    assert arb.engines_env_dir == tmp_path
+    assert build_arbiter(engines, engines_env_dir=tmp_path / "x").engines_env_dir == tmp_path / "x"
+
+
+def test_status_and_generation_release_answer_while_a_load_is_in_flight(engines: dict[str, EngineSpec]) -> None:
+    """The controller's start (minutes on a cold load) runs outside the state lock: /health's status() call, a
+    generation finishing on the other resident engine, and the FIFO must not wait for it."""
+    arb, controller, _, _ = make(engines)
+    assert arb.request_load("gpt-oss-120b", task_id="t1").granted
+    assert arb.try_generation("gpt-oss-120b", task_id="g1").granted
+    started, release = threading.Event(), threading.Event()
+    real_start = controller.start
+
+    def slow_start(key: str) -> None:
+        started.set()
+        assert release.wait(5)
+        real_start(key)
+
+    controller.start = slow_start  # type: ignore[method-assign]
+    result: list = []
+    t = threading.Thread(target=lambda: result.append(arb.request_load("qwen2.5-vl-72b", task_id="t2")))
+    t.start()
+    assert started.wait(5)
+    t0 = time.monotonic()
+    status = arb.status()  # must return now, not after the load
+    assert time.monotonic() - t0 < 1.0
+    assert status["busy"] == "loading qwen2.5-vl-72b"
+    placeholder = [r for r in status["resident"] if r["engine"] == "qwen2.5-vl-72b"]
+    assert placeholder and placeholder[0]["loading"] is True
+    assert arb.charged_bytes == sum(r.charged_bytes for r in arb.resident.values())  # the budget is reserved
+    # The generation on the other engine ends and releases; the FIFO and a further request are answered at once.
+    arb.release_generation(task_id="g1")
+    assert arb.generating is None
+    assert arb.try_generation("qwen2.5-vl-72b", task_id="g2").decision is Decision.REFUSED  # not serving yet
+    assert arb.try_generation("gpt-oss-120b", task_id="g3").granted
+    arb.release_generation(task_id="g3")
+    queued = arb.request_load("gpt-oss-120b-abliterated", task_id="t3")
+    assert queued.decision is Decision.QUEUED and "arbiter busy" in queued.reason
+    assert arb.request_unload("gpt-oss-120b", task_id="t4").decision is Decision.QUEUED
+    assert arb.request_load("qwen2.5-vl-72b", task_id="t5").decision is Decision.QUEUED  # same key: in progress
+    release.set()
+    t.join(5)
+    assert result and result[0].granted and arb.busy is None
+    assert arb.resident["qwen2.5-vl-72b"].loading is False and arb.status()["busy"] is None
+    assert arb.try_generation("qwen2.5-vl-72b", task_id="g4").granted
+
+
+def test_failed_start_releases_the_reservation(engines: dict[str, EngineSpec]) -> None:
+    arb, _, _, _ = make(engines)
+    arb.controller = StubController(engines=engines, probe=arb.probe, fail_start=["nemotron-3-super"])
+    with pytest.raises(EngineControlError):
+        arb.request_load("nemotron-3-super", task_id="t1")
+    assert arb.resident == {} and arb.busy is None and arb.charged_bytes == 0
+    assert arb.request_load("gpt-oss-120b", task_id="t2").granted  # not halted: the memory was never taken
+
+
 def test_never_preempts_mid_generation(engines: dict[str, EngineSpec]) -> None:
     arb, controller, _, _ = make(engines, budget_gib=100.0)  # room for one Ren-class engine only
     assert arb.request_load("gpt-oss-120b", task_id="t1").granted
@@ -320,8 +454,12 @@ def test_release_confirmation_polls_until_the_counter_drops(engines: dict[str, E
 def test_deep_think_tier_downgrades_when_it_does_not_fit(engines: dict[str, EngineSpec]) -> None:
     full, _, _, _ = make(engines, budget_gib=170.0)
     plan = full.plan_deep_think("deep", task_id="dt1")
-    assert plan.granted == "deep" and not plan.downgraded and plan.engines == (APEX_KEY,)
+    assert plan.granted == "deep" and not plan.downgraded and APEX_KEY in plan.engines
+    # Section 9.1 deep: Standard's pair, Qwen3.5 as third opinion, the Apex engine for the synthesis — one at a time,
+    # all requested up front (rule 8); the largest (the Apex engine) sets the requirement.
+    assert plan.engines == ("gpt-oss-120b", "nemotron-3-super", "qwen3.5-122b", APEX_KEY)
     assert plan.required_bytes == full.projected_footprint(APEX_KEY).total_bytes
+    assert plan.required_bytes == max(full.projected_footprint(k).total_bytes for k in plan.engines)
 
     mid, _, _, _ = make(engines, budget_gib=140.0)  # the Apex engine (155 GB + KV) no longer fits
     plan = mid.plan_deep_think("deep", task_id="dt2")

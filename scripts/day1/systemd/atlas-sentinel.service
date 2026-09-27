@@ -6,6 +6,8 @@
 # Contract with the `atlas` package: `atlas-admin enqueue sentinel` sends atlas' Sentinel task to the cpu queue and
 # exits 0 once the broker accepted it (it does not wait); `--wait SECONDS` blocks until the task finished and prints
 # the resulting ledger record as one JSON line (used once by step 08 to prove the ledger; not used by the timer).
+# The broker URL (with the Redis password) comes from /etc/atlas/secrets/redis.env, read by PID 1 (the file itself
+# is atlas-owned, so `atlas-admin` run by hand as atlas with `set -a; source` also works).
 # If the orchestrator or Redis is down, the enqueue fails, this unit fails, and the journal says so: nothing silent.
 
 [Unit]
@@ -19,6 +21,7 @@ User=atlas
 Group=atlas
 WorkingDirectory=${ATLAS_OPT}/orchestrator
 EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 Environment=HOME=/var/lib/atlas
 ExecStart=${ATLAS_OPT}/venv/bin/atlas-admin enqueue sentinel

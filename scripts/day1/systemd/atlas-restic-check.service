@@ -1,10 +1,12 @@
 # /etc/systemd/system/atlas-restic-check.service — the quarterly restore test (Section 9.5 "Restore test: quarterly
 # restore to a scratch directory, verified by checksum, logged"; V13). Installed by phase2/07-restic.sh through
 # render_template (ATLAS_ETC, ATLAS_OPT substituted).
-# Step 1 runs verify/v13-restic.sh through lib/common.sh's run_verify so the result lands in verify.jsonl (phase
-# "quarterly") as well as in the journal; step 2 reads back a tenth of the repository data (restic check
-# --read-data-subset, VERIFIED flag). A failure of either fails the unit, which the journal and ntfy (the verify
-# script calls notify) make visible.
+# Step 1 runs verify/v13-restic.sh DIRECTLY (not through run_verify: verify.jsonl holds the Day 1 records, whose
+# latest-per-id semantics a quarterly row would overwrite — fix round); its one-line evidence goes to the journal, and a
+# failure is pushed to the Principal's phone through lib/common.sh's `notify` (ntfy, Section 9.3 alert row) before the
+# unit fails. Step 2 reads back a tenth of the repository data (restic check --read-data-subset, VERIFIED flag), pushed
+# and failed the same way. ATLAS_PHASE=quarterly makes v13 skip its own structural `restic check` (step 2 covers it)
+# and names its log file quarterly-<date>.log.
 
 [Unit]
 Description=AEGIS quarterly restore test and repository check (Section 9.5, V13)
@@ -15,9 +17,9 @@ ConditionPathExists=${ATLAS_ETC}/restic.env
 Type=oneshot
 EnvironmentFile=${ATLAS_ETC}/restic.env
 Environment=ATLAS_PHASE=quarterly
+Environment=ATLAS_LOG_TO_STDERR=1
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-ExecStart=/bin/bash -c 'source ${ATLAS_OPT}/day1/lib/common.sh && run_verify V13 v13-restic.sh'
-ExecStart=/usr/bin/restic check --read-data-subset=1/10
+ExecStart=/bin/bash -c 'source ${ATLAS_OPT}/day1/lib/common.sh; out="$$(${ATLAS_OPT}/day1/verify/v13-restic.sh)" || { echo "$$out" >&2; notify "AEGIS quarterly restore test FAILED: $$out"; exit 1; }; echo "$$out"; chk="$$(restic check --read-data-subset=1/10 2>&1)" || { echo "$$chk" >&2; notify "AEGIS quarterly restic check --read-data-subset=1/10 FAILED: $${chk:0:300}"; exit 1; }; echo "restic check --read-data-subset=1/10 ok"'
 TimeoutStartSec=4h

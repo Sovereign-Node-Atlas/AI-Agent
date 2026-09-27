@@ -12,6 +12,10 @@ line ({"ok": true|false, ...}) so the bash caller can parse it; everything human
       to http://localhost:N/ which only reaches this process from a browser running on the node. Then the token is
       stored mode 600 owned by --owner and the three APIs are proven. An existing valid/refreshable token skips
       the browser (idempotent re-runs).
+      The library prints the prompt with print() to STDOUT (google_auth_oauthlib 1.4.1 flow.py:462, VERIFIED in
+      the wheel); the bash caller captures stdout for the JSON line, so the call runs under
+      contextlib.redirect_stdout(sys.stderr): the framed block and the URL reach the terminal through stderr,
+      and only the final JSON line is written to the real stdout (fix round, blocker).
   verify --token FILE --email EMAIL
       No browser, no prompt: refresh if needed, prove Gmail (users.labels.list), Calendar (calendarList.list) and
       Drive (about.get), check the signed-in address is EMAIL.
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import contextlib
 import datetime as dt
 import json
 import os
@@ -133,7 +138,10 @@ def cmd_authorise(args: argparse.Namespace) -> int:
             {
                 "ok": False,
                 "email": args.email,
-                "error": f"{client_path} has no top-level 'installed' key: create a 'Desktop app' OAuth client in Google Cloud and download its JSON",
+                "error": (
+                    f"{client_path} has no top-level 'installed' key: create a 'Desktop app' OAuth client in "
+                    f"Google Cloud and download its JSON"
+                ),
             }
         )
     try:
@@ -157,14 +165,17 @@ def cmd_authorise(args: argparse.Namespace) -> int:
             f"{FRAME}\n"
         )
         try:
-            creds = flow.run_local_server(
-                host="localhost",
-                port=args.port,
-                open_browser=False,
-                authorization_prompt_message=prompt,
-                success_message=f"{args.email}: authorised for A.T.L.A.S. You can close this tab.",
-                timeout_seconds=args.timeout,
-            )
+            # print() resolves sys.stdout at call time, so the library's prompt (the URL) lands on stderr, which the
+            # bash caller forwards to the console; stdout stays reserved for the one JSON line emit() prints.
+            with contextlib.redirect_stdout(sys.stderr):
+                creds = flow.run_local_server(
+                    host="localhost",
+                    port=args.port,
+                    open_browser=False,
+                    authorization_prompt_message=prompt,
+                    success_message=f"{args.email}: authorised for A.T.L.A.S. You can close this tab.",
+                    timeout_seconds=args.timeout,
+                )
         except Exception as exc:  # broad on purpose: timeout, port busy, user denied: all end the same way
             return emit(
                 {"ok": False, "email": args.email, "error": f"authorisation flow failed: {type(exc).__name__}: {exc}"}
@@ -227,7 +238,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_rclone_remote(args: argparse.Namespace) -> int:
-    """rclone.conf [NAME]: type=drive, client_id, client_secret, scope=drive, token={...} (drive.md VERIFIED keys)."""
+    """rclone.conf [NAME]: type=drive, client_id, client_secret, scope=drive, token={...} (drive.md VERIFIED keys).
+
+    --conf is /etc/atlas/secrets/google/rclone.conf (CONVENTIONS.md §7.2: a second full copy of the credentials must
+    stay inside the secrets tree; fix round). rclone rewrites it on every token refresh, so the file is written
+    0600 owned by --owner and the directory must be writable by that account.
+    """
     from google.oauth2.credentials import Credentials
 
     token_path = Path(args.token)
@@ -236,14 +252,14 @@ def cmd_rclone_remote(args: argparse.Namespace) -> int:
     creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if not creds.refresh_token:
         return emit({"ok": False, "remote": args.remote, "error": "token has no refresh_token; rclone needs one"})
-    expiry = creds.expiry or dt.datetime.now(dt.timezone.utc)
+    expiry = creds.expiry or dt.datetime.now(dt.UTC)
     if expiry.tzinfo is None:
-        expiry = expiry.replace(tzinfo=dt.timezone.utc)
+        expiry = expiry.replace(tzinfo=dt.UTC)
     token = {
         "access_token": creds.token or "",
         "token_type": "Bearer",
         "refresh_token": creds.refresh_token,
-        "expiry": expiry.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expiry": expiry.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     conf = Path(args.conf)
     cfg = configparser.ConfigParser(interpolation=None)

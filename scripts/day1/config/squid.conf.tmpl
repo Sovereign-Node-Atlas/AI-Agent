@@ -4,8 +4,16 @@
 # client through unfiltered (platform research item 6), so the whole file is replaced rather than extended.
 #
 # No SSL bump: the allow/deny decision is made on the CONNECT host:443 line, which carries the hostname in clear.
-# Listens on every address so containers can reach it at their bridge gateway (172.17.0.1 for docker0); ufw admits
-# port 3128 only from loopback and the Docker bridges, and the "clients" acl below refuses anything else.
+#
+# Binding: CONVENTIONS §8 says "squid 3128 (loopback only)"; rule §7.1 makes every container go through this proxy,
+# and a container reaches the host only at its bridge gateway (172.17.0.1 on docker0, 172.x.0.1 on each compose
+# bridge, which Docker allocates when the project first starts, i.e. after this file is rendered in step 4). Squid
+# cannot bind an address that does not exist yet, so the port is opened on every address and the fence is layered:
+#   * ufw (phase1/04-system.sh): `deny in on <LAN_IFACE> to any port 3128` comes BEFORE the allows, so a LAN that
+#     itself sits in 172.16.0.0/12 is refused; then `allow in on docker0` and `allow in from 172.16.0.0/12`;
+#     the WireGuard bridge (10.42.42.0/24) is not admitted at all (VPN clients never use the node as a proxy);
+#   * the "clients" acl below admits loopback and ${SQUID_CLIENT_NETS} (the Docker bridge ranges) and denies the rest.
+# "Loopback only" therefore reads "loopback plus the Docker bridge gateways", which is what §7.1 requires.
 
 http_port 3128
 

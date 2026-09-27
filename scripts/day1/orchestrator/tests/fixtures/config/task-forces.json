@@ -5,26 +5,55 @@
       "name": "Corporate Mergers & Acquisitions",
       "group": "CORP-DEALS",
       "hemisphere": "corporate",
-      "owners": ["Gideon"],
+      "owners": [
+        "Gideon"
+      ],
       "default_tier": "sensitive",
       "dual_sign_off": false,
-      "domain_cards": [{"domain": 5, "why": "CFO & Controller: valuation inputs."}],
+      "domain_cards": [
+        {
+          "domain": 5,
+          "why": "CFO & Controller: valuation inputs."
+        }
+      ],
       "relay": [],
-      "triggers": ["merger", "acquisition"]
+      "triggers": [
+        "merger",
+        "acquisition"
+      ]
     },
     {
       "code": "TF_OMEGA",
-      "name": "Sovereign Strategy",
+      "name": "Absolute Apex Contingency",
       "group": "APEX",
-      "hemisphere": "corporate",
-      "owners": ["Ren", "Arthur"],
+      "hemisphere": "both",
+      "owners": [
+        "Ren",
+        "Arthur"
+      ],
+      "trigger": "principal-only",
+      "engine": "deepseek-v4-flash",
       "default_tier": "sensitive",
       "dual_sign_off": true,
-      "domain_cards": [{"domain": 5, "why": "CFO"}, {"domain": 14, "why": "Estate"}],
-      "relay": ["Ren", "Arthur"],
+      "domain_cards": [
+        {
+          "domain": 22,
+          "why": "Director of OSINT & Executive Protection: an apex contingency is first a threat to the Principal; protection framing leads."
+        },
+        {
+          "domain": 14,
+          "why": "Private Family Advisor & Estate Guardian: the family and estate consequences Arthur must weigh."
+        },
+        {
+          "domain": 6,
+          "why": "General Counsel: the legal exposure and obligations that bound every option on the table."
+        }
+      ],
+      "relay": [
+        "Ren",
+        "Arthur"
+      ],
       "triggers": [],
-      "engine": "deepseek-v4-flash",
-      "trigger": "principal-only",
       "unknown_key_must_be_ignored": true
     }
   ]

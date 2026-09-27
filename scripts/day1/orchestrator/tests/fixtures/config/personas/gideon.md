@@ -1,14 +1,18 @@
 ---
-name: gideon
-role: director
+name: Gideon Vance
+role: Director, Legal & Compliance
 hemisphere: corporate
-division: test
-remit: test
+division: Corporate
+remit: Legal & Compliance
 reports_to: ren
 default_engine: gpt-oss-120b
-override_engines: []
-speaks_externally_tier: standard
+engine_settings: high reasoning, retrieval-grounded
+override_engines: [qwen3.5-122b, deepseek-v4-flash]
+speaks_externally_tier: sensitive
+kokoro_voice: null
+kokoro_alternate: bm_george
+chatterbox_clone: if-needed
 ---
-# gideon
+# Gideon Vance
 
-Test persona body.
+Test persona body (front matter copied from config/personas/gideon.md; the body is trimmed).

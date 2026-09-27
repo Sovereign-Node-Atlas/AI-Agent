@@ -4,10 +4,13 @@ Subcommands and who calls them:
   init-db              phase2/02-orchestrator.sh step 7: create ATLAS_DB_PATH (idempotent)
   engines list         the engines.json table with ports and unit state
   arbiter status       live GTT counters, unit states, the last ledger decisions
-  vault-session-test   V18 helper; the implementation is atlas.vault (another writer), imported lazily
+  vault-session-test   V18 helper: `atlas-admin vault-session-test --file PATH [--idle-seconds N]` (contract in
+                       phase2/README-contracts.md, called by verify/v18-vault.sh); the implementation is
+                       atlas.vault.vault_session_test(idle_seconds, file=...) (another writer), imported lazily
   enqueue <task>       systemd/atlas-sentinel.service, atlas-prune.service, atlas-aegis.service, phase2/08-sentinel.sh:
-                       send a Celery task; --wait SECONDS blocks and prints the ledger record as ONE JSON line
-                       (contract in phase2/02-orchestrator.sh; the task module atlas.tasks is another writer's)
+                       send a Celery task on the queue atlas.celery_app routes it to (--queue overrides); --wait
+                       SECONDS blocks and prints the ledger record as ONE JSON line (contract in
+                       phase2/02-orchestrator.sh; the task module atlas.tasks is another writer's)
 
 Every failure exits non-zero with a one-line reason on stderr (rule §7.4); nothing here prompts.
 """
@@ -18,11 +21,12 @@ import argparse
 import importlib
 import json
 import logging
+import sqlite3
 import sys
 from collections.abc import Sequence
 from typing import Any
 
-from atlas.arbiter import GIB, SysfsMemoryProbe
+from atlas.arbiter import GIB, ArbiterError, SysfsMemoryProbe
 from atlas.config import ConfigError, EngineSpec, Settings, load_engines
 from atlas.engines import EngineControlError, SystemdEngineController
 from atlas.ledger import Ledger, new_task_id
@@ -30,7 +34,7 @@ from atlas.ledger import Ledger, new_task_id
 log = logging.getLogger("atlas.admin")
 
 # Celery task names (contract with atlas.tasks / atlas.celery_app, NOT stated in CONVENTIONS.md: the task writer
-# registers these names; the cpu queue is the default, aegis-* may route to gpu inside the task module's task_routes).
+# registers these names; the queue comes from the app's task_routes (chat_retention -> gpu, the rest -> cpu default).
 ENQUEUE_TASKS: dict[str, str] = {
     "sentinel": "atlas.tasks.sentinel_pulse",
     "prune": "atlas.tasks.prune_sweep",
@@ -145,12 +149,23 @@ def cmd_vault_session_test(args: argparse.Namespace) -> int:
         return _fail(f"atlas.vault is not installed in this package ({exc}); V18 needs the vault writer's module", 2)
     fn = getattr(vault, "vault_session_test", None)
     if fn is None:
-        return _fail("atlas.vault has no vault_session_test(); contract: vault_session_test(idle_seconds: int) -> int",
-                     2)
-    return int(fn(args.idle_seconds))
+        return _fail("atlas.vault has no vault_session_test(); contract: "
+                     "vault_session_test(idle_seconds: int, file: str | None) -> int", 2)
+    return int(fn(args.idle_seconds, file=args.file))
 
 
 # --- enqueue (atlas.celery_app, another writer) -----------------------------------------------------------------------
+
+
+def _routed_queue(app: Any, name: str) -> str:
+    """The queue Celery's router would deliver `name` to (task_routes, else task_default_queue)."""
+    try:
+        route = app.amqp.router.route({}, name)
+        queue = route.get("queue")
+        return str(getattr(queue, "name", queue) or app.conf.task_default_queue or "cpu")
+    except Exception as exc:  # a router error must not hide the task; say which queue we assume
+        log.warning("could not resolve the route of %s (%s); assuming the default queue", name, exc)
+        return str(app.conf.task_default_queue or "cpu")
 
 
 def cmd_enqueue(args: argparse.Namespace) -> int:
@@ -165,19 +180,23 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     if app is None:
         return _fail("atlas.celery_app exposes no `app` (contract in phase2/02-orchestrator.sh)", 2)
     settings = Settings.from_env()
+    # The queue the app's own router picks (task_routes: chat_retention -> gpu, the single worker of C15), unless
+    # --queue overrides it; the ledger row names the queue the task was really sent to (Section 9.7 honesty).
+    effective = args.queue or _routed_queue(app, name)
+    opts: dict[str, Any] = {"queue": args.queue} if args.queue else {}
     ledger = Ledger(settings.db_path)
     ledger.init_db()
     task_id = new_task_id()
     # The Celery id equals the ledger id so the worker (and --wait) find the same row.
-    ledger.insert_task(args.task, task_id=task_id, status="queued", queue="cpu", payload={"source": "atlas-admin"})
+    ledger.insert_task(args.task, task_id=task_id, status="queued", queue=effective, payload={"source": "atlas-admin"})
     try:
-        result = app.send_task(name, task_id=task_id, queue=args.queue)
+        result = app.send_task(name, task_id=task_id, **opts)
     except Exception as exc:
         ledger.update_task(task_id, status="failed", error=f"enqueue failed: {exc}")
         ledger.close()
         return _fail(f"could not enqueue {name}: {exc}")
     if args.wait is None:
-        print(f"enqueued {args.task} as {name} task_id={task_id} queue={args.queue}")
+        print(f"enqueued {args.task} as {name} task_id={task_id} queue={effective}")
         ledger.close()
         return 0
     try:
@@ -228,12 +247,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("vault-session-test", help="V18: open by button, lock on idle, no vault content in memory")
     v.add_argument("--idle-seconds", type=int, default=5)
+    v.add_argument("--file", required=True, metavar="PATH",
+                   help="file to read inside a vault-tagged session (V18; phase2/README-contracts.md)")
     v.set_defaults(fn=cmd_vault_session_test)
 
     q = sub.add_parser("enqueue", help="send a Celery task (sentinel, prune, aegis-freeze, aegis-thaw, chat-retention)")
     q.add_argument("task", choices=sorted(ENQUEUE_TASKS))
     q.add_argument("--wait", type=float, default=None, metavar="SECONDS")
-    q.add_argument("--queue", default="cpu")
+    q.add_argument("--queue", default=None, help="override the task's configured route (default: what "
+                                                  "atlas.celery_app.task_routes says, else the cpu queue)")
     q.set_defaults(fn=cmd_enqueue)
     return p
 
@@ -248,6 +270,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _fail(f"config: {exc}")
     except EngineControlError as exc:
         return _fail(f"engine control: {exc}")
+    except ArbiterError as exc:
+        return _fail(f"arbiter: {exc}")
+    except (sqlite3.Error, OSError) as exc:
+        # sqlite ("unable to open database file", a locked WAL) or the directory it lives in (mkdir/chmod refused).
+        return _fail(f"ledger: {exc} (ATLAS_DB_PATH={Settings.from_env().db_path}; is its directory writable by "
+                     "this user?)")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,14 @@
 # job simply waits its turn"). The concurrency is a literal 1 here on purpose: it is not configurable through the env
 # file, because two gpu workers would let two tasks hold engines at once. The task still asks the Engine Arbiter
 # before it loads anything (4.2 rule 2); this unit only guarantees the queue discipline.
-# Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+# Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT, ATLAS_SRV substituted).
+# The broker/result URLs (with the Redis password) come from /etc/atlas/secrets/redis.env, read by PID 1.
+#
+# DOCKER GROUP == HOST ROOT (recorded, fix round): this worker starts the Phase 4 ROCm containers (`docker run` of
+# docker/rocm-base) and therefore keeps the docker group, which makes it root-equivalent on the host; render and
+# video are the GPU device nodes. CONVENTIONS.md §2 fixes the groups; the consequence and the alternatives are in
+# atlas-orchestrator.service's header. Self-modification (16.3 items 6 and 8): package, venv, day1 copy and /etc are
+# read-only below.
 
 [Unit]
 Description=A.T.L.A.S. Celery worker (gpu queue, concurrency 1)
@@ -17,6 +24,7 @@ Group=atlas
 SupplementaryGroups=docker render video
 WorkingDirectory=${ATLAS_OPT}/orchestrator
 EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 Environment=PYTHONUNBUFFERED=1
@@ -25,10 +33,15 @@ ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/
 ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app worker -Q gpu -n gpu@%H --loglevel=INFO --concurrency=1 --prefetch-multiplier=1
 Restart=always
 RestartSec=5
+TimeoutStartSec=300
 # A GraphRAG indexing pass or a Deep Think round may run long; give it time to finish the current task.
 KillMode=mixed
 TimeoutStopSec=900
 LimitNOFILE=65536
+ProtectSystem=full
+PrivateTmp=true
+ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv ${ATLAS_OPT}/day1 ${ATLAS_ETC}
+ReadWritePaths=${ATLAS_SRV} /var/lib/atlas -/srv/cold -/run/atlas
 
 [Install]
 WantedBy=multi-user.target

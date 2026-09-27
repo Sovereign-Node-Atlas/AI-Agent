@@ -142,13 +142,13 @@ def test_systemd_controller_uses_plain_sudo_and_the_unit_name(engines: dict[str,
     assert ctl.is_active("gpt-oss-120b") is True
     cmds = [c for c, _ in runner.calls]
     assert cmds == [
-        ["sudo", "systemctl", "start", "llama-server@gpt-oss-120b"],
-        ["sudo", "systemctl", "stop", "llama-server@gpt-oss-120b"],
-        ["sudo", "systemctl", "restart", "llama-server@nemotron-3-super"],
+        ["sudo", "-n", "systemctl", "start", "llama-server@gpt-oss-120b"],
+        ["sudo", "-n", "systemctl", "stop", "llama-server@gpt-oss-120b"],
+        ["sudo", "-n", "systemctl", "restart", "llama-server@nemotron-3-super"],
         ["systemctl", "is-active", "--quiet", "llama-server@gpt-oss-120b"],  # status needs no sudo
     ]
     for cmd, kw in runner.calls:
-        assert "-E" not in cmd  # adjudicated conflict 7: never sudo -E
+        assert "-E" not in cmd  # adjudicated conflict 7: never sudo -E; -n is non-interactive (sudo and sudo-rs)
         assert kw["stdin"] is subprocess.DEVNULL  # sudo-rs can never wait for a password
     _, kw = runner.calls[0]
     assert kw["timeout"] == 900.0  # TimeoutStartSec=900 in systemd/llama-server@.service
@@ -161,6 +161,23 @@ def test_systemd_controller_failure_names_the_journal() -> None:
     assert ctl.is_active("qwen3.5-122b") is False
     with pytest.raises(EngineControlError, match="not in the sudoers fragment"):
         ctl._systemctl("enable", "x", 1.0)
+
+
+def test_systemd_controller_refuses_keys_that_are_not_bare_unit_names(engines: dict[str, EngineSpec]) -> None:
+    # sudoers matches arguments as one string: `llama-server@*` would have permitted `stop llama-server@x ufw.service`.
+    # The installers write explicit lines; this side never builds such a command in the first place.
+    runner = FakeRunner()
+    ctl = SystemdEngineController(runner=runner)
+    for bad in ("x ufw.service atlas-aegis.timer", "x\tufw.service", "", "../x", "a;b", "x ufw.service"):
+        with pytest.raises(EngineControlError, match="not a bare unit instance name"):
+            ctl.stop(bad)
+        with pytest.raises(EngineControlError, match="not a bare unit instance name"):
+            ctl.is_active(bad)
+    assert runner.calls == []  # refused before sudo or systemctl ran
+    with_map = SystemdEngineController(engines=engines, runner=runner)
+    with pytest.raises(EngineControlError, match=r"not in engines\.json"):
+        with_map.start("llama-4-does-not-exist")
+    assert runner.calls == []
 
 
 def test_stub_controller_moves_the_probe(engines: dict[str, EngineSpec]) -> None:

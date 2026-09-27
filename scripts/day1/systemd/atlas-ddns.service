@@ -2,6 +2,8 @@
 # Installed by phase1/07-remote.sh via render_template (ATLAS_ETC, VPN_HOST). Runs as the atlas-ddns service account;
 # the token file is mode 600 atlas-ddns:atlas-ddns inside the root-only secrets directory (CONVENTIONS.md §2) and is
 # read by PID 1 before privileges drop, so the account itself never needs to traverse the directory.
+# Sandbox: the updater only ever talks to the loopback squid proxy (HTTPS_PROXY from proxy.env), so every other
+# address, every capability and every non-service syscall is denied; a bug in curl/jq cannot reach the LAN directly.
 [Unit]
 Description=ATLAS Cloudflare dynamic DNS for ${VPN_HOST}
 After=network-online.target squid.service
@@ -16,10 +18,33 @@ EnvironmentFile=${ATLAS_ETC}/secrets/cloudflare.env
 # HTTP_PROXY/HTTPS_PROXY/NO_PROXY: every outbound request goes through the allowlist proxy (§7.1)
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 StateDirectory=atlas-ddns
+UMask=0077
 ExecStart=/usr/local/sbin/atlas-ddns
+# Filesystem and process view
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Privileges
 NoNewPrivileges=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Network: loopback only (the proxy at 127.0.0.1:3128); AF_UNIX for logger(1) -> /dev/log
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost

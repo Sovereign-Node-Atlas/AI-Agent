@@ -4,12 +4,19 @@ Modules: sentinel (9.3), prune (9.6), aegis (9.5), ouroboros (9.4), retention (D
 
 Every task runs in a Celery worker process, NOT in the orchestrator's process. The Engine Arbiter is an object inside
 the orchestrator, so a task that needs a model calls the orchestrator's loopback API (`OrchestratorClient`): its
-/internal/v1/chat/completions holds the single generation lock (4.2 rule 3) and loads through the Arbiter (rule 2), so
-"a background task that calls an LLM partway through still queues behind the resident engine" (9.7, C15) is true by
-construction. Only 127.0.0.1 is ever dialled; trust_env=False keeps the allowlist proxy out of loopback traffic.
+/internal/v1/chat/completions loads a weight-bearing engine through the Arbiter (4.2 rule 2) and generates on it under
+the single generation lock (rule 3). The three resident small models (router-qwen3.5-4b, bge-m3, the reranker) are
+outside the Arbiter's ledger by design (4.1 "always loaded", 5.3): a generation on one of them takes NO lock; it
+waits while a weight-bearing generation is running (so "a background task that calls an LLM partway through still
+queues behind the resident engine", 9.7 C15, holds in that direction) but a chat generation never waits for it. That
+is the whole claim; nothing in this package holds a lock for a 4B call (fix round, rule §7.4).
+Only 127.0.0.1 is ever dialled; trust_env=False keeps the allowlist proxy out of loopback traffic. When the
+orchestrator's admin routes carry a token (ORCH_ADMIN_TOKEN_FILE, atlas.api), the client sends it as X-Atlas-Token.
 
 Ledger rule: `atlas-admin enqueue` inserts the task row with the Celery task id BEFORE sending (admin.py); the worker
 finds that row and updates it. Beat-scheduled and chained tasks have no row yet, so `TaskRecord.start()` inserts one.
+An internal generation made on a task's behalf gets its own CHILD row (parent_task_id = the Celery id) in the
+orchestrator, so the parent row is never marked done or failed mid-flight by the generation it asked for.
 """
 
 from __future__ import annotations
@@ -29,7 +36,15 @@ from atlas.ledger import Ledger
 
 log = logging.getLogger("atlas.tasks")
 
-__all__ = ["OrchestratorClient", "TaskRecord", "notify", "open_task_ledger", "read_secret_line", "settings"]
+__all__ = [
+    "OrchestratorClient",
+    "TaskRecord",
+    "admin_token",
+    "notify",
+    "open_task_ledger",
+    "read_secret_line",
+    "settings",
+]
 
 
 def settings() -> Settings:
@@ -60,6 +75,33 @@ def read_secret_line(path: str | Path, key: str | None = None) -> str:
     raise RuntimeError(f"secret file {p} carries no {key or 'value'}")
 
 
+def _owner_mode(path: str | Path) -> str:
+    """`uid:gid mode` of a path (and of its parent when the path itself cannot be stat'ed), for error messages that
+    must name the cause (rule §7.4): a secret file inside a non-traversable directory shows as the parent's mode."""
+    import stat
+
+    for p in (Path(path), Path(path).parent):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        return f"{p}={st.st_uid}:{st.st_gid} {stat.filemode(st.st_mode)}"
+    return f"{path}=unstat-able"
+
+
+def admin_token(env: Mapping[str, str] | None = None) -> str | None:
+    """The orchestrator's admin token (ORCH_ADMIN_TOKEN_FILE, atlas.api `require_admin`), or None when the node runs
+    without one (loopback-only admin routes). A configured but unreadable file is an error, never a silent None."""
+    env = dict(os.environ if env is None else env)
+    path = env.get("ORCH_ADMIN_TOKEN_FILE")
+    if not path:
+        return None
+    try:
+        return read_secret_line(path, "ORCH_ADMIN_TOKEN")
+    except RuntimeError as exc:
+        raise RuntimeError(f"ORCH_ADMIN_TOKEN_FILE={path} is set but unreadable ({exc}; {_owner_mode(path)})") from exc
+
+
 def notify(
     message: str,
     *,
@@ -83,11 +125,20 @@ def notify(
     if tags:
         headers["Tags"] = ",".join(tags)
     token_file = env.get("NTFY_TOKEN_FILE")
-    if token_file and Path(token_file).is_file():
+    if token_file:
+        # No silent `is_file()` gate (fix round): a token file this worker cannot traverse to (/etc/atlas/secrets must
+        # be root:atlas 750, the file atlas:atlas 600) is an ERROR in the journal, and the push still goes out so the
+        # server's refusal is visible too; ntfy's default-deny auth would drop an unauthenticated push.
         try:
             headers["Authorization"] = f"Bearer {read_secret_line(token_file, 'NTFY_TOKEN')}"
         except RuntimeError as exc:
-            log.warning("ntfy token not read (%s); pushing without auth", exc)
+            log.error(
+                "ntfy token file %s unreadable (%s; owner:mode %s); pushing without auth, which ntfy will refuse "
+                "under default-deny",
+                token_file,
+                exc,
+                _owner_mode(token_file),
+            )
     try:
         with httpx.Client(trust_env=False, timeout=timeout_s) as c:
             r = c.post(f"{url}/{topic}", content=message.encode("utf-8"), headers=headers)
@@ -110,7 +161,14 @@ class OrchestratorClient:
         self.base_url = (base_url or env.get("ORCH_URL") or f"http://127.0.0.1:{env.get('ORCH_PORT') or 8800}").rstrip(
             "/"
         )
-        self._http = httpx.Client(base_url=self.base_url, timeout=timeout_s, trust_env=False, transport=transport)
+        headers: dict[str, str] = {}
+        token = admin_token()
+        if token:
+            headers["X-Atlas-Token"] = token
+        self._http = httpx.Client(
+            base_url=self.base_url, timeout=timeout_s, trust_env=False, transport=transport, headers=headers
+        )
+        self.last_child_task_id: str | None = None  # the orchestrator's child ledger row of the last generate()
 
     def close(self) -> None:
         self._http.close()
@@ -145,6 +203,7 @@ class OrchestratorClient:
             raise RuntimeError(f"orchestrator generate on {engine} -> HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
         choice = (data.get("choices") or [{}])[0]
+        self.last_child_task_id = str((data.get("atlas") or {}).get("task_id") or "") or None
         return str((choice.get("message") or {}).get("content") or "")
 
     def route(self, message: str) -> dict[str, Any]:
@@ -191,11 +250,15 @@ class TaskRecord:
     def elapsed_s(self) -> float:
         return time.time() - self.started
 
-    def done(self, result: Any = None) -> dict[str, Any]:
+    def done(self, result: Any = None, *, returned: Any = None) -> dict[str, Any]:
+        """Mark the row done with `result` in the ledger; the Celery return value is `returned` when given (so a task
+        can keep bulk text in the ledger and hand Redis only a small summary, fix round: the result backend keeps
+        values for result_expires days)."""
         self.ledger.update_task(self.task_id, status="done", result=result)
         log.info("task %s (%s) done in %.1fs", self.task_id, self.kind, self.elapsed_s)
         self._close()
-        return result if isinstance(result, dict) else {"result": result}
+        out = result if returned is None else returned
+        return out if isinstance(out, dict) else {"result": out}
 
     def failed(self, error: str) -> None:
         self.ledger.update_task(self.task_id, status="failed", error=error[:2000])

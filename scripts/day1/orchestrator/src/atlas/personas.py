@@ -36,6 +36,7 @@ from atlas.config import (
 log = logging.getLogger("atlas.personas")
 
 __all__ = [
+    "LEAD_MINIMUM_EXTERNAL_TIER",
     "EngineBinding",
     "Persona",
     "PersonaRegistry",
@@ -47,8 +48,9 @@ __all__ = [
 HEMISPHERE_LEADS: dict[str, str] = {"corporate": "ren", "estate": "arthur"}
 
 # Section 6.2 "Speaks externally" column, the authoritative tier per director. ren/arthur are not in the 6.2 table;
-# their files carry an inference (config/README.md) which the registry honours, falling back to `sensitive`
-# (16.1 rule 2: the leads are reserved for matters that warrant them, which are never routine).
+# their files carry an inference (config/README.md, to be confirmed with the Principal) which the registry honours
+# with one floor: a lead is never `routine` (16.1 rule 2: the leads are reserved for matters that warrant them, and
+# a routine item auto-sends without a human look). A lead file declaring `routine` is a ConfigError, not a default.
 SECTION_6_2_EXTERNAL_TIER: dict[str, str] = {
     "gideon": "sensitive",
     "silas": "standard",
@@ -181,8 +183,16 @@ class PersonaRegistry(Mapping[str, Persona]):
         raise ConfigError(f"no persona matches owner name {name!r} (task-forces.json owners must name a persona)")
 
 
+LEAD_MINIMUM_EXTERNAL_TIER = "standard"  # 16.1 rule 2: a hemisphere lead never speaks externally at routine tier
+
+
 def external_tier(persona: Persona) -> str:
-    """The tier at which a persona speaks externally (6.2 column; the file's value must agree with 6.2)."""
+    """The tier at which a persona speaks externally (6.2 column; the file's value must agree with 6.2).
+
+    Directors: the 6.2 value, with a warning when the file disagrees. Leads (ren, arthur): the file's declared tier
+    (an inference the Principal confirms, config/README.md), refused loudly when it is below `standard` so a lead's
+    outbound item can never auto-send (16.1 rule 2, 16.2 routine behaviour).
+    """
     expected = SECTION_6_2_EXTERNAL_TIER.get(persona.key)
     declared = persona.speaks_externally_tier
     if expected is not None and declared != expected:
@@ -192,6 +202,9 @@ def external_tier(persona: Persona) -> str:
         return expected
     if declared not in TIERS:
         raise ConfigError(f"persona {persona.key}: speaks_externally_tier {declared!r} is not one of {TIERS}")
+    if persona.key in HEMISPHERE_LEADS.values() and TIERS.index(declared) < TIERS.index(LEAD_MINIMUM_EXTERNAL_TIER):
+        raise ConfigError(f"persona {persona.key}: a hemisphere lead cannot speak externally at {declared!r} tier "
+                          f"(16.1 rule 2; minimum {LEAD_MINIMUM_EXTERNAL_TIER}); fix config/personas/{persona.key}.md")
     return declared
 
 

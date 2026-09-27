@@ -6,12 +6,29 @@
 # Contract with the `atlas` package (CONVENTIONS.md §1 orchestrator/; not stated there, stated here and in
 # phase2/02-orchestrator.sh): the console script `atlas-orchestrator --host H --port P` serves GET /health (200 when
 # ready), GET /v1/models (ids atlas, ren, arthur) and POST /v1/chat/completions, and reads its settings from the
-# environment (keys listed in phase2/02-orchestrator.sh, written to /etc/atlas/orchestrator.env).
+# environment (keys listed in phase2/02-orchestrator.sh, written to /etc/atlas/orchestrator.env; the Redis URLs come
+# from /etc/atlas/secrets/redis.env, loaded below, because they carry the Redis password).
 #
 # Control path (CONVENTIONS.md §8): the process runs as `atlas` and starts/stops engines with `sudo systemctl
 # start|stop|restart llama-server@<key>` under /etc/sudoers.d/atlas-engines, so NoNewPrivileges must stay off here.
-# The sandbox (16.4) needs the docker group. Every outbound request of the integrations goes through the allowlist
-# proxy: proxy.env is loaded last so HTTPS_PROXY is set for the Google/Xero/feed clients (rule §7.1).
+# Every outbound request of the integrations goes through the allowlist proxy: proxy.env is loaded last so HTTPS_PROXY
+# is set for the Google/Xero/feed clients (rule §7.1).
+#
+# DOCKER GROUP == HOST ROOT (recorded, fix round; phase1/06-docker.sh header states the same decision): the sandbox
+# (16.4) and the Phase 4 containers are `docker run` calls from this account, and CONVENTIONS.md §2 puts `atlas` in the
+# docker group for that. Any docker-group member can `docker run --privileged -v /:/host`, so for a process that has
+# been compromised (a prompt-injected task that reaches a shell) every hardening line below, the exact sudoers
+# fragments and the outbound allowlist are advisory, not enforced. The baseline (CONVENTIONS.md §2) fixes the group
+# membership, so it stays; the alternatives (a root-owned `atlas-sandbox-run <job-dir>` helper under sudoers, or a
+# docker-socket proxy limited to containers/create with the sandbox HostConfig) are a Principal decision that also
+# changes the package's run line (docker/sandbox/Dockerfile header) and phase1/06-docker.sh.
+#
+# Self-modification (Section 16.3 items 6 and 8, fix round): the package tree, the venv, the day1 copy and /etc are
+# read-only for this process (ReadOnlyPaths= plus ProtectSystem=full); the engine env files under /etc/atlas/engines are
+# read-only too — a change to an engine's flags is a proposal the Principal applies through the phase scripts, never a
+# write from here. ProtectSystem=strict was NOT chosen: it would also make /run read-only, which sudo-rs (its
+# timestamp directory) and the docker client may need (UNVERIFIED either way; a control path that breaks at 02:30 is
+# worse than one explicit read-only list).
 
 [Unit]
 Description=A.T.L.A.S. orchestrator (Engine Arbiter, router, approval gate, ledger)
@@ -28,23 +45,27 @@ Group=atlas
 SupplementaryGroups=docker render video
 WorkingDirectory=${ATLAS_OPT}/orchestrator
 EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/var/lib/atlas
 # Redis is a container (docker/core/compose.yml, restart: unless-stopped); wait for the loopback port rather than
-# crash-loop on the first boot. /dev/tcp is a bash feature, hence /bin/bash.
+# crash-loop on the first boot. /dev/tcp is a bash feature, hence /bin/bash. The loop is 180 s; TimeoutStartSec is
+# longer so its own message, not a systemd kill, is what the journal shows when Redis never comes.
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-orchestrator: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
 ExecStart=${ATLAS_OPT}/venv/bin/atlas-orchestrator --host ${ORCH_HOST} --port ${ORCH_PORT}
 Restart=on-failure
 RestartSec=5
-TimeoutStartSec=180
+TimeoutStartSec=300
 TimeoutStopSec=60
 KillMode=mixed
 LimitNOFILE=65536
 # Only paths the service must write; everything else read-only (weights are read by llama-server, not here).
 ProtectSystem=full
-ReadWritePaths=${ATLAS_SRV} ${ATLAS_ETC}/engines /var/lib/atlas /srv/cold /run/atlas
+PrivateTmp=true
+ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv ${ATLAS_OPT}/day1 ${ATLAS_ETC}
+ReadWritePaths=${ATLAS_SRV} /var/lib/atlas -/srv/cold -/run/atlas
 RuntimeDirectory=atlas
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes

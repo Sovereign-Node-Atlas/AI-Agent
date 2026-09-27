@@ -8,16 +8,31 @@ research/gguf-models.md (§9 endpoints) unless marked UNVERIFIED:
     predicted_n, predicted_ms, predicted_per_second); streams carry per-token timings with "timings_per_token": true.
   * POST /v1/embeddings (OpenAI shape) on the --embedding server; POST /v1/rerank {"model","query","documents","top_n"}
     on the --reranking server.
-  * The control path (CONVENTIONS.md §8): `sudo systemctl start|stop|restart llama-server@<key>` under
-    /etc/sudoers.d/atlas-engines; plain sudo, never `sudo -E` (adjudicated conflict 7); `systemctl is-active` needs
-    no sudo.
+  * The control path (CONVENTIONS.md §8): `sudo -n systemctl start|stop|restart llama-server@<key>` under
+    /etc/sudoers.d/atlas-engines; plain sudo, never `sudo -E` (adjudicated conflict 7); `-n` (non-interactive, accepted
+    by sudo and sudo-rs) makes a missing or mismatched fragment fail at once with "a password is required" instead of
+    an askpass attempt; `systemctl is-active` needs no sudo.
     llama-server@.service's ExecStartPost polls /health, so `systemctl start` returns only when the engine can serve.
+
+Privilege boundary, stated plainly (fix round):
+  * sudoers(5) matches command-line arguments as ONE space-separated string, so a `llama-server@*` line would also
+    permit `stop llama-server@x ufw.service`. The installers (phase2/01-llama.sh, 02-orchestrator.sh) therefore write
+    one explicit line per verb and engine key (30 lines, no wildcard), and this module refuses any key that is not a
+    bare unit instance name ([A-Za-z0-9._-]+) and, when it knows engines.json, any key that is not in it — before
+    sudo is ever called. Both checks hold whether the installed sudo is sudo or sudo-rs.
+  * `atlas` is in the `docker` group for the AEGIS sandbox (CONVENTIONS.md §2, Section 16.4; atlas-orchestrator.service
+    SupplementaryGroups=docker). Docker-socket access is root-equivalent on the host (`docker run --privileged -v
+    /:/host`), so the sudoers fragment bounds ACCIDENTS (a wrong key, a bug), not a hostile or prompt-injected atlas
+    process. The real boundaries for that case are the sandbox caps (memory, cpu, pids, --network none, timeout, no
+    docker.sock mount — atlas.sandbox, another writer's module, must assert the last one in code) and the approval
+    gate (Section 16.2).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -34,6 +49,8 @@ log = logging.getLogger("atlas.engines")
 SYSTEMCTL = "systemctl"
 SUDO = "sudo"
 UNIT_PREFIX = "llama-server@"
+# A key becomes a sudoers command argument and a systemd instance name: the same alphabet phase2/01-llama.sh enforces.
+UNIT_KEY_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 class EngineError(RuntimeError):
@@ -271,12 +288,22 @@ class SystemdEngineController:
         self.sudo = sudo
         self._run = runner
 
+    def _check_key(self, key: str) -> str:
+        """Refuse anything that is not a bare engine key before it reaches sudo or systemctl (see module docstring)."""
+        if not UNIT_KEY_RE.fullmatch(key):
+            raise EngineControlError(f"engine key {key!r} is not a bare unit instance name ([A-Za-z0-9._-]+); refusing "
+                                     "to build a systemctl command from it")
+        if self.engines and key not in self.engines:
+            raise EngineControlError(f"engine key {key!r} is not in engines.json (CONVENTIONS.md §8); the sudoers "
+                                     "fragment names exactly those keys")
+        return key
+
     def _systemctl(self, verb: str, key: str, timeout_s: float) -> None:
         if verb not in self.ALLOWED:
             raise EngineControlError(f"systemctl {verb} is not in the sudoers fragment (only {self.ALLOWED})")
-        unit = f"{UNIT_PREFIX}{key}"
-        # Plain `sudo`, no -E (conflict 7); stdin closed so sudo-rs can never wait for a password.
-        cmd = ([SUDO] if self.sudo else []) + [SYSTEMCTL, verb, unit]
+        unit = f"{UNIT_PREFIX}{self._check_key(key)}"
+        # Plain `sudo -n`, never -E (conflict 7); stdin closed so neither sudo nor sudo-rs can wait for a password.
+        cmd = ([SUDO, "-n"] if self.sudo else []) + [SYSTEMCTL, verb, unit]
         try:
             proc = self._run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s,
                              check=False)
@@ -306,7 +333,7 @@ class SystemdEngineController:
         self._systemctl("restart", key, self.start_timeout_s)
 
     def is_active(self, key: str) -> bool:
-        unit = f"{UNIT_PREFIX}{key}"
+        unit = f"{UNIT_PREFIX}{self._check_key(key)}"
         try:
             proc = self._run([SYSTEMCTL, "is-active", "--quiet", unit], stdin=subprocess.DEVNULL, capture_output=True,
                              text=True, timeout=30, check=False)

@@ -5,16 +5,21 @@
 #
 # Order (each part idempotent):
 #   1. config/sentinel-feeds.json (D6: CoinDesk RSS, ASX and US index feeds, RSS news, node telemetry) is validated
-#      as JSON, every feed host is proven to be in config/allowlist.txt (the file's own contract), and each URL is
-#      probed ONCE through the allowlist proxy: an unreachable feed is logged as "feed unreachable" (its URL is
-#      UNVERIFIED by the research and the task treats it the same way), never a failure.
-#   2. SENTINEL_FEEDS / SENTINEL_LOG_DIR in $ATLAS_ETC/orchestrator.env (step 02 wrote the defaults; re-asserted).
-#   3. Units: atlas-sentinel.service/.timer (hourly), atlas-prune.service/.timer (72 h), enabled.
+#      as JSON, every feed host is proven to be in config/allowlist.txt (the file's own contract), every entry of the
+#      allowlist's Sentinel group that no feed references is reported (a wildcard nothing uses widens 12.5's surface;
+#      allowlist.txt is another writer's file, so this is a warning naming the line to remove), and each URL is probed
+#      ONCE through the allowlist proxy: an unreachable feed is logged as "feed unreachable" (its URL is UNVERIFIED by
+#      the research and the task treats it the same way), never a failure.
+#   2. SENTINEL_FEEDS / SENTINEL_LOG_DIR in $ATLAS_ETC/orchestrator.env (step 02 wrote the defaults; re-asserted), and
+#      the alert path proven for its reader: the cpu worker (user atlas) must be able to read NTFY_TOKEN_FILE
+#      ($ATLAS_ETC/secrets/ntfy.env, atlas:atlas 600 inside the root:atlas 750 secrets dir) — otherwise every BLUF push
+#      fails silently at 03:00 (fix round).
+#   3. Units: atlas-sentinel.service/.timer (hourly), atlas-prune.service/.timer (every 3 days), enabled.
 #   4. One Sentinel pulse NOW: `atlas-admin enqueue sentinel --wait 600` (contract, step 02 header) must finish and
 #      print the ledger record as one JSON object; that record is the proof the ledger shows the pulse.
 #
-# Contracts relied on: orch_admin/ORCH_ENV/ORCH_DIR from phase2/02-orchestrator.sh; the orchestrator and the cpu
-# worker are running (step 02); Phase 1 step 7's ntfy for the alert path (the task, not this step, pushes).
+# Contracts relied on: orch_admin/ORCH_ENV/ORCH_DIR/REDIS_ENV from phase2/02-orchestrator.sh; the orchestrator and the
+# cpu worker are running (step 02); Phase 1 step 7's ntfy for the alert path (the task, not this step, pushes).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -26,11 +31,13 @@ fi
 
 SENTINEL_FEEDS_FILE="$ATLAS_DAY1_DIR/config/sentinel-feeds.json"
 SENTINEL_ALLOWLIST="$ATLAS_DAY1_DIR/config/allowlist.txt"
+SENTINEL_NTFY_TOKEN="$ATLAS_ETC/secrets/ntfy.env"
 
 _sentinel_validate_feeds() {
   [[ -f "$SENTINEL_FEEDS_FILE" ]] || die "$SENTINEL_FEEDS_FILE is missing"
   [[ -f "$SENTINEL_ALLOWLIST" ]] || die "$SENTINEL_ALLOWLIST is missing"
-  # JSON shape + allowlist sync in one pass; prints "id<TAB>url" per feed (primary and fallback URLs).
+  # JSON shape + allowlist sync in one pass; prints "id<TAB>url" per feed (primary and fallback URLs) and
+  # "UNUSED<TAB>entry" for every Sentinel-group allowlist entry no feed host matches.
   local urls
   urls="$(python3 - "$SENTINEL_FEEDS_FILE" "$SENTINEL_ALLOWLIST" <<'PY'
 import json, sys
@@ -45,43 +52,68 @@ assert "rss" in kinds, "no RSS feed (D6: RSS news)"
 ids = {f["id"] for f in feeds}
 for need in ("coindesk-news", "asx200", "sp500"):
     assert need in ids, f"feed {need} missing (D6)"
-allow = []
-for line in open(allow_path, encoding="utf-8"):
-    line = line.split("#", 1)[0].strip()
+for f in feeds:
+    assert f.get("hemisphere") in ("corporate", "estate"), f"feed {f['id']}: hemisphere must be corporate|estate (CONVENTIONS.md §8)"
+allow: list[str] = []
+sentinel_group: list[str] = []
+in_group = False
+for raw in open(allow_path, encoding="utf-8"):
+    stripped = raw.strip()
+    if stripped.startswith("#"):
+        if "sentinel" in stripped.lower() and stripped.startswith("# ---"):
+            in_group = True
+        elif stripped.startswith("# ---"):
+            in_group = False
+        continue
+    line = stripped.split("#", 1)[0].strip()
     if line:
         allow.append(line.lower())
+        if in_group:
+            sentinel_group.append(line.lower())
+def matches(host: str, a: str) -> bool:
+    if a.startswith("."):
+        return host == a[1:] or host.endswith(a)
+    return host == a
 def allowed(host: str) -> bool:
     host = host.lower()
-    for a in allow:
-        if a.startswith("."):
-            if host == a[1:] or host.endswith(a):
-                return True
-        elif host == a:
-            return True
-    return False
+    return any(matches(host, a) for a in allow)
 bad = []
 out = []
+hosts = set()
 for f in feeds:
     for key in ("url", "fallback_url"):
         u = f.get(key)
         if not u:
             continue
-        host = urlsplit(u).hostname or ""
+        host = (urlsplit(u).hostname or "").lower()
+        hosts.add(host)
         if not allowed(host):
             bad.append(f"{f['id']}: {host}")
         out.append(f"{f['id']}\t{u}")
 if bad:
     print("hosts missing from config/allowlist.txt:", bad, file=sys.stderr)
     sys.exit(1)
+for a in sentinel_group:
+    if not any(matches(h, a) for h in hosts):
+        out.append(f"UNUSED\t{a}")
 print("\n".join(out))
 PY
 )" || die "config/sentinel-feeds.json is invalid or names a host missing from config/allowlist.txt (see above)"
-  log "sentinel-feeds.json valid: $(wc -l <<<"$urls") URL(s), every host allowlisted"
-  # One probe each through the proxy (20 s); unreachable = logged, not fatal (URLs are UNVERIFIED by the research).
-  proxy_env
-  local id url code ok=0 bad=0
+  local id url n_urls=0
   while IFS=$'\t' read -r id url; do
     [[ -n "$url" ]] || continue
+    if [[ "$id" == UNUSED ]]; then
+      warn "config/allowlist.txt Sentinel group entry '$url' is referenced by no feed in config/sentinel-feeds.json: an allowlisted domain nothing uses widens the outbound surface (Section 12.5); remove it from allowlist.txt (that file's writer) or add the feed that uses it"
+    else
+      n_urls=$(( n_urls + 1 ))
+    fi
+  done <<<"$urls"
+  log "sentinel-feeds.json valid: $n_urls URL(s), every host allowlisted"
+  # One probe each through the proxy (20 s); unreachable = logged, not fatal (URLs are UNVERIFIED by the research).
+  proxy_env
+  local code ok=0 bad=0
+  while IFS=$'\t' read -r id url; do
+    [[ -n "$url" && "$id" != UNUSED ]] || continue
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -A 'Mozilla/5.0 (X11; Linux x86_64) ATLAS-Sentinel/1.0' "$url" 2>/dev/null || true)"
     if [[ "$code" =~ ^2 ]]; then
       ok=$(( ok + 1 ))
@@ -98,7 +130,16 @@ _sentinel_env() {
   ensure_kv "$ORCH_ENV" SENTINEL_FEEDS "$SENTINEL_FEEDS_FILE"
   ensure_kv "$ORCH_ENV" SENTINEL_LOG_DIR "$ATLAS_SRV/data/sentinel"
   ensure_kv "$ORCH_ENV" COLD_DIR /srv/cold
+  ensure_kv "$ORCH_ENV" NTFY_TOKEN_FILE "$SENTINEL_NTFY_TOKEN"
+  chown root:atlas "$ORCH_ENV"; chmod 640 "$ORCH_ENV"
   ensure_dir /srv/cold atlas:atlas 750
+  # The alert path's reader is the cpu worker (atlas): prove the read now (fix round).
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 750
+  [[ -s "$SENTINEL_NTFY_TOKEN" ]] || die "$SENTINEL_NTFY_TOKEN is missing: Phase 1 step 7 writes it (NTFY_TOKEN=tk_...); without it the Sentinel BLUF alert (Section 9.3) cannot reach the Principal's phone"
+  grep -qE '^NTFY_TOKEN=tk_' "$SENTINEL_NTFY_TOKEN" || die "$SENTINEL_NTFY_TOKEN carries no NTFY_TOKEN=tk_... line (Phase 1 step 7's format)"
+  svc_user_run cat "$SENTINEL_NTFY_TOKEN" >/dev/null 2>&1 \
+    || die "the atlas account cannot read $SENTINEL_NTFY_TOKEN ($(stat -c '%U:%G %a' "$SENTINEL_NTFY_TOKEN"); $ATLAS_ETC/secrets is $(stat -c '%U:%G %a' "$ATLAS_ETC/secrets"), must be root:atlas 750 and the file atlas:atlas 600): the cpu worker's ntfy pushes would fail"
+  log "alert path: $SENTINEL_NTFY_TOKEN readable by atlas (NTFY_TOKEN_FILE, KEY=VALUE format)"
 }
 
 _sentinel_units() {
@@ -107,7 +148,9 @@ _sentinel_units() {
   for u in atlas-sentinel atlas-prune; do
     render_template -m 644 "$ATLAS_DAY1_DIR/systemd/$u.service" "/etc/systemd/system/$u.service" ATLAS_ETC ATLAS_OPT
     install -m 644 "$ATLAS_DAY1_DIR/systemd/$u.timer" "/etc/systemd/system/$u.timer"
+    grep -qF "EnvironmentFile=$REDIS_ENV" "/etc/systemd/system/$u.service" || die "$u.service does not load $REDIS_ENV (the broker URL for the enqueue)"
   done
+  grep -q '^OnCalendar=' /etc/systemd/system/atlas-prune.timer || die "atlas-prune.timer must be a calendar timer (Section 9.6 every 72 hours; a monotonic timer fires after every boot)"
   systemctl daemon-reload
   systemctl enable --now atlas-sentinel.timer >/dev/null
   systemctl enable --now atlas-prune.timer >/dev/null
@@ -140,6 +183,6 @@ step_08() {
   _sentinel_env
   _sentinel_units
   _sentinel_pulse_now
-  notify "Phase 2 step 8 done: Sentinel hourly timer (D6 feeds), 72-hour prune timer; first pulse in the ledger"
+  notify "Phase 2 step 8 done: Sentinel hourly timer (D6 feeds), 3-day prune timer; first pulse in the ledger"
   log "step 08 done"
 }

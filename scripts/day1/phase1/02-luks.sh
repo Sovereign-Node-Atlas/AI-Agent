@@ -248,8 +248,9 @@ step_02() {
 
   # --- Accepted unencrypted OS: nothing on the OS drive may open the data volume from now on (header) -----------
   if _luks_os_accepted && [[ -s "$ATLAS_LUKS_KEYFILE" ]]; then
-    _luks_has_token "$dev" tpm2 && _luks_has_token "$dev" recovery \
-      || die "refusing to wipe the keyfile slot: TPM2 and recovery tokens must both be enrolled first"
+    if ! { _luks_has_token "$dev" tpm2 && _luks_has_token "$dev" recovery; }; then
+      die "refusing to wipe the keyfile slot: TPM2 and recovery tokens must both be enrolled first"
+    fi
     systemd-cryptenroll --wipe-slot=password --unlock-tpm2-device=auto "$dev" \
       || die "systemd-cryptenroll --wipe-slot=password failed on $dev; the keyfile slot is still present"
     shred -u "$ATLAS_LUKS_KEYFILE"

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# verify/v03a-gtt.sh — V3 first half (Section 3.3, 17 step 5, 21): the kernel parameters were accepted on kernel 7.x,
-# the GTT pool read from sysfs matches them, and vulkaninfo sees the GPU as RADV GFX1151 (adjudicated conflict 6:
-# match on "GFX1151", never on the marketing name; conflict 8: the amdgpu.gttsize deprecation warning is expected).
+# verify/v03a-gtt.sh — V3 first half (Section 3.3, 17 step 5, 21): the two Appendix B kernel parameters were accepted
+# on kernel 7.x (amdgpu.gttsize=196608 ttm.pages_limit=50331648), the GTT pool read from sysfs matches them, and
+# vulkaninfo sees the GPU as RADV GFX1151 (adjudicated conflict 6: match on "GFX1151", never on the marketing name;
+# conflict 8: the amdgpu.gttsize deprecation warning is expected). amdgpu.lockup_timeout (conflict 8, applied by step
+# 4) is REPORTED in the evidence line only: Section 21 defines V3 as the Appendix B parameters plus the GTT pool, so
+# its absence is never a fail condition here.
 # Usage: v03a-gtt.sh [EXPECTED_GTT_MIB]   (default 196608 = 192 GiB; tolerance: >= 95 % of it, <= it + 1 MiB)
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
@@ -10,15 +13,16 @@ source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 expected="${1:-196608}"
 cmdline="$(cat /proc/cmdline)"
 fails=()
-for p in "ttm.pages_limit=50331648" "amdgpu.gttsize=$expected" "amdgpu.lockup_timeout=10000,60000,10000,10000"; do
+for p in "ttm.pages_limit=50331648" "amdgpu.gttsize=$expected"; do
   grep -qw -- "$p" <<<"$cmdline" || fails+=("cmdline lacks $p")
 done
 pages="$(cat /sys/module/ttm/parameters/pages_limit 2>/dev/null || echo missing)"
 [[ "$pages" == "50331648" ]] || fails+=("ttm.pages_limit live=$pages")
 gttparam="$(cat /sys/module/amdgpu/parameters/gttsize 2>/dev/null || echo missing)"
 [[ "$gttparam" == "$expected" ]] || fails+=("amdgpu.gttsize live=$gttparam")
+# Reported, not gated (see the header).
 lockup="$(cat /sys/module/amdgpu/parameters/lockup_timeout 2>/dev/null || echo missing)"
-[[ "$lockup" == "10000,60000,10000,10000" ]] || fails+=("amdgpu.lockup_timeout live=$lockup")
+grep -qw -- 'amdgpu.lockup_timeout=10000,60000,10000,10000' <<<"$cmdline" || lockup+="(not on cmdline)"
 
 total=""
 if total="$(gpu_gtt_total_mb 2>/dev/null)"; then

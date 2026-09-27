@@ -1,14 +1,17 @@
 # /etc/systemd/system/atlas-prune.timer — every 72 hours (Section 9.6 "A Celery beat job every 72 hours"; the
-# timer enqueues, Celery executes: CONVENTIONS.md §8). Monotonic schedule: first run an hour after boot, then every
-# 72 h of uptime; Persistent=true catches up a run missed while the node was off.
+# timer enqueues, Celery executes: CONVENTIONS.md §8). Calendar schedule (fix round): a monotonic OnBootSec/
+# OnUnitActiveSec pair fired a sweep an hour after EVERY boot and ignored Persistent=, so a node rebooted daily pruned
+# daily. Days 1,4,...,28 at 03:10 local (after the 02:30 AEGIS window; the sweep waits in the cpu queue while a freeze
+# is on) give a 3-day cadence; the month-end gap is 3 to 4 days (1 day only in February), which 9.6's "every 72
+# hours" tolerates better than a daily sweep. Persistent=true now genuinely runs a sweep missed while the node was off.
 # Installed verbatim by phase2/08-sentinel.sh.
 [Unit]
 Description=Run the A.T.L.A.S. semantic pruning sweep every 72 hours
 
 [Timer]
-OnBootSec=1h
-OnUnitActiveSec=72h
+OnCalendar=*-*-1,4,7,10,13,16,19,22,25,28 03:10:00
 RandomizedDelaySec=30min
+AccuracySec=1min
 Persistent=true
 Unit=atlas-prune.service
 

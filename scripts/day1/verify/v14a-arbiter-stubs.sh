@@ -5,7 +5,7 @@
 # exactly one stdout line (the pytest summary); never prompts; safe to re-run; no live service is touched.
 #
 # Contract with the orchestrator package (CONVENTIONS.md §7.7/§7.8, README-contracts.md "Unit tests"): the tests live
-# at orchestrator/tests/test_arbiter.py and run with `/opt/atlas/venv/bin/python -m pytest -q tests/test_arbiter.py`
+# at orchestrator/tests/test_arbiter.py and run with `/opt/atlas/venv/bin/python -m pytest tests/test_arbiter.py`
 # from the package directory, with stubs for llama-server, Redis and Docker. Pass = pytest exit 0 (exit 5 "no tests
 # collected" is a fail, never a pass). The installed copy ($ATLAS_OPT/orchestrator, the editable install of step 2)
 # is preferred; the mirrored tree ($ATLAS_DAY1_DIR/orchestrator) is the fallback.
@@ -22,7 +22,7 @@ py="$ATLAS_OPT/venv/bin/python"
 pkg="$ATLAS_OPT/orchestrator"
 [[ -f "$pkg/tests/$TEST" ]] || pkg="$ATLAS_DAY1_DIR/orchestrator"
 [[ -f "$pkg/tests/$TEST" ]] || { echo "$ID fail: tests/$TEST not found under $ATLAS_OPT/orchestrator or $ATLAS_DAY1_DIR/orchestrator (contract: orchestrator/tests/$TEST)"; exit 1; }
-"$py" -m pytest --version >/dev/null 2>&1 || { echo "$ID fail: pytest is not installed in $ATLAS_OPT/venv (phase2/10-gate.sh installs it; by hand: $ATLAS_OPT/venv/bin/pip install pytest)"; exit 1; }
+"$py" -m pytest --version >/dev/null 2>&1 || { echo "$ID fail: pytest is not installed in $ATLAS_OPT/venv (phase2/10-gate.sh installs the package's [dev] extra; by hand: $ATLAS_OPT/venv/bin/pip install -e '$ATLAS_OPT/orchestrator[dev]')"; exit 1; }
 
 # Settings the package may read at import time (never a live service: the tests stub those).
 if [[ -r "$ATLAS_ETC/orchestrator.env" ]]; then
@@ -32,14 +32,16 @@ if [[ -r "$ATLAS_ETC/orchestrator.env" ]]; then
   set +a
 fi
 export PYTHONDONTWRITEBYTECODE=1
-cmd=("$py" -m pytest -q -p no:cacheprovider "tests/$TEST")
+# No -q here: pyproject.toml already sets addopts = "-q"; a second -q makes pytest -qq, which prints no "N passed" line.
+cmd=("$py" -m pytest -p no:cacheprovider "tests/$TEST")
 # Run as the service account when root (no root-owned files in the atlas-owned tree).
 if [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ "$(stat -c %U "$pkg")" == atlas ]]; then
   cmd=(runuser -u atlas -- "${cmd[@]}")
 fi
 rc=0
 out="$(cd "$pkg" && timeout 540 "${cmd[@]}" 2>&1)" || rc=$?
-summary="$(grep -E '[0-9]+ (passed|failed|error|errors|skipped|xfailed|xpassed|warning|warnings)' <<<"$out" | tail -n1 | sed -e 's/=//g' -e 's/^ *//' -e 's/ *$//')"
+# `|| true`: under set -Eeuo pipefail a grep with no match would abort the script before the evidence line (fix round).
+summary="$(grep -E '[0-9]+ (passed|failed|error|errors|skipped|xfailed|xpassed|warning|warnings)' <<<"$out" | tail -n1 | sed -e 's/=//g' -e 's/^ *//' -e 's/ *$//' || true)"
 if (( rc == 0 )); then
   echo "$CLAIM: tests/$TEST -> ${summary:-pytest exit 0}"
   exit 0

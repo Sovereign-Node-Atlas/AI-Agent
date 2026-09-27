@@ -3,18 +3,30 @@
 Division of labour (atlas-aegis.service header, CONVENTIONS.md §8 "AEGIS nightly is the same pattern"):
   * atlas-aegis.timer starts atlas-aegis.service as ROOT (the restic passphrase and /srv/backups are root-only).
   * ExecStartPre runs `atlas-admin enqueue aegis-freeze --wait 900` -> `atlas.tasks.aegis_freeze` here: pause the
-    Celery queues (cancel_consumer on cpu and gpu: running tasks finish, nothing new starts), raise the freeze flag
-    that atlas.memory honours (every writer in this package waits), and give ChromaDB and the LightRAG store a
-    consistent moment (below). Returns a dict; the unit tolerates a failure so a backup still happens.
+    `gpu` consumer (cancel_consumer: the running task finishes, nothing new starts), raise the freeze flag that
+    atlas.memory honours (every writer in this package spools or waits), and give ChromaDB and the LightRAG store a
+    consistent moment (below). Returns a dict; the unit (its helper) fails the backup when the freeze fails while the
+    orchestrator is up.
+    THE `cpu` CONSUMER IS NEVER CANCELLED (fix round, blocker): the thaw is itself a Celery task on the cpu queue
+    (`atlas-admin enqueue aegis-thaw`, admin.py routes it there), so cancelling cpu would leave the thaw undeliverable,
+    the flag up and every memory write refused until a worker restart. The cpu side is quiesced by the freeze flag
+    alone (every memory writer honours it; a cpu task that starts during the backup spools its writes). The unit's
+    helper additionally re-adds both consumers over celery's broadcast channel before it enqueues the thaw, so an
+    older freeze that did cancel cpu is recovered too; add_consumer on a queue already consumed is harmless.
   * ExecStart runs restic itself (as root); ExecStopPost enqueues `aegis-thaw` -> `atlas.tasks.aegis_thaw`: flag
-    down, consumers back.
+    down, consumers back, and the memory spool (writes deferred during the freeze) replayed.
   * The manual `[EXECUTE AEGIS BACKUP]` trigger (9.5) is `atlas.tasks.aegis_manual_backup`, which runs
-    `sudo -n systemctl start atlas-aegis.service` under /etc/sudoers.d/atlas-aegis (plain sudo, conflict 7): the same
-    unit, the same freeze/thaw, the same include set.
+    `sudo -n systemctl start --no-block atlas-aegis.service` under /etc/sudoers.d/atlas-aegis (plain sudo, conflict
+    7; the fragment permits `start` and `start --no-block`): the same unit, the same freeze/thaw, the same include
+    set. `--no-block` because `systemctl start` of a Type=oneshot blocks until ExecStart finishes (restic runs minutes
+    to hours; TimeoutStartSec=6h): the task returns once `systemctl is-active` reports activating/active, and reports
+    failure only when the unit is neither (fix round: a blocking start that timed out was a false failure).
   * `restic_backup_command()` types the backup line for a caller that IS root (the include file path is checked, the
     D9 retention is `forget --keep-daily 30 --keep-monthly 12 --prune`). The task text names
     /etc/atlas/restic.include; phase2/07-restic.sh writes /etc/atlas/restic-include.txt: both are looked for, in that
-    order, and a missing include file stops the run (never an empty backup).
+    order, and a missing include file stops the run (never an empty backup). The exclude file is required too, and
+    the vault's plaintext mount (VAULT_MOUNT_DIR, vault.env) is excluded explicitly on top of it: an open vault's
+    plaintext must never enter a snapshot (Section 11), whatever the exclude file says.
 
 "Consistent snapshot" (9.5 Freeze row), honestly: ChromaDB 1.x's Rust server has no documented snapshot/checkpoint
 API (services-tools.md §2.1 lists the config; UNVERIFIED that any exists), and its persist dir is root-owned. What
@@ -40,11 +52,20 @@ log = logging.getLogger("atlas.aegis")
 DEFAULT_FREEZE_FLAG = "/run/atlas/aegis-freeze"
 INCLUDE_CANDIDATES: tuple[str, ...] = ("/etc/atlas/restic.include", "/etc/atlas/restic-include.txt")
 EXCLUDE_FILE = "/etc/atlas/restic-exclude.txt"
+DEFAULT_VAULT_MOUNT_DIR = "/srv/atlas/vault/open"  # atlas.vault.DEFAULT_MOUNT_DIR; vault.env VAULT_MOUNT_DIR
 KEEP_DAILY, KEEP_MONTHLY = 30, 12  # D9
-QUEUES: tuple[str, ...] = ("cpu", "gpu")
+# The thaw travels on `cpu` (admin.py ENQUEUE_TASKS + celery_app task_default_queue), so `cpu` is never in this set.
+FREEZE_QUEUES: tuple[str, ...] = ("gpu",)
+THAW_QUEUES: tuple[str, ...] = ("cpu", "gpu")  # re-adding an already-consumed queue is a no-op reply
+THAW_QUEUE = "cpu"  # where atlas.tasks.aegis_thaw is delivered; tests assert it is never frozen
+QUEUES = FREEZE_QUEUES  # kept name: what freeze() pauses
 AEGIS_UNIT = "atlas-aegis.service"
+START_CONFIRM_S = 30.0  # how long trigger_unit waits for systemd to report the unit activating/active
 
 __all__ = [
+    "FREEZE_QUEUES",
+    "THAW_QUEUE",
+    "THAW_QUEUES",
     "aegis_freeze",
     "aegis_manual_backup",
     "aegis_thaw",
@@ -73,12 +94,37 @@ def include_file(env: dict[str, str] | None = None) -> Path:
     )
 
 
+def exclude_file(env: dict[str, str] | None = None) -> Path:
+    env = dict(os.environ if env is None else env)
+    path = Path(env.get("RESTIC_EXCLUDE_FILE") or EXCLUDE_FILE)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no restic exclude file at {path} (phase2/07-restic.sh writes it: secrets, weights, the vault mount); "
+            "refusing to back up an unfiltered include set"
+        )
+    return path
+
+
 def restic_backup_command(env: dict[str, str] | None = None) -> list[str]:
+    env = dict(os.environ if env is None else env)
     inc = include_file(env)
-    cmd = ["restic", "backup", "--files-from", str(inc), "--exclude-caches", "--one-file-system", "--tag", "aegis"]
-    if Path(EXCLUDE_FILE).is_file():
-        cmd += ["--exclude-file", EXCLUDE_FILE]
-    return cmd
+    exc = exclude_file(env)
+    # The plaintext view of the vault is excluded here as well as in the exclude file (Section 11: ciphertext only).
+    mount = (env.get("VAULT_MOUNT_DIR") or DEFAULT_VAULT_MOUNT_DIR).rstrip("/") or DEFAULT_VAULT_MOUNT_DIR
+    return [
+        "restic",
+        "backup",
+        "--files-from",
+        str(inc),
+        "--exclude-file",
+        str(exc),
+        "--exclude",
+        mount,
+        "--exclude-caches",
+        "--one-file-system",
+        "--tag",
+        "aegis",
+    ]
 
 
 def restic_forget_command() -> list[str]:
@@ -88,14 +134,22 @@ def restic_forget_command() -> list[str]:
 def freeze(
     *,
     control: Any | None = None,
-    queues: Sequence[str] = QUEUES,
+    queues: Sequence[str] = FREEZE_QUEUES,
     settle_s: float | None = None,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Pause consumers, raise the flag, settle. `control` is celery's app.control (injected for tests)."""
+    """Pause consumers, raise the flag, settle. `control` is celery's app.control (injected for tests).
+
+    Refuses to cancel THAW_QUEUE whatever the caller passes: the thaw must stay deliverable (blocker, fix round).
+    """
     env = dict(os.environ if env is None else env)
     flag = _flag_path(env)
     paused: dict[str, Any] = {}
+    if THAW_QUEUE in queues:
+        raise ValueError(
+            f"freeze must never cancel the {THAW_QUEUE!r} consumer: atlas.tasks.aegis_thaw is delivered on it "
+            "(admin.py enqueue aegis-thaw); the freeze flag quiesces the cpu writers instead (Section 9.5)"
+        )
     if control is not None:
         for q in queues:
             try:
@@ -119,8 +173,14 @@ def freeze(
 
 
 def thaw(
-    *, control: Any | None = None, queues: Sequence[str] = QUEUES, env: dict[str, str] | None = None
+    *,
+    control: Any | None = None,
+    queues: Sequence[str] = THAW_QUEUES,
+    env: dict[str, str] | None = None,
+    memory: Any | None = None,
 ) -> dict[str, Any]:
+    """Flag down, consumers back, then replay the writes atlas.memory spooled while the flag was up (9.5 "then
+    writes resume"). `memory` is an atlas.memory.MemoryStore (built by the task; injected in tests)."""
     flag = _flag_path(env)
     existed = flag.exists()
     try:
@@ -135,28 +195,73 @@ def thaw(
             except Exception as exc:
                 resumed[q] = f"error: {exc}"
                 log.error("aegis thaw: add_consumer(%s) failed: %s", q, exc)
+    replay: dict[str, Any] = {"replayed": 0, "failed": 0, "skipped": "no memory store"}
+    if memory is not None:
+        try:
+            replay = memory.replay_spool()
+        except Exception as exc:  # the thaw itself succeeded; a replay failure is reported, not hidden
+            replay = {"replayed": 0, "failed": -1, "error": f"{type(exc).__name__}: {exc}"}
+            log.error("aegis thaw: spool replay failed: %s", exc)
     log.info(
-        "aegis thaw: flag %s removed (was %s), consumers resumed on %s",
+        "aegis thaw: flag %s removed (was %s), consumers resumed on %s, spool %s",
         flag,
         "present" if existed else "absent",
         ",".join(queues),
+        replay,
     )
-    return {"flag": str(flag), "was_frozen": existed, "resumed": resumed, "thawed_at": time.time()}
+    return {"flag": str(flag), "was_frozen": existed, "resumed": resumed, "thawed_at": time.time(), "spool": replay}
 
 
-def trigger_unit(unit: str = AEGIS_UNIT, *, runner: Any = subprocess.run) -> dict[str, Any]:
-    """The manual trigger: `sudo -n systemctl start atlas-aegis.service` (/etc/sudoers.d/atlas-aegis)."""
-    cmd = ["sudo", "-n", "systemctl", "start", unit]
+def unit_state(unit: str, *, runner: Any = subprocess.run) -> str:
+    """`systemctl is-active <unit>` (no sudo needed): active | activating | inactive | failed | deactivating | ..."""
+    try:
+        proc = runner(
+            ["systemctl", "is-active", unit], capture_output=True, text=True, timeout=30, check=False, stdin=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"unknown ({exc})"
+    return (proc.stdout or "").strip() or "unknown"
+
+
+def trigger_unit(
+    unit: str = AEGIS_UNIT,
+    *,
+    runner: Any = subprocess.run,
+    sleep: Any = time.sleep,
+    confirm_s: float = START_CONFIRM_S,
+) -> dict[str, Any]:
+    """The manual trigger: `sudo -n systemctl start --no-block atlas-aegis.service` (/etc/sudoers.d/atlas-aegis),
+    then `systemctl is-active` until the unit reports activating/active. A blocking start that times out is treated
+    as "started, still running" and confirmed the same way; failure is reported only when the unit is not
+    active/activating afterwards (rule §7.4: never a false failure)."""
+    cmd = ["sudo", "-n", "systemctl", "start", "--no-block", unit]
+    timed_out = False
     try:
         proc = runner(cmd, capture_output=True, text=True, timeout=120, check=False, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired:
+        timed_out = True  # a Type=oneshot start that blocked: the unit is running; confirm below
+        proc = None
+    except OSError as exc:
         raise RuntimeError(f"{' '.join(cmd)} could not run: {exc}") from exc
-    if proc.returncode != 0:
+    if proc is not None and proc.returncode != 0:
+        state = unit_state(unit, runner=runner)
+        if state not in ("active", "activating"):
+            raise RuntimeError(
+                f"{' '.join(cmd)} exited {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]} "
+                f"(unit is {state}; is /etc/sudoers.d/atlas-aegis installed by phase2/07-restic.sh, with the "
+                "`start --no-block` line?)"
+            )
+    deadline = time.monotonic() + confirm_s
+    state = unit_state(unit, runner=runner)
+    while state not in ("active", "activating") and time.monotonic() < deadline:
+        sleep(1.0)
+        state = unit_state(unit, runner=runner)
+    if state not in ("active", "activating"):
         raise RuntimeError(
-            f"{' '.join(cmd)} exited {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]} "
-            "(is /etc/sudoers.d/atlas-aegis installed by phase2/07-restic.sh?)"
+            f"{unit} is {state} after `{' '.join(cmd)}` (StartLimitBurst=2 per 6 h reached, or the unit failed at "
+            "once: journalctl -u atlas-aegis.service)"
         )
-    return {"unit": unit, "started": True, "command": " ".join(cmd)}
+    return {"unit": unit, "started": True, "state": state, "command": " ".join(cmd), "start_timed_out": timed_out}
 
 
 # --- Celery tasks -----------------------------------------------------------------------------------------------------
@@ -183,7 +288,14 @@ def aegis_thaw(self: Any) -> dict[str, Any]:
 
     rec = TaskRecord(self.request.id, "aegis-thaw")
     try:
-        out = thaw(control=app.control)
+        memory = None
+        try:
+            from atlas.memory import build_memory_store
+
+            memory = build_memory_store(with_graph=False)
+        except Exception as exc:  # no memory store yet (before Phase 2 step 4): nothing spooled, nothing to replay
+            log.warning("aegis thaw: memory store not available (%s); no spool replay", exc)
+        out = thaw(control=app.control, memory=memory)
     except Exception as exc:
         rec.failed(f"{type(exc).__name__}: {exc}")
         raise
@@ -201,5 +313,8 @@ def aegis_manual_backup(self: Any, requested_by: str = "principal") -> dict[str,
         rec.failed(f"{type(exc).__name__}: {exc}")
         notify(f"AEGIS manual backup could not start: {exc}", title="ATLAS AEGIS", priority="high", tags=["warning"])
         raise
-    notify("AEGIS backup started (manual trigger); the unit reports on completion in the journal.", title="ATLAS AEGIS")
+    notify(
+        f"AEGIS backup started (manual trigger; unit {out['state']}); the unit reports on completion in the journal.",
+        title="ATLAS AEGIS",
+    )
     return rec.done(out)
