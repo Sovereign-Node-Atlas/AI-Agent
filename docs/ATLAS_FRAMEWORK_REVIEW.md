@@ -3,12 +3,12 @@
 | Field | Value |
 |---|---|
 | Document | ATLAS_FRAMEWORK_REVIEW.md |
-| Version | 0.3 — baseline closed: workbook returned complete |
+| Version | 0.3.1 — Day 1 script build: research corrections folded in |
 | Date | 2026-09-21 |
-| Supersedes | v0.2.1 and v0.2 (2026-09-21, same day); v0.1 (2026-09-18) |
+| Supersedes | v0.3 (2026-09-21); v0.2.1 and v0.2 (2026-09-21); v0.1 (2026-09-18) |
 | Scope | Everything agreed in the design conversation, through the Principal's completed confirmation workbook and the September hardware change |
 | Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions resolved, risks, and what Day 1 must prove before anything is trusted |
-| Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21. Nothing has been executed; the Day 1 script is written against this document. |
+| Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21. Nothing has been executed. The Day 1 scripts under `scripts/day1/` are written against this document; the fact-checking that preceded them corrected the baseline in the places listed in Section 23, none of which reopens a decision. |
 
 ## How to read this document
 
@@ -121,8 +121,10 @@ Prompt processing: ~350 tok/s stock, ~1,000 tok/s tuned, measured on a 7B model;
 ### 3.3 Kernel parameters — AGREED, VERIFY V3
 
 ```
-amdgpu.gttsize=196608 ttm.pages_limit=50331648
+amdgpu.gttsize=196608 ttm.pages_limit=50331648 amdgpu.lockup_timeout=10000,60000,10000,10000
 ```
+
+**Amended in v0.3.1 (Section 23):** `ttm.pages_limit` is the parameter of record on kernel 7.0; `amdgpu.gttsize` is still honoured but logs a deprecation warning, which V3 treats as expected. `amdgpu.lockup_timeout` is added because DeepSeek V4 Flash triggers a Vulkan DeviceLost on 7.x kernels without it (llama.cpp issue #25664); without it V22 would fail for a kernel reason, not a model one.
 
 Sized for 192 GB: `gttsize` is expressed in MiB and `pages_limit` in 4 KiB pages. These were validated on 6.x kernels at 128 GB; **V3** confirms they apply on 7.0 at this capacity, that `rocminfo` reports `gfx1151` as expected, and that `llama-cli --list-devices` sees the full budget. If the reported identifier were ever to differ, the community ROCm wheels would need rebuilding against it before Phase 4 runs; the Principal has confirmed it reads `gfx1151`.
 
@@ -138,7 +140,7 @@ Two different stacks serve two different layers, and this is deliberate:
 
 **Why this resolution matters.** The brief chose 26.04 for the LLM layer, where Vulkan is sufficient, but Phase 4's engines need PyTorch-on-ROCm, which does not install cleanly on the 26.04 host kernel. Containerised ROCm removes the conflict. The host never needs a ROCm install.
 
-**RISK R1** — PyTorch has no official gfx1151 wheel yet. The working path is a community-maintained wheel (scottt/rocm-TheRock). AMD's roadmap targets mid-2026 for first-class support. Pin the wheel version. Every Phase 4 engine is tested individually and reported pass/fail. This layer is less battle-tested than the LLM layer and the brief treats it that way.
+**RISK R1, amended in v0.3.1** — AMD now publishes gfx1151 PyTorch wheels (ROCm 10.0.0, torch 2.13.0, from AMD's own wheel index), and the Ryzen AI Max+ PRO 495 is on the ROCm support list; the community scottt wheel from 2025 is no longer the path and is not pinned. The residual risk moved: kernel 7.0 with gfx1151 has open, unresolved PyTorch hang reports (ROCm/pytorch #6530, #6182), so a V11 failure may be the host kernel rather than the container; the mitigation would be a 6.18 kernel, which would reopen Section 3.1, so it is flagged for the Principal and not acted on during Day 1. Pin the wheel version. Every Phase 4 engine is tested individually and reported pass/fail. This layer is less battle-tested than the LLM layer and the brief treats it that way.
 
 ### 3.5 Disk layout and encryption — GAP filled
 
@@ -221,12 +223,12 @@ Nothing in the earlier brief named the component that enforces the residency and
 | Flash Attention | On | Prerequisite for cache quantisation |
 | KV cache type, Arthur's engines (Nemotron, Qwen3.5) | `q8_0` | Precision-sensitive audit and legal work |
 | KV cache type, Ren's engines (gpt-oss, abliterated) | `q4_0` | More headroom for prose and multi-branch Deep Think |
-| KV cache type, Apex engine (DeepSeek V4 Flash) | `q4_0`, context capped | Only ~10–15 GB of margin remains at 155 GB of weights |
+| KV cache type, Apex engine (DeepSeek V4 Flash) | `q4_0` **as the target, proven by ladder** (Section 23): Phase 3 loads f16, then `q8_0`, then `q4_0`, running a coherence prompt at each rung, and keeps the lowest coherent setting; K and V types must be identical on this architecture | Only ~10–15 GB of margin remains at 155 GB of weights; quantised KV on `deepseek4` produced garbage output in July–August 2026 (llama.cpp #25382, #26423, fix unmerged), so the setting is measured, not assumed |
 | KV cache type, vision engine (Qwen2.5-VL-72B) | `q8_0` | Document and drawing reads are precision-sensitive |
 | Per-model quantisation check | Day 1 verification script | **VERIFY V4**: unsupported architectures silently fall back to full precision |
 | Context size | Explicit per model, never the default | Default contexts are small and silently truncate agent history |
-| Context shift with `n_keep` | On; `n_keep` covers system prompt + persona directive + router state | Anchors never evicted; generation never hard-stops |
-| Parallel slots | 8, except where noted | KV cost at 32k × 8 slots: gpt-oss < 20 GB, Nemotron < 10 GB, Qwen3.5 < 15 GB. The vision engine runs 2 slots while co-resident with gpt-oss, keeping the pair inside the ~28 GB of cache the 142 GB combination leaves |
+| Context shift with `n_keep` | On, **passed explicitly as `--context-shift --keep <n>`** on every launch line (it is off by default in current llama-server); `n_keep` covers system prompt + persona directive + router state | Anchors never evicted; generation never hard-stops |
+| Parallel slots | 8, except where noted, **always passed explicitly** (`--parallel` defaults to auto). `--ctx-size` is the total pool across slots, so 32k per slot means `--ctx-size 262144`; the Apex engine runs `--parallel 1` | KV cost at 32k × 8 slots: gpt-oss < 20 GB, Nemotron < 10 GB, Qwen3.5 < 15 GB. The vision engine runs 2 slots while co-resident with gpt-oss, keeping the pair inside the ~28 GB of cache the 142 GB combination leaves |
 | Hard pre-flight | Engine Arbiter | The actual OOM backstop |
 | Long-document recall | Vector Cortex retrieval, never KV tricks | Context shift keeps anchors and recency; it does not recall a mid-document fact once evicted |
 
@@ -257,10 +259,10 @@ Slot-level cache reuse in llama-server keeps layers 1–2 resident across dispat
 | Engine | Architecture | Quantisation | File | Decode | Role |
 |---|---|---|---|---|---|
 | gpt-oss-120b | 117B MoE, 5.1B active | **MXFP4, native** | 63 GB | 30–55 tok/s | Default resident engine. Ren, Helena, Victor, Gideon, Minerva |
-| gpt-oss-120b abliterated (Huihui) | Same weights, refusals removed | **MXFP4, native** | 63 GB | Same | Valerie default; Ren and Arthur on explicit override |
-| Nemotron 3 Super | 120B hybrid Mamba MoE, 12.7B active | **`Q8_0`**, raised from 4-bit | 120–123 GB | ~12–14 tok/s | Arthur default. Silas, Alaric |
+| gpt-oss-120b abliterated (Huihui) | Same weights, refusals removed | **MXFP4, re-quantised** (Section 23: the abliteration is applied to the BF16 upcast; the MXFP4 GGUF is a requant, same size and speed, the "no accuracy cost" argument below does not transfer) | 63 GB | Same | Valerie default; Ren and Arthur on explicit override |
+| Nemotron 3 Super | 120B hybrid Mamba MoE, 12B active (A12B) | **`Q8_0`**, raised from 4-bit | 120–123 GB | ~12–14 tok/s | Arthur default. Silas, Alaric |
 | Qwen3.5-122B-A10B | 122B MoE, 10B active, 256k context, multilingual | **`Q8_0`**, raised from 4-bit | 130 GB | ~15–17 tok/s | Override engine for long documents and future languages |
-| **DeepSeek V4 Flash** | 284B MoE, 13B active | **`UD-Q4_K_XL`** | 155 GB | 25–32 tok/s | **NEW. The Apex engine.** Deep Think deep tier, TF_OMEGA, strong cross-checks. Runs alone |
+| **DeepSeek V4 Flash** (0731 checkpoint, MIT) | 284B MoE, 13B active | **`UD-Q4_K_XL`** | 155 GB | 25–32 tok/s | **NEW. The Apex engine.** Deep Think deep tier, TF_OMEGA, strong cross-checks. Runs alone |
 
 Decode speed follows bytes read per token, not parameter count: 13B active at 4-bit is about 6.5 GB per token, while Nemotron's 12.7B active at 8-bit is about 12.7 GB. That is why the 284B engine outruns the 120B one.
 
@@ -744,18 +746,18 @@ Green: build with confidence. Yellow: attempt with automatic fallback; never blo
 | Wan2.2 (in place of Wan2.1) | Video generation | Green: validated on gfx1151 by maintained toolboxes | 20 to 40 GB | Domain 12, Helena |
 | **FLUX.1-dev** | Image generation, architectural visualisation with LoRA (the "Arch-DiT" imagery use). The **dev** variant, chosen for quality over the Apache-licensed schnell variant; the Principal accepts the dev non-commercial licence (15.5) | Green: validated on gfx1151 | 12 to 24 GB | Domains 8 and 12 |
 | **Qwen2.5-VL-72B at `Q8_0`** | Vision-language: documents, drawings, screenshots, scans. **The sole vision engine** | Green. Official Apache-2.0 release with GGUF builds published, so it is **pulled in Phase 3 as a GGUF engine, not built here** | 79 GB | General. Valerie for drawings, Minerva for scans, Gideon for scanned contracts |
-| Florence-2 | Lightweight vision, detection, captioning, OCR | Green | under 2 GB | General |
-| TimesFM or Chronos | Time-series forecasting | Green | under 5 GB | Domain 21, Silas |
+| Florence-2 | Lightweight vision, detection, captioning, OCR | Green; the native `florence-community` checkpoints, no remote code (Section 23) | under 2 GB | General |
+| Chronos (Chronos-Bolt / Chronos-2) | Time-series forecasting. **TimesFM dropped in v0.3.1:** its current 3.0 release is non-commercial (Section 23) | Green, Apache-2.0 | under 5 GB | Domain 21, Silas |
 | Stable Audio Open | Music and sound generation | Green | under 5 GB | Domain 12, Helena |
 | CosyVoice2 | Voice cloning alternative | Green | under 5 GB | Voice layer, optional |
-| UI-TARS 2.0 | Vision-driven GUI automation for RewardPay and Wix design | Green | 8 to 16 GB | Domain 1, Valerie |
+| UI-TARS-1.5-7B | Vision-driven GUI automation for RewardPay and Wix design. **UI-TARS 2.0 has no open weights** (Section 23, watch-list 15.5) | Green | 8 to 16 GB | Domain 1, Valerie |
 | OpenVLA | Vision-language-action for robotics | Green technically, dormant until hardware exists | 8 to 16 GB | Domain 29, Valerie |
 | Rad-DINO | Radiology vision | Green | under 2 GB | Domains 10 and 15, Minerva |
 | SAM 2 | Image and video segmentation and tracking | Green with limitation: build with the CUDA post-processing extension disabled, minor mask cleanup lost | under 4 GB | Domains 22 and 7 |
-| PointLLM | Point-cloud understanding | Verify V8: point-cloud ops often carry custom kernels | 8 to 16 GB | Domains 8 and 29 |
+| PointLLM | Point-cloud understanding | Verify V8: point-cloud ops often carry custom kernels. Licence CC-BY-NC-4.0 (research use; recorded under 16.5) | 8 to 16 GB | Domains 8 and 29 |
 | Clay or Prithvi | Satellite and geospatial analysis | Verify V9 | under 5 GB | Domain 7 |
 | Microsoft TRELLIS | Image-to-3D | Yellow: community ROCm forks exist but hit build errors on sparse-voxel kernels, attempt, log, move on | 8 to 12 GB | Domains 8 and 12 |
-| Blender Cycles (HIP) | Photorealistic rendering, the beauty half of "Lumina-PBR" | Yellow: works on this chip, occasional mid-render crashes reported, CPU-render fallback mandatory | varies | Domain 8, Valerie |
+| Blender 4.5 LTS, Cycles (HIP) | Photorealistic rendering, the beauty half of "Lumina-PBR" | Yellow: works on this chip, occasional mid-render crashes reported, CPU-render fallback mandatory | varies | Domain 8, Valerie |
 | Meditron-70B | Medical cross-check | Runs through llama.cpp in Phase 3 at `Q8_0`, not here | ~74 GB | Domain 10, Minerva |
 | Evo (Arc Institute) | Genomics | Deferred: port unverified, and this GPU lacks the FP8 hardware Evo's larger checkpoints expect | n/a | Domain 15 |
 | NVIDIA Modulus / PhysicsNeMo | Physics simulation | Deferred: CUDA-locked, would need an NVIDIA card in a USB4 external GPU dock, since this machine has no PCIe slot | n/a | Domains 8 and 9 |
@@ -794,6 +796,7 @@ Engines the Principal has asked about that fail a standing rule today. Each carr
 | Engine | What it does | Why not now | What would change the answer | Would replace |
 |---|---|---|---|---|
 | Qwen3.8-LiveTranslate (19 Sep 2026) | Real-time simultaneous interpretation: 60 languages understood, 29 spoken, about 2.3 s lag | **Hosted API only** (Alibaba Cloud Model Studio, QwenCloud, WebSocket). No open weights. Fails the zero-cloud rule (Section 1) on inference off-node and audio leaving the machine | An open-weights release. Qwen has released weights for Qwen3-Omni, so this is plausible | Nothing. Live interpretation is an open gap; the Whisper to engine to Kokoro pipeline (14.1) does consecutive translation only, and only in Kokoro's eight languages |
+| UI-TARS 2.0 | Vision-driven GUI agent, successor to the 1.5-7B build in 15.2 | Technical report only; no open weights as of September 2026 | An open-weights release | UI-TARS-1.5-7B |
 | Qwen-Image-2.1 (20 Sep 2026) | Image generation and editing in one 7B checkpoint: native RGBA, 2K, up to ten reference images, strongest text-in-image of its class; about 14 GB BF16, GGUF available, plain BF16 path on gfx1151 | **Qwen Research License, non-commercial only.** Same restriction that excluded Fish Audio S2 (C20). Not a peer of Qwen2.5-VL-72B, which reads images; this one makes them | Re-licensing to Apache-2.0 (Qwen did this for Qwen2.5 within months) or a commercial licence obtained by the Principal | FLUX.1-dev outright: half the footprint, generate and edit in one model |
 
 **Decision recorded 2026-09-21:** the Principal keeps **FLUX.1-dev** as the image engine, quality being the deciding factor, and accepts that FLUX.1-dev itself carries a non-commercial licence (the Apache-2.0 variant is schnell, which trades quality for speed). The commercial-use exposure is therefore the same for FLUX.1-dev and Qwen-Image-2.1; the licence is not what separates them, quality and maturity on gfx1151 are. This is noted so that the two watch-list rows are read consistently: Qwen-Image-2.1 stays off the list because FLUX.1-dev is the better-validated engine today, not because its licence is worse.
@@ -854,7 +857,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 
 ## 17. Day 1 Execution Protocol
 
-Four phases. One entry command per phase. Every phase is idempotent: re-running skips what is complete. Every phase writes a log and ends with a printed pass/fail table. Phases 3 and 4 run detached under systemd so a dropped SSH session cannot kill them, and both are resumable at the file level.
+**Implemented by `scripts/day1/`** (entry point `atlas-day1.sh`; `README.md` there gives the commands in order, the interactive pauses and what to have ready; `COVERAGE.md` maps every step and every V item below to its file). Four phases. One entry command per phase. Every phase is idempotent: re-running skips what is complete. Every phase writes a log and ends with a printed pass/fail table. Phases 3 and 4 run detached under systemd so a dropped SSH session cannot kill them, and both are resumable at the file level.
 
 ### Phase 1 — Platform (reboot in the middle)
 
@@ -1032,7 +1035,9 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 - [x] Decide where the LUKS recovery key and restic passphrase live (D3). **Done**: node plus external USB.
 - [x] Confirm the Sentinel feed list (D6), the director alias pattern (D14), and the Apple build path (D11, removed).
 - [x] Store the USB recovery drive away from the node, not beside it (R16). **Done.**
-- [x] Create the Google Cloud OAuth client for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). **Client created.** The consent click itself still happens during Phase 2; Google requires the account owner to click Allow.
+- [x] Create the Google Cloud OAuth client for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). **Client created.** The consent click itself still happens during Phase 2; Google requires the account owner to click Allow. Drop the client JSON into `/srv/atlas/staging/inbox/google-oauth-client.json` once Phase 1 has created that folder.
+- [ ] **New in v0.3.1:** create a Hugging Face access token (read scope) and, with the same account, accept the licences of the gated models on huggingface.co: `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0` (V6), `black-forest-labs/FLUX.1-dev` and `stabilityai/stable-audio-open-1.0` (Phase 4). Phase 2 asks for the token once at its start and stores it under `/etc/atlas/secrets/`; a 403 during a pull names the licence page to visit.
+- [ ] **New in v0.3.1:** have the Cloudflare zone id for `sovereign-node.link` to hand (Overview page of the zone). A `Zone:DNS:Edit`-only token cannot look the zone up by name; Phase 1 step 7 asks for the id once if the token cannot list zones.
 - [x] Source reference recordings for Alaric's gravelly voice and, if the British male presets collide, Gideon's. **Sourced.** The Day 1 script names the directory they are copied into before Phase 2; if absent, both fall back to the nearest Kokoro preset and V7 is recorded as deferred, not failed.
 - [x] Have a monitor and keyboard available for Phase 1 only, in case first boot needs a hand. **Done.**
 
@@ -1053,6 +1058,40 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 - [x] C1 through C20 accepted in the returned workbook. C19 was reopened and re-decided in the Principal's favour.
 - [x] C21 through C26, new in v0.2, **accepted** in the returned workbook: the Ubuntu and amd64v3 rejections, the quantisation rise, the closed reserve list, the vision consolidation, and the residency-versus-generation reading.
 - [x] R9, R16, R19, R20 and R21 **acknowledged** in the returned workbook: two changed wording in v0.2, three were new.
+
+---
+
+## 23. Day 1 script build — corrections folded into the baseline (v0.3.1)
+
+The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass over every package, image, model repository and flag the baseline names. Where the checked fact disagreed with the document, the scripts follow the fact and the document is amended above. None of these reopens a decision (D1–D14) or a resolution (C1–C26); each is a correction of a literal the baseline typed before it was checked. Listed here so the Principal can see what moved and why.
+
+| # | Where | What the baseline said | What is true (September 2026) | Effect on Day 1 |
+|---|---|---|---|---|
+| S1 | 5.1 | Abliterated gpt-oss is "MXFP4, native" | Huihui abliterates the BF16 upcast; the MXFP4 GGUF is a re-quantisation (noctrex). Same 63 GB, same speed | None on sizing; the "no accuracy cost" reasoning applies only to the standard gpt-oss |
+| S2 | 4.3, App. B | Apex engine KV cache `q4_0` | Quantised KV on `deepseek4` produced garbage in July–August 2026; the fix is unmerged; K and V types must be equal | Phase 3 ladders f16 → q8_0 → q4_0 with a coherence check and records the winner; an f16-only result caps the context and still passes V22 |
+| S3 | 5.1 | "DeepSeek V4 Flash" | Two checkpoints exist; the 0731 release (MIT) supersedes the April preview | Pinned to `unsloth/DeepSeek-V4-Flash-0731-GGUF`; launched with `--parallel 1` (the auto slot count OOMs on this architecture) |
+| S4 | 4.3, App. B | Context shift with `n_keep` on | Off by default in current llama-server; `--parallel` defaults to auto; `--ctx-size` is the total pool across slots | Every launch line carries `--context-shift --keep <n> --parallel <n>`; 32k per slot × 8 is `--ctx-size 262144` |
+| S5 | 5.1 | Meditron-70B Q8_0 pulled as a GGUF | TheBloke's Q8_0 is a raw byte split (`-split-a`, `-split-b`) llama.cpp cannot load; training context 4096 | Phase 3 joins the halves with a size check; context fixed at 4096, one slot |
+| S6 | 5.1 | Nemotron 3 Super 12.7B active | 12B active (A12B); needs llama.cpp ≥ b8297; an open report of a GPU memory fault on Vulkan at ~20k-token prompts (llama.cpp #20732) | Phase 3's 8k prefill test checks the server is still alive afterwards and records a warning with the issue number, not a hang |
+| S7 | 17, 21 | Checksums pre-recorded | Hugging Face was unreachable from the research sandbox, so only three sha256 values were recovered | The pull step reads `lfs.oid` and `lfs.size` per file from the Hugging Face tree API at pull time, verifies, and writes them to `MANIFEST.json` (the manifest AEGIS backs up) |
+| S8 | 3.3, App. B | `amdgpu.gttsize` + `ttm.pages_limit` | `gttsize` deprecated but honoured; DeepSeek V4 triggers DeviceLost on kernel 7.x without `amdgpu.lockup_timeout` | `amdgpu.lockup_timeout=10000,60000,10000,10000` added; V3a accepts the deprecation warning |
+| S9 | 3.5, 17 step 2 | `systemd-cryptenroll --tpm2-device=auto` | systemd 259's default PCR mask is empty: the volume would unlock in any boot environment | `--tpm2-pcrs=7` passed; V2 fails on an empty PCR list |
+| S10 | 17 step 3 | tmpfs for `/tmp` enabled | Already the 26.04 default; the old unit path no longer exists | Verified, not enabled |
+| S11 | 12.3 | Token scoped `Zone:DNS:Edit` only | Such a token cannot list zones to find the zone id | `CF_ZONE_ID` stored beside the token; resolved once if the token allows, else asked for once (Section 22) |
+| S12 | 3.6, App. B | Services "bound to LAN and WireGuard interfaces" | WG-Easy runs in Docker: there is no host `wg0`; VPN traffic arrives from the compose bridge. Docker bypasses ufw for published ports and container egress | Binding is expressed as ufw rules on the LAN interface and the WG-Easy bridge; every published port is pinned to the LAN address; container egress is enforced in the `DOCKER-USER` chain; the outbound allowlist is a local Squid proxy with owner-matched egress (hostnames cannot be filtered by ufw) |
+| S13 | 17 step 5b | Firefox installed | The archive package is a snap stub | Mozilla's apt repository, added to the allowlist |
+| S14 | 17 step 1, 5 | Identify the Radeon 8065S | No public PCI id for the 8065S; `vulkaninfo` prints the RADV device string | Pre-flight identifies the GPU by vendor and DRM class; the post-boot check matches `RADV GFX1151`, never the marketing name |
+| S15 | 3.4 R1 | Community scottt PyTorch wheel | AMD publishes gfx1151 wheels (ROCm 10.0.0, torch 2.13.0); open kernel-7.0 hang reports remain | AMD's index is the base image; the kernel risk is flagged, not acted on |
+| S16 | 15.2 | UI-TARS 2.0 | No open weights; technical report only | UI-TARS-1.5-7B built; 2.0 on the watch-list |
+| S17 | 15.2 | TimesFM or Chronos | TimesFM 3.0 is non-commercial; Chronos is Apache-2.0 | Chronos built |
+| S18 | 15.2 | Florence-2 `microsoft/Florence-2-large` | Needs remote code and breaks on current transformers | Native `florence-community` checkpoints |
+| S19 | 15.2, 22 | FLUX.1-dev and Stable Audio Open pulled in Phase 4 | Both gated: licence acceptance on huggingface.co plus a token | New Section 22 item; the scripts fail with the licence URL on a 403 |
+| S20 | 15.2, 16.5 | PointLLM | Licence CC-BY-NC-4.0 | Recorded under 16.5 with the other research-licensed items |
+| S21 | 3.1 | Ubuntu 26.04 | Ships `sudo-rs`, which rejects `sudo -E` | Phases run as root; the orchestrator's control path is a NOPASSWD sudoers fragment with exactly three `systemctl` verbs |
+| S22 | 21 V4 | "Unsupported architectures silently fall back" | llama.cpp errors out at context creation rather than falling back | V4 is the `llama_kv_cache ... K (q8_0) V (q8_0)` log line plus a health check |
+| S23 | 9.3 vs 9.7 | Sentinel on a systemd timer; Celery replaces separate schedulers | Both, read together | The timers only enqueue the Celery task; Celery executes. AEGIS nightly and the 72-hour prune use the same pattern, with restic's own timer as the fallback if the orchestrator is down |
+
+**Watch-list additions from the build:** UI-TARS 2.0 (S16). **Reserved for the Principal:** the kernel-7.0 hang reports in S15, if V11 fails for that reason.
 
 ---
 
@@ -1083,11 +1122,11 @@ Open WebUI Filter  --relay-->  Orchestrator
 
 ## Appendix B — Configuration reference
 
-**Kernel (GRUB):** `amdgpu.gttsize=196608 ttm.pages_limit=50331648`
+**Kernel (GRUB):** `amdgpu.gttsize=196608 ttm.pages_limit=50331648 amdgpu.lockup_timeout=10000,60000,10000,10000`
 
-**llama-server, Arthur's engines (Nemotron `Q8_0`, Qwen3.5 `Q8_0`) and the vision engine (Qwen2.5-VL-72B `Q8_0`):** `-fa on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size <explicit> --parallel 8 --keep <n_keep> --slot-save-path /srv/atlas/data/slots`
+**llama-server, Arthur's engines (Nemotron `Q8_0`, Qwen3.5 `Q8_0`) and the vision engine (Qwen2.5-VL-72B `Q8_0`):** `-fa on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 262144 --parallel 8 --context-shift --keep <n_keep> --slot-save-path /srv/atlas/data/slots --host 127.0.0.1` (ctx-size is the total pool: 32k × 8 slots)
 
-**llama-server, Ren's engines (gpt-oss MXFP4 and its abliterated twin) and the Apex engine (DeepSeek V4 Flash `UD-Q4_K_XL`):** same with `--cache-type-k q4_0 --cache-type-v q4_0`. The Apex engine additionally runs with a reduced `--ctx-size`, since only 10 to 15 GB remain beside 155 GB of weights.
+**llama-server, Ren's engines (gpt-oss MXFP4 and its abliterated twin) and the Apex engine (DeepSeek V4 Flash `UD-Q4_K_XL`):** same with `--cache-type-k q4_0 --cache-type-v q4_0`. The Apex engine runs `--parallel 1`, a reduced `--ctx-size` (only 10 to 15 GB remain beside 155 GB of weights), and whichever cache type the Phase 3 ladder proved coherent (Section 4.3). Build: llama.cpp tag `v0.4.1`, `-DGGML_VULKAN=ON -DLLAMA_BUILD_IS_DEV=OFF -DLLAMA_OPENSSL=ON -DLLAMA_USE_PREBUILT_UI=OFF`.
 
 **Desktop:** XFCE with xrdp bound to the LAN and WireGuard interfaces, no autologin, session started on demand.
 
