@@ -3,11 +3,13 @@
     "purpose": "The Phase 4 engines of ATLAS_FRAMEWORK_REVIEW.md Section 15.2 (Section 17 Phase 4; Section 21 V8, V9, V11). Read by phase4-engines.sh, phase4/lib-engine.sh (each phase4/engines/<key>.sh reads its own entry) and phase4/engines/p4common.py. Meditron-70B and the vision engine (Qwen2.5-VL-72B) are Phase 3 GGUF engines and are not listed (Section 15.2, 17 step 2).",
     "tier_rule": "green: built in step 02 in list order, a failure is recorded fail and the phase continues. yellow: attempted in step 03, a failure is recorded deferred. verify: step 04, records verify_id (V8 pointllm, V9 clay-prithvi) pass or deferred. deferred: listed for the table only, no build_script, never attempted (Section 15.2 says why).",
     "order_rule": "List order is Section 17 step 2's order of value; the driver keeps it.",
-    "hf_rule": "hf_repos[] is what the engine pulls with huggingface_hub.snapshot_download through the allowlist proxy (HF_HOME=/srv/atlas/engines/hf). gated=true repos get HF_TOKEN from /etc/atlas/secrets/hf-token.env and fail with the exact licence URL on 401/403 (research conflict 16). verified=false means the repo id, size or licence came from a search snippet (rocm-containers.md: huggingface.co was blocked in the research sandbox); p4common.py re-reads https://huggingface.co/api/models/<repo> (gated, cardData.license, siblings) at pull time and records it in $HF_HOME/manifests/<repo>.json. allow_patterns limits the pull (FLUX: skip the 24 GB single-file duplicates).",
-    "pip_rule": "pip[] is installed into /srv/atlas/engines/venv/<key> (a --system-site-packages venv over the image's ROCm torch) under the image's /opt/atlas/constraints-rocm.txt, so no engine pin can replace the gfx1151 torch (rocm-containers.md §4 item 2, §6.6). Pins are typed only where the research gives one (rule §7.9); unpinned entries say so in research_note.",
+    "hf_rule": "hf_repos[] is what the engine pulls with huggingface_hub.snapshot_download through the allowlist proxy (HF_HOME=/srv/atlas/engines/hf). gated=true repos get HF_TOKEN from /etc/atlas/secrets/hf-token.env, bind-mounted read-only into that pull container only (never an env var; public repos never see the token) and fail with the exact licence URL on 401/403 (research conflict 16); a squid 403 is reported as a proxy denial, not a licence. verified=false means the repo id, size or licence came from a search snippet; p4common.py re-reads https://huggingface.co/api/models/<repo>?blobs=true (gated, cardData.license, sha, siblings with sizes and LFS sha256) at pull time, records it in $HF_HOME/manifests/<repo>.json, verifies every LFS file's sha256 after the download, and pins the revision: `revision` when given here, else the hub sha of the first successful pull written to $HF_HOME/manifests/<repo>.pinned and used on every later run (delete it to re-pin). allow_patterns limits the pull (FLUX: skip the 24 GB single-file duplicates).",
+    "pip_rule": "pip[] is installed into /srv/atlas/engines/venv/<key> (a --system-site-packages venv over the image's ROCm torch) under the image's /opt/atlas/constraints-rocm.txt, so no engine pin can replace the gfx1151 torch (rocm-containers.md §4 item 2, §6.6). Pins are typed only where the research gives one (rule §7.9); unpinned entries say so in research_note. Every successful install is frozen to $ATLAS_SRV/engines/manifests/<key>-freeze.txt (the audit artefact for unpinned entries).",
     "footprint_rule": "footprint_gb_expected is Section 15.2's planning figure. The measured value is the GTT counter delta (mem_info_gtt_used) on the host while the engine's test runs, written to $ATLAS_STATE/phase4/<key>.json as footprint_mb and registered with the Arbiter in step 05.",
     "timeout_rule": "timeout_s bounds one engine's script (build + pull + test); load_timeout_s is the in-test watchdog for a hung model load (kernel 7.0 mmap/hang reports, ROCm/legacy-rocm-build #6530): a load slower than this is killed and recorded fail, never waited for.",
-    "research": "rocm-containers.md (2026-09-22) §3 and §6; adjudicated conflicts 12-19."
+    "research": "rocm-containers.md (2026-09-22) §3 and §6; adjudicated conflicts 12-19.",
+    "sandbox_rule": "Every container run carries --pids-limit 4096, --memory/--memory-swap = mem_limit_gb (null -> max(16, 2 x footprint_gb_expected); GTT is not charged to the cgroup, so this bounds CPU-side memory only), --cpus = nproc - 2, --cap-drop ALL, no-new-privileges. Build/pull/clone runs have the proxy and no GPU; the GPU test run has /dev/kfd, /dev/dri, --network none and only the extra flags V11 recorded in $ATLAS_SRV/engines/v11-runflags.txt (phase4/lib-engine.sh header).",
+    "yellow_rule": "Section 17 step 3 'log pass or fail, never block' and CONVENTIONS §7.4 'yellow records deferred': the result file carries result=deferred AND outcome=fail (blocking=false), and the step 6 table prints deferred(fail)."
   },
   "base_image": {
     "tag": "atlas/rocm-base:10.0.0",
@@ -19,11 +21,13 @@
     "torch": "2.13.0+rocm10.0.0",
     "torchvision": "0.28.0+rocm10.0.0",
     "diagnostic_fallback_image": "docker.io/kyuz0/amd-strix-halo-comfyui:latest",
-    "note": "AMD's own gfx1151 wheels are the primary (adjudicated conflict 12; rocm-containers.md §1.1 VERIFIED index and extras, versions VERIFIED via TheRock #7839). scottt's 2025 wheel is NOT pinned. The fallback image is only run as a diagnostic when V11 fails, to separate 'our image is wrong' from 'this kernel/BIOS combination is broken' (§1.1)."
+    "diagnostic_fallback_digest": null,
+    "note": "AMD's own gfx1151 wheels are the primary (adjudicated conflict 12; rocm-containers.md §1.1 VERIFIED index and extras, versions VERIFIED via TheRock #7839). scottt's 2025 wheel is NOT pinned. The fallback image is only run as a diagnostic when V11 fails, to separate 'our image is wrong' from 'this kernel/BIOS combination is broken' (§1.1). The fallback tag is floating (the research gives a push date, no digest; rule §7.9): diagnostic_fallback_digest is null, so the FIRST pull is UNPINNED and the driver records the pulled digest in $ATLAS_STATE/phase4/diag-image.txt and uses it on every later run; the README lists the recorded digest. The diagnostic run is hardened (atlas uid, --cap-drop ALL, no-new-privileges, pids/memory caps, read-only root)."
   },
   "defaults": {
     "timeout_s": 14400,
-    "load_timeout_s": 900
+    "load_timeout_s": 900,
+    "mem_limit_gb": null
   },
   "engines": [
     {
@@ -32,13 +36,39 @@
       "job": "Image generation, architectural visualisation (the Arch-DiT imagery use)",
       "tier": "green",
       "hf_repos": [
-        {"repo": "black-forest-labs/FLUX.1-dev", "gated": true, "licence": "FLUX.1 [dev] Non-Commercial License", "verified": false,
-         "allow_patterns": ["*.json", "*.txt", "*.md", "scheduler/*", "text_encoder/*", "text_encoder_2/*", "tokenizer/*", "tokenizer_2/*", "transformer/*", "vae/*"]}
+        {
+          "repo": "black-forest-labs/FLUX.1-dev",
+          "gated": true,
+          "licence": "FLUX.1 [dev] Non-Commercial License",
+          "verified": false,
+          "allow_patterns": [
+            "*.json",
+            "*.txt",
+            "*.md",
+            "scheduler/*",
+            "text_encoder/*",
+            "text_encoder_2/*",
+            "tokenizer/*",
+            "tokenizer_2/*",
+            "transformer/*",
+            "vae/*"
+          ],
+          "revision": null
+        }
       ],
-      "pip": ["diffusers", "transformers", "accelerate", "sentencepiece", "protobuf", "safetensors", "pillow"],
+      "pip": [
+        "diffusers",
+        "transformers",
+        "accelerate",
+        "sentencepiece",
+        "protobuf",
+        "safetensors",
+        "pillow"
+      ],
       "build_script": "phase4/engines/flux1-dev.sh",
       "test_script": "phase4/engines/flux1-dev_test.py",
       "footprint_gb_expected": 24,
+      "mem_limit_gb": 64,
       "owner": "Domains 8 and 12 (Valerie, Helena)",
       "verify_id": null,
       "timeout_s": 14400,
@@ -51,13 +81,36 @@
       "job": "Video generation",
       "tier": "green",
       "hf_repos": [
-        {"repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "gated": false, "licence": "apache-2.0", "verified": false,
-         "allow_patterns": ["*.json", "*.txt", "*.md", "scheduler/*", "text_encoder/*", "tokenizer/*", "transformer*/*", "vae/*"]}
+        {
+          "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+          "gated": false,
+          "licence": "apache-2.0",
+          "verified": false,
+          "allow_patterns": [
+            "*.json",
+            "*.txt",
+            "*.md",
+            "scheduler/*",
+            "text_encoder/*",
+            "tokenizer/*",
+            "transformer*/*",
+            "vae/*"
+          ],
+          "revision": null
+        }
       ],
-      "pip": ["diffusers", "transformers", "accelerate", "ftfy", "imageio", "imageio-ffmpeg"],
+      "pip": [
+        "diffusers",
+        "transformers",
+        "accelerate",
+        "ftfy",
+        "imageio",
+        "imageio-ffmpeg"
+      ],
       "build_script": "phase4/engines/wan2.2.sh",
       "test_script": "phase4/engines/wan2.2_test.py",
       "footprint_gb_expected": 34,
+      "mem_limit_gb": 96,
       "owner": "Domain 12 (Helena)",
       "verify_id": null,
       "timeout_s": 14400,
@@ -70,12 +123,23 @@
       "job": "Lightweight vision: captioning, detection, OCR",
       "tier": "green",
       "hf_repos": [
-        {"repo": "florence-community/Florence-2-large", "gated": false, "licence": "mit", "verified": false, "allow_patterns": null}
+        {
+          "repo": "florence-community/Florence-2-large",
+          "gated": false,
+          "licence": "mit",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
-      "pip": ["transformers>=4.56.1", "pillow"],
+      "pip": [
+        "transformers>=4.56.1",
+        "pillow"
+      ],
       "build_script": "phase4/engines/florence-2.sh",
       "test_script": "phase4/engines/florence-2_test.py",
       "footprint_gb_expected": 2,
+      "mem_limit_gb": 16,
       "owner": "General",
       "verify_id": null,
       "timeout_s": 7200,
@@ -88,17 +152,27 @@
       "job": "Time-series forecasting",
       "tier": "green",
       "hf_repos": [
-        {"repo": "amazon/chronos-bolt-base", "gated": false, "licence": "apache-2.0", "verified": false, "allow_patterns": null}
+        {
+          "repo": "amazon/chronos-bolt-base",
+          "gated": false,
+          "licence": "apache-2.0",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
-      "pip": ["chronos-forecasting"],
+      "pip": [
+        "chronos-forecasting"
+      ],
       "build_script": "phase4/engines/timesfm-chronos.sh",
       "test_script": "phase4/engines/timesfm-chronos_test.py",
       "footprint_gb_expected": 1,
+      "mem_limit_gb": 16,
       "owner": "Domain 21 (Silas)",
       "verify_id": null,
       "timeout_s": 3600,
       "licence_note": "Adjudicated conflict 14: TimesFM 3.0 is non-commercial; Chronos (Apache-2.0) is the forecasting engine. amazon/chronos-2 is a drop-in later.",
-      "research_note": "rocm-containers.md §3.4: package and model ids VERIFIED (README); predict_quantiles signature UNVERIFIED-by-snippet."
+      "research_note": "rocm-containers.md §3.4: package and model ids VERIFIED (README); predict_quantiles(inputs, prediction_length, quantile_levels) takes the series positionally (VERIFIED src/chronos/base.py)."
     },
     {
       "key": "ui-tars",
@@ -106,17 +180,31 @@
       "job": "Vision-driven GUI automation (RewardPay and Wix design)",
       "tier": "green",
       "hf_repos": [
-        {"repo": "ByteDance-Seed/UI-TARS-1.5-7B", "gated": false, "licence": "apache-2.0", "verified": false, "allow_patterns": null}
+        {
+          "repo": "ByteDance-Seed/UI-TARS-1.5-7B",
+          "gated": false,
+          "licence": "apache-2.0",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
-      "pip": ["transformers", "accelerate", "qwen-vl-utils", "pillow", "ui-tars"],
+      "pip": [
+        "transformers",
+        "accelerate",
+        "qwen-vl-utils",
+        "pillow",
+        "ui-tars"
+      ],
       "build_script": "phase4/engines/ui-tars.sh",
       "test_script": "phase4/engines/ui-tars_test.py",
       "footprint_gb_expected": 16,
+      "mem_limit_gb": 48,
       "owner": "Domain 1 (Valerie)",
       "verify_id": null,
       "timeout_s": 14400,
       "licence_note": null,
-      "research_note": "Adjudicated conflict 13: UI-TARS 2.0 has no open weights (README VERIFIED); 1.5-7B is built and UI-TARS-2 goes on the Section 15.5 watch-list. Loading code follows the Qwen2.5-VL convention (UNVERIFIED)."
+      "research_note": "Adjudicated conflict 13: UI-TARS 2.0 has no open weights (README VERIFIED); Section 15.2 (v0.3.1) names UI-TARS-1.5-7B as the built engine and Section 15.5 already carries UI-TARS 2.0 on the watch-list (nothing is added to that list here). Section 17 step 2 still says 'UI-TARS 2.0': this row is the engine built in its place. Loading code follows the Qwen2.5-VL convention (UNVERIFIED)."
     },
     {
       "key": "rad-dino",
@@ -124,12 +212,23 @@
       "job": "Radiology vision backbone",
       "tier": "green",
       "hf_repos": [
-        {"repo": "microsoft/rad-dino", "gated": false, "licence": "mit (research use only per the card)", "verified": false, "allow_patterns": null}
+        {
+          "repo": "microsoft/rad-dino",
+          "gated": false,
+          "licence": "mit (research use only per the card)",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
-      "pip": ["transformers", "pillow"],
+      "pip": [
+        "transformers",
+        "pillow"
+      ],
       "build_script": "phase4/engines/rad-dino.sh",
       "test_script": "phase4/engines/rad-dino_test.py",
       "footprint_gb_expected": 1,
+      "mem_limit_gb": 16,
       "owner": "Domains 10 and 15 (Minerva)",
       "verify_id": null,
       "timeout_s": 3600,
@@ -142,18 +241,38 @@
       "job": "Image and video segmentation and tracking",
       "tier": "green",
       "hf_repos": [
-        {"repo": "facebook/sam2.1-hiera-large", "gated": false, "licence": "apache-2.0", "verified": false, "allow_patterns": null, "fallback_repo": "facebook/sam2-hiera-large"}
+        {
+          "repo": "facebook/sam2.1-hiera-large",
+          "gated": false,
+          "licence": "apache-2.0",
+          "verified": false,
+          "allow_patterns": null,
+          "fallback_repo": "facebook/sam2-hiera-large",
+          "revision": null
+        }
       ],
-      "pip": ["hydra-core>=1.3.2", "iopath", "pillow", "numpy", "tqdm"],
-      "git": [{"url": "https://github.com/facebookresearch/sam2.git", "dir": "sam2"}],
+      "pip": [
+        "hydra-core>=1.3.2",
+        "iopath",
+        "pillow",
+        "numpy",
+        "tqdm"
+      ],
+      "git": [
+        {
+          "url": "https://github.com/facebookresearch/sam2.git",
+          "dir": "sam2"
+        }
+      ],
       "build_script": "phase4/engines/sam2.sh",
       "test_script": "phase4/engines/sam2_test.py",
       "footprint_gb_expected": 4,
+      "mem_limit_gb": 16,
       "owner": "Domains 22 and 7",
       "verify_id": null,
       "timeout_s": 7200,
       "licence_note": null,
-      "research_note": "rocm-containers.md §3.7: SAM2_BUILD_CUDA=0 pip install -e . VERIFIED (INSTALL.md, setup.py); only the small-hole mask post-processing is lost (Section 15.2). The 2.1 HF id is UNVERIFIED; fallback_repo is the README's VERIFIED example id. dl.fbaipublicfiles.com is not allowlisted, so the .pt fallback is not used."
+      "research_note": "rocm-containers.md §3.7: SAM2_BUILD_CUDA=0 pip install -e . VERIFIED (INSTALL.md, setup.py); only the small-hole mask post-processing is lost (Section 15.2). The 2.1 HF id is UNVERIFIED; fallback_repo is the README's VERIFIED example id. dl.fbaipublicfiles.com is not allowlisted, so the .pt fallback is not used. pip install -e . runs with --no-build-isolation (INSTALL.md): the build-system's torch>=2.5.1 would otherwise pull the CUDA wheel into a throwaway build env."
     },
     {
       "key": "stable-audio-open",
@@ -161,17 +280,25 @@
       "job": "Music and sound generation",
       "tier": "green",
       "hf_repos": [
-        {"repo": "stabilityai/stable-audio-open-1.0", "gated": true, "licence": "Stability AI Community License", "verified": false, "allow_patterns": null}
+        {
+          "repo": "stabilityai/stable-audio-open-1.0",
+          "gated": true,
+          "licence": "Stability AI Community License",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
-      "pip": ["stable-audio-tools", "einops"],
+      "pip": [],
       "build_script": "phase4/engines/stable-audio-open.sh",
       "test_script": "phase4/engines/stable-audio-open_test.py",
       "footprint_gb_expected": 5,
+      "mem_limit_gb": 24,
       "owner": "Domain 12 (Helena)",
       "verify_id": null,
       "timeout_s": 7200,
       "licence_note": "Gated with a manual form on huggingface.co; accept it with the HF_TOKEN account before Phase 4 (conflict 16).",
-      "research_note": "rocm-containers.md §3.8: package VERIFIED; flash-attn is not available on ROCm gfx1151, the model must fall back to SDPA (UNVERIFIED that every module does); inference snippet UNVERIFIED-by-snippet."
+      "research_note": "rocm-containers.md §3.8: package VERIFIED; flash-attn is not available on ROCm gfx1151, the model must fall back to SDPA (UNVERIFIED that every module does); inference snippet UNVERIFIED-by-snippet. Fix round (rule §7.9 deviation, README): stable-audio-tools==0.0.20 declares requires-python <3.11 and pins torch==2.7.1/torchaudio==2.7.1 (VERIFIED PyPI), so stable-audio-open.sh installs it --no-deps --ignore-requires-python and its runtime deps minus torch separately; the wav is written with soundfile (torchaudio >= 2.9 needs torchcodec)."
     },
     {
       "key": "cosyvoice2",
@@ -179,18 +306,32 @@
       "job": "Voice cloning alternative (optional)",
       "tier": "green",
       "hf_repos": [
-        {"repo": "FunAudioLLM/CosyVoice2-0.5B", "gated": false, "licence": "apache-2.0", "verified": false, "allow_patterns": null}
+        {
+          "repo": "FunAudioLLM/CosyVoice2-0.5B",
+          "gated": false,
+          "licence": "apache-2.0",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
       "pip": [],
-      "git": [{"url": "https://github.com/FunAudioLLM/CosyVoice.git", "dir": "CosyVoice", "recursive": true}],
+      "git": [
+        {
+          "url": "https://github.com/FunAudioLLM/CosyVoice.git",
+          "dir": "CosyVoice",
+          "recursive": true
+        }
+      ],
       "build_script": "phase4/engines/cosyvoice2.sh",
       "test_script": "phase4/engines/cosyvoice2_test.py",
       "footprint_gb_expected": 5,
+      "mem_limit_gb": 24,
       "owner": "Voice layer (optional)",
       "verify_id": null,
       "timeout_s": 10800,
       "licence_note": null,
-      "research_note": "Section 15.2 says green; rocm-containers.md §3.9 says treat as yellow (requirements.txt pins torch/onnxruntime, pynini needs OpenFst). The tier stays green per the document; the script filters those pins out under the constraints file (UNVERIFIED workaround) and a failure is a recorded fail, never a block."
+      "research_note": "Section 15.2 says green; rocm-containers.md §3.9 says treat as yellow (requirements.txt pins torch/onnxruntime, pynini needs OpenFst). The tier stays green per the document; the script filters those pins out under the constraints file (UNVERIFIED workaround) and a failure is a recorded fail, never a block. The test passes the prompt wav PATH (VERIFIED cosyvoice/cli/cosyvoice.py) and replaces upstream load_wav (torchaudio.load -> torchcodec on >= 2.9) with a soundfile loader; soundfile is added to the venv."
     },
     {
       "key": "openvla",
@@ -198,17 +339,31 @@
       "job": "Vision-language-action for robotics (dormant until hardware exists)",
       "tier": "green",
       "hf_repos": [
-        {"repo": "openvla/openvla-7b", "gated": false, "licence": "mit", "verified": false, "allow_patterns": null}
+        {
+          "repo": "openvla/openvla-7b",
+          "gated": false,
+          "licence": "mit",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
-      "pip": ["transformers==4.40.1", "tokenizers==0.19.1", "timm==0.9.10", "accelerate", "pillow"],
+      "pip": [
+        "transformers==4.40.1",
+        "tokenizers==0.19.1",
+        "timm==0.9.10",
+        "accelerate",
+        "pillow"
+      ],
       "build_script": "phase4/engines/openvla.sh",
       "test_script": "phase4/engines/openvla_test.py",
       "footprint_gb_expected": 16,
+      "mem_limit_gb": 48,
       "owner": "Domain 29 (Valerie)",
       "verify_id": null,
       "timeout_s": 10800,
       "licence_note": null,
-      "research_note": "rocm-containers.md §3.10: pins VERIFIED from openvla pyproject.toml (torch==2.2.0 deliberately NOT applied: the ROCm torch stays); trust_remote_code=True is required by the repo; attn_implementation=sdpa instead of flash-attn (README VERIFIED: the model works without it)."
+      "research_note": "rocm-containers.md §3.10: pins VERIFIED from openvla pyproject.toml (torch==2.2.0 deliberately NOT applied: the ROCm torch stays); trust_remote_code=True is required by the repo; attn_implementation=sdpa instead of flash-attn (README VERIFIED: the model works without it). trust_remote_code executes the repo's Python: the pull pins the revision to the hub sha of the first successful pull ($HF_HOME/manifests/openvla__openvla-7b.pinned), so the code run in the GPU container is that commit on every later run (README)."
     },
     {
       "key": "trellis",
@@ -216,21 +371,45 @@
       "job": "Image-to-3D",
       "tier": "yellow",
       "hf_repos": [
-        {"repo": "microsoft/TRELLIS-image-large", "gated": false, "licence": "mit", "verified": false, "allow_patterns": null}
+        {
+          "repo": "microsoft/TRELLIS-image-large",
+          "gated": false,
+          "licence": "mit",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
-      "pip": ["easydict", "imageio", "imageio-ffmpeg", "trimesh", "rembg", "onnxruntime", "opencv-python-headless", "pillow"],
+      "pip": [
+        "easydict",
+        "imageio",
+        "imageio-ffmpeg",
+        "trimesh",
+        "rembg",
+        "onnxruntime",
+        "opencv-python-headless",
+        "pillow"
+      ],
       "git": [
-        {"url": "https://github.com/microsoft/TRELLIS.git", "dir": "TRELLIS", "recursive": true},
-        {"url": "https://github.com/kroqueta-s/trellis-strix-halo.git", "dir": "trellis-strix-halo"}
+        {
+          "url": "https://github.com/microsoft/TRELLIS.git",
+          "dir": "TRELLIS",
+          "recursive": true
+        },
+        {
+          "url": "https://github.com/kroqueta-s/trellis-strix-halo.git",
+          "dir": "trellis-strix-halo"
+        }
       ],
       "build_script": "phase4/engines/trellis.sh",
       "test_script": "phase4/engines/trellis_test.py",
       "footprint_gb_expected": 12,
+      "mem_limit_gb": 48,
       "owner": "Domains 8 and 12",
       "verify_id": null,
       "timeout_s": 14400,
       "licence_note": null,
-      "research_note": "rocm-containers.md §3.13: upstream needs six CUDA-only packages; attempt A = upstream code + kroqueta-s pure-torch shims (gfx1151-validated on Windows only, Linux UNVERIFIED). A build or run failure records deferred with the last 20 log lines. Attempt B (TRELLIS.2 + paladx2105 ROCm 10.0 wheels) is noted, not automated: its wheel URLs are unverified."
+      "research_note": "rocm-containers.md §3.13: upstream needs six CUDA-only packages; attempt A = upstream code + kroqueta-s pure-torch shims (gfx1151-validated on Windows only, Linux UNVERIFIED). A build or run failure records deferred with the last 20 log lines. Attempt B (TRELLIS.2 + paladx2105 ROCm 10.0 wheels) is noted, not automated: its wheel URLs are unverified. The kroqueta-s shims are one module, runners/trellis/shims.py, whose install() registers spconv/flash_attn/nvdiffrast/kaolin/open3d replacements in sys.modules before `import trellis` (VERIFIED README + docstring); trellis_test.py calls it."
     },
     {
       "key": "blender-cycles",
@@ -239,15 +418,19 @@
       "tier": "yellow",
       "hf_repos": [],
       "pip": [],
-      "download": {"index": "https://download.blender.org/release/Blender4.5/", "pattern": "blender-4.5.[0-9]*-linux-x64.tar.xz"},
+      "download": {
+        "index": "https://download.blender.org/release/Blender4.5/",
+        "pattern": "blender-4.5.[0-9]*-linux-x64.tar.xz"
+      },
       "build_script": "phase4/engines/blender-cycles.sh",
       "test_script": "phase4/engines/blender-cycles_test.py",
       "footprint_gb_expected": 2,
+      "mem_limit_gb": 16,
       "owner": "Domain 8 (Valerie)",
       "verify_id": null,
       "timeout_s": 7200,
       "licence_note": null,
-      "research_note": "Adjudicated conflict 18: pin 4.5 LTS (newest 4.5.x on the release index, tarball name pattern UNVERIFIED). gfx1151 HIP kernels are in the tarball since Blender commit 6363181a (VERIFIED via Bforartists #4932); whether HIP 6.x fatbins load on the ROCm 10.0 runtime is UNVERIFIED. The test renders the default cube at 64 samples with HIP, then with CPU (mandatory fallback, Section 15.2) and records which succeeded; pass needs at least the CPU render."
+      "research_note": "Adjudicated conflict 18: pin 4.5 LTS (newest 4.5.x on the release index, tarball name pattern UNVERIFIED). gfx1151 HIP kernels are in the tarball since Blender commit 6363181a (VERIFIED via Bforartists #4932); whether HIP 6.x fatbins load on the ROCm 10.0 runtime is UNVERIFIED. The test renders the default cube at 64 samples with HIP, then with CPU (mandatory fallback, Section 15.2) and records which succeeded; pass needs at least the CPU render. Blender runs with --offline-mode (>= 4.2) and the --bpy step fails when bpy.app.online_access is True; each render has its own timeout under the load watchdog so the CPU fallback always runs."
     },
     {
       "key": "pointllm",
@@ -255,18 +438,31 @@
       "job": "Point-cloud understanding",
       "tier": "verify",
       "hf_repos": [
-        {"repo": "RunsenXu/PointLLM_7B_v1.2", "gated": false, "licence": "cc-by-nc-4.0", "verified": false, "allow_patterns": null}
+        {
+          "repo": "RunsenXu/PointLLM_7B_v1.2",
+          "gated": false,
+          "licence": "cc-by-nc-4.0",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        }
       ],
       "pip": [],
-      "git": [{"url": "https://github.com/OpenRobotLab/PointLLM.git", "dir": "PointLLM"}],
+      "git": [
+        {
+          "url": "https://github.com/OpenRobotLab/PointLLM.git",
+          "dir": "PointLLM"
+        }
+      ],
       "build_script": "phase4/engines/pointllm.sh",
       "test_script": "phase4/engines/pointllm_test.py",
       "footprint_gb_expected": 16,
+      "mem_limit_gb": 48,
       "owner": "Domains 8 and 29",
       "verify_id": "V8",
       "timeout_s": 14400,
       "licence_note": "cc-by-nc-4.0 (UNVERIFIED-by-snippet): non-commercial, the same class the baseline flags for FLUX (adjudicated conflict 17; Section 16.5). Recorded for the Principal.",
-      "research_note": "rocm-containers.md §3.11: point ops are pure torch (VERIFIED), the risk is dependency rot (transformers 2023 commit, tokenizers==0.12.1 built from source with rustc, open3d unpinned). Failure records V8 deferred, as Section 17 step 4 allows."
+      "research_note": "rocm-containers.md §3.11: point ops are pure torch (VERIFIED), the risk is dependency rot (transformers 2023 commit, tokenizers==0.12.1 built from source with rustc, open3d unpinned). Failure records V8 deferred, as Section 17 step 4 allows. tokenizers==0.12.1 has wheels for cp36-cp310 only (VERIFIED PyPI): the sdist build needs index.crates.io, static.crates.io and crates.io in config/allowlist.txt (Phase 1 writer); pointllm.sh stops with that message when they are absent."
     },
     {
       "key": "clay-prithvi",
@@ -274,14 +470,39 @@
       "job": "Satellite and geospatial analysis",
       "tier": "verify",
       "hf_repos": [
-        {"repo": "ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL", "gated": false, "licence": "apache-2.0", "verified": false, "allow_patterns": null},
-        {"repo": "made-with-clay/Clay", "gated": false, "licence": "apache-2.0 (older cards said OpenRAIL-M)", "verified": false, "allow_patterns": ["v1.5/clay-v1.5.ckpt"]}
+        {
+          "repo": "ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL",
+          "gated": false,
+          "licence": "apache-2.0",
+          "verified": false,
+          "allow_patterns": null,
+          "revision": null
+        },
+        {
+          "repo": "made-with-clay/Clay",
+          "gated": false,
+          "licence": "apache-2.0 (older cards said OpenRAIL-M)",
+          "verified": false,
+          "allow_patterns": [
+            "v1.5/clay-v1.5.ckpt"
+          ],
+          "revision": null
+        }
       ],
-      "pip": ["terratorch", "pyyaml"],
-      "git": [{"url": "https://github.com/Clay-foundation/model.git", "dir": "clay-model"}],
+      "pip": [
+        "terratorch",
+        "pyyaml"
+      ],
+      "git": [
+        {
+          "url": "https://github.com/Clay-foundation/model.git",
+          "dir": "clay-model"
+        }
+      ],
       "build_script": "phase4/engines/clay-prithvi.sh",
       "test_script": "phase4/engines/clay-prithvi_test.py",
       "footprint_gb_expected": 5,
+      "mem_limit_gb": 24,
       "owner": "Domain 7",
       "verify_id": "V9",
       "timeout_s": 10800,
@@ -298,6 +519,7 @@
       "build_script": null,
       "test_script": null,
       "footprint_gb_expected": null,
+      "mem_limit_gb": null,
       "owner": "Domain 15",
       "verify_id": null,
       "timeout_s": null,
@@ -314,6 +536,7 @@
       "build_script": null,
       "test_script": null,
       "footprint_gb_expected": null,
+      "mem_limit_gb": null,
       "owner": "Domains 8 and 9",
       "verify_id": null,
       "timeout_s": null,

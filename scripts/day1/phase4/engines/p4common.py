@@ -14,13 +14,20 @@ Two roles:
    which phase4/lib-engine.sh merges into $ATLAS_STATE/phase4/<key>.json (the footprint itself is measured on the host
    from the GTT counter while this process runs; peak_alloc_mb is torch's own view, a cross-check).
 
-2. CLI for the pull step:  python3 p4common.py pull REPO [--allow PATTERN ...] [--fallback REPO2] [--manifest DIR]
-   Re-reads https://huggingface.co/api/models/<repo> (gated, cardData.license, siblings[].rfilename/lfs) at pull
+2. CLI for the pull step:  python3 p4common.py pull REPO [--allow PATTERN ...] [--fallback REPO2] [--revision REV]
+                                                  [--manifest DIR]
+   Re-reads {HF_ENDPOINT}/api/models/<repo>?blobs=true (gated, cardData.license, sha, siblings[].size/lfs.oid) at pull
    time and writes <manifest-dir>/<repo with / as __>.json (research §0: never trust the snippet sizes), then
-   huggingface_hub.snapshot_download(repo, allow_patterns=...). Exit codes: 0 ok; 3 gated/forbidden (the licence URL is
-   printed on stderr as the last line: "LICENCE_URL https://huggingface.co/<repo>"); 4 repo not found (after trying
-   --fallback); 1 anything else. HF_TOKEN comes from the environment (the driver passes the secrets file as
-   --env-file for gated repos); it is never printed.
+   huggingface_hub.snapshot_download(repo, allow_patterns=..., revision=...) and verifies every LFS file against its
+   sha256 from the manifest (rule §7.3 / Section 17 Phase 3 "pull, with checksum verification"); a mismatch deletes the
+   file and fails. Revision pin (rule §7.9): --revision when the json gives one; otherwise the first successful pull
+   writes the hub's HEAD sha to <manifest-dir>/<repo>.pinned and every later run uses it (delete the file to re-pin).
+   Exit codes: 0 ok; 1 anything else (a squid TCP_DENIED 403 is reported as "proxy denied", never as a licence
+   problem); 3 gated/forbidden (the licence URL is printed on stderr as the last line: "LICENCE_URL
+   https://huggingface.co/<repo>"); 4 repo not found (after trying --fallback); 5 sha256 mismatch.
+   HF_TOKEN: from the environment, else read from $HF_TOKEN_FILE (lib-engine.sh bind-mounts the secrets file at
+   /run/secrets/hf-token.env for gated repos only); it is never printed. HF_ENDPOINT is honoured only when it is
+   https://huggingface.co or a *.hf.co host (the token travels as a Bearer header to whatever host it names).
 
 Kernel 7.0 mmap regression (ROCm/legacy-rocm-build #6530, research §0 item 5): safetensors loading through mmap runs
 at ~1.5 MB/s on this kernel. `Test` therefore monkeypatches safetensors.torch.load_file to read-then-load
@@ -34,6 +41,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -189,6 +197,24 @@ class Test:
             self.fail(f"{type(exc).__name__}: {exc} | " + " | ".join(tb[-6:]))
 
 
+# --- loader kwargs (fix round) ----------------------------------------------------------------------------------------
+def load_kwargs(cls: type, dtype: object, *, disable_mmap: bool = True) -> dict[str, object]:
+    """The from_pretrained keyword spellings this diffusers/transformers build accepts, decided ONCE from the
+    signature instead of try/except retries (a TypeError raised inside a 30 GB load would otherwise re-run it).
+    `dtype` when the signature names it, else `torch_dtype` (accepted by every release; deprecated in the newest);
+    `disable_mmap` only when it is an explicit parameter (the safetensors mmap patch in Test covers the rest)."""
+    import inspect
+
+    try:
+        params = inspect.signature(cls.from_pretrained).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kw: dict[str, object] = {"dtype" if "dtype" in params else "torch_dtype": dtype}
+    if disable_mmap and "disable_mmap" in params:
+        kw["disable_mmap"] = True
+    return kw
+
+
 # --- synthetic inputs (no network, no gated data) --------------------------------------------------------------------
 def synthetic_image(path: Path, kind: str = "scene", size: tuple[int, int] = (640, 480)) -> Path:
     """A deterministic test picture: coloured shapes and text ("scene"), a fake GUI ("gui"), or a grey X-ray-like
@@ -225,7 +251,42 @@ def synthetic_image(path: Path, kind: str = "scene", size: tuple[int, int] = (64
 
 
 # --- pull CLI -------------------------------------------------------------------------------------------------------
-def _api_json(url: str, token: str | None) -> tuple[int, Any]:
+HF_DEFAULT = "https://huggingface.co"
+HF_ENDPOINT_RE = re.compile(r"^https://(huggingface\.co|[a-z0-9.-]+\.hf\.co)/?$")
+
+
+def hf_token() -> str | None:
+    """HF_TOKEN from the environment, else the first HF_TOKEN=... (or bare) line of $HF_TOKEN_FILE."""
+    tok = os.environ.get("HF_TOKEN")
+    if tok:
+        return tok
+    path = os.environ.get("HF_TOKEN_FILE") or "/run/secrets/hf-token.env"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("HF_TOKEN="):
+                    line = line[len("HF_TOKEN="):].strip().strip("'\"")
+                return line or None
+    except OSError:
+        return None
+    return None
+
+
+def hf_base() -> str | None:
+    """The API/hub base: HF_ENDPOINT when it is huggingface.co or *.hf.co, the default when unset, None when bad."""
+    ep = os.environ.get("HF_ENDPOINT")
+    if not ep:
+        return HF_DEFAULT
+    if HF_ENDPOINT_RE.match(ep):
+        return ep.rstrip("/")
+    return None
+
+
+def _api_json(url: str, token: str | None) -> tuple[int, Any, dict[str, str]]:
+    """GET url -> (status, json or None, lower-cased response headers)."""
     import urllib.error
     import urllib.request
 
@@ -234,31 +295,101 @@ def _api_json(url: str, token: str | None) -> tuple[int, Any]:
         req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            return resp.status, json.loads(resp.read().decode("utf-8")), hdrs
     except urllib.error.HTTPError as exc:
-        return exc.code, None
+        hdrs = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
+        return exc.code, None, hdrs
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        _log(f"GET {url} failed: {exc!r} (proxy reachable? see /var/log/squid/access.log)")
+        return 0, None, {}
 
 
-def pull(repo: str, allow: list[str] | None, fallback: str | None, manifest_dir: Path) -> int:
-    token = os.environ.get("HF_TOKEN") or None
-    base = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+def _is_proxy_denial(code: int, hdrs: dict[str, str]) -> bool:
+    """squid answers 403 (TCP_DENIED) for a host outside the allowlist; its error pages carry Server: squid and
+    X-Squid-Error. A 403 from squid is an allowlist problem, never a licence problem (rule §7.4)."""
+    if code != 403:
+        return False
+    return "squid" in hdrs.get("server", "").lower() or "x-squid-error" in hdrs
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(16 * 2**20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_snapshot(snapshot: Path, files: list[dict[str, Any]]) -> list[str]:
+    """sha256 of every manifest file that carries an LFS oid; returns the names that mismatched (deleted)."""
+    bad: list[str] = []
+    for f in files:
+        want = f.get("sha256")
+        if not want:
+            continue
+        target = snapshot / str(f["name"])
+        if not target.exists():
+            _log(f"verify: {f['name']} missing from the snapshot")
+            bad.append(str(f["name"]))
+            continue
+        got = _sha256_file(target)
+        if got != want:
+            _log(f"verify: sha256 MISMATCH {f['name']}: got {got} expected {want}; deleting")
+            try:
+                real = target.resolve()
+                target.unlink()
+                if real != target and real.exists():
+                    real.unlink()
+            except OSError as exc:
+                _log(f"verify: could not delete {target}: {exc}")
+            bad.append(str(f["name"]))
+    return bad
+
+
+def pull(repo: str, allow: list[str] | None, fallback: str | None, manifest_dir: Path,
+         revision: str | None = None) -> int:
+    token = hf_token()
+    base = hf_base()
+    if base is None:
+        _log(f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT')!r} is not huggingface.co or *.hf.co: refusing to send the "
+             "token there (rule §7.2); unset it in /etc/atlas/atlas.env")
+        return 1
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    # Control request first: a public model. 403 here is the proxy (allowlist), not a licence.
+    code, _, hdrs = _api_json(f"{base}/api/models/gpt2", None)
+    if code == 0 or _is_proxy_denial(code, hdrs):
+        _log(f"proxy denied {base} (control GET api/models/gpt2 -> HTTP {code}): huggingface.co is not allowlisted or "
+             "the proxy is down; see /var/log/squid/access.log")
+        return 1
+    pin_file = manifest_dir / (repo.replace("/", "__") + ".pinned")
+    if not revision and pin_file.is_file():
+        revision = pin_file.read_text(encoding="utf-8").strip() or None
+        if revision:
+            _log(f"{repo}: using the pinned revision {revision} from {pin_file} (delete it to re-pin)")
     tried = [repo] + ([fallback] if fallback else [])
     chosen: str | None = None
     meta: Any = None
     for cand in tried:
-        code, meta = _api_json(f"{base}/api/models/{cand}", token)
-        _log(f"api/models/{cand}: HTTP {code}")
+        url = f"{base}/api/models/{cand}" + (f"/revision/{revision}" if revision else "") + "?blobs=true"
+        code, meta, hdrs = _api_json(url, token)
+        _log(f"api/models/{cand}{'@' + revision if revision else ''}: HTTP {code}")
         if code == 200:
             chosen = cand
             break
+        if _is_proxy_denial(code, hdrs) or code == 0:
+            _log(f"proxy denied or unreachable for {cand} (HTTP {code}): allowlist / squid, not a licence problem")
+            return 1
         if code in (401, 403):
             print(f"LICENCE_URL https://huggingface.co/{cand}", file=sys.stderr, flush=True)
             _log(f"{cand} is gated or private for this token: accept the licence at https://huggingface.co/{cand} "
-                 "with the account that owns HF_TOKEN in /etc/atlas/secrets/hf-token.env")
+                 "with the account that owns HF_TOKEN in /etc/atlas/secrets/hf-token.env (or the token is invalid)")
             return 3
         if code == 404:
             continue
-        _log(f"unexpected HTTP {code} from the hub API for {cand} (proxy? allowlist?)")
+        _log(f"unexpected HTTP {code} from the hub API for {cand}")
         return 1
     if chosen is None:
         _log(f"none of {tried} exists on the hub (HTTP 404)")
@@ -276,21 +407,22 @@ def pull(repo: str, allow: list[str] | None, fallback: str | None, manifest_dir:
         size = int(lfs.get("size") or s.get("size") or 0)
         total += size
         files.append({"name": name, "bytes": size or None, "sha256": lfs.get("oid")})
+    sha = meta.get("sha")
     manifest = {
         "repo": chosen,
         "requested": repo,
         "gated": meta.get("gated"),
         "license": (meta.get("cardData") or {}).get("license"),
-        "sha": meta.get("sha"),
+        "sha": sha,
+        "revision_requested": revision,
         "allow_patterns": allow,
         "files": files,
         "total_bytes": total,
         "pulled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-    manifest_dir.mkdir(parents=True, exist_ok=True)
     mpath = manifest_dir / (chosen.replace("/", "__") + ".json")
     mpath.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    _log(f"{chosen}: gated={manifest['gated']} license={manifest['license']} files={len(files)} "
+    _log(f"{chosen}: gated={manifest['gated']} license={manifest['license']} sha={sha} files={len(files)} "
          f"bytes={total / 1e9:.1f} GB -> {mpath}")
     if meta.get("gated") and not token:
         print(f"LICENCE_URL https://huggingface.co/{chosen}", file=sys.stderr, flush=True)
@@ -298,17 +430,38 @@ def pull(repo: str, allow: list[str] | None, fallback: str | None, manifest_dir:
         return 3
 
     from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
 
+    rev = revision or sha
     try:
-        path = snapshot_download(repo_id=chosen, allow_patterns=allow or None, token=token, max_workers=4)
+        path = snapshot_download(repo_id=chosen, allow_patterns=allow or None, token=token, max_workers=4,
+                                 revision=rev)
     except GatedRepoError:
         print(f"LICENCE_URL https://huggingface.co/{chosen}", file=sys.stderr, flush=True)
         return 3
-    except RepositoryNotFoundError:
-        return 4
-    _log(f"{chosen}: snapshot at {path}")
-    # Record where the snapshot landed so a test can find a fallback repo id without the API.
+    except HfHubHTTPError as exc:
+        # RepositoryNotFoundError is raised for 401 too (invalid/expired token): branch on the real status code.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403):
+            print(f"LICENCE_URL https://huggingface.co/{chosen}", file=sys.stderr, flush=True)
+            _log(f"{chosen}: HTTP {status} from the hub during download: licence not accepted for this token, or the "
+                 "token in /etc/atlas/secrets/hf-token.env is invalid/expired")
+            return 3
+        if status == 404 or isinstance(exc, RepositoryNotFoundError):
+            _log(f"{chosen}@{rev}: not found on the hub (HTTP {status})")
+            return 4
+        _log(f"{chosen}: hub error HTTP {status}: {exc}")
+        return 1
+    _log(f"{chosen}: snapshot at {path}; verifying sha256 of {sum(1 for f in files if f.get('sha256'))} LFS files")
+    bad = verify_snapshot(Path(path), files)
+    if bad:
+        _log(f"{chosen}: {len(bad)} file(s) failed sha256 verification and were deleted: {bad[:5]}")
+        return 5
+    # Pin the revision this pull used (rule §7.9) and record where the snapshot landed so a test can find a fallback
+    # repo id without the API.
+    if not pin_file.is_file() and sha:
+        pin_file.write_text(f"{sha}\n", encoding="utf-8")
+        _log(f"{repo}: pinned to revision {sha} in {pin_file}")
     (manifest_dir / (repo.replace("/", "__") + ".resolved")).write_text(chosen + "\n", encoding="utf-8")
     print(chosen)
     return 0
@@ -321,10 +474,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("repo")
     p.add_argument("--allow", action="append", default=None)
     p.add_argument("--fallback", default=None)
+    p.add_argument("--revision", default=None, help="hub revision to pull (json hf_repos[].revision); else pinned")
     p.add_argument("--manifest", default=os.path.join(os.environ.get("HF_HOME", "/srv/atlas/engines/hf"), "manifests"))
     ns = parser.parse_args(argv)
     if ns.cmd == "pull":
-        return pull(ns.repo, ns.allow, ns.fallback, Path(ns.manifest))
+        return pull(ns.repo, ns.allow, ns.fallback, Path(ns.manifest), ns.revision)
     return 1
 
 

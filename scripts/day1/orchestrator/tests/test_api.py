@@ -1,6 +1,8 @@
 """The orchestrator API with TestClient: /v1/models lists three; a chat completion streams through the REAL router
 (stub classifier), the REAL prompt builder, the REAL Arbiter over stub controller/probe and a StubLlama; the approval
-flow runs the REAL ApprovalQueue over StubSender; vault, strike and arbiter endpoints. No live service."""
+flow runs the REAL ApprovalQueue over StubSender; vault, strike and arbiter endpoints; the admin token and the
+loopback rule; the never-delegate pass; the Phase 3 load-test contract (/arbiter/load, engine-keyed chat). No live
+service."""
 
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from atlas import vault as vault_mod
-from atlas.api import AppDeps, NoChannelSender, build_app
+from atlas.api import ADMIN_TOKEN_HEADER, AppDeps, NoChannelSender, build_app, history_has_vault_prefix
 from atlas.approval import ApprovalQueue, StubNotifier, StubSender
 from atlas.config import load_config
 from atlas.ledger import Ledger
@@ -73,6 +75,7 @@ def harness(config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         load_wait_s=5.0,
         generation_wait_s=5.0,
         enqueue=lambda name, kw: "celery-task-1",
+        trusted_hosts=frozenset({"127.0.0.1", "::1", "testclient"}),  # TestClient's client host
     )
     app = build_app(deps)
     return {
@@ -116,6 +119,7 @@ def test_models_lists_atlas_ren_arthur(harness: dict[str, Any]) -> None:
     assert [m["id"] for m in r.json()["data"]] == ["atlas", "ren", "arthur"]
     assert client.get("/health").status_code == 200
     assert _chat(client, "x", model="gpt-4").status_code == 404
+    assert _chat(client, "x", model="gpt-4").json()["detail"].startswith("model 'gpt-4' is not served")
 
 
 # --- chat -------------------------------------------------------------------------------------------------------------
@@ -173,7 +177,7 @@ def test_ren_and_arthur_force_the_hemisphere_and_hard_rules_win(harness: dict[st
     client: TestClient = harness["client"]
     r = _chat(client, "hi", model="arthur")
     assert r.json()["atlas"]["persona"] == "arthur" and r.json()["atlas"]["engine"] == "nemotron-3-super"
-    assert r.json()["atlas"]["override"] == "[ARTHUR]"
+    assert r.json()["atlas"]["override"] == "[ARTHUR]" and r.json()["atlas"]["forced_lead"] == "arthur"
     r = _chat(client, "hi", model="ren")
     assert r.json()["atlas"]["persona"] == "ren" and r.json()["atlas"]["override"] == "[REN]"
     # The engine never sees the forcing prefix.
@@ -182,6 +186,26 @@ def test_ren_and_arthur_force_the_hemisphere_and_hard_rules_win(harness: dict[st
     r = _chat(client, "medical results to review")
     assert r.json()["atlas"]["persona"] == "arthur" and r.json()["atlas"]["hard_keyword_hit"] == "medical"
     assert "hard-rule:medical" in r.json()["atlas"]["reason"]
+    assert r.json()["atlas"]["forced_lead"] is None
+
+
+def test_model_picker_ren_cannot_bypass_the_privacy_membrane(harness: dict[str, Any]) -> None:
+    """7.2 rule 1 over the UI model picker: `model=ren` + a hard keyword goes to Arthur, the Principal is told why,
+    and the overruled routing is a 9.4 strike."""
+    client: TestClient = harness["client"]
+    r = _chat(client, "my medical results came back", model="ren")
+    assert r.status_code == 200, r.text
+    head = r.json()["atlas"]
+    assert head["persona"] == "arthur" and head["engine"] == "nemotron-3-super" and head["hemisphere"] == "estate"
+    assert head["hard_keyword_hit"] == "medical" and head["forced_lead"] == "ren"
+    assert "overruled-by-hard-rule:medical" in head["reason"]
+    text = r.json()["choices"][0]["message"]["content"]
+    assert text.startswith("[ATLAS] Routed to Arthur") and "'medical'" in text and "Stub answer" in text
+    strikes = harness["ledger"].list_strikes(task_id=head["task_id"])
+    assert len(strikes) == 1 and strikes[0]["kind"] == "overridden-routing"
+    # The turn remembered under the ESTATE hemisphere (Arthur's), never corporate.
+    cols = harness["chroma"].collections
+    assert cols["estate"].count() == 1 and ("corporate" not in cols or cols["corporate"].count() == 0)
 
 
 def test_vault_tagged_session_is_not_remembered(harness: dict[str, Any]) -> None:
@@ -197,6 +221,34 @@ def test_vault_tagged_session_is_not_remembered(harness: dict[str, Any]) -> None
     assert "vault-tagged" in r.json()["choices"][0]["message"]["content"]
     assert r.json()["atlas"]["command"] == "vault-session" and r.json()["atlas"]["persona"] == "arthur"
     assert harness["sessions"].is_vault("chat-2")
+
+
+def test_vault_prefix_earlier_in_the_history_tags_the_session(harness: dict[str, Any]) -> None:
+    """10.5 'for the life of that session' survives a filter/Open WebUI restart: the history carries [VAULT]."""
+    client: TestClient = harness["client"]
+    sessions: SessionTags = harness["sessions"]
+    history = [
+        {"role": "user", "content": "[VAULT] here is the trust deed"},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": "summarise the trustee powers"},
+    ]
+    assert history_has_vault_prefix(history)
+    assert not sessions.is_vault("chat-restarted")
+    r = client.post(
+        "/v1/chat/completions", json={"model": "arthur", "messages": history, "atlas_session": "chat-restarted"}
+    )
+    assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"]
+    assert sessions.is_vault("chat-restarted")
+    cols = harness["chroma"].collections
+    assert "estate" not in cols or cols["estate"].count() == 0
+    assert harness["deps"].memory.dropped[-1]["session_id"] == "chat-restarted"
+    # The X-OpenWebUI-Chat-Id header is a session channel too (ENABLE_FORWARD_USER_INFO_HEADERS).
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "arthur", "messages": [{"role": "user", "content": "[VAULT] x"}]},
+        headers={"x-openwebui-chat-id": "owui-77"},
+    )
+    assert r.status_code == 200 and sessions.is_vault("owui-77")
 
 
 def test_engine_failure_records_a_strike_and_streams_an_error(harness: dict[str, Any]) -> None:
@@ -215,25 +267,183 @@ def test_engine_failure_records_a_strike_and_streams_an_error(harness: dict[str,
     assert harness["ledger"].get_task(task_id)["status"] == "failed"
     strikes = harness["ledger"].list_strikes(task_id=task_id)
     assert len(strikes) == 1 and strikes[0]["kind"] == "failed-generation"
+    assert "Plan the bid." in strikes[0]["description"]
     assert harness["chroma"].collections["scars"].count() == 1
     assert harness["arbiter"].generating is None  # the lock was released on failure
     r = _chat(client, "x")
     assert r.status_code == 502 and r.json()["error"]["status"] == 502
 
 
-def test_log_strike_prefix_records_a_manual_strike(harness: dict[str, Any]) -> None:
-    r = _chat(harness["client"], "[LOG STRIKE: wrong-tax-rate] used 30% not 25%")
+def test_engine_failure_in_a_vault_session_leaks_nothing(harness: dict[str, Any]) -> None:
+    """Blocker of the fix round (10.5): the automatic strike of a failed generation in a vault-tagged session writes
+    no scar and withholds the Principal's text from the ledger (the ledger is in the restic include set)."""
+    harness["llama"].fail = "llama-server HTTP 500: boom"
+    client: TestClient = harness["client"]
+    secret = "the will leaves the vineyard to Mara"
+    r = _chat(client, secret, model="arthur", atlas_session="chat-vault-fail", atlas_vault=True)
+    assert r.status_code == 502
+    task_id = r.json()["error"]["task_id"]
+    strikes = harness["ledger"].list_strikes(task_id=task_id)
+    assert len(strikes) == 1 and strikes[0]["kind"] == "failed-generation"
+    assert "vineyard" not in strikes[0]["description"] and "context withheld" in strikes[0]["description"]
+    assert strikes[0]["scar_id"] is None
+    cols = harness["chroma"].collections
+    assert "scars" not in cols or cols["scars"].count() == 0
+    assert "vineyard" not in json.dumps(harness["ledger"].list_strikes())
+
+
+def test_log_strike_prefix_records_a_manual_strike_that_the_next_dispatch_sees(harness: dict[str, Any]) -> None:
+    client: TestClient = harness["client"]
+    r = _chat(client, "[LOG STRIKE: wrong-tax-rate] used 30% not 25% on the AEC bid")
     assert r.status_code == 200 and "Strike #1" in r.json()["choices"][0]["message"]["content"]
     assert r.json()["atlas"]["command"] == "ouroboros-strike"
     strike = harness["ledger"].list_strikes()[0]
     assert strike["kind"] == "manual" and "wrong-tax-rate" in strike["description"]
     assert harness["chroma"].collections["scars"].count() == 1
+    scar_meta = next(iter(harness["chroma"].collections["scars"].rows.values()))[1]
+    assert scar_meta["persona"] == "ren" and scar_meta["source"] == "principal"  # tagged to the routed persona
+    # 9.4 Injection: the scar is layer 4 of the NEXT dispatch's system prompt, whoever logged it (no persona filter).
+    r = _chat(client, "tax rate on the AEC bid, again")
+    assert r.status_code == 200
+    system = harness["llama"].made[-1].requests[0]["messages"][0]["content"]
+    assert "wrong-tax-rate" in system and "used 30% not 25%" in system
 
 
 def test_execute_aegis_backup_prefix_enqueues_the_manual_trigger(harness: dict[str, Any]) -> None:
     r = _chat(harness["client"], "[EXECUTE AEGIS BACKUP]")
     assert "celery-task-1" in r.json()["choices"][0]["message"]["content"]
     assert r.json()["atlas"]["command"] == "aegis"
+    # Redis down (kombu OperationalError): a plain reply and a ledger note, never a 500 or a broken stream.
+
+    def boom(name: str, kw: dict[str, Any]) -> str:
+        raise ConnectionError("Error 111 connecting to 127.0.0.1:6379")
+
+    harness["deps"].enqueue = boom
+    r = _chat(harness["client"], "[EXECUTE AEGIS BACKUP]")
+    assert r.status_code == 200 and "could not be enqueued" in r.json()["choices"][0]["message"]["content"]
+    assert harness["ledger"].get_task(r.json()["atlas"]["task_id"])["status"] == "done"
+
+
+def test_never_delegate_pass_rewrites_the_stream(harness: dict[str, Any]) -> None:
+    """16.1 rule 5 as a code path between synthesis and output: the Principal never reads a task-shaped request."""
+    harness["llama"].text = "The lease is ready. Please send me the signed copy. Can you find the Q3 bank statements?"
+    client: TestClient = harness["client"]
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "atlas", "stream": True, "messages": [{"role": "user", "content": "Lease status?"}]},
+    ) as r:
+        body = "".join(r.iter_text())
+    chunks = _sse_chunks(body)
+    text = "".join((c["choices"][0]["delta"].get("content") or "") for c in chunks)
+    assert text.startswith("The lease is ready. Decision needed: shall ATLAS send you the signed copy?")
+    assert "Please send me" not in text and "Can you find" not in text
+    assert text.endswith("Decision needed: shall ATLAS find the Q3 bank statements?")
+    row = harness["ledger"].get_task(chunks[0]["atlas"]["task_id"])
+    gov = json.loads(row["result_json"])["governance"]
+    assert gov["register"] == "principal" and gov["rewrites"] == 2 and gov["flagged"] == []
+    # Non-stream: the same text; the memory holds the rewritten turn.
+    r = _chat(client, "Lease status?", stream=False)
+    assert r.json()["choices"][0]["message"]["content"] == text
+    docs = [row[0] for row in harness["chroma"].collections["corporate"].rows.values()]
+    assert all("Please send me" not in d for d in docs) and any("Decision needed" in d for d in docs)
+
+
+def test_engine_key_model_runs_the_internal_pipeline_and_queues(harness: dict[str, Any]) -> None:
+    """Phase 3 contract (phase3/loadtest.py): `model: <engine key>` on /v1/chat/completions goes through the
+    Arbiter's load and generation lock, no router, no memory write."""
+    client: TestClient = harness["client"]
+    r = _chat(client, "Write a 250-word essay about lighthouses.", model="gpt-oss-120b")
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "Stub answer from the engine."
+    assert r.json()["atlas"]["engine"] == "gpt-oss-120b" and "timings" in r.json()
+    assert "gpt-oss-120b" in harness["arbiter"].resident and harness["arbiter"].generating is None
+    row = harness["ledger"].get_task(r.json()["atlas"]["task_id"])
+    assert row["kind"] == "internal-generate" and row["status"] == "done" and row["engine"] == "gpt-oss-120b"
+    assert not harness["ledger"].list_routing_decisions(task_id=row["id"])  # no router on the engine path
+    assert "corporate" not in harness["chroma"].collections  # nothing remembered
+    assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["atlas", "ren", "arthur"]
+
+
+def test_arbiter_load_unload_and_remeasure_routes(harness: dict[str, Any]) -> None:
+    client: TestClient = harness["client"]
+    r = client.post("/arbiter/load", json={"engine": "gpt-oss-120b", "ctx": 32768, "parallel": 1, "task_id": "p3"})
+    assert r.status_code == 200, r.text
+    assert r.json()["decision"] == "granted" and r.json()["granted"] and r.json()["projected_bytes"] > 0
+    assert "gpt-oss-120b" in harness["arbiter"].resident
+    assert client.post("/arbiter/load", json={"engine": "nope"}).status_code == 404
+    # Resident: re-measuring is refused (4.1: the resident set is what is there with NO engine loaded).
+    assert client.post("/arbiter/remeasure").status_code == 409
+    r = client.post("/arbiter/unload", json={"engine": "gpt-oss-120b", "task_id": "p3"})
+    assert r.status_code == 200 and r.json()["decision"] == "granted"
+    assert harness["arbiter"].resident == {}
+    assert client.post("/arbiter/unload", json={"engine": "gpt-oss-120b"}).json()["decision"] == "granted"
+    # Nothing resident: the resident set is re-read from the counter (the small models came up after start).
+    budget_before = harness["arbiter"].budget_bytes
+    harness["arbiter"].probe.used_bytes += 7 * 1024**3
+    r = client.post("/arbiter/remeasure")
+    assert r.status_code == 200 and r.json()["budget_bytes"] == budget_before - 7 * 1024**3
+    # ... and lazily on the next load when nothing is resident.
+    harness["arbiter"].probe.used_bytes += 1024**3
+    client.post("/arbiter/load", json={"engine": "gpt-oss-120b"})
+    assert harness["arbiter"].budget_bytes == budget_before - 8 * 1024**3
+
+
+def test_admin_token_guards_every_route_but_health_and_v1(harness: dict[str, Any]) -> None:
+    deps: AppDeps = harness["deps"]
+    deps.admin_token = "s3cret-token"
+    deps.trusted_hosts = frozenset({"127.0.0.1"})  # TestClient is not loopback now
+    client = TestClient(build_app(deps))
+    assert client.get("/health").status_code == 200 and client.get("/v1/models").status_code == 200
+    assert _chat(client, "hello").status_code == 200
+    for method, path in (
+        ("GET", "/vault/status"),
+        ("POST", "/vault/lock"),
+        ("GET", "/approvals"),
+        ("GET", "/arbiter/status"),
+        ("POST", "/arbiter/remeasure"),
+    ):
+        r = client.request(method, path)
+        assert r.status_code == 401, (path, r.text)
+        assert client.request(method, path, headers={ADMIN_TOKEN_HEADER: "wrong"}).status_code == 403
+    assert client.get("/vault/status", headers={ADMIN_TOKEN_HEADER: "s3cret-token"}).status_code == 200
+    assert client.get("/arbiter/status", headers={ADMIN_TOKEN_HEADER: "s3cret-token"}).status_code == 200
+    # /internal/* is loopback-only whatever the token says.
+    r = client.post("/internal/route", json={"message": "x"}, headers={ADMIN_TOKEN_HEADER: "s3cret-token"})
+    assert r.status_code == 403 and "loopback" in r.json()["detail"]
+    # Without a token: loopback only.
+    deps.admin_token = None
+    client = TestClient(build_app(deps))
+    assert client.get("/vault/status").status_code == 403
+    deps.trusted_hosts = frozenset({"testclient"})
+    client = TestClient(build_app(deps))
+    assert (
+        client.get("/vault/status").status_code == 200
+        and client.post("/internal/route", json={"message": "x"}).status_code == 200
+    )
+
+
+def test_internal_generation_gets_a_child_ledger_row(harness: dict[str, Any]) -> None:
+    """A Celery task's own id is the PARENT: the generation made on its behalf must not mark it done or failed."""
+    client: TestClient = harness["client"]
+    ledger: Ledger = harness["ledger"]
+    ledger.insert_task("sentinel-bluf", task_id="celery-parent-1", status="running", queue="gpu")
+    r = client.post(
+        "/internal/v1/chat/completions",
+        json={
+            "model": "router-qwen3.5-4b",
+            "messages": [{"role": "user", "content": "BLUF this"}],
+            "atlas_task_id": "celery-parent-1",
+        },
+    )
+    assert r.status_code == 200
+    child = r.json()["atlas"]["task_id"]
+    assert child != "celery-parent-1" and r.json()["atlas"]["parent_task_id"] == "celery-parent-1"
+    assert ledger.get_task("celery-parent-1")["status"] == "running"
+    row = ledger.get_task(child)
+    assert (
+        row["parent_task_id"] == "celery-parent-1" and row["status"] == "done" and row["engine"] == "router-qwen3.5-4b"
+    )
 
 
 def test_internal_generate_route_and_plan(harness: dict[str, Any]) -> None:
@@ -286,20 +496,24 @@ def test_approval_flow(harness: dict[str, Any]) -> None:
     r = client.get("/approvals")
     assert r.status_code == 200 and [i["id"] for i in r.json()["items"]] == [held]
     assert client.get("/approvals", params={"status": "all"}).json()["count"] == 2
+    # decided_by is required (fix round): the ledger records WHO decided, never an assumed "principal".
+    assert client.post(f"/approvals/{held}/approve").status_code == 422
+    assert client.post(f"/approvals/{held}/approve", json={"note": "go"}).status_code == 422
     r = client.post(f"/approvals/{held}/approve", json={"decided_by": "principal", "note": "go"})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "sent" and r.json()["dispatched"] is True
     row = ledger.get_approval(held)
     assert row["status"] == "sent" and "approved by principal" in row["note"]
-    assert client.post(f"/approvals/{held}/approve").status_code == 409
-    assert client.post(f"/approvals/{auto}/reject").status_code == 409
-    assert client.post("/approvals/999/reject").status_code == 404
+    by = {"decided_by": "principal"}
+    assert client.post(f"/approvals/{held}/approve", json=by).status_code == 409
+    assert client.post(f"/approvals/{auto}/reject", json=by).status_code == 409
+    assert client.post("/approvals/999/reject", json=by).status_code == 404
     sensitive = ledger.insert_approval(
         task_id="t3", tier="sensitive", kind="email", status="held", persona="gideon", recipient="x@y", draft="d"
     )
     # 16.2: a sensitive item needs the strong cross-check before the Principal can approve it.
-    assert client.post(f"/approvals/{sensitive}/approve").status_code == 409
-    r = client.post(f"/approvals/{sensitive}/reject", json={"note": "not now"})
+    assert client.post(f"/approvals/{sensitive}/approve", json=by).status_code == 409
+    r = client.post(f"/approvals/{sensitive}/reject", json={"decided_by": "principal", "note": "not now"})
     assert r.status_code == 200 and r.json()["status"] == "rejected" and "not now" in r.json()["note"]
 
 
@@ -310,7 +524,7 @@ def test_no_channel_sender_fails_the_send_loudly(harness: dict[str, Any]) -> Non
     held = ledger.insert_approval(
         task_id="t9", tier="standard", kind="email", status="held", persona="silas", recipient="a@b", draft="d"
     )
-    r = harness["client"].post(f"/approvals/{held}/approve")
+    r = harness["client"].post(f"/approvals/{held}/approve", json={"decided_by": "principal"})
     assert r.status_code == 502 and "no outbound channel" in r.json()["detail"]
     row = ledger.get_approval(held)
     assert row["status"] == "approved" and "send failed" in row["note"]

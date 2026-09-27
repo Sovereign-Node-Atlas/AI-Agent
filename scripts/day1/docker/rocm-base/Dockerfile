@@ -25,8 +25,11 @@
 #   * that the stable index serves cp312 wheels for the "==" pins above (research §1.1: exact cp-tag list unverified).
 #     If pip cannot resolve "torch==2.13.0+rocm10.0.0" the RUN fails and the error names the pin; drop the "==" pins
 #     and let the extras resolve, then record the resolved versions from /opt/atlas/constraints-rocm.txt.
-#   * `rocm-sdk path --root` flag spelling (research §1.2); the rocminfo symlink is best-effort and selftest.py has
-#     fallbacks (rocminfo on PATH, then $(rocm-sdk path --root)/bin/rocminfo, then torch's gcnArchName).
+#   * `rocm-sdk path --root` flag spelling (research §1.2): the rocminfo step tries it first, then searches the wheel
+#     install for an executable rocminfo, and FAILS THE BUILD when none is found (V11 requires rocminfo itself,
+#     Section 21; selftest.py no longer accepts torch's gcnArchName as a substitute).
+#   * Telemetry off for every process in this image (rule §7.1): HF_HUB_DISABLE_TELEMETRY, DISABLE_TELEMETRY,
+#     DO_NOT_TRACK, HF_HUB_DISABLE_IMPLICIT_TOKEN in the ENV block (lib-engine.sh repeats them at run time).
 #   * torchaudio, diffusers, transformers, accelerate, huggingface_hub, safetensors, einops, pillow, numpy, scipy carry
 #     no research pin (rule §7.9; the README must say so). The resolved versions are frozen into
 #     /opt/atlas/base-freeze.txt at build time and copied to /srv/atlas/engines/manifests/ by the driver.
@@ -88,15 +91,27 @@ RUN mkdir -p /opt/atlas \
     && grep -q '^torch==' /opt/atlas/constraints-rocm.txt \
     && cat /opt/atlas/constraints-rocm.txt
 
-# rocminfo/hipcc from the wheel install on PATH (best-effort; `rocm-sdk path --root` spelling UNVERIFIED, §1.2).
-RUN ROCM_ROOT="$(rocm-sdk path --root 2>/dev/null || true)"; \
-    if [ -n "$ROCM_ROOT" ] && [ -x "$ROCM_ROOT/bin/rocminfo" ]; then \
-      ln -sf "$ROCM_ROOT/bin/rocminfo" /usr/local/bin/rocminfo; \
-      [ -x "$ROCM_ROOT/bin/rocm-smi" ] && ln -sf "$ROCM_ROOT/bin/rocm-smi" /usr/local/bin/rocm-smi; \
-      echo "rocminfo linked from $ROCM_ROOT"; \
-    else \
-      echo "NOTE: rocm-sdk path --root gave nothing usable; selftest.py falls back to torch's gcnArchName"; \
-    fi
+# rocminfo (and rocm-smi when present) from the wheel install on PATH. `rocm-sdk path --root` spelling is UNVERIFIED
+# (research §1.2), so the wheel tree is searched as well; the build stops when no rocminfo exists, because V11's
+# proof is rocminfo listing gfx1151 (Section 21) and an image without it cannot pass.
+RUN set -e; \
+    ROCM_ROOT="$(rocm-sdk path --root 2>/dev/null || true)"; \
+    BIN=""; \
+    if [ -n "$ROCM_ROOT" ] && [ -x "$ROCM_ROOT/bin/rocminfo" ]; then BIN="$ROCM_ROOT/bin/rocminfo"; fi; \
+    if [ -z "$BIN" ]; then \
+      PKG="$(python3.12 -c 'import rocm_sdk,os; print(os.path.dirname(rocm_sdk.__file__))' 2>/dev/null || true)"; \
+      for d in "$PKG" /usr/local/lib/python3.12 /usr/lib/python3/dist-packages; do \
+        [ -d "$d" ] || continue; \
+        BIN="$(find "$d" -name rocminfo -type f -perm -u+x 2>/dev/null | head -n1)"; \
+        [ -n "$BIN" ] && break; \
+      done; \
+    fi; \
+    if [ -z "$BIN" ]; then echo "FATAL: rocminfo not found in the rocm[libraries,devel,device-gfx1151] install (rocm-sdk path --root gave '$ROCM_ROOT'); research §1.2 layout changed" >&2; exit 1; fi; \
+    ln -sf "$BIN" /usr/local/bin/rocminfo; \
+    SMI="$(find "$(dirname "$(dirname "$BIN")")" -name rocm-smi -type f -perm -u+x 2>/dev/null | head -n1)"; \
+    [ -n "$SMI" ] && ln -sf "$SMI" /usr/local/bin/rocm-smi; \
+    test -x /usr/local/bin/rocminfo || exit 1; \
+    echo "rocminfo linked from $BIN"
 
 # gfx1151 runtime knobs (research §2.2). HF_HOME is bind-mounted from the host (Appendix C: one cache for all engines).
 ENV TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
@@ -107,6 +122,10 @@ ENV TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
     MIOPEN_USER_DB_PATH=/srv/atlas/engines/miopen \
     MIOPEN_CUSTOM_CACHE_DIR=/srv/atlas/engines/miopen \
     HOME=/srv/atlas/engines/home \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    DISABLE_TELEMETRY=1 \
+    DO_NOT_TRACK=1 \
+    HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
     ATLAS_ROCM_CONSTRAINTS=/opt/atlas/constraints-rocm.txt
 
 # The atlas service account (Appendix B: run as the service user in render and video; the gids are added at run time

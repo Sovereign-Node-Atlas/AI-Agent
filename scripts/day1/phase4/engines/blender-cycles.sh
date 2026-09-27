@@ -6,7 +6,8 @@
 # sibling checksum file on the same index (UNVERIFIED file name: the index listing is searched for it; none -> stop),
 # unpacked to $ATLAS_SRV/engines/blender/. Test: blender-cycles_test.py renders the default cube at 64 samples with
 # HIP (libamdhip64 from the ROCm wheels inside the image; UNVERIFIED that Blender's HIP 6.x fatbins load on the 10.0
-# runtime), then with CPU; pass needs at least the CPU render, the notes say which devices succeeded.
+# runtime), then with CPU; pass needs at least the CPU render, the notes say which devices succeeded. Blender runs
+# with --offline-mode (>= 4.2): no extension-repository sync, ever (rule §7.1).
 P4_KEY="blender-cycles"
 # shellcheck source=phase4/lib-engine.sh
 source "$(dirname "$(readlink -f "$0")")/../lib-engine.sh"
@@ -17,9 +18,16 @@ BL_HOME="$P4_ENGINES_DIR/blender"
 
 p4_build() {
   if [[ -x "$BL_HOME/blender" ]]; then
-    log "$P4_KEY: $BL_HOME/blender already unpacked ($(cat "$BL_HOME/.atlas-version" 2>/dev/null || echo '?'))"
-    return 0
+    log "$P4_KEY: $BL_HOME/blender already unpacked ($(p4_safe_read "$BL_HOME/.atlas-version" 2>/dev/null || echo '?'))"
+  else
+    _bl_fetch
   fi
+  # The test needs no venv packages: it drives the blender binary; the venv exists only so p4_run_test's python path
+  # holds. Created here (inside p4_build) so a re-run of a passed engine touches nothing.
+  p4_venv_create
+}
+
+_bl_fetch() {
   proxy_env
   local listing tar sha_name
   listing="$(curl -fsSL --max-time 120 "$BL_INDEX")" || die "$P4_KEY: cannot list $BL_INDEX (download.blender.org allowlisted? proxy up?)"
@@ -31,6 +39,7 @@ p4_build() {
   [[ -n "$sha_name" ]] || die "$P4_KEY: no sha256 file for $tar on $BL_INDEX; refusing an unverified 300 MB binary (rule §7.3). Download and verify by hand, then unpack to $BL_HOME"
   mkdir -p "$P4_HOST_DL"
   local tarball="${P4_HOST_DL:?}/${tar:?}"
+  [[ ! -L "$tarball" && ! -L "$P4_HOST_DL/$sha_name" ]] || die "$P4_KEY: $P4_HOST_DL holds a symlink where the download goes; refusing to write through it"
   log "$P4_KEY: downloading $BL_INDEX$tar (+ $sha_name) through the proxy"
   curl -fsSL -C - --retry 5 --retry-delay 10 --max-time 3600 -o "$tarball" "$BL_INDEX$tar" \
     || die "$P4_KEY: download of $tar failed; re-run to resume"
@@ -50,6 +59,7 @@ p4_build() {
   mkdir -p "$BL_HOME.tmp"
   tar -xJf "$tarball" -C "$BL_HOME.tmp" --strip-components=1 || die "$P4_KEY: tar -xJf $tar failed"
   [[ -x "$BL_HOME.tmp/blender" ]] || die "$P4_KEY: no blender binary at the top of the tarball (layout changed?)"
+  [[ ! -e "$BL_HOME.tmp/.atlas-version" ]] || die "$P4_KEY: the tarball carries a .atlas-version entry; refusing"
   echo "$ver" >"$BL_HOME.tmp/.atlas-version"
   rm -rf "${BL_HOME:?}"
   mv "$BL_HOME.tmp" "$BL_HOME"
@@ -57,7 +67,5 @@ p4_build() {
   p4_note "Blender $ver LTS unpacked to $BL_HOME (sha256 verified)"
 }
 
-# The test needs no venv packages: it drives the blender binary; the venv exists only so p4_run_test's python path holds.
 P4_TEST_SETTINGS=("blender=/srv/atlas/engines/blender/blender")
-p4_venv_create
 p4_main "$@"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Chronos-Bolt forecast on a synthetic series (rocm-containers.md §6.5: package/ids VERIFIED, predict_quantiles
-signature UNVERIFIED-by-snippet — a TypeError falls back to .predict()). Writes chronos_forecast.csv."""
+"""Chronos-Bolt forecast on a synthetic series (rocm-containers.md §6.5: package/ids VERIFIED). The series is passed
+positionally: chronos-forecasting's predict_quantiles/predict take `inputs` as their first parameter (VERIFIED
+src/chronos/base.py, chronos_bolt.py; a `context=` keyword does not exist). Writes chronos_forecast.csv."""
 
 from __future__ import annotations
 
@@ -22,13 +23,13 @@ def main(t: Test) -> None:
     ctx = torch.sin(torch.linspace(0, 40, 400)) + 0.1 * torch.randn(400, generator=torch.Generator().manual_seed(0))
     horizon = 24
     try:
-        quantiles, mean = pipe.predict_quantiles(context=ctx, prediction_length=horizon,
-                                                 quantile_levels=[0.1, 0.5, 0.9])
+        # (1, horizon, 3) fp32 CPU quantiles and (1, horizon) mean (VERIFIED signature: inputs positional).
+        quantiles, mean = pipe.predict_quantiles(ctx, prediction_length=horizon, quantile_levels=[0.1, 0.5, 0.9])
         q = quantiles[0].float().cpu()
         m = mean[0].float().cpu()
-    except (TypeError, AttributeError) as exc:
+    except AttributeError as exc:
         t.note(f"predict_quantiles unavailable ({exc}); using predict()")
-        samples = pipe.predict(context=ctx, prediction_length=horizon)
+        samples = pipe.predict(ctx, prediction_length=horizon)
         s = samples[0].float().cpu()
         q = torch.stack([s.quantile(0.1, dim=0), s.quantile(0.5, dim=0), s.quantile(0.9, dim=0)], dim=-1)
         m = s.mean(dim=0)

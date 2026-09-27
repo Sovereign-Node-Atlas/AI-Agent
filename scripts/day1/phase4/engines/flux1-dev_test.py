@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""FLUX.1-dev load + generate (rocm-containers.md §6.5, VERIFIED from diffusers flux.md except disable_mmap).
-Writes flux_dev.png; prints P4RESULT. bf16, whole pipeline on device (192 GB unified memory: no CPU offload)."""
+"""FLUX.1-dev load + generate (rocm-containers.md §6.5, VERIFIED from diffusers flux.md except disable_mmap, which is
+passed only when the from_pretrained signature names it — p4common.load_kwargs decides the spellings once, so the
+24 GB load runs exactly once). Writes flux_dev.png; prints P4RESULT. bf16, whole pipeline on device (192 GB unified
+memory: no CPU offload)."""
 
 from __future__ import annotations
 
@@ -8,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from p4common import Test
+from p4common import Test, load_kwargs
 
 REPO = "black-forest-labs/FLUX.1-dev"
 
@@ -17,16 +19,9 @@ def main(t: Test) -> None:
     import torch
     from diffusers import FluxPipeline
 
-    kwargs = {"dtype": torch.bfloat16}
-    try:
-        # UNVERIFIED kwarg name (research §3.1); the safetensors mmap patch in p4common covers the case it is rejected.
-        pipe = FluxPipeline.from_pretrained(REPO, disable_mmap=True, **kwargs)
-    except TypeError as exc:
-        t.note(f"from_pretrained rejected disable_mmap ({exc}); relying on the mmap patch")
-        try:
-            pipe = FluxPipeline.from_pretrained(REPO, **kwargs)
-        except TypeError:
-            pipe = FluxPipeline.from_pretrained(REPO, torch_dtype=torch.bfloat16)
+    kw = load_kwargs(FluxPipeline, torch.bfloat16)
+    t.note(f"from_pretrained kwargs: {sorted(kw)}")
+    pipe = FluxPipeline.from_pretrained(REPO, **kw)
     pipe = pipe.to(t.device)
     t.loaded()
     steps = int(t.setting("steps", "20"))

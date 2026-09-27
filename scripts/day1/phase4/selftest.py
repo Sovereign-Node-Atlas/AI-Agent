@@ -5,8 +5,9 @@ diffusion self-tests"). Research: rocm-containers.md §2.3 and §6.3 (each API c
 script as a whole is UNVERIFIED on this hardware until it runs).
 
 Steps (all must pass; each is timed and reported):
-  1. rocminfo_gfx1151   rocminfo on PATH, else $(rocm-sdk path --root)/bin/rocminfo, else torch's gcnArchName
-                        (the binary is a wheel-install detail, research §1.2; the arch is the proof).
+  1. rocminfo_gfx1151   rocminfo on PATH, else $(rocm-sdk path --root)/bin/rocminfo, MUST list gfx1151 (Section 21
+                        V11: "rocminfo reports gfx1151"); no binary = fail (the Dockerfile guarantees one). torch's
+                        gcnArchName is checked in addition, never as a substitute.
   2. torch_device       torch.cuda.is_available(), device name/arch, HSA_OVERRIDE_GFX_VERSION unset (#6034),
                         `pip show amd-torch-device-gfx1151` succeeds (TheRock #7839: without it every kernel launch
                         fails with hipErrorInvalidImage).
@@ -53,18 +54,25 @@ def rocminfo() -> str:
         cands.append(os.path.join(root, "bin", "rocminfo"))
     except Exception:
         pass
+    used: str | None = None
     for c in cands:
         if c and os.path.exists(c):
             out = subprocess.run([c], capture_output=True, text=True, timeout=120, check=False).stdout
             if "gfx1151" not in out:
                 raise AssertionError(f"{c} ran but did not list gfx1151")
-            return f"{c}: gfx1151 listed"
+            used = c
+            break
+    if used is None:
+        raise AssertionError(
+            "rocminfo binary not found in the image (rocm[...] wheels: check `rocm-sdk path --root` / site-packages; "
+            "the Dockerfile's rocminfo step should have failed the build)"
+        )
     import torch
 
-    arch = torch.cuda.get_device_properties(0).gcnArchName
+    arch = str(torch.cuda.get_device_properties(0).gcnArchName)
     if not arch.startswith("gfx1151"):
-        raise AssertionError(f"gcnArchName={arch}")
-    return f"no rocminfo binary; torch gcnArchName={arch}"
+        raise AssertionError(f"{used} lists gfx1151 but torch gcnArchName={arch}")
+    return f"{used}: gfx1151 listed; torch gcnArchName={arch}"
 
 
 def torch_gpu() -> dict[str, Any]:

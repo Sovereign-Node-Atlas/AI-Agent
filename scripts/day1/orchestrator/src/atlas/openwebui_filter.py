@@ -1,7 +1,7 @@
 """
 title: A.T.L.A.S. Router
 author: ATLAS Day 1 (scripts/day1/orchestrator/src/atlas/openwebui_filter.py)
-version: 0.1.0
+version: 0.2.0
 description: Thin relay into the orchestrator (Section 7.1): forwards the override prefix and the vault flag.
 """
 
@@ -12,13 +12,17 @@ description: Thin relay into the orchestrator (Section 7.1): forwards the overri
 #   1. reads the leading override prefix of the current user message ("[REN]", "[ARTHUR:LONG]", "[DEEP THINK: ...]",
 #      "[LOG STRIKE: ...]", "[VAULT]", ... the set is config/router-rules.json, owned by the orchestrator; the filter
 #      forwards the bracketed token verbatim and never interprets it);
-#   2. keeps the "vault" session flag: once "[VAULT]" has been seen in a chat, every later request of that chat carries
-#      atlas_vault=true (Section 10.5: vault-tagged for the life of the session);
-#   3. forwards both, plus the chat id as the session id and the user's id, as body fields the orchestrator understands
-#      (atlas_override, atlas_vault, atlas_session, atlas_user) and mirrors them under body["metadata"]["atlas"].
-# The body fields travel to POST /v1/chat/completions of the OpenAI-compatible backend (the orchestrator). UNVERIFIED:
-# that Open WebUI 0.11.4 forwards unknown top-level body keys to the backend unchanged; the metadata mirror is the
-# fallback the orchestrator also reads. Both are logged by the orchestrator, so a dropped field shows up on Day 1.
+#   2. sets the "vault" flag when ANY user message of the chat starts with "[VAULT]" (Section 10.5: vault-tagged for
+#      the life of the session). The whole history Open WebUI resends with every turn is scanned (the same rule as
+#      atlas.tasks.retention.is_vault_chat), so the flag survives a container restart or a reboot; the in-process
+#      set is only an accelerator (fix round: the last-message-only rule lost the tag after a restart);
+#   3. forwards both, plus the chat id as the session id and the user's id, as TOP-LEVEL body fields the orchestrator
+#      understands (atlas_override, atlas_vault, atlas_session, atlas_user).
+# VERIFIED against Open WebUI v0.11.4 (fix-round review of routers/openai.py, main.py, utils/middleware.py): top-level
+# body keys survive to the backend (`payload = {**form_data}`, no key whitelist); `body["metadata"]` is Open WebUI's
+# own dict and is popped before the backend call, so the earlier metadata mirror never reached the orchestrator and
+# is gone. The orchestrator also reads the X-OpenWebUI-Chat-Id header (ENABLE_FORWARD_USER_INFO_HEADERS=true in the
+# compose file, another writer) as a second channel for the session id.
 #
 # Frontmatter rule (services-tools.md §1.4, VERIFIED utils/plugin.py): no `requirements:` line, nothing is pip-installed
 # at load time (the node is offline). The class must be named `Filter` (type detection is hasattr(module, "Filter")).
@@ -37,6 +41,12 @@ _PREFIX_RE = re.compile(r"^\s*(\[[A-Z][A-Z0-9 _:.-]*(?::[^\]]*)?\])", re.IGNOREC
 VAULT_TOKEN = "[VAULT]"
 
 
+def _text_of(content: Any) -> str:
+    if isinstance(content, list):  # multimodal: text parts only
+        return " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+    return str(content or "")
+
+
 class Filter:
     class Valves(BaseModel):
         ORCHESTRATOR_URL: str = Field(
@@ -44,14 +54,11 @@ class Filter:
             description="The orchestrator (informational: Open WebUI reaches it through "
             "OPENAI_API_BASE_URL; kept so the admin sees where prompts go).",
         )
-        FORWARD_METADATA_MIRROR: bool = Field(
-            default=True, description="Also mirror the fields under body.metadata.atlas."
-        )
         priority: int = Field(default=0, description="Filter order (0 = first).")
 
     def __init__(self) -> None:
         self.valves = self.Valves()
-        # Chats that have seen [VAULT] (Section 10.5). Per process; the orchestrator keeps its own copy too.
+        # Chats that have seen [VAULT] (Section 10.5): an accelerator only; the history scan is the rule.
         self._vault_chats: set[str] = set()
 
     # --- helpers -----------------------------------------------------------------------------------------------------
@@ -60,11 +67,17 @@ class Filter:
     def _last_user_message(body: dict[str, Any]) -> str:
         for m in reversed(body.get("messages") or []):
             if isinstance(m, dict) and m.get("role") == "user":
-                c = m.get("content")
-                if isinstance(c, list):  # multimodal: text parts only
-                    return " ".join(str(p.get("text", "")) for p in c if isinstance(p, dict))
-                return str(c or "")
+                return _text_of(m.get("content"))
         return ""
+
+    @staticmethod
+    def history_has_vault(body: dict[str, Any]) -> bool:
+        """True when any user message of the chat starts with [VAULT] (retention.is_vault_chat's rule)."""
+        for m in body.get("messages") or []:
+            if isinstance(m, dict) and m.get("role") == "user":
+                if _text_of(m.get("content")).lstrip().upper().startswith(VAULT_TOKEN):
+                    return True
+        return False
 
     @staticmethod
     def read_prefix(text: str) -> str | None:
@@ -92,20 +105,18 @@ class Filter:
         text = self._last_user_message(body)
         prefix = self.read_prefix(text)
         chat_id = self._chat_id(body, __metadata__)
-        if prefix and prefix.upper() == VAULT_TOKEN and chat_id:
+        vault = self.history_has_vault(body) or (prefix is not None and prefix.upper() == VAULT_TOKEN)
+        if vault and chat_id:
             self._vault_chats.add(chat_id)
-        vault = bool(chat_id and chat_id in self._vault_chats) or (prefix is not None and prefix.upper() == VAULT_TOKEN)
-        fields: dict[str, Any] = {
-            "atlas_override": prefix,
-            "atlas_vault": vault,
-            "atlas_session": chat_id or None,
-            "atlas_user": str((__user__ or {}).get("id") or (__user__ or {}).get("email") or ""),
-        }
-        body.update(fields)
-        if self.valves.FORWARD_METADATA_MIRROR:
-            meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
-            meta["atlas"] = dict(fields)
-            body["metadata"] = meta
+        vault = vault or bool(chat_id and chat_id in self._vault_chats)
+        body.update(
+            {
+                "atlas_override": prefix,
+                "atlas_vault": vault,
+                "atlas_session": chat_id or None,
+                "atlas_user": str((__user__ or {}).get("id") or (__user__ or {}).get("email") or ""),
+            }
+        )
         return body
 
     async def outlet(self, body: dict[str, Any], __user__: dict[str, Any] | None = None) -> dict[str, Any]:

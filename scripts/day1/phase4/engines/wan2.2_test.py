@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Wan2.2 TI2V-5B text-to-video (rocm-containers.md §6.5: structure VERIFIED from diffusers wan.md — fp32 VAE,
-UniPC with flow_shift, frames = 4k+1; the 5B-specific values are UNVERIFIED). Writes wan22_5b.mp4."""
+UniPC with flow_shift, frames = 4k+1; the 5B-specific values are UNVERIFIED). The dtype/disable_mmap keyword
+spellings are decided once from the from_pretrained signature (p4common.load_kwargs): a ~34 GB load runs exactly once.
+Writes wan22_5b.mp4."""
 
 from __future__ import annotations
 
@@ -8,22 +10,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from p4common import Test
+from p4common import Test, load_kwargs
 
 REPO = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-
-
-def _load(cls: type, **kw: object) -> object:
-    """from_pretrained with the dtype/torch_dtype and disable_mmap spellings tried in order (research §3.1 note)."""
-    import torch
-
-    for extra in ({"dtype": kw.pop("_dtype", torch.bfloat16), "disable_mmap": True},
-                  {"dtype": torch.bfloat16}, {"torch_dtype": torch.bfloat16}):
-        try:
-            return cls.from_pretrained(REPO, **kw, **extra)
-        except TypeError:
-            continue
-    return cls.from_pretrained(REPO, **kw)
 
 
 def main(t: Test) -> None:
@@ -32,11 +21,9 @@ def main(t: Test) -> None:
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
     from diffusers.utils import export_to_video
 
-    try:
-        vae = AutoencoderKLWan.from_pretrained(REPO, subfolder="vae", dtype=torch.float32)
-    except TypeError:
-        vae = AutoencoderKLWan.from_pretrained(REPO, subfolder="vae", torch_dtype=torch.float32)
-    pipe = _load(WanPipeline, vae=vae)
+    vae = AutoencoderKLWan.from_pretrained(REPO, subfolder="vae",
+                                           **load_kwargs(AutoencoderKLWan, torch.float32, disable_mmap=False))
+    pipe = WanPipeline.from_pretrained(REPO, vae=vae, **load_kwargs(WanPipeline, torch.bfloat16))
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
     pipe.to(t.device)
     t.loaded()

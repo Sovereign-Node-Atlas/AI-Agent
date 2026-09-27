@@ -4,11 +4,14 @@ Section 15.2), recording which succeeded. Two modes in one file:
 
   outer (run by p4_run_test with the venv python): finds libamdhip64 inside the ROCm wheels (UNVERIFIED path
       _rocm_sdk_core/lib, research §3.14: it is searched for, not assumed), runs
-      `blender -b --factory-startup --python THIS_FILE -- --bpy --device HIP|CPU --out DIR` twice, parses the
-      BLENDER_RESULT line each prints, and emits P4RESULT.
+      `blender -b --offline-mode --factory-startup --python THIS_FILE -- --bpy --device HIP|CPU --out DIR` twice,
+      parses the BLENDER_RESULT line each prints, and emits P4RESULT. There is no weight load, so the load watchdog is
+      disarmed as soon as the binary is found (a hung HIP render must NOT kill the process before the CPU fallback: each
+      render has its own subprocess timeout, capped below the watchdog).
   --bpy (run inside Blender's own Python): sets Cycles, 64 samples, 640x480, the device (HIP through the preferences
       API: compute_device_type='HIP', get_devices(), enable HIP devices — exit 2 when Blender lists none), renders
-      to <out>/cube_<device>.png, prints BLENDER_RESULT {json}.
+      to <out>/cube_<device>.png, prints BLENDER_RESULT {json} including bpy.app.online_access (must be False:
+      --offline-mode, Blender >= 4.2; rule §7.1).
 Pass = CPU render produced a PNG; HIP result goes in the notes either way."""
 
 from __future__ import annotations
@@ -34,7 +37,12 @@ def bpy_mode(argv: list[str]) -> int:
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "PNG"
     scene.render.filepath = str(out / f"cube_{device.lower()}.png")
-    info: dict[str, object] = {"device": device, "samples": samples}
+    online = bool(getattr(bpy.app, "online_access", False))
+    info: dict[str, object] = {"device": device, "samples": samples, "online_access": online}
+    if online:
+        print("BLENDER_RESULT " + json.dumps({**info, "ok": False, "error": "bpy.app.online_access is True: "
+              "--offline-mode was not honoured (Blender < 4.2?); rule §7.1"}), flush=True)
+        return 3
     if device == "CPU":
         scene.cycles.device = "CPU"
     else:
@@ -84,6 +92,10 @@ def outer_mode() -> None:
         blender = t.setting("blender", "/srv/atlas/engines/blender/blender")
         if not os.access(blender, os.X_OK):
             t.fail(f"{blender} is not executable (the build step unpacks the tarball there)")
+        # No model load to watch: disarm the watchdog now so a hung HIP render never pre-empts the CPU fallback.
+        t.loaded("blender binary present; no weight load")
+        # Per-render cap: 1800 s, but never beyond the load-timeout budget the driver gave this test.
+        render_timeout = max(120, min(1800, int(t.args.load_timeout) - 30))
         libdirs = _hip_lib_dirs()
         env = dict(os.environ)
         if libdirs:
@@ -93,11 +105,12 @@ def outer_mode() -> None:
             t.note("no libamdhip64.so found in site-packages: HIP will report no device (UNVERIFIED wheel layout)")
         results: dict[str, dict[str, object]] = {}
         for device in ("HIP", "CPU"):
-            cmd = [blender, "-b", "--factory-startup", "--python", os.path.abspath(__file__), "--",
+            cmd = [blender, "-b", "--offline-mode", "--factory-startup", "--python", os.path.abspath(__file__), "--",
                    "--bpy", "--device", device, "--out", str(t.out), "--samples", t.setting("samples", "64")]
-            t.note(f"running {device} render")
+            t.note(f"running {device} render (timeout {render_timeout} s)")
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env, check=False)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=render_timeout, env=env,
+                                      check=False)
                 tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-40:])
                 line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("BLENDER_RESULT ")), None)
                 if line:
@@ -105,18 +118,20 @@ def outer_mode() -> None:
                 else:
                     rec = {"ok": False, "error": f"exit {proc.returncode}: {tail[-600:]}"}
             except subprocess.TimeoutExpired:
-                rec = {"ok": False, "error": "render timed out after 1800 s (mid-render hang, Section 15.2 note)"}
+                rec = {"ok": False, "error": f"render timed out after {render_timeout} s (mid-render hang, "
+                                            "Section 15.2 note)"}
             results[device] = rec
             verdict = "ok" if rec.get("ok") else "FAILED"
             t.note(f"{device}: {verdict} {rec.get('seconds', '')}s {rec.get('error', '')}"[:400])
-            if device == "HIP":
-                t.loaded(None if rec.get("ok") else "HIP failed; CPU fallback (mandatory) follows")
+            if device == "HIP" and not rec.get("ok"):
+                t.note("HIP failed; CPU fallback (mandatory) follows")
         (t.out / "blender_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
         if not results["CPU"].get("ok"):
             t.fail("CPU fallback render failed too: " + str(results["CPU"].get("error")))
         hip_ok = bool(results["HIP"].get("ok"))
         out = results["HIP"]["file"] if hip_ok else results["CPU"]["file"]
-        t.done(out, notes=f"HIP={'pass' if hip_ok else 'fail'} CPU=pass; blender {results['CPU'].get('blender')}")
+        t.done(out, notes=f"HIP={'pass' if hip_ok else 'fail'} CPU=pass; blender {results['CPU'].get('blender')}; "
+                          f"online_access={results['CPU'].get('online_access')}")
 
     Test("blender-cycles", no_mmap=False).run(main)
 

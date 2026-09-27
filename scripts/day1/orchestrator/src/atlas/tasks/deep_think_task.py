@@ -1,17 +1,25 @@
 """Deep Think as a Celery task on the gpu queue (Section 9.1, 9.7): the chat path runs Deep Think inline; a
 background job (a task force marked heavy, a Sentinel escalation) runs it here. Every engine call goes through the
-orchestrator's /internal/v1/chat/completions, which loads through the Engine Arbiter and holds the generation lock;
-the plan itself is the orchestrator's (/internal/deep-think/plan), so the downgrade of rule 8 is honoured."""
+orchestrator's /internal/v1/chat/completions, which loads through the Engine Arbiter and takes its generation lock
+for a weight-bearing engine (a resident small model only waits for a running generation, atlas.api._generation_lock);
+the plan itself is the orchestrator's (/internal/deep-think/plan), so the downgrade of rule 8 is honoured.
+
+Vault rule (10.5, fix round): a `session_id` that atlas.vault.SessionTags marks vault is REFUSED unless
+`remember=True` (the Principal's explicit "remember this"), because the answer would otherwise persist outside the
+vault. The Celery RESULT (Redis db 1, kept `result_expires` days) carries only a small summary; the answer and the
+log go to the ledger row (the `result` column) and nowhere else."""
 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from celery import shared_task
 
 from atlas import deep_think
+from atlas.vault import DEFAULT_SESSION_FILE, SessionTags
 
 log = logging.getLogger("atlas.tasks.deep_think")
 
@@ -24,6 +32,8 @@ def deep_think_task(
     context: str = "",
     documents: str = "",
     parent_task_id: str | None = None,
+    session_id: str | None = None,
+    remember: bool = False,
 ) -> dict[str, Any]:
     from atlas.tasks import OrchestratorClient, TaskRecord
 
@@ -32,8 +42,16 @@ def deep_think_task(
         "deep-think",
         queue="gpu",
         parent_task_id=parent_task_id,
-        payload={"tier": tier, "chars": len(problem)},
+        payload={"tier": tier, "chars": len(problem), "session_id": session_id},
     )
+    sessions = SessionTags(os.environ.get("VAULT_SESSION_FILE") or DEFAULT_SESSION_FILE)
+    if sessions.is_vault(session_id) and not remember:
+        msg = (
+            f"session {session_id} is vault-tagged: a Deep Think answer would persist in the ledger and the result "
+            "backend outside the vault (Section 10.5); refused unless remember=True"
+        )
+        rec.failed(msg)
+        raise RuntimeError(msg)
     client = OrchestratorClient()
     try:
         r = client._http.post("/internal/deep-think/plan", json={"tier": tier, "task_id": self.request.id})
@@ -57,12 +75,11 @@ def deep_think_task(
         raise
     finally:
         client.close()
-    return rec.done(
-        {
-            "tier_requested": tier,
-            "tier_granted": granted,
-            "answer": res.answer,
-            "log": res.log,
-            "duration_s": res.duration_s,
-        }
-    )
+    summary = {
+        "tier_requested": tier,
+        "tier_granted": granted,
+        "chars": len(res.answer),
+        "duration_s": res.duration_s,
+        "task_id": self.request.id,
+    }
+    return rec.done({**summary, "answer": res.answer, "log": res.log}, returned=summary)

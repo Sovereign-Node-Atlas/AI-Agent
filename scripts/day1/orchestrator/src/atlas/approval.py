@@ -46,7 +46,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
-from atlas.config import ConfigError, TIERS
+from atlas.config import TIERS, ConfigError
 from atlas.governance import (
     DisclosureResult,
     Register,
@@ -66,9 +66,9 @@ __all__ = [
     "ApprovalError",
     "ApprovalItem",
     "ApprovalQueue",
-    "CrossChecker",
     "CrossCheckRecord",
     "CrossCheckRequired",
+    "CrossChecker",
     "NotPending",
     "Notifier",
     "NullNotifier",
@@ -357,6 +357,8 @@ class ApprovalQueue:
             task_id=item.task_id, tier=item.tier, kind=item.kind, status=STATUS_APPROVED, persona=item.persona,
             recipient=item.recipient, subject=item.subject, draft=item.body, reasoning=item.reason or None,
             note=pre_note)
+        # The Sender sees the item as the ledger knows it (id, "approved"), exactly as approve() hands it over.
+        item = replace(item, id=approval_id, status=STATUS_APPROVED, note=pre_note)
         try:
             ref = self.sender.send(item)
         except Exception as exc:  # record the failure, then re-raise loudly

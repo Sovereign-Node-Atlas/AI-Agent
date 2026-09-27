@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Stable Audio Open 1.0: a 10-second conditioned generation (rocm-containers.md §6.5, UNVERIFIED-by-snippet of the
-card; the package is VERIFIED). Writes stable_audio.wav."""
+card; the package is VERIFIED). The wav is written with libsndfile (soundfile): torchaudio >= 2.9 routes save/load
+through torchcodec, which the ROCm image does not carry (VERIFIED pytorch/audio README: "deprecated from 2.8, removed
+in 2.9"). Writes stable_audio.wav."""
 
 from __future__ import annotations
 
@@ -14,8 +16,8 @@ REPO = "stabilityai/stable-audio-open-1.0"
 
 
 def main(t: Test) -> None:
+    import soundfile
     import torch
-    import torchaudio
     from einops import rearrange
     from stable_audio_tools import get_pretrained_model
     from stable_audio_tools.inference.generation import generate_diffusion_cond
@@ -37,7 +39,7 @@ def main(t: Test) -> None:
         t.fail("silent or non-finite audio")
     audio = audio.div(peak).clamp(-1, 1).cpu()
     out = t.out / "stable_audio.wav"
-    torchaudio.save(str(out), audio, sr)
+    soundfile.write(str(out), audio.T.numpy(), sr)      # (frames, channels) for libsndfile
     t.done(out, notes=f"{seconds} s at {sr} Hz, {steps} steps")
 
 

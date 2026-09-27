@@ -674,7 +674,9 @@ class Router:
         tag_hits = sorted(set(tags) & SENSITIVE_TAGS)
         lexicon_hits = find_sensitive_keywords(body, self.sensitive_keywords)
         domain_hits = sorted(set(selected) & SENSITIVE_DOMAINS)
-        abliterated = route.endswith("-abliterated")
+        # R13 keys on the engine that actually runs the dispatch: the lead's abliterated route, or a director whose
+        # default engine is the abliterated one (6.2 Valerie) dispatching for a routine preset.
+        abliterated = route.endswith("-abliterated") or dispatch_engine.endswith("-abliterated")
         tier = _max_tier(
             tf.default_tier if tf else "standard",
             "sensitive" if hits else None,

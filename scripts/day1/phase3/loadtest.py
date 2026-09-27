@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 """Phase 3 load tests: the measuring half of scripts/day1/phase3-models.sh (ATLAS_FRAMEWORK_REVIEW.md Section 17
-Phase 3 steps 2-4; Section 21 V4, V10, V14b, V21, V22; Section 4.2 rules 3-5, 7; R19).
+Phase 3 steps 2-4; Section 21 V4, V10, V14b, V21, V22; Section 4.2 rules 1-9; R19).
 
-Run as root by the driver (never by hand while the orchestrator is serving). Stdout carries ONLY lines of the form
+Run as root by the driver. Stdout carries ONLY lines of the form
     RECORD<TAB><ID><TAB><pass|fail|deferred|info><TAB><message>
 which the driver turns into verify.jsonl records with record_v; everything else goes to stderr (the unit's journal).
 Exit status 0 means "measured and recorded" (a failed engine is a recorded fail, not an exit code); non-zero means an
 infrastructure error the driver must stop on.
 
 Subcommands (global options first, see main()):
-    prepare                 stop any resident weight-bearing engine, wait for the GTT counter, write baseline.json
+    prepare                 unload every resident weight-bearing engine through the Arbiter, wait for the GTT
+                            counter, write baseline.json
     engine KEY [--previous PREV]
-                            swap PREV out (unload + release check, credited to PREV) and KEY in, prove V4 from the
-                            journal, measure decode/prefill at 512 and 8k prompt tokens, leave KEY resident.
-                            DeepSeek (kv_ladder) runs the f16 -> q8_0 -> q4_0 ladder with a coherence prompt instead.
+                            swap PREV out (unload + release check, credited to PREV) and KEY in through the Arbiter,
+                            prove V4 from the journal, measure decode/prefill at 512 and 8k prompt tokens, register
+                            the measured footprint with the Arbiter (rule 1), leave KEY resident.
+                            DeepSeek (kv_ladder) runs the engines.json ladder with a coherence prompt instead.
     finish [--previous PREV]
                             unload the last resident engine and credit its release check
     summarize               print the V10 lines (one per engine, then the summary the gate reads) and V22
     coresident --text KEY --vision KEY
                             Section 17 step 3: both resident (vision at parallel_coresident), GTT ~142 GB + caches,
-                            two generation requests through the orchestrator, the second proven to queue (V21, V14b)
-    table                   the Section 17 step 4 table from the result files
+                            two generation requests through the orchestrator, the second proven to queue (V21), then
+                            the real-engine refusal and Deep Think downgrade of Section 21 V14 (V14b)
+    table                   the Section 17 step 4 table from the result files, plus every baseline_deviation
 
 Result files: <results-dir>/<key>.json, one per engine (schema: EngineResult below), plus baseline.json and
 coresident.json. A result with "ok": true makes the driver skip that engine on a re-run (file-level resumability).
 
-Facts typed here and where they were VERIFIED (research/llama-cpp-vulkan.md, research/gguf-models.md, 2026-09-22):
+Facts typed here and where they were VERIFIED (research/llama-cpp-vulkan.md, research/gguf-models.md, 2026-09-22;
+the research files are cited through config/engines.json _meta where this checkout does not carry them):
   * GET /health is 503 while loading and 200 {"status":"ok"} once loaded (server README, server.cpp).
   * POST /completion and POST /v1/chat/completions carry a top-level "timings" object: cache_n, prompt_n, prompt_ms,
     prompt_per_second (prefill tok/s), predicted_n, predicted_ms, predicted_per_second (decode tok/s) (README).
@@ -37,27 +41,50 @@ Facts typed here and where they were VERIFIED (research/llama-cpp-vulkan.md, res
     plus "llama_context: flash_attn = enabled"; hard-error lines that mean the request was refused (server exits):
     "Flash Attention not supported, set to disabled", "quantized V cache requires flash_attn",
     "does not support different K", "does not divide n_embd_head". No ^ anchor: --log-timestamps may prefix lines.
+    Research conflict 11: llama.cpp errors out at context creation instead of falling back; the proof is the log line
+    plus the process-alive/health check.
   * /props does not expose the KV cache types (README): when the journal has no proof line, V4 is a fail with reason.
   * GTT in use: /sys/class/drm/card*/device/mem_info_gtt_used, bytes (amdgpu_gtt_mgr.c); the Arbiter's counter.
   * Nemotron 3 Super: llama.cpp issue #20732, GPU memory fault at ~20k-token prompts on Vulkan/HIP (conflict f).
   * DeepSeek V4: K and V types must be identical (llama-context.cpp), --parallel explicit (issue #26654), quantised
     KV disputed (issues #25382, #26423; conflict b); kernel 7.x DeviceLost needs amdgpu.lockup_timeout (issue #25664).
+  * --reasoning-format defaults to auto (VERIFIED, engines.json extra_args_rule): a thinking model's <think> block
+    lands in message.reasoning_content and message.content holds only what follows it.
   # UNVERIFIED: the per-request "cache_prompt": false field of POST /completion — README field (not re-read in the
     research); a nonce in every prompt and a check that timings.cache_n == 0 make the measurement independent of it.
+  # UNVERIFIED: that DeepSeek V4 Flash 0731's chat template emits a <think> block by default — the reviewer's reading
+    of the 0731 template; handled by budget (1024/2048 tokens), finish_reason and one retry, never assumed.
+    "chat_template_kwargs": {"thinking": false} is NOT sent (unverified for this template).
 
-CONTRACT with the orchestrator (atlas.api, another writer; CONVENTIONS.md §8 control path). Loopback, no API key:
+CONTRACT with the orchestrator (orchestrator/src/atlas/api.py, another writer; read at fix-round time, every route
+below exists there; CONVENTIONS.md §8 control path). Loopback only; admin routes take X-Atlas-Token when
+ORCH_ADMIN_TOKEN_FILE is configured (--admin-token-file), else loopback is enough:
   * GET  {ORCH_URL}/health -> 200 when ready.
-  * GET  {ORCH_URL}/arbiter/status -> 200 JSON as Arbiter.status(): gtt_used_bytes, resident[{engine,...}],
-         generating {engine, task_id} | null, generation_queue [...].
-  * POST {ORCH_URL}/arbiter/load   {"engine": KEY, "ctx": N, "parallel": N, "task_id": "phase3-loadtest"}
-         -> 200 {"decision": "granted"|"queued"|"refused", "reason": "..."}; the engine is then started through the
-         sudoers control path, /health polled here. A refusal is a real Arbiter decision and fails the engine loudly.
-  * POST {ORCH_URL}/arbiter/unload {"engine": KEY, "task_id": ...} -> 200.
-  * POST {ORCH_URL}/v1/chat/completions accepts "model": <engine key> (personas too) and routes it through the
-         Arbiter's generation lock (Section 4.2 rule 3/4); the llama-server "timings" object is passed through.
-  When /health is not 200 or /arbiter/* answers 404/405, this script says so in the log and falls back to
-  `systemctl start|stop llama-server@<key>` for the loads; the queueing proof (V14b/V21) then records fail with that
-  reason, because only the Arbiter can queue.
+  * GET  {ORCH_URL}/arbiter/status -> 200 Arbiter.status(): gtt_used_bytes, budget_bytes, free_bytes,
+         resident[{engine, projected_bytes, measured_bytes, ctx, parallel, kv_class, loading, unloading}], busy,
+         generating {engine, task_id} | null, generation_queue [...], halted.
+  * POST {ORCH_URL}/arbiter/load {"engine": KEY, "ctx": N, "parallel": N, "task_id": ...}
+         -> 200 {"engine", "decision": "granted"|"queued"|"refused"|"error", "granted", "reason", "projected_bytes",
+         "task_id"}. The Arbiter projects against the unit's env file (a ctx/parallel argument that disagrees with it
+         is refused), plans LRU evictions (rule 3), waits load_wait_s behind a running generation (rules 4, 6), starts
+         the unit through the sudoers path and returns granted only when it serves. 404 unknown engine, 503 halted
+         after a rule-5 failure, 500 controller error. queued here means "still blocked after load_wait_s": this
+         script waits and retries until LOAD_TIMEOUT_S; refused is a real decision and fails the engine loudly.
+  * POST {ORCH_URL}/arbiter/unload {"engine": KEY, "task_id": ...} -> the same shape; the rule-5 release check runs
+         inside (503 when the counter did not drop: the Arbiter halts). Anything but 200/granted is a refusal: this
+         script never stops a unit behind a serving Arbiter (Section 4.2, 9.3).
+  * POST {ORCH_URL}/arbiter/register {"engine": KEY, "total_bytes": N, "task_id": ...} -> 200 (rule 1).
+  * POST {ORCH_URL}/internal/v1/chat/completions {"model": <engine key>, "messages", "max_tokens", "stream": false}
+         -> OpenAI shape; runs the internal pipeline through the Arbiter's load and generation lock (rules 3, 4);
+         the llama-server "timings" object is passed through at the top level. /v1/chat/completions accepts engine
+         keys too, but /internal is the route written for this script and is used here.
+  * POST {ORCH_URL}/internal/deep-think/plan {"tier": "deep"|"standard"|"quick", "task_id"} -> {requested, granted,
+         engines, required_bytes, budget_bytes, reason, resident_engine} (rule 8; the tier's largest engine is
+         projected from its unit env file against the whole budget).
+  When /health is unreachable or not 200, this script says so loudly and falls back to `systemctl start|stop
+  llama-server@<key>` for the loads; V14b/V21 then record fail with that reason, because only the Arbiter can queue,
+  refuse or downgrade. When /health is 200 but /arbiter/status or /arbiter/load|unload is missing, it REFUSES to run
+  (Infra): engines are never controlled behind a serving orchestrator whose ledger would not see it.
 """
 
 from __future__ import annotations
@@ -73,26 +100,43 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 GIB = 1024**3
 GB = 10**9
-RELEASE_TOLERANCE_BYTES = 2 * GIB  # Section 17 step 2 brief: tolerance 2 GB
+# Section 4.2 rule 5: release confirmation belongs to the Arbiter (its own release_tolerance_bytes and
+# release_timeout_s, not exposed by /arbiter/status). The two figures below are this script's MEASUREMENT window
+# (the "released"/seconds columns of the Section 17 step 4 table) and the only check on the systemctl fallback path;
+# in orchestrator mode the Arbiter's granted/503 answer is the authority and both are reported.
+RELEASE_TOLERANCE_BYTES = 2 * GIB
 RELEASE_TIMEOUT_S = 120.0
 LOAD_TIMEOUT_S = 960.0  # llama-server@.service TimeoutStartSec=900 plus margin
+ARBITER_WAIT_S = 900.0  # api.py DEFAULT_LOAD_WAIT_S: how long /arbiter/load|unload may block before "queued"
 STOP_TIMEOUT_S = 180.0  # TimeoutStopSec=120 plus margin
 REQUEST_TIMEOUT_S = 1200.0  # an 8k prefill on a dense 72B at Q8_0 plus 128 decoded tokens at ~3 tok/s
 PREFILL_SHORT = 512
 PREFILL_LONG = 8192
 N_PREDICT = 128
+BAND_FAIL_FACTOR = 0.7  # Section 21 V10 "within the expected bands": below 70 % of the lower bound is a fail
 TASK_ID = "phase3-loadtest"
 UNIT_PREFIX = "llama-server@"
 P3_CLASSES = {"core", "apex", "vision", "crosscheck"}
+ORCH_CHAT_PATH = "/internal/v1/chat/completions"
+LLAMA_CHAT_PATH = "/v1/chat/completions"
+ADMIN_TOKEN_HEADER = "X-Atlas-Token"
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 NEMOTRON_ISSUE = "llama.cpp issue #20732 (Vulkan/HIP memory fault at ~20k-token prompts)"
 DEVICELOST_ISSUE = "llama.cpp issue #25664 (kernel 7.x amdgpu lockup_timeout; Phase 1 GRUB line)"
+DEEPSEEK_KV_ISSUES = "llama.cpp issues #25382/#26423"
+COHERENCE_TOKENS_FACTUAL = 1024
+COHERENCE_TOKENS_SUMMARY = 2048
+COHERENCE_RETRY_FACTOR = 4
+V14B_MAX_DOUBLINGS = 8
 
 KV_LINE_RE = re.compile(r"llama_kv_cache: size = .*K \((\w+)\): .*V \((\w+)\):")
 RECURRENT_RE = re.compile(r"llama_memory_recurrent: size = .*R \((\w+)\): .*S \((\w+)\):")
@@ -103,6 +147,7 @@ KV_REFUSED = (
     "does not support different K",
     "does not divide n_embd_head",
 )
+EXTERNAL_STOP_MARKS = ("Received SIGTERM", "Stopping ", "Deactivated successfully", "Stopped ")
 
 WORDS = (
     "atlas harbour ledger granite meadow copper lantern orbit velvet marble quartz ember willow falcon cinder timber "
@@ -133,6 +178,11 @@ def now_iso() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
 
 
+def short(obj: Any, n: int = 300) -> str:
+    text = obj if isinstance(obj, str) else json.dumps(obj, default=str)
+    return " ".join(text.split())[:n]
+
+
 class Infra(RuntimeError):
     """An infrastructure error: the driver stops the phase (exit non-zero)."""
 
@@ -149,14 +199,15 @@ class HttpFail(RuntimeError):
         self.body = body
 
 
-def http(method: str, url: str, body: dict[str, Any] | None = None, timeout: float = 30.0) -> tuple[int, Any]:
+def http(method: str, url: str, body: dict[str, Any] | None = None, timeout: float = 30.0,
+         headers: dict[str, str] | None = None) -> tuple[int, Any]:
     """Returns (status, parsed JSON or text). Raises HttpFail on transport errors; HTTP errors are returned."""
     data = None
-    headers = {"Accept": "application/json"}
+    hdrs = {"Accept": "application/json", **(headers or {})}
     if body is not None:
         data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
         with _OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
@@ -180,12 +231,29 @@ def health_code(port: int) -> int:
     return status
 
 
+def require_loopback(url: str) -> None:
+    """CONVENTIONS.md §8: the orchestrator binds 127.0.0.1; engine control and generation never leave the host."""
+    host = urllib.parse.urlparse(url).hostname
+    if host not in LOOPBACK_HOSTS:
+        raise Infra(f"--orch-url must be loopback (CONVENTIONS.md §8), got {url!r}")
+
+
 # --- sysfs GTT counter (llama-cpp-vulkan.md §5.2) ---------------------------------------------------------------------
 
 
+def drm_root() -> Path:
+    """ATLAS_DRM_ROOT is a test-only hook (CONVENTIONS.md §4: node paths are overridable for tests). On the node
+    (ATLAS_ETC is the real /etc/atlas) it is refused: the GTT counter is the rule-5 measurement behind every
+    'released' verdict and the V21 proof, and a fake tree must never reach it through the environment."""
+    override = os.environ.get("ATLAS_DRM_ROOT")
+    if override and os.environ.get("ATLAS_ETC", "/etc/atlas") == "/etc/atlas":
+        raise Infra("ATLAS_DRM_ROOT is a test-only hook; unset it on the node (ATLAS_ETC is /etc/atlas)")
+    return Path(override or "/sys/class/drm")
+
+
 def gpu_device_dir() -> Path:
-    # ATLAS_DRM_ROOT is a test hook (CONVENTIONS.md §4: node paths are overridable for tests); never set on the node.
-    for c in sorted(Path(os.environ.get("ATLAS_DRM_ROOT", "/sys/class/drm")).glob("card*")):
+    root = drm_root()
+    for c in sorted(root.glob("card*")):
         if not re.fullmatch(r"card\d+", c.name):
             continue
         vendor = c / "device" / "vendor"
@@ -194,7 +262,7 @@ def gpu_device_dir() -> Path:
                 return c / "device"
         except OSError:
             continue
-    raise Infra("no AMD GPU (vendor 0x1002) under /sys/class/drm")
+    raise Infra(f"no AMD GPU (vendor 0x1002) under {root}")
 
 
 def gtt_used_bytes() -> int:
@@ -246,6 +314,13 @@ def journal_tail(key: str, n: int = 40) -> str:
     return p.stdout.strip()
 
 
+def stopped_externally(tail: str) -> bool:
+    """True when the journal tail shows systemd stopping the unit (an orchestrator restart stops every unit it does
+    not own, api.py startup) rather than the server dying on its own: recorded as 'stopped externally', never as a
+    GPU fault, and still a failure so the engine is re-tested on the next run."""
+    return any(mark in tail for mark in EXTERNAL_STOP_MARKS)
+
+
 # --- configuration ----------------------------------------------------------------------------------------------------
 
 
@@ -266,6 +341,23 @@ def read_env(path: Path) -> dict[str, str]:
     return out
 
 
+def read_admin_token(path: str | None) -> str:
+    """ORCH_ADMIN_TOKEN_FILE (api.py): `ORCH_ADMIN_TOKEN=...` or the bare token. Never logged."""
+    if not path:
+        return ""
+    p = Path(path)
+    if not p.is_file():
+        raise Infra(f"--admin-token-file {path} is not readable; the orchestrator's admin routes need it")
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("ORCH_ADMIN_TOKEN="):
+            line = line.split("=", 1)[1].strip().strip("'\"")
+        return line
+    raise Infra(f"--admin-token-file {path} is empty")
+
+
 @dataclass
 class Ctx:
     engines_path: Path
@@ -277,6 +369,7 @@ class Ctx:
     slots_dir: Path
     port_base: int
     overrides: Path
+    admin_token: str = ""
     engines: dict[str, dict[str, Any]] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
 
@@ -301,7 +394,7 @@ class Ctx:
         except (KeyError, ValueError) as exc:
             raise Infra(f"{key}.env has no LLAMA_ARG_PORT") from exc
 
-    def render(self, key: str, set_ov: list[tuple[str, str]] = (), clear_ov: list[str] = ()) -> dict[str, str]:
+    def render(self, key: str, set_ov: Sequence[tuple[str, str]] = (), clear_ov: Sequence[str] = ()) -> dict[str, str]:
         """Write overrides through engine-env.py (its contract) and re-render this engine's env file."""
         cmd = [sys.executable, str(self.engine_env), "--engines", str(self.engines_path), "--out", str(self.env_dir),
                "--models-dir", str(self.models_dir), "--slots-dir", str(self.slots_dir),
@@ -319,6 +412,16 @@ class Ctx:
         except OSError:
             pass
         return self.env(key)
+
+    def override_of(self, key: str, fld: str) -> Any:
+        """The current overrides.json value of one field (None when absent), so a temporary override can be restored."""
+        if not self.overrides.is_file():
+            return None
+        try:
+            data = json.loads(self.overrides.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise Infra(f"{self.overrides} is not valid JSON: {exc}") from exc
+        return (data.get(key) or {}).get(fld)
 
     def result_path(self, key: str) -> Path:
         return self.results_dir / f"{key}.json"
@@ -351,16 +454,26 @@ class EngineResult:
     prefill_tps_8k: float | None = None
     prefill_8k_note: str = ""
     crashed_at_8k: bool = False
+    stopped_externally: bool = False
+    band_note: str = ""
+    band_fail: str = ""
+    footprint_bytes: int | None = None
+    footprint_note: str = ""
     released: bool | None = None
     release_s: float | None = None
     release_note: str = ""
     warnings: list[str] = field(default_factory=list)
     ladder: list[dict[str, Any]] = field(default_factory=list)
+    baseline_deviation: str = ""
     v22_result: str = ""
     v22_msg: str = ""
     resident_after: bool = False
     ok: bool = False
     tested_at: str = ""
+
+    def warn(self, msg: str) -> None:
+        if msg not in self.warnings:
+            self.warnings.append(msg)
 
     def save(self, ctx: Ctx) -> None:
         ctx.results_dir.mkdir(parents=True, exist_ok=True)
@@ -392,110 +505,187 @@ def read_baseline(ctx: Ctx) -> int:
 
 
 class Control:
-    def __init__(self, orch_url: str) -> None:
+    """Every load and unload goes through the Arbiter when the orchestrator serves (Section 4.2). The systemctl
+    fallback exists only for an orchestrator that is down; the mode is fixed at construction and never flips mid-run
+    (a serving orchestrator whose Arbiter API is missing is an Infra error, not a fallback)."""
+
+    def __init__(self, orch_url: str, admin_token: str = "") -> None:
         self.orch_url = orch_url.rstrip("/")
         self.mode = "systemctl"
         self.fallback_reason = ""
+        self.last_decision: dict[str, Any] = {}
+        self.headers = {ADMIN_TOKEN_HEADER: admin_token} if admin_token else {}
         self._probe()
 
+    # -- probe --
     def _probe(self) -> None:
         try:
             code, _ = http("GET", f"{self.orch_url}/health", timeout=5)
         except HttpFail as exc:
             self.fallback_reason = f"orchestrator {self.orch_url} unreachable ({exc})"
-            log(f"control: {self.fallback_reason}; falling back to systemctl for loads (V14b cannot pass this way)")
+            log(f"control: {self.fallback_reason}; FALLING BACK to systemctl for loads: V14b and V21 will record fail "
+                "(only the Arbiter queues, refuses and downgrades)")
             return
         if code != 200:
             self.fallback_reason = f"orchestrator {self.orch_url}/health answered {code}"
-            log(f"control: {self.fallback_reason}; falling back to systemctl")
+            log(f"control: {self.fallback_reason}; FALLING BACK to systemctl for loads: V14b and V21 will record fail")
             return
-        try:
-            code, body = http("GET", f"{self.orch_url}/arbiter/status", timeout=10)
-        except HttpFail as exc:
-            self.fallback_reason = f"GET /arbiter/status failed ({exc})"
-            log(f"control: {self.fallback_reason}; falling back to systemctl")
-            return
+        code, body = self._get("/arbiter/status")
+        if code in (401, 403):
+            raise Infra(f"GET /arbiter/status answered {code}: the orchestrator's admin routes need X-Atlas-Token "
+                        "(pass --admin-token-file, the ORCH_ADMIN_TOKEN_FILE of orchestrator.env)")
         if code != 200 or not isinstance(body, dict):
-            self.fallback_reason = f"GET /arbiter/status answered {code} (Arbiter API not implemented yet?)"
-            log(f"control: {self.fallback_reason}; falling back to systemctl")
-            return
+            raise Infra(f"orchestrator {self.orch_url} is serving (/health 200) but GET /arbiter/status answered "
+                        f"{code}: refusing to control engines behind it (Section 4.2); stop atlas-orchestrator.service "
+                        "or implement /arbiter/*")
+        for route in ("/arbiter/load", "/arbiter/unload", "/arbiter/register"):
+            # FastAPI answers 405 for a GET on a POST-only route that exists and 404 when the route is absent.
+            rc, _ = self._get(route)
+            if rc == 404:
+                raise Infra(f"orchestrator {self.orch_url} is serving without POST {route} (api.py); V10/V14b/V21 "
+                            "cannot be proved behind it: stop atlas-orchestrator.service or implement the route")
         self.mode = "orchestrator"
+        halted = body.get("halted")
+        if halted:
+            raise Infra(f"the Arbiter is halted ({halted}): every load is refused until a human looks (Section 4.2 "
+                        "rule 5); restart atlas-orchestrator.service after checking the GTT counter")
         log(f"control: orchestrator Arbiter API at {self.orch_url} (resident: "
-            f"{[r.get('engine') for r in body.get('resident', [])]})")
+            f"{[r.get('engine') for r in body.get('resident', [])]}, budget {fmt_gb(body.get('budget_bytes') or 0)})")
+
+    def _get(self, path: str) -> tuple[int, Any]:
+        try:
+            return http("GET", f"{self.orch_url}{path}", timeout=10, headers=self.headers)
+        except HttpFail as exc:
+            raise Infra(f"GET {path} failed while the orchestrator answered /health: {exc}") from exc
+
+    def post(self, path: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+        """A POST to an admin/internal route; transport errors surface as HttpFail for the caller to record."""
+        return http("POST", f"{self.orch_url}{path}", body, timeout=timeout, headers=self.headers)
 
     def status(self) -> dict[str, Any] | None:
         if self.mode != "orchestrator":
             return None
         try:
-            code, body = http("GET", f"{self.orch_url}/arbiter/status", timeout=10)
+            code, body = http("GET", f"{self.orch_url}/arbiter/status", timeout=10, headers=self.headers)
         except HttpFail:
             return None
         return body if code == 200 and isinstance(body, dict) else None
 
-    def _fallback(self, why: str) -> None:
-        self.mode = "systemctl"
-        self.fallback_reason = why
-        log(f"control: {why}; falling back to systemctl from here on")
+    def resident_keys(self) -> list[str]:
+        st = self.status() or {}
+        return [str(r.get("engine")) for r in st.get("resident", [])
+                if isinstance(r, dict) and not r.get("loading") and not r.get("unloading")]
 
+    def _wait_resident(self, key: str, deadline: float) -> bool:
+        """Rule 4/6: a queued load waits its turn; the ledger says when the engine serves."""
+        while time.monotonic() < deadline:
+            if key in self.resident_keys():
+                return True
+            time.sleep(5)
+        return False
+
+    # -- load --
     def load(self, key: str, ctx_size: int, parallel: int, port: int) -> float:
         """Start the engine and wait for /health 200. Returns the load time in seconds. Raises RuntimeError with the
         reason on failure (the caller records it); Infra only for broken tooling."""
         t0 = time.monotonic()
-        started_via = self.mode
         if self.mode == "orchestrator":
             body = {"engine": key, "ctx": ctx_size, "parallel": parallel, "task_id": TASK_ID}
-            try:
-                code, resp = http("POST", f"{self.orch_url}/arbiter/load", body, timeout=LOAD_TIMEOUT_S)
-            except HttpFail as exc:
-                self._fallback(f"POST /arbiter/load failed ({exc})")
-                code, resp = 0, None
-            if code in (404, 405):
-                self._fallback(f"POST /arbiter/load answered {code}")
-            elif code and code != 200:
-                raise RuntimeError(f"Arbiter refused to load {key}: HTTP {code} {str(resp)[:300]}")
-            elif code == 200:
-                decision = (resp or {}).get("decision") if isinstance(resp, dict) else None
-                if decision != "granted":
-                    raise RuntimeError(f"Arbiter did not grant {key}: {json.dumps(resp)[:400]}")
-        if self.mode == "systemctl":
+            deadline = t0 + ARBITER_WAIT_S + LOAD_TIMEOUT_S
+            while True:
+                try:
+                    code, resp = self.post("/arbiter/load", body, timeout=ARBITER_WAIT_S + LOAD_TIMEOUT_S + 60)
+                except HttpFail as exc:
+                    raise RuntimeError(f"POST /arbiter/load {key} failed: {exc} (the orchestrator was serving at "
+                                       "the start of this run; no systemctl fallback behind it)") from exc
+                if code == 503:
+                    raise RuntimeError(f"Arbiter halted, {key} not loaded: HTTP 503 {short(resp)} (Section 4.2 rule 5)")
+                if code != 200 or not isinstance(resp, dict):
+                    raise RuntimeError(f"Arbiter did not load {key}: HTTP {code} {short(resp)}")
+                self.last_decision = resp
+                decision = resp.get("decision")
+                reason = resp.get("reason", "")
+                if decision == "granted":
+                    log(f"control: Arbiter granted {key}: {reason} "
+                        f"(projected {fmt_gb(resp.get('projected_bytes') or 0)})")
+                    break
+                if decision == "queued":
+                    # Rules 4 and 6: never a failure; wait for the ledger, then ask again until the deadline.
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f"Arbiter kept {key} queued for {deadline - t0:.0f}s: {reason}")
+                    log(f"control: Arbiter queued {key}: {reason}; waiting for the ledger")
+                    if self._wait_resident(key, min(deadline, time.monotonic() + 300)):
+                        break
+                    continue
+                raise RuntimeError(f"Arbiter {decision or 'answered without a decision'} for {key}: {reason} "
+                                   f"({short(resp, 200)})")
+        else:
             run(["systemctl", "reset-failed", unit_of(key)])
             p = run(["systemctl", "start", unit_of(key)], timeout=LOAD_TIMEOUT_S + 30)
             if p.returncode != 0:
                 raise RuntimeError(f"systemctl start {unit_of(key)} failed (exit {p.returncode}): "
                                    f"{(p.stderr or p.stdout).strip()[:300]}; journal: {journal_tail(key, 15)[-600:]}")
-        deadline = time.monotonic() + LOAD_TIMEOUT_S
-        while time.monotonic() < deadline:
+        health_deadline = time.monotonic() + LOAD_TIMEOUT_S
+        while time.monotonic() < health_deadline:
             if health_code(port) == 200:
                 secs = time.monotonic() - t0
-                log(f"control: {key} healthy on 127.0.0.1:{port} after {secs:.1f}s (via {started_via})")
+                log(f"control: {key} healthy on 127.0.0.1:{port} after {secs:.1f}s (via {self.mode})")
                 return secs
             if not unit_active(key) and time.monotonic() - t0 > 10:
                 raise RuntimeError(f"{unit_of(key)} is not active after start; journal: {journal_tail(key, 20)[-800:]}")
             time.sleep(2)
         raise RuntimeError(f"{key} did not answer /health 200 within {LOAD_TIMEOUT_S:.0f}s")
 
-    def unload(self, key: str) -> None:
+    # -- unload --
+    def unload(self, key: str) -> str:
+        """Unload through the Arbiter (its rule-5 check inside) or, on the systemctl path, stop the unit. Returns the
+        Arbiter's reason. Raises RuntimeError on any answer but granted: a refusal means the engine is busy (Section
+        9.3: never swapped out from under a session) and this script never stops a unit behind a serving Arbiter."""
         if self.mode == "orchestrator":
             try:
-                code, resp = http("POST", f"{self.orch_url}/arbiter/unload", {"engine": key, "task_id": TASK_ID},
-                                  timeout=STOP_TIMEOUT_S)
+                code, resp = self.post("/arbiter/unload", {"engine": key, "task_id": TASK_ID},
+                                       timeout=ARBITER_WAIT_S + STOP_TIMEOUT_S + 60)
             except HttpFail as exc:
-                self._fallback(f"POST /arbiter/unload failed ({exc})")
-                code = 0
-            if code in (404, 405):
-                self._fallback(f"POST /arbiter/unload answered {code}")
-            elif code and code != 200:
-                log(f"control: /arbiter/unload {key} answered {code} {str(resp)[:200]}; stopping the unit directly")
-        # Whatever the Arbiter did, the unit must be down before the release check (the Arbiter's own stop is the same
-        # systemctl call through sudoers; repeating it as root is idempotent).
+                raise RuntimeError(f"POST /arbiter/unload {key} failed: {exc}") from exc
+            if code == 503:
+                raise RuntimeError(f"Arbiter halted after unloading {key}: HTTP 503 {short(resp)} (Section 4.2 rule "
+                                   "5: the GTT counter did not drop; restart atlas-orchestrator.service after looking)")
+            if code != 200 or not isinstance(resp, dict):
+                raise RuntimeError(f"Arbiter refused to unload {key}: HTTP {code} {short(resp, 200)}")
+            self.last_decision = resp
+            if resp.get("decision") != "granted":
+                raise RuntimeError(f"Arbiter did not unload {key}: {resp.get('decision')}: {resp.get('reason', '')}")
+            reason = str(resp.get("reason", ""))
+            if unit_active(key) and "not resident" in reason:
+                raise RuntimeError(f"{unit_of(key)} is active but the Arbiter does not list it ({reason}); a unit "
+                                   "started outside the Arbiter is never stopped behind it: stop it by hand or "
+                                   "restart atlas-orchestrator.service (api.py startup stops unowned units)")
+            log(f"control: Arbiter unloaded {key}: {reason}")
+            return reason
         p = run(["systemctl", "stop", unit_of(key)], timeout=STOP_TIMEOUT_S + 30)
         if p.returncode != 0:
             log(f"control: systemctl stop {unit_of(key)} exit {p.returncode}: {(p.stderr or p.stdout).strip()[:200]}")
         run(["systemctl", "reset-failed", unit_of(key)])
+        return "stopped via systemctl (fallback)"
+
+    # -- register (rule 1) --
+    def register(self, key: str, total_bytes: int) -> str:
+        """POST /arbiter/register; returns "" on success or the reason it was not registered (the caller warns)."""
+        if self.mode != "orchestrator":
+            return f"footprint not registered with the Arbiter: {self.fallback_reason}"
+        try:
+            code, resp = self.post("/arbiter/register", {"engine": key, "total_bytes": int(total_bytes),
+                                                         "task_id": TASK_ID}, timeout=30)
+        except HttpFail as exc:
+            return f"POST /arbiter/register failed: {exc}"
+        if code != 200:
+            return f"POST /arbiter/register answered {code}: {short(resp, 200)}"
+        return ""
 
 
 def wait_release(baseline: int, label: str) -> tuple[bool, float, str]:
-    """Section 4.2 rule 5: poll the GTT counter until it is back within tolerance of the baseline."""
+    """The measurement window of Section 4.2 rule 5 (see RELEASE_TOLERANCE_BYTES): poll the GTT counter until it
+    is back within tolerance of the baseline."""
     t0 = time.monotonic()
     last = gtt_used_bytes()
     while True:
@@ -516,22 +706,14 @@ def wait_release(baseline: int, label: str) -> tuple[bool, float, str]:
 # --- V4 proof ---------------------------------------------------------------------------------------------------------
 
 
-def prove_kv(key: str, expected: str, proof_lines: int, invocation_id: str, since: str, port: int,
-             ) -> tuple[bool, str, str]:
-    """(ok, message, applied type). Reads the journal of the current invocation; /props only for the reason text."""
-    lines = journal_lines(key, invocation_id, since)
+def evaluate_kv_lines(key: str, expected: str, proof_lines: int, lines: list[str], build: str = "",
+                      ) -> tuple[bool, str, str]:
+    """Pure part of the V4 proof: (ok, message, applied type) from the journal lines of the current invocation."""
     kv = [m for m in (KV_LINE_RE.search(ln) for ln in lines) if m]
     rec = [m for m in (RECURRENT_RE.search(ln) for ln in lines) if m]
     fa = [m.group(1) for m in (FA_RE.search(ln) for ln in lines) if m]
     refused = [s for s in KV_REFUSED if any(s in ln for ln in lines)]
     if not kv:
-        build = ""
-        try:
-            code, props = http("GET", f"http://127.0.0.1:{port}/props", timeout=10)
-            if code == 200 and isinstance(props, dict):
-                build = f"; /props build_info={props.get('build_info')} (no cache-type field exists there)"
-        except HttpFail:
-            pass
         why = "journal of the current invocation has no 'llama_kv_cache: size =' line" if lines else \
             "journal of the current invocation is empty (journalctl access?)"
         return False, f"{key}: V4 unproven: {why}{build}" + (f"; refused: {refused}" if refused else ""), ""
@@ -554,6 +736,29 @@ def prove_kv(key: str, expected: str, proof_lines: int, invocation_id: str, sinc
         parts.append(f"refused: {refused}")
     verdict = f"{expected} applied" if ok else f"{expected} requested, NOT proven"
     return ok, f"{key}: {verdict} ({'; '.join(parts)})", applied
+
+
+def prove_kv(key: str, expected: str, proof_lines: int, invocation_id: str, since: str, port: int,
+             ) -> tuple[bool, str, str]:
+    """(ok, message, applied type). Reads the journal of the current invocation; /props only for the reason text.
+    journald commits stderr lines asynchronously, so a warm re-load can answer /health before the proof line is
+    readable: three reads two seconds apart before the verdict."""
+    lines: list[str] = []
+    for attempt in range(3):
+        lines = journal_lines(key, invocation_id, since)
+        if any(KV_LINE_RE.search(ln) for ln in lines) or any(s in ln for s in KV_REFUSED for ln in lines):
+            break
+        if attempt < 2:
+            time.sleep(2)
+    build = ""
+    if not any(KV_LINE_RE.search(ln) for ln in lines):
+        try:
+            code, props = http("GET", f"http://127.0.0.1:{port}/props", timeout=10)
+            if code == 200 and isinstance(props, dict):
+                build = f"; /props build_info={props.get('build_info')} (no cache-type field exists there)"
+        except HttpFail:
+            pass
+    return evaluate_kv_lines(key, expected, proof_lines, lines, build)
 
 
 # --- generation and measurement ---------------------------------------------------------------------------------------
@@ -599,24 +804,30 @@ def completion(port: int, prompt: str, n_predict: int) -> dict[str, Any]:
 
 
 def chat(url: str, model: str, messages: list[dict[str, str]], max_tokens: int, timeout: float = REQUEST_TIMEOUT_S,
-         ) -> dict[str, Any]:
+         path: str = LLAMA_CHAT_PATH, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    """POST an OpenAI chat request: to a llama-server directly (path /v1/chat/completions, the model field is
+    ignored) or to the orchestrator (path /internal/v1/chat/completions, model = engine key, Arbiter lock)."""
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0, "stream": False}
     t_send = time.monotonic()
+    base = {"content": "", "reasoning": "", "finish": "", "timings": {}, "error": "", "t_send": t_send, "code": 0}
     try:
-        code, resp = http("POST", f"{url}/v1/chat/completions", body, timeout=timeout)
+        code, resp = http("POST", f"{url}{path}", body, timeout=timeout, headers=headers)
     except HttpFail as exc:
-        return {"content": "", "timings": {}, "error": str(exc), "t_send": t_send, "t_recv": time.monotonic(),
-                "code": 0}
+        return {**base, "error": str(exc), "t_recv": time.monotonic()}
     t_recv = time.monotonic()
     if code != 200 or not isinstance(resp, dict):
-        return {"content": "", "timings": {}, "error": f"HTTP {code}: {str(resp)[:300]}", "t_send": t_send,
-                "t_recv": t_recv, "code": code}
+        return {**base, "error": f"HTTP {code}: {str(resp)[:300]}", "t_recv": t_recv, "code": code}
+    content, reasoning, finish = "", "", ""
     try:
-        content = resp["choices"][0]["message"].get("content") or ""
+        choice = resp["choices"][0]
+        msg = choice.get("message") or {}
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        finish = choice.get("finish_reason") or ""
     except (KeyError, IndexError, TypeError, AttributeError):
-        content = ""
-    return {"content": content, "timings": resp.get("timings") or {}, "error": "", "t_send": t_send, "t_recv": t_recv,
-            "code": code}
+        pass
+    return {**base, "content": content, "reasoning": reasoning, "finish": finish,
+            "timings": resp.get("timings") or {}, "t_recv": t_recv, "code": code}
 
 
 def measure_point(port: int, target: int, label: str) -> tuple[dict[str, Any], str]:
@@ -649,40 +860,92 @@ COHERENCE_PASSAGE = (
 COHERENCE_KEYWORDS = ("water", "evaporat", "cloud", "rain", "ocean", "river", "vapour", "condens", "groundwater", "ice")
 
 
+def chat_with_thinking_budget(port: int, model: str, messages: list[dict[str, str]], max_tokens: int,
+                              ) -> tuple[dict[str, Any], str]:
+    """One chat turn against a llama-server with a reasoning model in mind: when the answer is empty because the
+    thinking budget ran out (finish_reason "length"), retry once with a larger budget rather than call it incoherent.
+    Returns (response, note)."""
+    r = chat(f"http://127.0.0.1:{port}", model, messages, max_tokens)
+    if r["error"]:
+        return r, ""
+    if not r["content"].strip() and r["finish"] == "length":
+        bigger = max_tokens * COHERENCE_RETRY_FACTOR
+        r2 = chat(f"http://127.0.0.1:{port}", model, messages, bigger)
+        if r2["error"]:
+            return r2, ""
+        return r2, (f"thinking budget of {max_tokens} tokens exhausted (reasoning {len(r['reasoning'])} chars); "
+                    f"retried at {bigger}")
+    return r, ""
+
+
+def text_quality(a2: str) -> tuple[bool, str, dict[str, Any]]:
+    """Garbage/repetition heuristics on a summary; (ok, reason, stats)."""
+    words = re.findall(r"[A-Za-z']+", a2)
+    stats: dict[str, Any] = {"words": len(words)}
+    if len(words) < 20:
+        return False, f"summary too short/empty ({len(words)} words): {a2[:80]!r}", stats
+    non_ascii = sum(1 for ch in a2 if ord(ch) > 127) / max(len(a2), 1)
+    if non_ascii > 0.15:
+        return False, f"summary is mojibake ({non_ascii:.0%} non-ASCII): {a2[:80]!r}", stats
+    uniq = len({w.lower() for w in words}) / len(words)
+    stats["uniq"] = uniq
+    if uniq < 0.3:
+        return False, f"summary is repetitive (unique-word ratio {uniq:.2f}): {a2[:80]!r}", stats
+    grams = [" ".join(words[i:i + 4]).lower() for i in range(len(words) - 3)]
+    if grams and max(grams.count(g) for g in set(grams)) > 4:
+        return False, f"summary repeats a 4-gram more than 4 times: {a2[:80]!r}", stats
+    hits = sum(1 for k in COHERENCE_KEYWORDS if k in a2.lower())
+    stats["hits"] = hits
+    if hits < 3:
+        return False, f"summary is off-topic ({hits} of {len(COHERENCE_KEYWORDS)} keywords): {a2[:80]!r}", stats
+    return True, "", stats
+
+
 def coherence_check(port: int, model: str) -> tuple[bool, str]:
-    """A short factual question with a known answer plus a 200-token summary; garbage or repetition fails."""
-    r1 = chat(f"http://127.0.0.1:{port}", model,
-              [{"role": "user", "content": "What is the capital of France? Answer with the city name only."}], 32)
+    """A short factual question with a known answer plus a ~120-word summary; garbage or repetition fails. A reasoning
+    model spends tokens in reasoning_content first, so the budgets are generous, an exhausted budget is retried once,
+    and the quality checks fall back to reasoning_content when content is empty."""
+    notes: list[str] = []
+    r1, note = chat_with_thinking_budget(
+        port, model, [{"role": "user", "content": "What is the capital of France? Answer with the city name only."}],
+        COHERENCE_TOKENS_FACTUAL)
+    if note:
+        notes.append(note)
     if r1["error"]:
         return False, f"factual question failed: {r1['error'][:200]}"
     a1 = r1["content"].strip()
+    if not a1:
+        return False, (f"factual question produced no answer (finish={r1['finish'] or '?'}, reasoning "
+                       f"{len(r1['reasoning'])} chars: {r1['reasoning'][:60]!r})")
     if "paris" not in a1.lower():
         return False, f"factual question wrong/garbled: {a1[:80]!r}"
-    r2 = chat(f"http://127.0.0.1:{port}", model,
-              [{"role": "user",
-                "content": f"Summarise the following passage in about 120 words:\n\n{COHERENCE_PASSAGE}"}], 200)
+    r2, note = chat_with_thinking_budget(
+        port, model,
+        [{"role": "user", "content": f"Summarise the following passage in about 120 words:\n\n{COHERENCE_PASSAGE}"}],
+        COHERENCE_TOKENS_SUMMARY)
+    if note:
+        notes.append(note)
     if r2["error"]:
         return False, f"summary request failed: {r2['error'][:200]}"
     a2 = r2["content"].strip()
-    words = re.findall(r"[A-Za-z']+", a2)
-    if len(words) < 20:
-        return False, f"summary too short/empty ({len(words)} words): {a2[:80]!r}"
-    non_ascii = sum(1 for ch in a2 if ord(ch) > 127) / max(len(a2), 1)
-    if non_ascii > 0.15:
-        return False, f"summary is mojibake ({non_ascii:.0%} non-ASCII): {a2[:80]!r}"
-    uniq = len({w.lower() for w in words}) / len(words)
-    if uniq < 0.3:
-        return False, f"summary is repetitive (unique-word ratio {uniq:.2f}): {a2[:80]!r}"
-    grams = [" ".join(words[i:i + 4]).lower() for i in range(len(words) - 3)]
-    if grams and max(grams.count(g) for g in set(grams)) > 4:
-        return False, f"summary repeats a 4-gram more than 4 times: {a2[:80]!r}"
-    hits = sum(1 for k in COHERENCE_KEYWORDS if k in a2.lower())
-    if hits < 3:
-        return False, f"summary is off-topic ({hits} of {len(COHERENCE_KEYWORDS)} keywords): {a2[:80]!r}"
-    return True, f"'{a1[:20]}' + {len(words)}-word summary, {hits} keywords, unique ratio {uniq:.2f}"
+    source = "content"
+    if not a2 and r2["reasoning"].strip():
+        a2, source = r2["reasoning"].strip(), "reasoning_content (content empty)"
+    ok, why, stats = text_quality(a2)
+    if not ok:
+        return False, why + (f" [{source}]" if source != "content" else "") + ("; " + "; ".join(notes) if notes else "")
+    return True, (f"'{a1[:20]}' + {stats['words']}-word summary ({source}), {stats['hits']} keywords, unique ratio "
+                  f"{stats['uniq']:.2f}" + ("; " + "; ".join(notes) if notes else ""))
 
 
 # --- per-engine test --------------------------------------------------------------------------------------------------
+
+
+def finalize_control(res: EngineResult, ctl: Control) -> None:
+    """Record how the engine was really controlled at save time (rule §7.4: the table must show a bypassed Arbiter)."""
+    res.control_mode = ctl.mode
+    if ctl.mode != "orchestrator":
+        res.warn(f"loaded via systemctl fallback: {ctl.fallback_reason}")
 
 
 def credit_release(ctx: Ctx, key: str, ok: bool, secs: float, note: str) -> None:
@@ -696,6 +959,20 @@ def credit_release(ctx: Ctx, key: str, ok: bool, secs: float, note: str) -> None
     res.save(ctx)
 
 
+def unload_and_release(ctl: Control, key: str, baseline: int) -> tuple[bool, float, str]:
+    """Unload through Control and confirm the memory came back. A refusal is recorded as a failed release with the
+    Arbiter's reason; nothing is stopped behind it."""
+    try:
+        reason = ctl.unload(key)
+    except RuntimeError as exc:
+        log(f"release {key}: FAIL {exc}")
+        return False, 0.0, f"unload refused/failed: {exc}"
+    ok, secs, note = wait_release(baseline, key)
+    if ctl.mode == "orchestrator":
+        note += f"; Arbiter: {reason}"
+    return ok, secs, note
+
+
 def swap_out(ctx: Ctx, ctl: Control, previous: str | None, baseline: int) -> tuple[float, str]:
     """Unload the previous engine (if resident) and confirm its memory came back. Returns (seconds, note)."""
     t0 = time.monotonic()
@@ -704,8 +981,7 @@ def swap_out(ctx: Ctx, ctl: Control, previous: str | None, baseline: int) -> tup
     if not unit_active(previous):
         return 0.0, f"{previous} was not resident"
     log(f"swap: unloading {previous}")
-    ctl.unload(previous)
-    ok, secs, note = wait_release(baseline, previous)
+    ok, secs, note = unload_and_release(ctl, previous, baseline)
     credit_release(ctx, previous, ok, secs, note)
     if not ok:
         log(f"swap: {previous} did NOT release its memory; the next load may be over budget")
@@ -713,9 +989,41 @@ def swap_out(ctx: Ctx, ctl: Control, previous: str | None, baseline: int) -> tup
 
 
 def stop_and_release(ctx: Ctx, ctl: Control, key: str, baseline: int, res: EngineResult) -> None:
-    ctl.unload(key)
-    ok, secs, note = wait_release(baseline, key)
-    res.released, res.release_s, res.release_note, res.resident_after = ok, round(secs, 1), note, False
+    ok, secs, note = unload_and_release(ctl, key, baseline)
+    res.released, res.release_s, res.release_note = ok, round(secs, 1), note
+    res.resident_after = unit_active(key) if not ok else False
+
+
+def register_footprint(ctl: Control, res: EngineResult, baseline: int) -> None:
+    """Section 4.2 rule 1: the measured footprint (GTT delta at the rendered ctx/parallel) replaces the Arbiter's
+    estimate. Measured while the engine is resident, right after the timing points."""
+    delta = max(0, gtt_used_bytes() - baseline)
+    res.footprint_bytes = delta
+    why = ctl.register(res.key, delta)
+    if why:
+        res.footprint_note = f"measured {fmt_gb(delta)}, NOT registered: {why}"
+        res.warn(res.footprint_note)
+    else:
+        res.footprint_note = f"measured {fmt_gb(delta)}, registered with the Arbiter"
+    log(f"{res.key}: footprint {res.footprint_note}")
+
+
+def check_band(res: EngineResult, spec: dict[str, Any]) -> None:
+    """Section 21 V10 'measured tok/s within the expected bands' (Section 5.1 figures in engines.json)."""
+    band = spec.get("expected_decode_tok_s")
+    if not band or res.decode_tps_512 is None:
+        return
+    lo, hi = float(band[0]), float(band[1])
+    d = res.decode_tps_512
+    if d < lo * BAND_FAIL_FACTOR:
+        res.band_fail = f"decode {d} tok/s below the expected band {band[0]}-{band[1]} (Section 5.1)"
+    elif d < lo:
+        res.band_note = f"decode {d} tok/s under the expected band {band[0]}-{band[1]} (within 30 %)"
+        res.warn(res.band_note)
+    elif d > hi:
+        res.band_note = f"decode {d} tok/s above the expected band {band[0]}-{band[1]} (informational)"
+    else:
+        res.band_note = f"decode {d} tok/s within the expected band {band[0]}-{band[1]}"
 
 
 def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict[str, str]) -> None:
@@ -732,9 +1040,7 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
     if not res.generated:
         res.load_error = f"no generation at 512 tokens (predicted_n={t.get('predicted_n')}, content empty)"
         return
-    band = spec.get("expected_decode_tok_s")
-    if band and res.decode_tps_512 < band[0] * 0.7:
-        res.warnings.append(f"decode {res.decode_tps_512} tok/s is >30% below the expected band {band[0]}-{band[1]}")
+    check_band(res, spec)
     ctx_size = int(env.get("ATLAS_CTX_SIZE", spec["ctx_size"]))
     parallel = int(env.get("ATLAS_PARALLEL", spec.get("parallel", 1)))
     per_slot = ctx_size // max(parallel, 1)
@@ -745,18 +1051,29 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
     r, note = measure_point(port, PREFILL_LONG, "8k")
     log(f"{key}: {note}")
     if r["error"]:
-        # Conflict f: Nemotron's ~20k memory fault; any engine that dies here is caught, never hung.
+        # Conflict f: Nemotron's ~20k memory fault; any engine that dies here is caught, never hung. Section 21 V10
+        # wants load, generate and swap at 8k as at 512: a dead server here is a FAIL, not a warning (the Nemotron
+        # issue is at ~20k, not 8k).
         time.sleep(3)
         alive = unit_active(key) and health_code(port) == 200
         if not alive:
-            res.crashed_at_8k = True
-            issue = NEMOTRON_ISSUE if key == "nemotron-3-super" else "server died during the 8k prefill"
-            tail = " | ".join(journal_tail(key, 6).splitlines()[-3:])[-300:]
-            res.warnings.append(f"8k prefill crashed the server ({issue}); journal: {tail}")
-            res.prefill_8k_note = "crashed"
+            tail_full = journal_tail(key, 30)
+            tail = " | ".join(tail_full.splitlines()[-3:])[-300:]
+            if stopped_externally(tail_full):
+                res.stopped_externally = True
+                res.prefill_8k_note = "stopped externally"
+                res.load_error = (f"server stopped externally during the 8k prefill (systemd stop, e.g. an "
+                                  f"atlas-orchestrator restart); journal: {tail}")
+            else:
+                res.crashed_at_8k = True
+                issue = NEMOTRON_ISSUE if key == "nemotron-3-super" else "server died during the 8k prefill"
+                res.prefill_8k_note = "crashed"
+                res.load_error = f"8k prefill crashed the server ({issue}); journal: {tail}"
+                if "ErrorDeviceLost" in tail_full:
+                    res.load_error += f" [{DEVICELOST_ISSUE}]"
         else:
             res.prefill_8k_note = f"request failed but server alive: {r['error'][:160]}"
-            res.warnings.append(res.prefill_8k_note)
+            res.load_error = f"8k prefill request failed: {r['error'][:200]}"
         return
     t = r["timings"]
     res.prefill_tps_8k = round(float(t.get("prompt_per_second") or 0), 2)
@@ -765,11 +1082,10 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
 
 def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     spec = ctx.spec(key)
-    ctl = Control(ctx.orch_url)
+    ctl = Control(ctx.orch_url, ctx.admin_token)
     baseline = read_baseline(ctx)
-    res = EngineResult(key=key, arbiter_class=spec.get("arbiter_class", ""), control_mode=ctl.mode, tested_at=now_iso())
-    if ctl.mode != "orchestrator":
-        res.warnings.append(f"loaded via systemctl fallback: {ctl.fallback_reason}")
+    res = EngineResult(key=key, arbiter_class=spec.get("arbiter_class", ""), control_mode=ctl.mode,
+                       tested_at=now_iso(), baseline_deviation=str(spec.get("baseline_deviation") or ""))
     if spec.get("kv_ladder"):
         ladder_engine(ctx, ctl, key, previous, baseline, res)
         return
@@ -778,6 +1094,7 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     if env.get("ATLAS_MODEL_PRESENT") != "1":
         res.load_error = (f"ATLAS_MODEL_PRESENT=0 in {key}.env: model file {env.get('ATLAS_MODEL_FILE')} "
                           "not found (step 01)")
+        finalize_control(res, ctl)
         res.save(ctx)
         record("V4", "fail", f"{key}: not loaded ({res.load_error})")
         return
@@ -793,7 +1110,9 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
         if "ErrorDeviceLost" in res.load_error:
             res.load_error += f" [{DEVICELOST_ISSUE}]"
         log(f"{key}: LOAD FAILED: {res.load_error}")
-        stop_and_release(ctx, ctl, key, baseline, res)
+        if unit_active(key) or key in ctl.resident_keys():
+            stop_and_release(ctx, ctl, key, baseline, res)
+        finalize_control(res, ctl)
         res.save(ctx)
         record("V4", "fail", f"{key}: not loaded ({res.load_error[:300]})")
         return
@@ -806,19 +1125,110 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     log(f"{key}: V4 {'PASS' if res.kv_proof_ok else 'FAIL'}: {res.kv_proof_msg}")
     record("V4", "pass" if res.kv_proof_ok else "fail", res.kv_proof_msg)
     run_measurements(ctx, res, key, port, env)
-    if res.crashed_at_8k or res.load_error:
-        stop_and_release(ctx, ctl, key, baseline, res)
-    else:
+    if not res.load_error:
+        register_footprint(ctl, res, baseline)
         res.resident_after = True  # the next engine's swap (or `finish`) measures this one's release
-    res.ok = res.load_ok and res.generated and not res.load_error and res.released is not False
+    else:
+        stop_and_release(ctx, ctl, key, baseline, res)
+    res.ok = (res.load_ok and res.generated and not res.load_error and not res.band_fail
+              and res.released is not False)
+    finalize_control(res, ctl)
     res.save(ctx)
     log(f"{key}: result ok={res.ok} decode512={res.decode_tps_512} decode8k={res.decode_tps_8k} "
         f"prefill512={res.prefill_tps_512} prefill8k={res.prefill_tps_8k} warnings={res.warnings}")
 
 
+# --- the DeepSeek KV ladder (engines.json kv_ladder_rule; Section 4.3; R19) ------------------------------------------
+
+
+@dataclass
+class LadderVerdict:
+    winner: str
+    v4_result: str
+    v4_msg: str
+    v22_result: str
+    v22_msg: str
+    set_ov: list[tuple[str, str]]
+    clear_ov: list[str]
+    note: str
+    deviation: str
+    summary: str
+
+
+def rung_verdict(r: dict[str, Any]) -> str:
+    if r.get("coherent") and r.get("kv_proof_ok"):
+        return "coherent"
+    if r.get("coherent"):
+        return "coherent but KV unproven"
+    return "incoherent" if r.get("load_ok") else "load failed"
+
+
+def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any]], base_kv: str,
+                  f16_cap: int | None, stop_reason: str, released: bool | None, release_note: str,
+                  decode_512: float | None, prefill_512: float | None) -> LadderVerdict:
+    """Pure decision of the ladder (engines.json kv_ladder_rule, Section 21 V4/V22, R19):
+      * the FIRST rung that loads, prints its proof lines and answers coherently wins (winners[0]);
+      * q4_0 (the Section 4.3 setting) -> V4 pass, overrides cleared;
+      * q8_0 -> V4 pass, but the message says the Section 4.3 setting was incoherent (a baseline deviation);
+      * f16 -> V4 DEFERRED: unquantised KV is exactly the fallback V4 exists to catch; deliberate is not quantised.
+        V22 still passes with the note (R19; engines.json known_issue), ctx capped to ctx_size_f16_cap;
+      * no winner -> V4 and V22 deferred with the reason (R19 keeps the phase unblocked)."""
+    summary = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in rungs)
+    untried = [kv for kv in ladder if kv not in {r["kv"] for r in rungs}]
+    if untried:
+        summary += ", " + ", ".join(f"{kv}=not tried" for kv in untried)
+    winners = [r["kv"] for r in rungs if r.get("coherent") and r.get("kv_proof_ok")]
+    if not winners:
+        reason = stop_reason or f"no coherent rung ({summary})"
+        return LadderVerdict(
+            winner="", v4_result="deferred",
+            v4_msg=f"{key}: no KV type proven coherent, V22 deferred (R19): {reason}",
+            v22_result="deferred",
+            v22_msg=f"DeepSeek V4 Flash deferred without blocking the phase (R19): {reason}; ladder: {summary}",
+            set_ov=[], clear_ov=["kv_type", "ctx_size"], note="overrides cleared", deviation="", summary=summary)
+    winner = winners[0]
+    before = [r for r in rungs if r["kv"] != winner and ladder.index(r["kv"]) < ladder.index(winner)]
+    detail = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in before) or "n/a"
+    base_rung = next((r for r in rungs if r["kv"] == base_kv), None)
+    base_state = rung_verdict(base_rung) if base_rung else "not tried"
+    ok = released is not False
+    perf = f"decode {decode_512} tok/s at 512, prefill {prefill_512} tok/s"
+    if winner == base_kv:
+        v = LadderVerdict(winner, "pass",
+                          f"{key}: {winner} applied and coherent (ladder: {summary}; baseline {base_kv} kept, "
+                          "overrides cleared)", "pass" if ok else "deferred", "", [], ["kv_type", "ctx_size"],
+                          "baseline kept (overrides cleared)", "", summary)
+    elif winner == "f16":
+        cap = int(f16_cap) if f16_cap else None
+        set_ov = [("kv_type", "f16")] + ([("ctx_size", str(cap))] if cap else [])
+        note = f"f16 override written, ctx capped to {cap}" if cap else "f16 override written (no ctx_size_f16_cap)"
+        deviation = (f"KV f16 instead of Section 4.3 q4_0: no quantised rung usable on this build ({detail}; "
+                     f"{DEEPSEEK_KV_ISSUES}); {note}")
+        v = LadderVerdict(winner, "deferred",
+                          f"{key}: unquantised KV: Section 4.3 q4_0 and q8_0 both unusable on this build "
+                          f"({detail}; {DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
+                          "pass" if ok else "deferred", "", set_ov, [], note, deviation, summary)
+    else:
+        note = f"{winner} written to overrides.json"
+        deviation = (f"KV {winner} instead of Section 4.3 q4_0: q4_0 {base_state} on this build "
+                     f"({DEEPSEEK_KV_ISSUES})")
+        v = LadderVerdict(winner, "pass",
+                          f"{key}: {winner} applied (Section 4.3 setting {base_kv} {base_state}: {detail}; "
+                          f"{DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
+                          "pass" if ok else "deferred", "", [], ["ctx_size"], note, deviation, summary)
+        v.set_ov = [("kv_type", winner)]
+    v.v22_msg = (f"DeepSeek V4 Flash 0731 UD-Q4_K_XL loads and generates coherently with {winner} KV ({perf}; "
+                 f"{v.note})" + (f"; unquantised KV, see V4 deferred ({DEEPSEEK_KV_ISSUES})" if winner == "f16" else "")
+                 + (f"; deferred: {release_note} (R19)" if not ok else ""))
+    return v
+
+
 def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseline: int, res: EngineResult) -> None:
-    """DeepSeek V4 Flash (research conflict b): f16 -> q8_0 -> q4_0, coherence at each rung, winner to overrides.json.
-    Any failure records V22 deferred with the reason and V4 deferred (R19: never blocks the phase)."""
+    """DeepSeek V4 Flash (research conflict b): the engines.json kv_ladder in list order (baseline q4_0 first, then
+    q8_0, then f16), coherence at each rung, first coherent rung wins. Section 4.3 states the ladder f16-first and
+    keeps the lowest coherent setting; both orders keep the same setting, the list order just loads the closed
+    setting first (engines.json kv_ladder_rule). A load failure records the rung and CONTINUES (rule 3 there);
+    a rung that loads but is incoherent escalates; only a rule-5 release failure ends the ladder early."""
     spec = ctx.spec(key)
     ladder: list[str] = list(spec["kv_ladder"])
     f16_cap = spec.get("ctx_size_f16_cap")
@@ -852,10 +1262,13 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
             rung["note"] = f"load failed: {exc}"
             if "ErrorDeviceLost" in str(exc):
                 rung["note"] += f" [{DEVICELOST_ISSUE}]"
-            log(f"{key}: rung {kv} {rung['note']}")
-            stop_and_release(ctx, ctl, key, baseline, res)
-            stop_reason = rung["note"]
-            break
+            log(f"{key}: rung {kv} {rung['note']}; continuing with the next rung (kv_ladder_rule 3)")
+            if unit_active(key) or key in ctl.resident_keys():
+                stop_and_release(ctx, ctl, key, baseline, res)
+                if res.released is False:
+                    stop_reason = f"memory not released after the failed {kv} rung: {res.release_note}"
+                    break
+            continue
         rung["load_ok"] = True
         res.load_ok = True
         if not swap_measured:
@@ -869,7 +1282,8 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         coherent, detail = coherence_check(port, key)
         rung["coherent"], rung["coherence"] = coherent, detail
         log(f"{key}: rung {kv} coherence {'ok' if coherent else 'FAIL'}: {detail}")
-        if coherent and ok:
+        won = coherent and ok
+        if won:
             run_measurements(ctx, res, key, port, env)
             rung.update({"decode_tps_512": res.decode_tps_512, "decode_tps_8k": res.decode_tps_8k,
                          "prefill_tps_512": res.prefill_tps_512, "prefill_tps_8k": res.prefill_tps_8k,
@@ -877,58 +1291,31 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
             if res.load_error:
                 rung["note"] = res.load_error
                 rung["coherent"] = False
+                won = False
                 res.load_error = ""
+            else:
+                register_footprint(ctl, res, baseline)
         stop_and_release(ctx, ctl, key, baseline, res)
         if res.released is False:
             stop_reason = f"memory not released after the {kv} rung: {res.release_note}"
             break
-        if kv == "f16" and not coherent:
-            stop_reason = f"incoherent already at f16 KV ({detail}); the model itself is broken on this build"
-            break
-    winners = [r["kv"] for r in res.ladder if r.get("coherent") and r.get("kv_proof_ok")]
-    def verdict(r: dict[str, Any]) -> str:
-        return "coherent" if r.get("coherent") else ("incoherent" if r.get("load_ok") else "load failed")
-
-    summary = ", ".join(f"{r['kv']}={verdict(r)}" for r in res.ladder)
-    untried = [kv for kv in ladder if kv not in {r["kv"] for r in res.ladder}]
-    if untried:
-        summary += ", " + ", ".join(f"{kv}=not tried" for kv in untried)
-    if winners:
-        winner = winners[-1]
-        res.kv_applied = winner
-        for r in res.ladder:
-            if r.get("load_ok") and not r.get("coherent") and ladder.index(r["kv"]) < ladder.index(winner):
-                res.warnings.append(f"rung {r['kv']} was incoherent although the more compressed {winner} is coherent "
-                                    "(suspicious)")
-        if winner == base_kv:
-            ctx.render(key, [], ["kv_type", "ctx_size"])  # a q4_0 win keeps the baseline (engines.json kv_class)
-            note = "baseline q4_0 kept (overrides cleared)"
-        elif winner == "f16":
-            ctx.render(key, [("kv_type", "f16")] + ([("ctx_size", str(int(f16_cap)))] if f16_cap else []), [])
-            note = f"f16 written to overrides.json, --ctx-size capped to {f16_cap} (~10 GB of cache beside the weights)"
-        else:
-            ctx.render(key, [("kv_type", winner)], ["ctx_size"])
-            note = f"{winner} written to overrides.json"
-        res.kv_proof_ok = True
-        res.kv_proof_msg = f"{key}: {winner} applied and coherent (ladder: {summary}; {note})"
-        record("V4", "pass", res.kv_proof_msg)
-        res.generated = True
-        res.ok = res.released is not False
-        res.v22_result = "pass" if res.ok else "deferred"
-        res.v22_msg = (f"DeepSeek V4 Flash 0731 UD-Q4_K_XL loads and generates coherently with {winner} KV "
-                       f"(decode {res.decode_tps_512} tok/s at 512, prefill {res.prefill_tps_512} tok/s; {note})")
-        if not res.ok:
-            res.v22_msg += f"; deferred: {res.release_note} (R19)"
-    else:
-        ctx.render(key, [], ["kv_type", "ctx_size"])
-        reason = stop_reason or f"no coherent rung ({summary})"
-        res.kv_proof_msg = f"{key}: no KV type proven coherent, V22 deferred (R19): {reason}"
-        record("V4", "deferred", res.kv_proof_msg)
-        res.v22_result = "deferred"
-        res.v22_msg = f"DeepSeek V4 Flash deferred without blocking the phase (R19): {reason}; ladder: {summary}"
-        res.ok = False
+        if won:
+            break  # kv_ladder_rule 2: the first coherent, proven rung wins
+    v = decide_ladder(key, ladder, res.ladder, base_kv, f16_cap, stop_reason, res.released, res.release_note,
+                      res.decode_tps_512, res.prefill_tps_512)
+    ctx.render(key, v.set_ov, v.clear_ov)
+    res.kv_applied = v.winner
+    res.kv_proof_ok = v.v4_result == "pass"
+    res.kv_proof_msg = v.v4_msg
+    res.generated = bool(v.winner)
+    res.v22_result, res.v22_msg = v.v22_result, v.v22_msg
+    if v.deviation:
+        res.baseline_deviation = (res.baseline_deviation + " | " if res.baseline_deviation else "") + v.deviation
+    res.ok = bool(v.winner) and res.released is not False and not res.band_fail
     res.resident_after = False
+    finalize_control(res, ctl)
     res.save(ctx)
+    record("V4", v.v4_result, v.v4_msg)
     log(f"{key}: ladder result: {res.v22_result}: {res.v22_msg}")
 
 
@@ -936,12 +1323,25 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
 
 
 def cmd_prepare(ctx: Ctx, _args: argparse.Namespace) -> int:
-    ctl = Control(ctx.orch_url)
+    ctl = Control(ctx.orch_url, ctx.admin_token)
     active = [k for k in ctx.core_keys() if unit_active(k)]
-    for k in active:
-        log(f"prepare: {k} is resident before the tests; unloading it")
-        ctl.unload(k)
-    if active:
+    if ctl.mode == "orchestrator":
+        ledger = ctl.resident_keys()
+        foreign = [k for k in active if k not in ledger]
+        if foreign:
+            raise Infra(f"{foreign} active but not in the Arbiter's ledger (resident: {ledger}); a unit the Arbiter "
+                        "does not own is never stopped behind it: restart atlas-orchestrator.service (its startup "
+                        "stops unowned units) or stop the unit by hand")
+        to_unload = [k for k in ctx.core_keys() if k in ledger]
+    else:
+        to_unload = active
+    for k in to_unload:
+        log(f"prepare: {k} is resident before the tests; unloading it (via {ctl.mode})")
+        try:
+            ctl.unload(k)
+        except RuntimeError as exc:
+            raise Infra(f"cannot establish the baseline: {exc}") from exc
+    if to_unload:
         time.sleep(5)
     # Settle: two readings 10 s apart within tolerance, so the baseline is not taken mid-release.
     deadline = time.monotonic() + RELEASE_TIMEOUT_S
@@ -960,7 +1360,7 @@ def cmd_prepare(ctx: Ctx, _args: argparse.Namespace) -> int:
     ctx.results_dir.mkdir(parents=True, exist_ok=True)
     (ctx.results_dir / "baseline.json").write_text(json.dumps({
         "gtt_used_bytes": cur, "gtt_total_bytes": total, "measured_at": now_iso(), "control_mode": ctl.mode,
-        "unloaded_first": active}, indent=2) + "\n", encoding="utf-8")
+        "fallback_reason": ctl.fallback_reason, "unloaded_first": to_unload}, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
@@ -970,19 +1370,17 @@ def cmd_engine(ctx: Ctx, args: argparse.Namespace) -> int:
 
 
 def cmd_finish(ctx: Ctx, args: argparse.Namespace) -> int:
-    ctl = Control(ctx.orch_url)
+    ctl = Control(ctx.orch_url, ctx.admin_token)
     baseline = read_baseline(ctx)
     prev = args.previous
     if prev and unit_active(prev):
         log(f"finish: unloading the last engine {prev}")
-        ctl.unload(prev)
-        ok, secs, note = wait_release(baseline, prev)
+        ok, secs, note = unload_and_release(ctl, prev, baseline)
         credit_release(ctx, prev, ok, secs, note)
     for k in ctx.core_keys():
         if unit_active(k):
-            log(f"finish: {k} still active (unexpected); stopping it")
-            ctl.unload(k)
-            ok, secs, note = wait_release(baseline, k)
+            log(f"finish: {k} still active (unexpected); unloading it")
+            ok, secs, note = unload_and_release(ctl, k, baseline)
             credit_release(ctx, k, ok, secs, note)
     return 0
 
@@ -992,40 +1390,51 @@ def fmt_num(v: float | None) -> str:
 
 
 def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
+    """Section 21 V10 per engine: load, generate (512 and 8k), swap, release, tok/s within the band."""
     band = spec.get("expected_decode_tok_s")
     band_s = f"{band[0]}-{band[1]}" if band else "n/a"
-    warn = " WARN" if res.warnings else ""
     if not res.load_ok:
-        return "fail", f"{res.key}: load FAILED ({res.load_error[:200]})"
-    parts = [f"{res.key}: load ok (KV {res.kv_applied or res.kv_requested})",
+        return "fail", f"{res.key}: load FAILED ({res.load_error[:200]}) [control {res.control_mode or '?'}]"
+    parts = [f"{res.key}: load ok (KV {res.kv_applied or res.kv_requested}, control {res.control_mode or '?'})",
              f"decode {fmt_num(res.decode_tps_512)}/{fmt_num(res.decode_tps_8k)} tok/s at 512/8k (expected {band_s})",
              f"prefill {fmt_num(res.prefill_tps_512)}/{fmt_num(res.prefill_tps_8k)} tok/s",
              f"swap {fmt_num(res.swap_s)}s",
+             f"footprint {fmt_gb(res.footprint_bytes) if res.footprint_bytes is not None else '-'}",
              f"released {'yes' if res.released else ('NO' if res.released is False else '?')}"]
     if res.prefill_8k_note:
         parts.append(f"8k: {res.prefill_8k_note[:120]}")
+    if res.band_fail:
+        parts.append(f"BAND FAIL: {res.band_fail}")
     if res.warnings:
         parts.append("warn: " + " | ".join(w[:160] for w in res.warnings))
     if res.load_error:
-        parts.append(f"error: {res.load_error[:160]}")
-    ok = res.generated and not res.load_error and res.released is True
-    return ("pass" if ok else "fail"), "; ".join(parts) + warn
+        parts.append(f"error: {res.load_error[:200]}")
+    ok = (res.generated and not res.load_error and not res.crashed_at_8k and not res.stopped_externally
+          and not res.band_fail and res.released is True)
+    return ("pass" if ok else "fail"), "; ".join(parts)
 
 
 def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
     failed: list[str] = []
     warned: list[str] = []
     missing: list[str] = []
+    off_band: list[str] = []
     apex_lines: list[str] = []
     for key in ctx.core_keys():
         spec = ctx.spec(key)
         res = load_result(ctx, key)
+        is_apex = spec.get("arbiter_class") == "apex"
         if res is None:
-            missing.append(key)
-            record("V10", "fail", f"{key}: no load-test result (step 02 did not reach it)")
+            if is_apex:
+                record("V10", "deferred", f"{key}: no ladder result [Apex: see V22]")
+                record("V22", "deferred", f"{key}: no ladder result recorded (R19)")
+                apex_lines.append(f"{key}=deferred")
+            else:
+                missing.append(key)
+                record("V10", "fail", f"{key}: no load-test result (step 02 did not reach it)")
             continue
         result, msg = v10_line(res, spec)
-        if spec.get("arbiter_class") == "apex":
+        if is_apex:
             # R19: the Apex engine has its own row (V22); its V10 line is informational and never fails the summary.
             record("V10", "pass" if result == "pass" else "deferred", msg + " [Apex: see V22]")
             apex_lines.append(f"{key}={res.v22_result or 'deferred'}")
@@ -1036,28 +1445,41 @@ def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
             failed.append(key)
         elif res.warnings:
             warned.append(key)
+        if res.band_fail or "under the expected band" in res.band_note:
+            off_band.append(key)
     tested = [k for k in ctx.core_keys() if ctx.spec(k).get("arbiter_class") != "apex"]
     if failed or missing:
         record("V10", "fail", f"summary: {len(failed) + len(missing)} of {len(tested)} engines failed "
-               f"({', '.join(failed + missing)}); warns: {', '.join(warned) or 'none'}; "
-               f"apex: {', '.join(apex_lines) or '-'}")
+               f"({', '.join(failed + missing)}); off-band: {', '.join(off_band) or 'none'}; "
+               f"warns: {', '.join(warned) or 'none'}; apex: {', '.join(apex_lines) or '-'}")
     else:
+        bands = "within the expected bands" if not off_band else f"tok/s under band for {', '.join(off_band)}"
         record("V10", "pass", f"summary: all {len(tested)} engines load, generate, swap and release memory at their "
-               f"fixed quantisations; warns: {', '.join(warned) or 'none'}; apex: {', '.join(apex_lines) or '-'}")
+               f"fixed quantisations, {bands}; warns: {', '.join(warned) or 'none'}; "
+               f"apex: {', '.join(apex_lines) or '-'}")
     return 0
 
 
 def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
-    cols = ("engine", "load", "KV type", "decode 512/8k", "prefill 512/8k", "swap s", "released", "notes")
+    cols = ("engine", "load", "KV type", "decode 512/8k", "prefill 512/8k", "swap s", "footprint", "released",
+            "control", "notes")
     rows: list[tuple[str, ...]] = []
+    deviations: list[tuple[str, str]] = []
     for key in ctx.core_keys():
+        spec = ctx.spec(key)
         res = load_result(ctx, key)
+        if spec.get("baseline_deviation"):
+            deviations.append((key, str(spec["baseline_deviation"])))
         if res is None:
-            rows.append((key, "-", "-", "-", "-", "-", "-", "not tested"))
+            rows.append((key, "-", "-", "-", "-", "-", "-", "-", "-", "not tested"))
             continue
+        if res.baseline_deviation and res.baseline_deviation != str(spec.get("baseline_deviation") or ""):
+            deviations.append((key, res.baseline_deviation))
         notes = []
         if res.arbiter_class == "apex":
             notes.append(f"V22 {res.v22_result or '?'}")
+        if res.band_fail:
+            notes.append("BELOW BAND")
         if res.warnings:
             notes.append("warn")
         if res.prefill_8k_note:
@@ -1067,7 +1489,9 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
         rows.append((key, "ok" if res.load_ok else "FAIL", res.kv_applied or res.kv_requested or "-",
                      f"{fmt_num(res.decode_tps_512)}/{fmt_num(res.decode_tps_8k)}",
                      f"{fmt_num(res.prefill_tps_512)}/{fmt_num(res.prefill_tps_8k)}", fmt_num(res.swap_s),
-                     "yes" if res.released else ("NO" if res.released is False else "?"), "; ".join(notes) or "-"))
+                     fmt_gb(res.footprint_bytes) if res.footprint_bytes is not None else "-",
+                     "yes" if res.released else ("NO" if res.released is False else "?"),
+                     res.control_mode or "?", "; ".join(notes) or "-"))
     widths = [max(len(str(r[i])) for r in [cols, *rows]) for i in range(len(cols))]
     for r in [cols, *rows]:
         print("  ".join(str(c).ljust(w) for c, w in zip(r, widths, strict=True)), file=sys.stderr)
@@ -1075,44 +1499,175 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
     if co.is_file():
         d = json.loads(co.read_text(encoding="utf-8"))
         print(f"two-residency: {d.get('summary', '-')}", file=sys.stderr)
+    # engines.json baseline_deviation_rule: every deviation from a closed value is printed here, never only in the file.
+    print("Baseline deviations (engines.json baseline_deviation_rule):" if deviations else
+          "Baseline deviations: none", file=sys.stderr)
+    for key, text in deviations:
+        print(f"  {key}: {text}", file=sys.stderr)
     return 0
 
 
-# --- two-residency (Section 17 step 3; V21, V14b) ---------------------------------------------------------------------
+# --- two-residency (Section 17 step 3; V21) and the real-engine Arbiter proof (V14b) ---------------------------------
+
+
+def queue_proof(a: dict[str, Any], b: dict[str, Any], solo_second_s: float) -> tuple[bool, str]:
+    """Pure V21 arithmetic: did the second request start only after the first finished? With timings passed through,
+    the second's busy time (prompt_ms + predicted_ms) is subtracted from its receive time to find when it started;
+    without timings, its wall clock must cover the first's wall clock plus most of its own solo duration."""
+    ta, tb = a.get("timings") or {}, b.get("timings") or {}
+    wall_a, wall_b = a["t_recv"] - a["t_send"], b["t_recv"] - b["t_send"]
+    if tb.get("prompt_ms") is not None and tb.get("predicted_ms") is not None:
+        busy_b = (float(tb["prompt_ms"]) + float(tb["predicted_ms"])) / 1000.0
+        start_b = b["t_recv"] - busy_b
+        gap = start_b - a["t_recv"]
+        ok = gap >= -1.0
+        busy_a = (float(ta.get("prompt_ms", 0)) + float(ta.get("predicted_ms", 0))) / 1000.0 if ta else None
+        proof = (f"timings: second started {gap:+.1f}s relative to the first's completion "
+                 f"(second busy {busy_b:.1f}s of {wall_b:.1f}s wall; first {wall_a:.1f}s wall"
+                 + (f", first busy {busy_a:.1f}s" if busy_a is not None else "") + ")")
+        return ok, proof
+    ok = wall_b >= wall_a + 0.8 * solo_second_s - 1.0
+    proof = (f"wall-clock (no timings passed through): second took {wall_b:.1f}s vs {solo_second_s:.1f}s solo while "
+             f"the first took {wall_a:.1f}s")
+    return ok, proof
+
+
+def pick_probe_key(ctx: Ctx, exclude: Sequence[str]) -> str:
+    """The engine whose unit profile is rendered over budget for the V14b proof: nemotron-3-super by preference (the
+    Deep Think adversary engine, so one over-budget profile makes both the standard and the deep tier not fit), else
+    the first non-Apex core engine that is not part of the pair."""
+    cands = [k for k in ctx.core_keys() if k not in exclude and ctx.spec(k).get("arbiter_class") != "apex"]
+    if "nemotron-3-super" in cands:
+        return "nemotron-3-super"
+    if not cands:
+        raise Infra("no engine left for the V14b over-budget proof (engines.json lists only the pair?)")
+    return cands[0]
+
+
+def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: dict[str, Any],
+                          loaded: list[str]) -> tuple[bool, str]:
+    """Section 21 V14, real engines: the Arbiter refuses an over-budget load and downgrades a Deep Think depth when
+    the projected footprint exceeds budget. On a healthy node every engine fits the ~170 GB budget alone (Section
+    4.1) and the Arbiter EVICTS to make room rather than refusing, so an honest over-budget projection is produced
+    the way the Arbiter itself reads it: the probe engine's unit env file (phase2/engine-env.py, root) is rendered
+    with a ctx_size override doubled until /internal/deep-think/plan says the standard tier no longer fits; then
+    (a) the deep tier is planned and must be downgraded, (b) POST /arbiter/load of that engine at that profile must be
+    refused. The override is restored in a finally block; nothing is loaded. The Arbiter's KV model (arbiter.py)
+    scales with ctx, which is why doubling reaches over budget in a few steps."""
+    key = pick_probe_key(ctx, exclude)
+    spec = ctx.spec(key)
+    prior_ctx = ctx.override_of(key, "ctx_size")
+    base_ctx = int(prior_ctx or spec["ctx_size"])
+    plan_hdr = ctl.headers  # the admin header is harmless on /internal (loopback-only either way)
+    out["v14b_probe_engine"] = key
+    out["v14b_prior_ctx_override"] = prior_ctx
+
+    def plan(tier: str) -> dict[str, Any]:
+        code, resp = http("POST", f"{ctl.orch_url}/internal/deep-think/plan", {"tier": tier, "task_id": TASK_ID},
+                          timeout=60, headers=plan_hdr)
+        if code != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"POST /internal/deep-think/plan {tier} answered {code}: {short(resp, 200)}")
+        return resp
+
+    try:
+        before = plan("deep")
+        out["v14b_plan_deep_before"] = before
+        log(f"coresident/V14b: deep-think plan before the proof: granted={before.get('granted')} "
+            f"({before.get('reason')}; required {fmt_gb(before.get('required_bytes') or 0)}, "
+            f"budget {fmt_gb(before.get('budget_bytes') or 0)})")
+        ctx_over = base_ctx
+        env: dict[str, str] = {}
+        over = False
+        for _ in range(V14B_MAX_DOUBLINGS):
+            ctx_over *= 2
+            env = ctx.render(key, [("ctx_size", str(ctx_over))], [])
+            p = plan("standard")
+            if p.get("granted") != "standard":
+                over = True
+                break
+            log(f"coresident/V14b: {key} at ctx {ctx_over} still fits the standard tier "
+                f"(required {fmt_gb(p.get('required_bytes') or 0)} of budget {fmt_gb(p.get('budget_bytes') or 0)})")
+        if not over:
+            return False, (f"could not render {key} over budget within {V14B_MAX_DOUBLINGS} doublings of ctx_size "
+                           f"(last {ctx_over}); the Arbiter's projection does not scale with ctx as expected")
+        # (a) rule 8: the deep tier must be downgraded now that its adversary engine does not fit.
+        deep = plan("deep")
+        out["v14b_plan_deep_over"] = deep
+        downgraded = deep.get("granted") != "deep" and "downgrad" in str(deep.get("reason", "")).lower()
+        a_msg = (f"deep-think deep -> {deep.get('granted')} ({deep.get('reason')}; budget "
+                 f"{fmt_gb(deep.get('budget_bytes') or 0)})")
+        # (b) rule 2: the load itself must be refused, not evicted around.
+        try:
+            code, resp = ctl.post("/arbiter/load", {"engine": key, "ctx": int(env["ATLAS_CTX_SIZE"]),
+                                                    "parallel": int(env["ATLAS_PARALLEL"]), "task_id": TASK_ID},
+                                  timeout=120)
+        except HttpFail as exc:
+            return False, f"{a_msg}; POST /arbiter/load {key} failed: {exc}"
+        out["v14b_load_decision"] = resp if isinstance(resp, dict) else {"http": code, "body": short(resp)}
+        if code != 200 or not isinstance(resp, dict):
+            return False, f"{a_msg}; POST /arbiter/load {key} answered HTTP {code} {short(resp, 200)}"
+        decision, reason = resp.get("decision"), str(resp.get("reason", ""))
+        if decision == "granted":
+            loaded.append(key)  # it really loaded: cleanup must unload it, and the proof failed
+            return False, f"{a_msg}; the Arbiter GRANTED the over-budget load of {key} ({reason})"
+        refused = decision == "refused" and "budget" in reason.lower()
+        b_msg = (f"load of {key} at ctx {env['ATLAS_CTX_SIZE']} x {env['ATLAS_PARALLEL']} slots "
+                 f"(projected {fmt_gb(resp.get('projected_bytes') or 0)}) -> {decision}: {reason}")
+        ok = downgraded and refused
+        msg = (f"{'refused' if refused else 'NOT refused'}: {b_msg}; "
+               f"{'downgraded' if downgraded else 'NOT downgraded'}: {a_msg}; "
+               "probe profile rendered through engine-env.py for the proof and restored")
+        return ok, msg
+    finally:
+        restore: list[tuple[str, str]] = [("ctx_size", str(prior_ctx))] if prior_ctx is not None else []
+        clear = [] if prior_ctx is not None else ["ctx_size"]
+        env_back = ctx.render(key, restore, clear)
+        log(f"coresident/V14b: {key} env restored (ctx {env_back.get('ATLAS_CTX_SIZE')}, "
+            f"parallel {env_back.get('ATLAS_PARALLEL')})")
 
 
 def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     text_key, vision_key = args.text, args.vision
     tspec, vspec = ctx.spec(text_key), ctx.spec(vision_key)
-    ctl = Control(ctx.orch_url)
+    ctl = Control(ctx.orch_url, ctx.admin_token)
     baseline = read_baseline(ctx)
-    out: dict[str, Any] = {"text": text_key, "vision": vision_key, "control_mode": ctl.mode, "tested_at": now_iso()}
+    out: dict[str, Any] = {"text": text_key, "vision": vision_key, "control_mode": ctl.mode,
+                           "fallback_reason": ctl.fallback_reason, "tested_at": now_iso()}
     for k in ctx.core_keys():
         if unit_active(k):
             log(f"coresident: {k} is resident; unloading it first")
-            ctl.unload(k)
-            wait_release(baseline, k)
+            ok, _, note = unload_and_release(ctl, k, baseline)
+            if not ok:
+                raise Infra(f"cannot start the two-residency test: {k} did not release: {note}")
     loaded: list[str] = []
     used_after: dict[str, int] = {}  # GTT used right after each load, so each unload has a measured release target
 
-    def cleanup() -> None:
+    def cleanup() -> list[str]:
         # Reverse order: after unloading the vision engine the counter must be back where it was with the text engine
         # alone; after unloading the text engine it must be back at the baseline (Section 4.2 rule 5, per engine).
+        problems: list[str] = []
         for i, k in reversed(list(enumerate(loaded))):
-            ctl.unload(k)
             target = baseline if i == 0 else used_after.get(loaded[i - 1], baseline)
-            ok, _, note = wait_release(target, k)
+            ok, _, note = unload_and_release(ctl, k, target)
             out[f"released_{k}"] = ok
             out[f"release_note_{k}"] = note
+            if not ok:
+                problems.append(f"{k} did not release after the two-residency test ({note})")
         # Restore the vision engine's stand-alone rendering (8 slots); the orchestrator decides co-residency live.
         ctx.render(vision_key, [], ["coresident"])
+        return problems
 
     def finish(v21: tuple[str, str], v14b: tuple[str, str]) -> int:
-        cleanup()
+        problems = cleanup()
+        if problems:
+            # Section 4.2 rule 5 is part of the two-residency proof itself: a leak fails V21, never a stale V10.
+            v21 = ("fail", f"{v21[1]}; release: {' | '.join(problems)}")
         out["v21"] = v21
         out["v14b"] = v14b
-        out["summary"] = f"V21 {v21[0]}: {v21[1][:160]} | V14b {v14b[0]}: {v14b[1][:120]}"
-        (ctx.results_dir / "coresident.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+        out["control_mode"] = ctl.mode
+        out["summary"] = f"V21 {v21[0]}: {v21[1][:200]} | V14b {v14b[0]}: {v14b[1][:200]}"
+        (ctx.results_dir / "coresident.json").write_text(json.dumps(out, indent=2, default=str) + "\n",
+                                                          encoding="utf-8")
         record("V21", *v21)
         record("V14b", *v14b)
         return 0
@@ -1129,15 +1684,25 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
             secs = ctl.load(key, int(env["ATLAS_CTX_SIZE"]), int(env["ATLAS_PARALLEL"]), int(env["LLAMA_ARG_PORT"]))
         except RuntimeError as exc:
             out[f"load_error_{key}"] = str(exc)
-            loaded.append(key)  # stop it in cleanup even if half-loaded
-            beside = loaded[0] if loaded[0] != key else "nothing"
+            if unit_active(key) or key in ctl.resident_keys():
+                loaded.append(key)  # stop it in cleanup even if half-loaded
+            beside = loaded[0] if loaded and loaded[0] != key else "nothing"
             return finish(("fail", f"{key} failed to load beside {beside}: {str(exc)[:200]}"),
-                          ("fail", f"{key} not loaded; queueing not testable"))
+                          ("fail", f"{key} not loaded; Arbiter proof not testable"))
         loaded.append(key)
         time.sleep(3)
         used_after[key] = gtt_used_bytes()
         log(f"coresident: {key} loaded in {secs:.0f}s (ctx {env['ATLAS_CTX_SIZE']}, parallel {env['ATLAS_PARALLEL']}); "
             f"GTT used {fmt_gb(used_after[key])}")
+    if ctl.mode == "orchestrator":
+        # Rule 3: the Arbiter may have evicted the text engine to fit the vision one; the ledger says.
+        ledger = ctl.resident_keys()
+        gone = [k for k in loaded if k not in ledger]
+        if gone:
+            loaded[:] = [k for k in loaded if k in ledger]
+            why = (f"the Arbiter evicted {gone} to load {vision_key} (resident now: {ledger}; last decision: "
+                   f"{short(ctl.last_decision, 200)}); the pair does not co-reside at these profiles")
+            return finish(("fail", why), ("fail", f"pair not resident; {why}"))
     time.sleep(5)
     used = gtt_used_bytes()
     delta = used - baseline
@@ -1152,8 +1717,9 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     log(f"coresident: {'OK' if residency_ok else 'OUT OF TOLERANCE'}: {mem_msg}")
 
     if ctl.mode != "orchestrator":
-        why = f"queueing not provable: {ctl.fallback_reason} (only the Arbiter queues a second generation)"
-        return finish(("fail", f"{mem_msg}; {why}"), ("fail", why))
+        why = (f"not provable via systemctl fallback: {ctl.fallback_reason} (only the Arbiter queues a second "
+               "generation, refuses a load or downgrades a tier)")
+        return finish(("fail", f"{mem_msg}; queueing {why}"), ("fail", f"refusal/downgrade {why}"))
 
     # Solo timings of each engine (direct, no Arbiter) give the wall-clock reference for the concurrent run.
     tport, vport = int(tenv["LLAMA_ARG_PORT"]), int(venv["LLAMA_ARG_PORT"])
@@ -1163,12 +1729,13 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     solo_v = chat(f"http://127.0.0.1:{vport}", vision_key, q_vision, 160)
     if solo_t["error"] or solo_v["error"]:
         why = f"solo generation failed: text={solo_t['error'][:120]!r} vision={solo_v['error'][:120]!r}"
-        return finish(("fail", f"{mem_msg}; {why}"), ("fail", why))
+        return finish(("fail", f"{mem_msg}; {why}"), ("fail", f"not attempted: {why}"))
     d_t = solo_t["t_recv"] - solo_t["t_send"]
     d_v = solo_v["t_recv"] - solo_v["t_send"]
     log(f"coresident: solo durations text {d_t:.1f}s, vision {d_v:.1f}s")
 
-    # Two requests at once THROUGH THE ORCHESTRATOR; the Arbiter must run the second only after the first finished.
+    # Two requests at once THROUGH THE ORCHESTRATOR (/internal/v1/chat/completions, model = engine key); the Arbiter
+    # must run the second only after the first finished (Section 4.2 rules 3, 4).
     results: dict[str, dict[str, Any]] = {}
     seen_queue: list[str] = []
     seen_generating: set[str] = set()
@@ -1186,7 +1753,7 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
             time.sleep(0.5)
 
     def fire(name: str, model: str, msgs: list[dict[str, str]], max_tokens: int) -> None:
-        results[name] = chat(ctx.orch_url, model, msgs, max_tokens)
+        results[name] = chat(ctx.orch_url, model, msgs, max_tokens, path=ORCH_CHAT_PATH)
 
     poller = threading.Thread(target=poll, daemon=True)
     poller.start()
@@ -1200,49 +1767,38 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     stop_poll.set()
     poller.join(timeout=2)
     a, b = results["first"], results["second"]
-    out["concurrent"] = {"first": {k: v for k, v in a.items() if k != "content"},
-                         "second": {k: v for k, v in b.items() if k != "content"},
+    out["concurrent"] = {"first": {k: v for k, v in a.items() if k not in ("content", "reasoning")},
+                         "second": {k: v for k, v in b.items() if k not in ("content", "reasoning")},
                          "queue_seen": seen_queue[:5], "generating_seen": sorted(seen_generating)}
     if a["error"] or b["error"]:
         why = (f"orchestrator chat failed: first(model={text_key})={a['error'][:140]!r} "
                f"second(model={vision_key})={b['error'][:140]!r} "
-               "(contract: model = engine key, see loadtest.py header)")
-        return finish(("fail", f"{mem_msg}; {why}"), ("fail", why))
-    proof = ""
-    ok = False
-    ta, tb = a["timings"], b["timings"]
-    if tb.get("prompt_ms") is not None and tb.get("predicted_ms") is not None:
-        busy_b = (float(tb["prompt_ms"]) + float(tb["predicted_ms"])) / 1000.0
-        start_b = b["t_recv"] - busy_b
-        gap = start_b - a["t_recv"]
-        ok = gap >= -1.0
-        wall_a, wall_b = a["t_recv"] - a["t_send"], b["t_recv"] - b["t_send"]
-        busy_a = (float(ta.get("prompt_ms", 0)) + float(ta.get("predicted_ms", 0))) / 1000.0 if ta else None
-        proof = (f"timings: second started {gap:+.1f}s relative to the first's completion "
-                 f"(second busy {busy_b:.1f}s of {wall_b:.1f}s wall; first {wall_a:.1f}s wall"
-                 + (f", first busy {busy_a:.1f}s" if busy_a is not None else "") + ")")
-    else:
-        wall_b = b["t_recv"] - b["t_send"]
-        ok = wall_b >= (a["t_recv"] - a["t_send"]) + 0.8 * d_v - 1.0
-        proof = (f"wall-clock (no timings passed through): second took {wall_b:.1f}s vs {d_v:.1f}s solo while the "
-                 f"first took {a['t_recv'] - a['t_send']:.1f}s")
+               f"(contract: POST {ORCH_CHAT_PATH} with model = engine key, see loadtest.py header)")
+        v14b_ok, v14b_msg = False, "not attempted: " + why
+        try:
+            v14b_ok, v14b_msg = arbiter_refusal_proof(ctx, ctl, (text_key, vision_key), out, loaded)
+        except (RuntimeError, Infra) as exc:
+            v14b_msg = f"proof aborted: {exc}"
+        return finish(("fail", f"{mem_msg}; {why}"), ("pass" if v14b_ok else "fail", v14b_msg))
+    ok, proof = queue_proof(a, b, d_v)
     if seen_queue:
         proof += f"; Arbiter status showed a generation queue ({seen_queue[0]})"
     if seen_generating:
         proof += f"; generating seen: {sorted(seen_generating)}"
     log(f"coresident: queueing {'PROVEN' if ok else 'NOT proven'}: {proof}")
     verb = "queued behind" if ok else "did NOT wait for"
-    v14b = ("pass" if ok else "fail",
-            f"second generation request ({vision_key}) {verb} the first ({text_key}); {proof}")
     v21 = ("pass" if (ok and residency_ok) else "fail",
-           f"{mem_msg}; {'queueing proven' if ok else 'queueing NOT proven'}"
+           f"{mem_msg}; second generation request ({vision_key}) {verb} the first ({text_key}); {proof}"
            f"{'' if residency_ok else '; memory out of tolerance'}")
-    rc = finish(v21, v14b)
-    for k in loaded:
-        if out.get(f"released_{k}") is False:
-            record("V10", "fail",
-                   f"{k}: memory not released after the two-residency test ({out.get(f'release_note_{k}')})")
-    return rc
+
+    # V14b: refusal and downgrade against the real engine set while the pair is resident.
+    try:
+        v14b_ok, v14b_msg = arbiter_refusal_proof(ctx, ctl, (text_key, vision_key), out, loaded)
+    except (RuntimeError, Infra) as exc:
+        v14b_ok, v14b_msg = False, f"proof aborted: {exc}"
+    log(f"coresident: V14b {'PASS' if v14b_ok else 'FAIL'}: {v14b_msg}")
+    v14b = ("pass" if v14b_ok else "fail", v14b_msg)
+    return finish(v21, v14b)
 
 
 # --- main -------------------------------------------------------------------------------------------------------------
@@ -1253,12 +1809,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--engines", required=True, help="config/engines.json")
     ap.add_argument("--env-dir", required=True, help="$ATLAS_ETC/engines")
     ap.add_argument("--results-dir", required=True, help="$ATLAS_STATE/phase3/results")
-    ap.add_argument("--orch-url", required=True, help="http://127.0.0.1:$ORCH_PORT")
+    ap.add_argument("--orch-url", required=True, help="http://127.0.0.1:$ORCH_PORT (loopback only)")
     ap.add_argument("--engine-env", required=True, help="phase2/engine-env.py")
     ap.add_argument("--models-dir", required=True)
     ap.add_argument("--slots-dir", required=True)
     ap.add_argument("--port-base", type=int, required=True)
     ap.add_argument("--overrides", required=True, help="$ATLAS_ETC/engines/overrides.json")
+    ap.add_argument("--admin-token-file", default=None,
+                    help="ORCH_ADMIN_TOKEN_FILE of orchestrator.env when configured (X-Atlas-Token for /arbiter/*)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("prepare").set_defaults(fn=cmd_prepare)
     p = sub.add_parser("engine")
@@ -1275,10 +1833,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--vision", required=True)
     p.set_defaults(fn=cmd_coresident)
     args = ap.parse_args(argv)
-    ctx = Ctx(engines_path=Path(args.engines), env_dir=Path(args.env_dir), results_dir=Path(args.results_dir),
-              orch_url=args.orch_url, engine_env=Path(args.engine_env), models_dir=Path(args.models_dir),
-              slots_dir=Path(args.slots_dir), port_base=args.port_base, overrides=Path(args.overrides))
     try:
+        require_loopback(args.orch_url)
+        ctx = Ctx(engines_path=Path(args.engines), env_dir=Path(args.env_dir), results_dir=Path(args.results_dir),
+                  orch_url=args.orch_url, engine_env=Path(args.engine_env), models_dir=Path(args.models_dir),
+                  slots_dir=Path(args.slots_dir), port_base=args.port_base, overrides=Path(args.overrides),
+                  admin_token=read_admin_token(args.admin_token_file))
+        log(f"{args.cmd}: orchestrator {args.orch_url}, GTT counter under {drm_root()}"
+            + (" (admin token loaded)" if ctx.admin_token else ""))
         ctx.load_engines()
         return int(args.fn(ctx, args))
     except Infra as exc:

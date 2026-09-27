@@ -5,21 +5,49 @@ Endpoints
     GET  /health                       200 {"status":"ok"} when the app is wired (arbiter measured, ledger open)
     GET  /v1/models                    {"data":[{"id":"atlas"},{"id":"ren"},{"id":"arthur"}]} (12.1)
     POST /v1/chat/completions          OpenAI shape, stream true/false. "atlas" runs the 4-Way Router; "ren"/"arthur"
-                                       force the hemisphere (the router's own [REN]/[ARTHUR] override, 7.2 rule 4).
+                                       force the hemisphere (the router's own [REN]/[ARTHUR] override, 7.2 rule 4;
+                                       a hard-keyword hit still wins, 7.2 rule 1, and the redirect is said and
+                                       recorded as an "overridden-routing" strike). An ENGINE KEY as the model (the
+                                       CONVENTIONS.md §8 keys) is the Phase 3 load-test contract (phase3/loadtest.py:
+                                       "accepts model: <engine key>"): it runs the internal pipeline (no router, no
+                                       memory) through the Arbiter's load and generation lock; /v1/models still lists
+                                       only the three ids of 12.1.
                                        Pipeline (Appendix A): router -> layered prompt (prompts.build_system_prompt,
                                        4.4) -> ledger task -> Engine Arbiter load (waits in its queue) -> generation
-                                       lock -> llama-server SSE relayed as OpenAI chunks -> memory write (unless
-                                       vault-tagged) -> ledger done; on failure an Ouroboros strike. The router's
-                                       `command` (deep-think, ouroboros-strike, aegis, vault-session) is honoured.
+                                       lock -> llama-server SSE relayed as OpenAI chunks, each sentence through the
+                                       never-delegate rewrite (16.1 rule 5; governance.never_delegate_rewrite) with
+                                       the PRINCIPAL register set -> memory write (unless vault-tagged) -> ledger
+                                       done; on failure an Ouroboros strike. The router's `command` (deep-think,
+                                       ouroboros-strike, aegis, vault-session) is honoured.
     POST /vault/open {passphrase}      pipes it to atlas-vault; never logged (Section 11); /vault/lock; /vault/status
     GET  /approvals[?status=held]      the queue (16.2); POST /approvals/{id}/approve|reject {decided_by, note}
     POST /arbiter/register             {engine, total_bytes, task_id}: Phase 3/4 record a measured footprint (rule 1)
+    POST /arbiter/load                 {engine, ctx, parallel, task_id} -> {decision: granted|queued|refused, reason,
+                                       projected_bytes}: a load through the Arbiter (4.2 rule 2; phase3/loadtest.py)
+    POST /arbiter/unload               {engine, task_id} -> the same shape (rule 5 release check inside)
+    POST /arbiter/remeasure            re-read the resident set (4.1) while NO engine is resident: Phase 2 step 4/5
+                                       add the small models after the orchestrator measured at step 2. The chat path
+                                       and /arbiter/load also re-measure lazily whenever nothing is resident.
     GET  /arbiter/status               the Arbiter's ledger view (4.2 rule 9)
     POST /strike                       {persona, domain, context, error, correction, kind}: Ouroboros (9.4)
     POST /internal/v1/chat/completions {model: <engine key>}: generation for the Celery tasks through the Arbiter
-                                       (9.7 C15); loopback only, never listed in /v1/models
+                                       (9.7 C15); loopback only, never listed in /v1/models. Gets its own CHILD ledger
+                                       row (parent_task_id = the caller's atlas_task_id); the child id is returned in
+                                       the `atlas` object so the caller can correlate.
     POST /internal/route               {message} -> the router's decision as JSON (retention needs the hemisphere)
     POST /internal/deep-think/plan     {tier} -> the Arbiter's plan (4.2 rule 8)
+
+Authentication (fix round). Every route except GET /health and /v1/* is an admin route: it needs the header
+`X-Atlas-Token` equal to the token in ORCH_ADMIN_TOKEN_FILE (a file under /etc/atlas/secrets, `ORCH_ADMIN_TOKEN=...`
+or the bare token; atlas.tasks.admin_token reads the same file for the Celery side). When no token file is configured
+(the Day 1 state: phase2/02-orchestrator.sh does not write one yet, see the notes), the admin routes accept LOOPBACK
+clients only, so a non-loopback bind never exposes the approval gate, the vault button or engine-keyed generation.
+/internal/* is loopback-only in both modes. Section 11 ("opened by a button") and 16.2 ("until the Principal taps
+approve") need the interface to reach these routes over LAN/WireGuard, which is what the token is for.
+
+Not implemented here, stated so no gate or writer relies on it (fix round, rule §7.4): Section 8.5 task-force
+dispatch (director dispatch, sequential relay, synthesis by the lead). The router's `directors` are echoed in the
+`atlas` object and the hemisphere lead answers with the preset's cards. Phase 2 step 2 calls this a scaffold.
 
 Wiring: `build_app(deps)` takes an `AppDeps` so tests inject doubles for llama-server, the engine controller, the
 memory probe, docker and the vault helper (CONVENTIONS.md §7.8); the router, the prompt builder and the approval
@@ -34,9 +62,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hmac
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -45,7 +75,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -54,6 +84,7 @@ from atlas.approval import ApprovalError, ApprovalItem, ApprovalQueue, CrossChec
 from atlas.arbiter import APEX_KEY, DEEP_THINK_TIERS, Arbiter, ArbiterError, Decision, ReleaseTimeout, UnknownEngine
 from atlas.config import HEMISPHERES, AtlasConfig, ConfigError, EngineSpec
 from atlas.engines import EngineError, _sse_events
+from atlas.governance import RewriteResult, never_delegate_rewrite, register
 from atlas.ledger import Ledger, new_task_id
 from atlas.memory import MemoryStore, MemoryStoreError
 from atlas.router import RouterError, RoutingDecision, parse_override
@@ -67,6 +98,12 @@ LEAD_OVERRIDE: dict[str, str] = {"ren": "[REN]", "arthur": "[ARTHUR]"}  # router
 DEFAULT_LOAD_WAIT_S = 900.0  # a swap is 15-45 s (4.2 rule 4); a queued load waits behind a running generation
 DEFAULT_GENERATION_WAIT_S = 1800.0
 DEFAULT_MAX_TOKENS = 4096
+ADMIN_TOKEN_HEADER = "x-atlas-token"
+LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1"})
+VAULT_PREFIX = "[VAULT]"  # the router's vault-session override key; retention.is_vault_chat uses the same rule
+# Sentence boundary for the streaming never-delegate pass: the same rule as governance._SENTENCE_SPLIT, so a chunk
+# flushed here is rewritten exactly as the whole text would be (the rewrite is per sentence).
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])|\n+")
 
 __all__ = [
     "AppDeps",
@@ -78,6 +115,7 @@ __all__ = [
     "RouterLike",
     "build_app",
     "build_production_deps",
+    "history_has_vault_prefix",
     "main",
 ]
 
@@ -256,6 +294,11 @@ class AppDeps:
     chat_turn_ttl_hours: float = 24 * 30  # 10.4: operational data 30 days hot; the 72 h prune archives on expiry
     enqueue: Callable[[str, dict[str, Any]], str | None] | None = None  # Celery send (aegis manual trigger)
     ready: bool = True
+    # Admin routes (everything but /health and /v1/*): `admin_token` from ORCH_ADMIN_TOKEN_FILE, compared in constant
+    # time against X-Atlas-Token; with no token only `trusted_hosts` (loopback) may call them. /internal/* is always
+    # limited to `trusted_hosts`.
+    admin_token: str | None = None
+    trusted_hosts: frozenset[str] = LOOPBACK_HOSTS
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -282,13 +325,26 @@ class VaultOpenRequest(BaseModel):
 
 
 class ApprovalDecision(BaseModel):
-    decided_by: str = "principal"
+    # No default (fix round): the ledger must record WHO decided; "approved by principal" is never assumed.
+    decided_by: str = Field(min_length=1)
     note: str | None = None
 
 
 class RegisterRequest(BaseModel):
     engine: str
     total_bytes: int = Field(ge=0)
+    task_id: str | None = None
+
+
+class LoadRequest(BaseModel):
+    engine: str
+    ctx: int | None = Field(default=None, ge=1)
+    parallel: int | None = Field(default=None, ge=1)
+    task_id: str | None = None
+
+
+class UnloadRequest(BaseModel):
+    engine: str
     task_id: str | None = None
 
 
@@ -359,18 +415,43 @@ def _sse(obj: Mapping[str, Any]) -> bytes:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode()
 
 
+def _text_of(content: Any) -> str:
+    if isinstance(content, list):  # multimodal: text parts only
+        return " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+    return str(content or "")
+
+
+def history_has_vault_prefix(messages: Sequence[Mapping[str, Any]]) -> bool:
+    """True when ANY user message of the chat starts with [VAULT] (10.5: tagged for the life of the session). The
+    same rule as retention.is_vault_chat, so a filter-less client and a restarted Open WebUI (whose filter forgets
+    its in-process set) are covered by the history Open WebUI resends with every turn."""
+    return any(
+        m.get("role") == "user" and _text_of(m.get("content")).lstrip().upper().startswith(VAULT_PREFIX)
+        for m in messages
+    )
+
+
 def _session_of(req: ChatRequest, request: Request | None) -> tuple[str, bool, str | None]:
     meta = (req.metadata or {}).get("atlas") if isinstance(req.metadata, dict) else None
     meta = meta if isinstance(meta, dict) else {}
     headers = request.headers if request is not None else {}
+    # Channels, in order: the filter's top-level fields (VERIFIED to survive Open WebUI 0.11.4, fix round); the
+    # X-OpenWebUI-Chat-Id header (sent when ENABLE_FORWARD_USER_INFO_HEADERS=true, env.py); the metadata mirror
+    # (dead for Open WebUI, which pops `metadata` before the backend call; kept for other clients).
     session = (
         req.atlas_session
-        or meta.get("atlas_session")
         or headers.get("x-atlas-session")
+        or headers.get("x-openwebui-chat-id")
+        or meta.get("atlas_session")
         or (req.metadata or {}).get("chat_id")
         or uuid.uuid4().hex
     )
-    vault = bool(req.atlas_vault or meta.get("atlas_vault") or headers.get("x-atlas-vault", "").lower() == "true")
+    vault = bool(
+        req.atlas_vault
+        or meta.get("atlas_vault")
+        or headers.get("x-atlas-vault", "").lower() == "true"
+        or history_has_vault_prefix(req.messages)
+    )
     override = req.atlas_override or meta.get("atlas_override") or headers.get("x-atlas-override") or None
     return str(session), vault, override
 
@@ -398,12 +479,88 @@ def _item_dict(item: ApprovalItem) -> dict[str, Any]:
     return d
 
 
+def _client_host(request: Request) -> str:
+    return request.client.host if request.client is not None else ""
+
+
+class _Rewriter:
+    """The never-delegate pass over a stream (16.1 rule 5). Text is buffered to sentence boundaries; every complete
+    sentence goes through governance.never_delegate_rewrite with the PRINCIPAL register, so the Principal reads the
+    rewritten sentence, never the raw one. `flush()` at the end handles the tail. Rewrites and flags are kept for
+    the ledger row."""
+
+    def __init__(self, audience: str = "principal") -> None:
+        self.audience = audience
+        self.buffer = ""
+        self.rewrites: list[tuple[str, str]] = []
+        self.flagged: list[str] = []
+        self.register = str(register("", audience).register)
+
+    def _apply(self, text: str) -> str:
+        if not text:
+            return text
+        res: RewriteResult = never_delegate_rewrite(text, self.audience)
+        self.rewrites.extend(res.rewrites)
+        self.flagged.extend(res.flagged)
+        return res.text
+
+    def feed(self, delta: str) -> str:
+        self.buffer += delta
+        matches = list(_SENTENCE_END.finditer(self.buffer))
+        if not matches:
+            return ""
+        # Cut BEFORE the separator: the rewrite keeps a piece's leading whitespace but not a trailing one, so the
+        # separator travels at the head of the next chunk and the author's layout survives.
+        cut = matches[-1].start()
+        ready, self.buffer = self.buffer[:cut], self.buffer[cut:]
+        return self._apply(ready)
+
+    def flush(self) -> str:
+        ready, self.buffer = self.buffer, ""
+        return self._apply(ready)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "register": self.register,
+            "rewrites": len(self.rewrites),
+            "flagged": list(self.flagged)[:20],
+        }
+
+
 # --- the app ----------------------------------------------------------------------------------------------------------
 
 
 def build_app(deps: AppDeps) -> FastAPI:
     app = FastAPI(title="A.T.L.A.S. orchestrator", version=__version__)
     app.state.deps = deps
+
+    # --- authentication (fix round) -------------------------------------------------------------------------------
+
+    def require_loopback(request: Request) -> None:
+        """/internal/*: loopback only, whatever the bind and whatever the token (engine-keyed generation)."""
+        host = _client_host(request)
+        if host not in deps.trusted_hosts:
+            raise HTTPException(403, f"internal routes accept loopback clients only (got {host or 'unknown'})")
+
+    def require_admin(request: Request) -> None:
+        """Admin routes: X-Atlas-Token when a token is configured, else loopback only (module docstring)."""
+        if deps.admin_token:
+            given = request.headers.get(ADMIN_TOKEN_HEADER)
+            if not given:
+                raise HTTPException(401, f"missing {ADMIN_TOKEN_HEADER} (ORCH_ADMIN_TOKEN_FILE is configured)")
+            if not hmac.compare_digest(given.encode("utf-8"), deps.admin_token.encode("utf-8")):
+                raise HTTPException(403, f"{ADMIN_TOKEN_HEADER} does not match")
+            return
+        host = _client_host(request)
+        if host not in deps.trusted_hosts:
+            raise HTTPException(
+                403,
+                f"admin routes accept loopback clients only until ORCH_ADMIN_TOKEN_FILE is configured "
+                f"(got {host or 'unknown'})",
+            )
+
+    admin = [Depends(require_admin)]
+    internal = [Depends(require_loopback)]
 
     @app.get("/health")
     def health() -> JSONResponse:
@@ -413,6 +570,7 @@ def build_app(deps: AppDeps) -> FastAPI:
             "arbiter_halted": deps.arbiter.status().get("halted"),
             "memory": deps.memory is not None,
             "outbound_channel": not isinstance(deps.approval.sender, NoChannelSender),
+            "admin_token": bool(deps.admin_token),
         }
         return JSONResponse(status, status_code=200 if deps.ready else 503)
 
@@ -426,24 +584,33 @@ def build_app(deps: AppDeps) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     def chat_completions(req: ChatRequest, request: Request) -> Any:
-        if req.model not in MODELS:
-            raise HTTPException(404, f"model {req.model!r} is not served; /v1/models lists {list(MODELS)}")
         if not req.messages:
             raise HTTPException(422, "messages[] is empty")
+        if req.model in deps.config.engines:
+            # Phase 3 contract (phase3/loadtest.py header): an engine key runs the internal pipeline through the
+            # Arbiter's load and generation lock, so a second request provably queues (V21, V14b).
+            gen = _chat_pipeline(deps, req, session_id=req.atlas_session or "engine", override=None, internal=True)
+            return _respond(gen, req.stream)
+        if req.model not in MODELS:
+            raise HTTPException(
+                404, f"model {req.model!r} is not served; /v1/models lists {list(MODELS)}; engine keys are accepted"
+            )
         session_id, vault_flag, override = _session_of(req, request)
         if vault_flag:
             deps.sessions.tag_vault(session_id)
         gen = _chat_pipeline(deps, req, session_id=session_id, override=override, internal=False)
         return _respond(gen, req.stream)
 
-    @app.post("/internal/v1/chat/completions")
+    @app.post("/internal/v1/chat/completions", dependencies=internal)
     def internal_completions(req: ChatRequest) -> Any:
         if req.model not in deps.config.engines:
             raise HTTPException(404, f"unknown engine {req.model!r} (CONVENTIONS.md §8 keys)")
+        if not req.messages:
+            raise HTTPException(422, "messages[] is empty")
         gen = _chat_pipeline(deps, req, session_id=req.atlas_session or "internal", override=None, internal=True)
         return _respond(gen, req.stream)
 
-    @app.post("/internal/route")
+    @app.post("/internal/route", dependencies=internal)
     def internal_route(req: RouteRequest) -> dict[str, Any]:
         task_id = new_task_id()
         text = _routed_message(deps.config, req.force_persona or "atlas", req.message, None)
@@ -453,10 +620,11 @@ def build_app(deps: AppDeps) -> FastAPI:
             raise HTTPException(500, f"router: {exc}") from exc
         return {"task_id": task_id, **info.as_dict()}
 
-    @app.post("/internal/deep-think/plan")
+    @app.post("/internal/deep-think/plan", dependencies=internal)
     def internal_plan(req: PlanRequest) -> dict[str, Any]:
         if req.tier not in DEEP_THINK_TIERS:
             raise HTTPException(422, f"tier must be one of {DEEP_THINK_TIERS}")
+        _maybe_remeasure(deps)
         plan = deep_think.plan(req.tier, deps.arbiter, task_id=req.task_id)
         resident = [k for k in deps.arbiter.resident if k != APEX_KEY]
         return {
@@ -471,7 +639,7 @@ def build_app(deps: AppDeps) -> FastAPI:
 
     # --- vault (Section 11; README-contracts.md) ----------------------------------------------------------------
 
-    @app.post("/vault/open")
+    @app.post("/vault/open", dependencies=admin)
     def vault_open(req: VaultOpenRequest) -> JSONResponse:
         try:
             res = deps.vault.open(req.passphrase)
@@ -479,21 +647,21 @@ def build_app(deps: AppDeps) -> FastAPI:
             raise HTTPException(500, str(exc)) from exc
         return JSONResponse(res.as_dict(), status_code=200 if res.ok else 403)
 
-    @app.post("/vault/lock")
+    @app.post("/vault/lock", dependencies=admin)
     def vault_lock() -> dict[str, Any]:
         try:
             return deps.vault.lock().as_dict()
         except VaultError as exc:
             raise HTTPException(500, str(exc)) from exc
 
-    @app.get("/vault/status")
+    @app.get("/vault/status", dependencies=admin)
     def vault_status() -> dict[str, Any]:
         res = deps.vault.status()
         return {"state": res.state, "message": res.message, "vault_sessions": deps.sessions.vault_sessions()}
 
     # --- approvals (16.2) -----------------------------------------------------------------------------------------
 
-    @app.get("/approvals")
+    @app.get("/approvals", dependencies=admin)
     def approvals(status: str = "held", limit: int = 100) -> dict[str, Any]:
         rows = deps.ledger.list_approvals(status=None if status == "all" else status, limit=limit)
         return {"status": status, "count": len(rows), "items": rows}
@@ -512,17 +680,27 @@ def build_app(deps: AppDeps) -> FastAPI:
         out["dispatched"] = item.was_sent
         return out
 
-    @app.post("/approvals/{approval_id}/approve")
-    def approve(approval_id: int, body: ApprovalDecision | None = None) -> dict[str, Any]:
-        return _decide(approval_id, "approve", body or ApprovalDecision())
+    @app.post("/approvals/{approval_id}/approve", dependencies=admin)
+    def approve(approval_id: int, body: ApprovalDecision) -> dict[str, Any]:
+        return _decide(approval_id, "approve", body)
 
-    @app.post("/approvals/{approval_id}/reject")
-    def reject(approval_id: int, body: ApprovalDecision | None = None) -> dict[str, Any]:
-        return _decide(approval_id, "reject", body or ApprovalDecision())
+    @app.post("/approvals/{approval_id}/reject", dependencies=admin)
+    def reject(approval_id: int, body: ApprovalDecision) -> dict[str, Any]:
+        return _decide(approval_id, "reject", body)
 
     # --- arbiter (4.2) --------------------------------------------------------------------------------------------
 
-    @app.post("/arbiter/register")
+    def _decision_dict(dec: Any) -> dict[str, Any]:
+        return {
+            "engine": dec.engine,
+            "decision": dec.decision.value,
+            "granted": bool(dec.granted),
+            "reason": dec.reason,
+            "projected_bytes": int(getattr(dec, "projected_bytes", 0) or 0),
+            "task_id": dec.task_id,
+        }
+
+    @app.post("/arbiter/register", dependencies=admin)
     def arbiter_register(req: RegisterRequest) -> dict[str, Any]:
         try:
             deps.arbiter.register_measured(req.engine, req.total_bytes, task_id=req.task_id)
@@ -530,13 +708,57 @@ def build_app(deps: AppDeps) -> FastAPI:
             raise HTTPException(404, str(exc)) from exc
         return {"engine": req.engine, "total_bytes": req.total_bytes, "registered": True}
 
-    @app.get("/arbiter/status")
+    @app.post("/arbiter/load", dependencies=admin)
+    def arbiter_load(req: LoadRequest) -> dict[str, Any]:
+        """A load through the Arbiter (4.2 rule 2): granted means resident and serving when this returns; queued
+        after `load_wait_s` and refused are real decisions the caller must honour (phase3/loadtest.py does)."""
+        if req.engine not in deps.config.engines:
+            raise HTTPException(404, f"unknown engine {req.engine!r} (CONVENTIONS.md §8 keys)")
+        _maybe_remeasure(deps)
+        try:
+            dec = deps.arbiter.request_load(
+                req.engine, req.ctx, req.parallel, task_id=req.task_id, wait_s=deps.load_wait_s
+            )
+        except UnknownEngine as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ReleaseTimeout as exc:
+            raise HTTPException(503, f"arbiter halted: {exc}") from exc
+        except ArbiterError as exc:
+            raise HTTPException(500, str(exc)) from exc
+        return _decision_dict(dec)
+
+    @app.post("/arbiter/unload", dependencies=admin)
+    def arbiter_unload(req: UnloadRequest) -> dict[str, Any]:
+        if req.engine not in deps.config.engines:
+            raise HTTPException(404, f"unknown engine {req.engine!r} (CONVENTIONS.md §8 keys)")
+        try:
+            dec = deps.arbiter.request_unload(req.engine, task_id=req.task_id, wait_s=deps.load_wait_s)
+        except UnknownEngine as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ReleaseTimeout as exc:
+            raise HTTPException(503, f"memory not released; arbiter halted: {exc}") from exc
+        except ArbiterError as exc:
+            raise HTTPException(500, str(exc)) from exc
+        return _decision_dict(dec)
+
+    @app.post("/arbiter/remeasure", dependencies=admin)
+    def arbiter_remeasure() -> dict[str, Any]:
+        """Re-read the resident set (4.1) once the small models are up; refused while an engine is resident."""
+        if deps.arbiter.resident:
+            raise HTTPException(409, f"cannot re-measure while resident: {sorted(deps.arbiter.resident)}")
+        try:
+            measured = deps.arbiter.measure_resident_set()
+        except ArbiterError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"resident_set_bytes": measured, "budget_bytes": deps.arbiter.budget_bytes}
+
+    @app.get("/arbiter/status", dependencies=admin)
     def arbiter_status() -> dict[str, Any]:
         return deps.arbiter.status()
 
     # --- ouroboros (9.4) ------------------------------------------------------------------------------------------
 
-    @app.post("/strike")
+    @app.post("/strike", dependencies=admin)
     def strike(req: StrikeRequest) -> dict[str, Any]:
         try:
             return record_strike(
@@ -552,11 +774,25 @@ def build_app(deps: AppDeps) -> FastAPI:
                 task_id=req.task_id,
                 hemisphere=req.hemisphere,
                 session_id=req.session_id,
+                vault=deps.sessions.is_vault(req.session_id),
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
     return app
+
+
+def _maybe_remeasure(deps: AppDeps) -> None:
+    """Section 4.1: the budget is measured against the resident set 'before anything depends on it'. The orchestrator
+    measures at start (Phase 2 step 2), before the three small models (step 4) and the voice models (step 5) exist,
+    so whenever NO engine is resident the counter is re-read: with nothing loaded, GTT in use IS the resident set.
+    A concurrent load makes measure_resident_set() raise; that is the race resolving itself, not an error."""
+    if deps.arbiter.resident:
+        return
+    try:
+        deps.arbiter.measure_resident_set()
+    except ArbiterError as exc:
+        log.debug("resident set not re-measured: %s", exc)
 
 
 def _respond(gen: Iterator[dict[str, Any]], stream: bool) -> Any:
@@ -617,25 +853,45 @@ def _error_chunk(cid: str, model: str, created: int, status: int, message: str, 
     }
 
 
+@contextlib.contextmanager
+def _wait_idle_slot(deps: AppDeps, key: str, task_id: str) -> Iterator[None]:
+    """A resident small model generates only while NO weight-bearing generation is running (4.2 rule 3, 9.7 C15:
+    'a background task that calls an LLM partway through still queues behind the resident engine'). It takes no
+    ticket in the Arbiter's FIFO (a chat generation never waits for a 4B call; 4.1 keeps these models outside the
+    ledger), so this is a wait, not a lock; the Arbiter's state is polled through its public `generating`."""
+    deadline = time.monotonic() + deps.generation_wait_s
+    while deps.arbiter.generating is not None:
+        if time.monotonic() >= deadline:
+            gen = deps.arbiter.generating
+            raise ArbiterError(
+                f"task {task_id}: {key} waited {deps.generation_wait_s:.0f}s behind the running generation "
+                f"{gen[0] if gen else '?'}"
+            )
+        time.sleep(0.25)
+    yield
+
+
 def _generation_lock(deps: AppDeps, spec: EngineSpec, task_id: str) -> contextlib.AbstractContextManager[None]:
     """The single generation slot (4.2 rules 3-4) for weight-bearing engines. The three resident small models are
     outside the Arbiter's ledger by design (4.1, 5.3: never budgeted; the router classifies before every big
-    generation), so a request on one of them does not queue behind the running generation."""
+    generation), so a request on one of them takes no ticket, but it WAITS while a weight-bearing generation runs
+    (`_wait_idle_slot`), which is the only claim any docstring in this package makes about a 4B call."""
     if spec.is_resident:
-        return contextlib.nullcontext()
+        return _wait_idle_slot(deps, spec.key, task_id)
     return deps.arbiter.acquire_generation(spec.key, task_id=task_id, timeout_s=deps.generation_wait_s)
 
 
 def _retrieve(deps: AppDeps, info: RouteInfo) -> dict[str, list[str]]:
     """Layer 4 (4.4): the closest scars (9.4) and the hemisphere's own memory; a retrieval failure is logged, not
-    hidden, and the dispatch continues without it."""
+    hidden, and the dispatch continues without it. Scars carry NO persona filter (fix round): 9.4 injects 'the
+    closest few scars above a similarity threshold', so the Principal's own [LOG STRIKE:] scars and automatic ones
+    from any persona reach every dispatch; similarity decides, not authorship."""
     out: dict[str, list[str]] = {"memory": [], "scars": []}
     if deps.memory is None:
         return out
     try:
         out["scars"] = [
-            s.as_prompt_line()
-            for s in retrieve_scars(info.message, memory=deps.memory, hemisphere=info.hemisphere, persona=info.persona)
+            s.as_prompt_line() for s in retrieve_scars(info.message, memory=deps.memory, hemisphere=info.hemisphere)
         ]
     except MemoryStoreError as exc:
         log.error("scar retrieval failed: %s", exc)
@@ -648,6 +904,37 @@ def _retrieve(deps: AppDeps, info: RouteInfo) -> dict[str, list[str]]:
     return out
 
 
+def _forced_lead_redirect(deps: AppDeps, req_model: str, info: RouteInfo, *, task_id: str, session_id: str) -> str:
+    """7.2 rule 1 over the model picker (fix round): `model=ren` is a preference the router's hard keywords overrule
+    (router.py records "overruled-by-hard-rule"). When that happened the Principal is told why, and the overruled
+    routing is a 9.4 'overridden routing decision' strike. Returns the note to show (empty when nothing happened)."""
+    forced = LEAD_OVERRIDE.get(req_model)
+    if forced is None or info.hard_keyword_hit is None or info.persona == req_model:
+        return ""
+    note = (
+        f"[ATLAS] Routed to {info.persona.title()} on {info.engine}: the hard keyword "
+        f"{info.hard_keyword_hit!r} (7.2 rule 1) overrides the {req_model!r} model selection.\n\n"
+    )
+    try:
+        record_strike(
+            info.persona,
+            info.task_force or info.route,
+            f"model picker {req_model!r} redirected by hard keyword {info.hard_keyword_hit!r}",
+            f"overridden routing: {forced} requested, hard rule sent it to {info.persona}",
+            ledger=deps.ledger,
+            memory=deps.memory,
+            kind="overridden-routing",
+            source="api",
+            task_id=task_id,
+            hemisphere=info.hemisphere,
+            session_id=session_id,
+            vault=deps.sessions.is_vault(session_id),
+        )
+    except Exception:
+        log.exception("overridden-routing strike not recorded for task %s", task_id)
+    return note
+
+
 def _chat_pipeline(
     deps: AppDeps, req: ChatRequest, *, session_id: str, override: str | None, internal: bool
 ) -> Iterator[dict[str, Any]]:
@@ -656,25 +943,40 @@ def _chat_pipeline(
     created = int(time.time())
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     message = _last_user_text(req.messages)
-    task_id = req.atlas_task_id or new_task_id()
     ledger = deps.ledger
     kind = "internal-generate" if internal else "chat"
-    if ledger.get_task(task_id) is None:
+    if internal:
+        # A child row (fix round): the caller's atlas_task_id is the PARENT (a Celery task still running); this
+        # generation must never mark that row done or failed mid-flight.
+        task_id = new_task_id()
         ledger.insert_task(
             kind,
             task_id=task_id,
             status="running",
             queue="api",
-            payload={
-                "model": req.model,
-                "session": session_id,
-                "chars": len(message),
-                "vault": deps.sessions.is_vault(session_id),
-            },
+            parent_task_id=req.atlas_task_id,
+            payload={"model": req.model, "session": session_id, "chars": len(message)},
         )
     else:
-        ledger.update_task(task_id, status="running")
+        task_id = req.atlas_task_id or new_task_id()
+        if ledger.get_task(task_id) is None:
+            ledger.insert_task(
+                kind,
+                task_id=task_id,
+                status="running",
+                queue="api",
+                payload={
+                    "model": req.model,
+                    "session": session_id,
+                    "chars": len(message),
+                    "vault": deps.sessions.is_vault(session_id),
+                },
+            )
+        else:
+            ledger.update_task(task_id, status="running")
     info: RouteInfo | None = None
+    streamer: Any = None
+    rewriter: _Rewriter | None = None
     try:
         if internal:
             spec = deps.config.engine(req.model)
@@ -686,9 +988,14 @@ def _chat_pipeline(
                 route="internal",
                 message=message,
             )
+            ledger.update_task(task_id, engine=spec.key, persona=info.persona, tier=info.tier)
             messages: list[dict[str, Any]] = list(req.messages)
             yield _chunk(
-                cid, req.model, created, role="assistant", extra={"atlas": {"task_id": task_id, "engine": spec.key}}
+                cid,
+                req.model,
+                created,
+                role="assistant",
+                extra={"atlas": {"task_id": task_id, "parent_task_id": req.atlas_task_id, "engine": spec.key}},
             )
         else:
             routed = _routed_message(deps.config, req.model, message, override)
@@ -720,16 +1027,24 @@ def _chat_pipeline(
                     if m.get("role") == "user":
                         m["content"] = info.message  # the override prefix is the router's, not the engine's
                         break
-            yield _chunk(
-                cid, req.model, created, role="assistant", extra={"atlas": {"task_id": task_id, **info.as_dict()}}
-            )
+            note = _forced_lead_redirect(deps, req.model, info, task_id=task_id, session_id=session_id)
+            head = {"task_id": task_id, **info.as_dict()}
+            head["forced_lead"] = req.model if req.model in LEAD_OVERRIDE else None
+            yield _chunk(cid, req.model, created, role="assistant", content=note or None, extra={"atlas": head})
+            rewriter = _Rewriter("principal")
             if info.command == "deep-think":
                 text = _run_deep_think(deps, info.deep_think or "standard", info, task_id)
+                text = rewriter.feed(text) + rewriter.flush()
                 yield _chunk(cid, req.model, created, content=text, finish="stop")
-                ledger.update_task(task_id, status="done", result={"deep_think": info.deep_think, "chars": len(text)})
+                ledger.update_task(
+                    task_id,
+                    status="done",
+                    result={"deep_think": info.deep_think, "chars": len(text), "governance": rewriter.summary()},
+                )
                 _remember_turn(deps, info, session_id, message, text)
                 return
         # Engine Arbiter: load (waits in its queue behind a running generation), then the single generation lock.
+        _maybe_remeasure(deps)
         decision_load = deps.arbiter.request_load(spec.key, task_id=task_id, wait_s=deps.load_wait_s)
         if not decision_load.granted:
             status = 503 if decision_load.decision is Decision.QUEUED else 507
@@ -750,32 +1065,62 @@ def _chat_pipeline(
                 for c in chunk.get("choices") or []:
                     d = (c.get("delta") or {}).get("content")
                     if d:
-                        parts.append(d)
-                        yield _chunk(cid, req.model, created, content=d)
+                        out = rewriter.feed(d) if rewriter is not None else d
+                        if out:
+                            parts.append(out)
+                            yield _chunk(cid, req.model, created, content=out)
                     if c.get("finish_reason"):
                         finish = c["finish_reason"]
                 if isinstance(chunk.get("timings"), dict):
                     timings = chunk["timings"]
+        tail = rewriter.flush() if rewriter is not None else ""
+        if tail:
+            parts.append(tail)
+            yield _chunk(cid, req.model, created, content=tail)
         text = "".join(parts)
         yield _chunk(cid, req.model, created, finish=finish or "stop", extra={"timings": timings} if timings else None)
-        ledger.update_task(task_id, status="done", result={"chars": len(text), "finish": finish, "timings": timings})
+        result: dict[str, Any] = {"chars": len(text), "finish": finish, "timings": timings}
+        if rewriter is not None:
+            result["governance"] = rewriter.summary()
+            if rewriter.flagged:
+                log.warning("task %s: never-delegate pass flagged %d sentence(s)", task_id, len(rewriter.flagged))
+        ledger.update_task(task_id, status="done", result=result)
         if not internal:
             _remember_turn(deps, info, session_id, message, text)
     except ReleaseTimeout as exc:
         # Rule 5 failure: the Arbiter is halted; nothing more loads until a human looks. Say so, loudly.
-        _fail(deps, task_id, info, message, exc, status=503)
+        _fail(deps, task_id, info, message, exc, status=503, session_id=session_id)
         yield _error_chunk(cid, req.model, created, 503, f"engine memory not released; arbiter halted: {exc}", task_id)
     except ArbiterError as exc:
         status = exc.args[1] if len(exc.args) > 1 and isinstance(exc.args[1], int) else 503
-        _fail(deps, task_id, info, message, exc, status=status)
+        _fail(deps, task_id, info, message, exc, status=status, session_id=session_id)
         yield _error_chunk(cid, req.model, created, status, str(exc.args[0]), task_id)
     except (EngineError, ConfigError, RouterError, RuntimeError, httpx.HTTPError) as exc:
-        _fail(deps, task_id, info, message, exc, status=502)
+        _fail(deps, task_id, info, message, exc, status=502, session_id=session_id)
         yield _error_chunk(cid, req.model, created, 502, f"{type(exc).__name__}: {exc}", task_id)
+    finally:
+        _close_quietly(streamer)
+
+
+def _close_quietly(streamer: Any) -> None:
+    """HttpEngineStreamer holds an httpx.Client per request (fix round: closed here, never left to the GC)."""
+    close = getattr(streamer, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:  # a close failure is worth a line, never a failed request
+            log.warning("engine streamer close failed: %s", exc)
 
 
 def _fail(
-    deps: AppDeps, task_id: str, info: RouteInfo | None, message: str, exc: BaseException, *, status: int
+    deps: AppDeps,
+    task_id: str,
+    info: RouteInfo | None,
+    message: str,
+    exc: BaseException,
+    *,
+    status: int,
+    session_id: str | None = None,
 ) -> None:
     err = f"{type(exc).__name__}: {exc.args[0] if exc.args else exc}"
     log.error("chat task %s failed (%d): %s", task_id, status, err)
@@ -783,7 +1128,8 @@ def _fail(
     persona = info.persona if info else "atlas"
     domain = (info.task_force or info.route) if info else "routing"
     try:
-        # 9.4 automatic strike: a failed generation is a strike; the scar is dropped by memory if the session is vault.
+        # 9.4 automatic strike: a failed generation is a strike. The session id travels with it (fix round): in a
+        # vault-tagged session record_strike withholds the context from the ledger and writes no scar (10.5).
         record_strike(
             persona,
             domain,
@@ -795,6 +1141,8 @@ def _fail(
             source="api",
             task_id=task_id,
             hemisphere=info.hemisphere if info else None,
+            session_id=session_id,
+            vault=deps.sessions.is_vault(session_id),
         )
     except Exception:
         log.exception("strike not recorded for task %s", task_id)
@@ -822,6 +1170,7 @@ def _run_deep_think(deps: AppDeps, tier: str, info: RouteInfo, task_id: str) -> 
     """Section 9.1 through the Arbiter: plan (rule 8), then every call loads and takes the generation lock."""
     if tier not in DEEP_THINK_TIERS:
         tier = "standard"
+    _maybe_remeasure(deps)
     plan = deep_think.plan(tier, deps.arbiter, task_id=task_id)
 
     def call(
@@ -835,12 +1184,15 @@ def _run_deep_think(deps: AppDeps, tier: str, info: RouteInfo, task_id: str) -> 
         full = [{"role": "system", "content": persona_prompt}, *messages]
         streamer = deps.streamer_for(spec)
         parts: list[str] = []
-        with _generation_lock(deps, spec, task_id):
-            for chunk in streamer.stream(full, temperature=temperature, max_tokens=max_tokens):
-                for c in chunk.get("choices") or []:
-                    d = (c.get("delta") or {}).get("content")
-                    if d:
-                        parts.append(d)
+        try:
+            with _generation_lock(deps, spec, task_id):
+                for chunk in streamer.stream(full, temperature=temperature, max_tokens=max_tokens):
+                    for c in chunk.get("choices") or []:
+                        d = (c.get("delta") or {}).get("content")
+                        if d:
+                            parts.append(d)
+        finally:
+            _close_quietly(streamer)
         return "".join(parts)
 
     resident = [k for k in deps.arbiter.resident if k != APEX_KEY]
@@ -867,10 +1219,12 @@ def _command(deps: AppDeps, info: RouteInfo, *, session_id: str, task_id: str) -
         )
     if info.command == "ouroboros-strike":
         # The router's body is "<name>] <context>" for "[LOG STRIKE: <name>] <context>" (the prefix ends at the colon).
+        # The scar is tagged to the ROUTED persona (fix round): the Principal logs the strike against whoever was
+        # working; retrieval is by similarity anyway (_retrieve), so the tag is a label, not a filter.
         name, _, rest = body.partition("]")
         name = name.strip(" [")
         out = record_strike(
-            "principal",
+            info.persona,
             info.task_force or "manual",
             rest.strip() or "(no context given)",
             name or body,
@@ -879,14 +1233,21 @@ def _command(deps: AppDeps, info: RouteInfo, *, session_id: str, task_id: str) -
             kind="manual",
             source="principal",
             task_id=task_id,
+            hemisphere=info.hemisphere,
             session_id=session_id,
+            vault=deps.sessions.is_vault(session_id),
         )
         scar = f"scar {out['scar_id']}" if out.get("scar_written") else f"no scar ({out.get('reason')})"
         return f"Strike #{out['strike_id']} logged; {scar}."
     if info.command == "aegis":
         if deps.enqueue is None:
             return "AEGIS manual backup cannot be enqueued: Celery is not wired into this process."
-        tid = deps.enqueue("atlas.tasks.aegis_manual_backup", {"requested_by": "principal"})
+        try:
+            tid = deps.enqueue("atlas.tasks.aegis_manual_backup", {"requested_by": "principal"})
+        except Exception as exc:  # kombu.exceptions.OperationalError when Redis is down: say so, do not 500
+            log.error("AEGIS manual backup not enqueued: %s", exc)
+            deps.ledger.update_task(task_id, error=f"enqueue failed: {type(exc).__name__}: {exc}"[:500])
+            return f"AEGIS backup could not be enqueued: {type(exc).__name__}: {exc} (is Redis up?)"
         return f"AEGIS backup requested (task {tid}); ntfy reports when the unit starts and the journal when it ends."
     return f"unknown command {info.command}"
 
@@ -903,10 +1264,18 @@ def build_production_deps() -> AppDeps:
     from atlas.personas import PersonaRegistry
     from atlas.prompts import build_system_prompt
     from atlas.router import LlamaClassifier, Router
-    from atlas.tasks import notify
+    from atlas.tasks import admin_token, notify
     from atlas.vault import build_vault_controller
 
     config = load_config()
+    # ORCH_ADMIN_TOKEN_FILE (fix round): a configured but unreadable file is a start-up failure, never a silent
+    # loopback-only fallback; an unset variable means "loopback only" and is logged as such.
+    token = admin_token()
+    if token is None:
+        log.warning(
+            "ORCH_ADMIN_TOKEN_FILE is not set: admin routes (/vault, /approvals, /arbiter, /strike) accept loopback "
+            "clients only; an interface on LAN/WireGuard needs the token (module docstring)"
+        )
     ledger = open_ledger(config.settings.db_path)
     arbiter = build_arbiter(config.engines, ledger=ledger)
     # The Arbiter must own every weight-bearing load (4.2). A unit still active from a previous orchestrator life
@@ -956,7 +1325,7 @@ def build_production_deps() -> AppDeps:
         router=router,
         build_system_prompt=prompt_builder,
         streamer_for=HttpEngineStreamer,
-        vault=build_vault_controller(sessions=sessions),
+        vault=build_vault_controller(sessions=sessions, notify=notify),
         sessions=sessions,
         approval=approval,
         memory=memory,
@@ -964,6 +1333,7 @@ def build_production_deps() -> AppDeps:
         enqueue=enqueue,
         load_wait_s=float(os.environ.get("ATLAS_LOAD_WAIT_S") or DEFAULT_LOAD_WAIT_S),
         generation_wait_s=float(os.environ.get("ATLAS_GENERATION_WAIT_S") or DEFAULT_GENERATION_WAIT_S),
+        admin_token=token,
     )
 
 

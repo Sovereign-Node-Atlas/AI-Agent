@@ -10,11 +10,19 @@ One pulse (`atlas.tasks.sentinel_pulse`, cpu queue, enqueued hourly by atlas-sen
   4. statistics first: deviations against the last `history_window` readings and the fixed thresholds of the file;
   5. write the pulse (JSON) to SENTINEL_LOG_DIR/pulses/... and to ledger.sentinel_pulses;
   6. ONLY when a threshold tripped: enqueue `atlas.tasks.sentinel_bluf` on the gpu queue, which asks the resident
-     router model for a BLUF entry through the orchestrator (the Arbiter's generation lock; never a swap under an
-     active session, 4.2 rule 6), writes the BLUF to the log, the ledger and the `sentinel` memory collection, and
-     pushes it through ntfy. Owners are carried as fields: alaric for threats, silas for markets, under arthur (C12).
+     router model for a BLUF entry through the orchestrator (that model is outside the Arbiter's ledger, 4.1: the
+     call takes no lock but waits while a weight-bearing generation runs, atlas.api._generation_lock; never a swap
+     under an active session, 4.2 rule 6), writes the BLUF to the log, the ledger and the `sentinel` memory
+     collection, and pushes it through ntfy. Owners are carried as fields: alaric for threats, silas for markets,
+     under arthur (C12).
 
 No model is invoked on a quiet pulse. Nothing here calls anything but the allowlisted feeds and loopback services.
+
+Telemetry honesty (fix round, rule §7.4): a reader whose source cannot be read (journalctl without the
+systemd-journal group, squid's log unreadable, docker inspect erroring) raises OSError and the source is listed
+"telemetry unreadable: <id>", never a healthy zero. Container names are tried as `atlas-<name>` and then bare
+`<name>` (compose.voice.yml and sentinel-feeds.json disagreed on the prefix); a container without a healthcheck reads
+`none|running` and is healthy. Pulse and BLUF files under SENTINEL_LOG_DIR follow the history's 400-day window (10.4).
 """
 
 from __future__ import annotations
@@ -52,7 +60,10 @@ __all__ = [
     "FeedReading",
     "PulseResult",
     "SentinelHistory",
+    "container_is_bad",
+    "container_names_to_try",
     "detect",
+    "prune_log_files",
     "pull_feed",
     "read_telemetry",
     "run_pulse",
@@ -194,6 +205,34 @@ class SentinelHistory:
         self._conn.execute("DELETE FROM items WHERE seen_ts < ?", (cutoff,))
         self._conn.execute("DELETE FROM telemetry WHERE ts < ?", (cutoff,))
         self._conn.commit()
+
+
+def prune_log_files(log_dir: str | Path, keep_days: int = 400, *, now: float | None = None) -> int:
+    """Remove pulse-*.json and bluf-*.json older than `keep_days` (10.4 / D9: Sentinel logs 12 months, the same
+    window as SentinelHistory.prune) and drop the year/month directories they leave empty. Returns the count."""
+    root = Path(log_dir)
+    cutoff = (now or time.time()) - keep_days * 86400
+    removed = 0
+    for sub, pattern in (("pulses", "pulse-*.json"), ("bluf", "bluf-*.json")):
+        base = root / sub
+        if not base.is_dir():
+            continue
+        for f in base.rglob(pattern):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError as exc:
+                log.warning("sentinel: could not prune %s: %s", f, exc)
+        for d in sorted((d for d in base.rglob("*") if d.is_dir()), key=lambda d: len(d.parts), reverse=True):
+            try:
+                if not any(d.iterdir()):
+                    d.rmdir()
+            except OSError:
+                continue
+    if removed:
+        log.info("sentinel: pruned %d log file(s) older than %d days under %s", removed, keep_days, root)
+    return removed
 
 
 # --- feeds ------------------------------------------------------------------------------------------------------------
@@ -364,20 +403,49 @@ def _read_services(units: Sequence[str]) -> dict[str, Any]:
     return {u: (states[i] if i < len(states) else "unknown") for i, u in enumerate(units)}
 
 
+# A container without a healthcheck has no .State.Health: the bare `{{.State.Health.Status}}` template errors (nil
+# pointer) and exits 1, which the earlier reader took for "absent" (a false alarm every hour for wg-easy).
+_INSPECT_FMT = "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.State.Status}}"
+
+
+def _inspect_container(name: str) -> tuple[str | None, str]:
+    """(state, stderr): state None only when docker says the container does not exist."""
+    proc = subprocess.run(
+        ["docker", "inspect", "-f", _INSPECT_FMT, name], capture_output=True, text=True, timeout=30, check=False
+    )
+    if proc.returncode == 0:
+        return proc.stdout.strip(), ""
+    err = (proc.stderr or proc.stdout).strip()
+    if "No such object" in err or "no such container" in err.lower():
+        return None, err
+    raise OSError(f"docker inspect {name}: {err[:200]}")
+
+
+def container_names_to_try(name: str) -> tuple[str, ...]:
+    """compose.yml/compose.voice.yml name containers atlas-<x>; older files and the feeds file used bare names."""
+    return (name,) if name.startswith("atlas-") else (f"atlas-{name}", name)
+
+
 def _read_containers(names: Sequence[str]) -> dict[str, Any]:
     if not shutil.which("docker"):
         raise OSError("docker not available")
     out: dict[str, Any] = {}
     for n in names:
-        proc = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Health.Status}}|{{.State.Status}}", n],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        out[n] = proc.stdout.strip() if proc.returncode == 0 else "absent"
+        state: str | None = None
+        for candidate in container_names_to_try(n):
+            state, _err = _inspect_container(candidate)
+            if state is not None:
+                break
+        out[n] = "absent" if state is None else state
     return out
+
+
+def container_is_bad(state: str) -> bool:
+    """unhealthy, absent, or not running; `none|running` (no healthcheck) is healthy."""
+    if state == "absent":
+        return True
+    health, _, status = state.partition("|")
+    return health == "unhealthy" or (status not in ("running", "") and status != "restarting")
 
 
 def _read_firewall() -> dict[str, float]:
@@ -390,12 +458,16 @@ def _read_firewall() -> dict[str, float]:
         timeout=60,
         check=False,
     )
+    if proc.returncode != 0:
+        # "No journal files were opened due to insufficient permissions": atlas is not in systemd-journal (phase1
+        # writer). A zero here would be a silent pass on the one security metric; say unreadable instead.
+        raise OSError(f"journalctl -k exit {proc.returncode}: {proc.stderr.strip()[:200] or 'no output'}")
     lines = proc.stdout.splitlines()
     ufw = sum(1 for ln in lines if "[UFW BLOCK]" in ln)
     dk = sum(1 for ln in lines if "ATLAS docker egress denied" in ln)
     squid = 0.0
     access = Path("/var/log/squid/access.log")
-    if access.is_file():
+    if access.exists():
         cutoff = time.time() - 3600
         try:
             with access.open(encoding="utf-8", errors="replace") as fh:
@@ -407,8 +479,8 @@ def _read_firewall() -> dict[str, float]:
                                 squid += 1
                         except ValueError:
                             continue
-        except OSError:
-            pass
+        except OSError as exc:
+            raise OSError(f"{access} exists but cannot be read by this user: {exc}") from exc
     return {
         "denied_per_hour": float(ufw + dk + squid),
         "ufw_block": float(ufw),
@@ -570,7 +642,7 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                 if not names:
                     names = str(src.get("source", "")).split()[-8:]
                 v = _read_containers(names)
-                bad = [n for n, s in v.items() if s.startswith("unhealthy") or s == "absent" or "|exited" in s]
+                bad = [n for n, s in v.items() if container_is_bad(str(s))]
                 if bad and th.get("unhealthy_alert", True):
                     anomalies.append(
                         Anomaly(
@@ -757,6 +829,7 @@ def run_pulse(
                 if v.get("ok"):
                     history.add_telemetry(sid, now, v)
         history.prune()
+        prune_log_files(log_dir, now=now)
     finally:
         history.close()
         if own_client:

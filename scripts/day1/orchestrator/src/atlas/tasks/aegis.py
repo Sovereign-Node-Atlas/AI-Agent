@@ -216,7 +216,12 @@ def unit_state(unit: str, *, runner: Any = subprocess.run) -> str:
     """`systemctl is-active <unit>` (no sudo needed): active | activating | inactive | failed | deactivating | ..."""
     try:
         proc = runner(
-            ["systemctl", "is-active", unit], capture_output=True, text=True, timeout=30, check=False, stdin=subprocess.DEVNULL
+            ["systemctl", "is-active", unit],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"unknown ({exc})"

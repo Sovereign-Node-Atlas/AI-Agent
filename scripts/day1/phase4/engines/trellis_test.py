@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """TRELLIS image-to-3D attempt (rocm-containers.md §6.5, UNVERIFIED end-to-end on Linux gfx1151). The upstream
-package is imported from the clone; the kroqueta-s shims (pure-torch spconv/flash_attn/nvdiffrast/kaolin
-replacements) are put on sys.path when their package directories are found. SPCONV_ALGO=native and ATTN_BACKEND=sdpa
-per the README. Writes trellis.glb (or trellis_outputs.txt when no mesh export is possible)."""
+package is imported from the clone after the kroqueta-s shims are installed: trellis-strix-halo ships ONE module,
+runners/trellis/shims.py (plus runners/trellis/raster.py for nvdiffrast), whose install() puts pure-torch replacements
+for spconv, flash_attn, nvdiffrast, kaolin (and stubs for open3d, kaolin.utils.testing) into sys.modules before
+`import trellis` (VERIFIED: the repo README table "What is replaced" and the shims.py docstring). SPCONV_ALGO=native and
+ATTN_BACKEND=sdpa per the README. Writes trellis.glb (or trellis_outputs.txt when no mesh export is possible)."""
 
 from __future__ import annotations
 
@@ -14,19 +16,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from p4common import Test
 
 REPO = "microsoft/TRELLIS-image-large"
-SHIM_PKGS = ("spconv", "flash_attn", "nvdiffrast", "kaolin")
+SHIM_MODULES = ("spconv", "flash_attn", "nvdiffrast", "kaolin", "open3d")
 
 
-def _find_shims(root: Path) -> list[Path]:
-    found: list[Path] = []
-    if not root.is_dir():
-        return found
-    for pkg in SHIM_PKGS:
-        for init in root.rglob(f"{pkg}/__init__.py"):
-            parent = init.parent.parent
-            if parent not in found:
-                found.append(parent)
-    return found
+def _install_shims(src: Path, t: Test) -> None:
+    shim_dir = src / "trellis-strix-halo" / "runners" / "trellis"
+    if not (shim_dir / "shims.py").is_file():
+        raise FileNotFoundError(f"{shim_dir}/shims.py not found (kroqueta-s/trellis-strix-halo layout changed?)")
+    sys.path.insert(0, str(shim_dir))
+    import shims  # type: ignore[import-not-found]  # the clone's module, not a package
+
+    shims.install()
+    registered = [m for m in SHIM_MODULES if m in sys.modules]
+    t.note(f"kroqueta-s shims.install() registered: {registered}")
 
 
 def _rgba_object(path: Path) -> Path:
@@ -44,10 +46,7 @@ def main(t: Test) -> None:
     os.environ["SPCONV_ALGO"] = "native"
     os.environ["ATTN_BACKEND"] = "sdpa"
     src = Path(t.args.src)
-    shims = _find_shims(src / "trellis-strix-halo")
-    for p in shims:
-        sys.path.insert(0, str(p))
-    t.note(f"shim paths: {[str(p) for p in shims] or 'none found (UNVERIFIED layout of trellis-strix-halo)'}")
+    _install_shims(src, t)
     sys.path.insert(0, str(src / "TRELLIS"))
     from PIL import Image
     from trellis.pipelines import TrellisImageTo3DPipeline

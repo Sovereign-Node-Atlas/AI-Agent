@@ -13,10 +13,13 @@ p4_build() {
   p4_venv_from_json
   p4_git_from_json
   # Clay's own dependency list may pin torch/lightning; the constraints file keeps the ROCm torch. Best effort.
-  if [[ -e "$P4_HOST_VENV/.atlas-clay-installed" ]]; then
+  local marker
+  marker="$(p4_marker clay-installed)"
+  if [[ -e "$marker" ]]; then
     log "$P4_KEY: clay already installed"
   elif p4_in_venv --net -- pip install -c /opt/atlas/constraints-rocm.txt "$P4_SRC/clay-model"; then
-    date -Is >"$P4_HOST_VENV/.atlas-clay-installed"
+    p4_venv_freeze
+    date -Is >"$marker"
   else
     p4_note "Clay install failed (best effort; V9 rests on Prithvi); see $P4_LOG"
   fi

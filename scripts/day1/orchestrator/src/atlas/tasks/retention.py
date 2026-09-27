@@ -13,8 +13,14 @@ one line, phase2/03-openwebui.sh), OPENWEBUI_CHAT_RETENTION_DAYS (90).
 Rules: pinned chats are kept (phase2/03-openwebui.sh contract). Vault-tagged chats (any message starting with the
 `[VAULT]` override, or `meta.tags` containing "vault") are deleted WITHOUT a summary: "vault sessions are never
 retained" (10.4, 10.5). Every summary goes through the orchestrator: /internal/route decides the hemisphere with the
-router's hard rules, /internal/v1/chat/completions on the resident router model writes the summary under the
-Arbiter's generation lock; the summary lands in that hemisphere's collection as a permanent (non-temporal) entry.
+router's hard rules, /internal/v1/chat/completions on the resident router model writes the summary; that model is
+outside the Arbiter's ledger (4.1), so the call takes no lock but waits while a weight-bearing generation runs
+(atlas.api._generation_lock, 9.7 C15). The summary lands in that hemisphere's collection as a permanent
+(non-temporal) entry.
+
+The admin token file (OPENWEBUI_ADMIN_TOKEN_FILE, atlas:atlas 600 under /etc/atlas/secrets) must be readable by the
+gpu worker: a failure names the path and the owner:mode of the file and its directory (fix round), because the
+directory's mode (root:root 700 in phase1) is the usual cause and the journal must say so.
 """
 
 from __future__ import annotations
@@ -249,7 +255,7 @@ def run_retention(
 @shared_task(name="atlas.tasks.chat_retention", bind=True)
 def chat_retention(self: Any) -> dict[str, Any]:
     from atlas.memory import build_memory_store
-    from atlas.tasks import OrchestratorClient, TaskRecord, read_secret_line
+    from atlas.tasks import OrchestratorClient, TaskRecord, _owner_mode, read_secret_line
 
     rec = TaskRecord(self.request.id, "chat-retention", queue="gpu")
     env = os.environ
@@ -257,7 +263,14 @@ def chat_retention(self: Any) -> dict[str, Any]:
         days = int(env.get("OPENWEBUI_CHAT_RETENTION_DAYS") or DEFAULT_DAYS)
         url = env.get("OPENWEBUI_URL") or f"http://127.0.0.1:{env.get('OPENWEBUI_PORT') or 3000}"
         token_file = env.get("OPENWEBUI_ADMIN_TOKEN_FILE") or "/etc/atlas/secrets/openwebui-admin.token"
-        token = read_secret_line(token_file)
+        try:
+            token = read_secret_line(token_file)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"OPENWEBUI_ADMIN_TOKEN_FILE={token_file} unreadable by this worker ({exc}; "
+                f"{_owner_mode(token_file)}); the directory must be traversable by atlas (root:atlas 710 or an "
+                "atlas-owned subdirectory)"
+            ) from exc
         owui = OpenWebUIClient(url, token)
         orch = OrchestratorClient()
         try:

@@ -12,9 +12,15 @@ Two things live here:
     `vault` for the life of that session; atlas.memory honours the tag by DROPPING every write from a vault-tagged
     session (logged, never silently) unless the Principal explicitly says "remember this" (`remember=True`).
 
-`vault_session_test()` is the V18 helper `atlas-admin vault-session-test` calls (admin.py imports it lazily): read a
-file inside a vault-tagged session, attempt a memory write through the normal path SYNCHRONOUSLY, close the file,
-print one JSON line, exit 0 only when the write was suppressed.
+`vault_session_test(idle_seconds, file)` is the V18 helper `atlas-admin vault-session-test --file PATH` calls
+(admin.py's parser accepts --file and passes it; one signature, no argv fallback since the fix round): read a file
+inside a vault-tagged session, attempt a memory write through the normal path SYNCHRONOUSLY, close the file, print
+one JSON line, exit 0 only when the write was suppressed.
+
+Passphrase guessing (fix round): `VaultController.open` counts refusals; from the fourth attempt on it sleeps
+2^(n-2) s (capped at 60 s) before calling the helper, logs the count, and at five refusals pushes an ntfy notice
+("vault passphrase refused N times"); a successful open or a lock resets the counter. scrypt slows each try, this
+bounds the loop.
 
 Helper exit codes (phase2/09b-vault.sh, VERIFIED in that file): open -> 0 mounted, 1 refused (gocryptfs exit 12 =
 wrong passphrase), 2 contract error; lock -> 0; status prints "open" or "locked".
@@ -149,6 +155,11 @@ class SessionTags:
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
+BACKOFF_AFTER = 3  # refusals before the first delay
+BACKOFF_CAP_S = 60.0
+NOTIFY_AT = 5  # refusals at which the Principal is told through ntfy
+
+
 class VaultController:
     def __init__(
         self,
@@ -159,6 +170,8 @@ class VaultController:
         runner: Runner = subprocess.run,
         sessions: SessionTags | None = None,
         timeout_s: float = 180.0,
+        sleep: Callable[[float], None] = time.sleep,
+        notify: Callable[..., object] | None = None,
     ) -> None:
         self.helper = helper
         self.mount_dir = mount_dir
@@ -166,6 +179,36 @@ class VaultController:
         self._run = runner
         self.sessions = sessions or SessionTags()
         self.timeout_s = timeout_s
+        self._sleep = sleep
+        self._notify = notify
+        self._lock = threading.Lock()
+        self.refusals = 0  # consecutive refused open attempts (per process)
+
+    def backoff_s(self) -> float:
+        """The delay before the next helper call: 0 up to BACKOFF_AFTER refusals, then 2^(n-2) s capped."""
+        if self.refusals < BACKOFF_AFTER:
+            return 0.0
+        return float(min(BACKOFF_CAP_S, 2 ** (self.refusals - BACKOFF_AFTER + 1)))
+
+    def _refused(self) -> None:
+        with self._lock:
+            self.refusals += 1
+            n = self.refusals
+        log.warning("vault open refused by the helper (wrong passphrase or mount failure); %d refusal(s) in a row", n)
+        if n == NOTIFY_AT and self._notify is not None:
+            try:
+                self._notify(
+                    f"vault passphrase refused {n} times in a row (POST /vault/open); the next attempts are delayed",
+                    title="ATLAS vault",
+                    priority="high",
+                    tags=["warning"],
+                )
+            except Exception as exc:  # the notice is best effort; the refusal itself is already logged
+                log.error("vault: ntfy notice not sent: %s", exc)
+
+    def _reset_refusals(self) -> None:
+        with self._lock:
+            self.refusals = 0
 
     def _argv(self, verb: str) -> list[str]:
         # `sudo -n`: never prompt (sudo-rs); the fragment allows exactly open|lock|status.
@@ -188,6 +231,10 @@ class VaultController:
         """Pipe the passphrase to `atlas-vault open`. The passphrase is in this call's memory only."""
         if not passphrase:
             return VaultResult(False, self.status().state, "empty passphrase", 1)
+        delay = self.backoff_s()
+        if delay > 0:
+            log.warning("vault open delayed %.0fs after %d refusals (guessing backoff)", delay, self.refusals)
+            self._sleep(delay)
         proc = self._call("open", stdin_text=passphrase + "\n")
         if proc.returncode == 0:
             state = "open" if self.status().state == "open" else "locked"
@@ -200,9 +247,10 @@ class VaultController:
                 log.error("vault open: %s", msg)
                 return VaultResult(False, state, msg, 0)
             log.info("vault opened at %s", self.mount_dir)
+            self._reset_refusals()
             return VaultResult(True, "open", "open", 0)
         if proc.returncode == 1:
-            log.warning("vault open refused by the helper (wrong passphrase or mount failure)")
+            self._refused()
             return VaultResult(False, "locked", "refused: passphrase incorrect or mount failed", 1)
         err = (proc.stderr or proc.stdout or "").strip()[:400]
         raise VaultError(f"atlas-vault open exited {proc.returncode}: {err}")
@@ -213,6 +261,7 @@ class VaultController:
             err = (proc.stderr or proc.stdout or "").strip()[:400]
             raise VaultError(f"atlas-vault lock exited {proc.returncode}: {err}")
         log.info("vault locked")
+        self._reset_refusals()
         return VaultResult(True, "locked", "locked", 0)
 
     def status(self) -> VaultResult:
@@ -235,7 +284,11 @@ class VaultController:
         return VaultResult(True, "locked", msg, 0)
 
 
-def build_vault_controller(env: dict[str, str] | None = None, sessions: SessionTags | None = None) -> VaultController:
+def build_vault_controller(
+    env: dict[str, str] | None = None,
+    sessions: SessionTags | None = None,
+    notify: Callable[..., object] | None = None,
+) -> VaultController:
     """Production wiring from /etc/atlas/orchestrator.env (VAULT_* keys mirrored by phase2/09b-vault.sh)."""
     env = dict(os.environ if env is None else env)
     session_file = env.get("VAULT_SESSION_FILE") or DEFAULT_SESSION_FILE
@@ -243,6 +296,7 @@ def build_vault_controller(env: dict[str, str] | None = None, sessions: SessionT
         helper=env.get("VAULT_HELPER") or DEFAULT_HELPER,
         mount_dir=env.get("VAULT_MOUNT_DIR") or DEFAULT_MOUNT_DIR,
         sessions=sessions or SessionTags(session_file),
+        notify=notify,
     )
 
 
@@ -255,11 +309,9 @@ def vault_session_test(idle_seconds: int = 5, file: str | None = None) -> int:
     Contract (README-contracts.md): synchronous, closes the file, prints ONE JSON line, exit 0. A write that reached a
     collection is a FAIL (exit 1) even though the JSON is printed: V18 also checks ChromaDB itself. `idle_seconds` is
     accepted for admin.py's `--idle-seconds` argument (this function does not sleep: the idle lock is gocryptfs's).
-    NOTE for the admin writer: verify/v18-vault.sh calls `atlas-admin vault-session-test --file PATH`; admin.py's
-    parser must accept --file and pass it here (contract stated in README-contracts.md, not CONVENTIONS.md).
+    `file` is admin.py's `--file` (its parser defines it, required, and calls `fn(args.idle_seconds, file=args.file)`);
+    there is no other way in (fix round: the argv fallback is gone so the contract is this one signature).
     """
-    if file is None:
-        file = os.environ.get("ATLAS_VAULT_TEST_FILE") or _file_from_argv()
     if not file:
         print(
             json.dumps(
@@ -335,17 +387,6 @@ def vault_session_test(idle_seconds: int = 5, file: str | None = None) -> int:
     controller.sessions.clear(session_id)
     print(json.dumps(result))
     return 0 if suppressed else 1
-
-
-def _file_from_argv() -> str | None:
-    """`--file PATH` from the process argv when the CLI parser did not pass it (admin.py contract note above)."""
-    argv = sys.argv
-    for i, a in enumerate(argv):
-        if a == "--file" and i + 1 < len(argv):
-            return argv[i + 1]
-        if a.startswith("--file="):
-            return a.split("=", 1)[1]
-    return None
 
 
 def main(argv: list[str] | None = None) -> int:

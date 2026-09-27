@@ -99,6 +99,28 @@ def test_empty_text_is_a_no_op() -> None:
     assert never_delegate_rewrite("   \n").changed is False
 
 
+def test_capitalised_tokens_are_not_pronouns() -> None:
+    # "US" (the country) and "ME" (Maine) survive the swap: the text is never mangled.
+    result = never_delegate_rewrite("Please send me the US tariff summary and our Q3 deck.")
+    assert result.text == f"{DECISION_PREFIX} shall ATLAS send you the US tariff summary and your Q3 deck?"
+    maine = never_delegate_rewrite("Please send me the forms from Maine (ME).")
+    assert maine.text == f"{DECISION_PREFIX} shall ATLAS send you the forms from Maine (ME)?"
+    assert "the you tariff" not in result.text and "(you)" not in maine.text
+
+
+@pytest.mark.parametrize("audience", ["external", "recipient", "director", "lead", "internal", "system"])
+def test_only_principal_facing_text_is_rewritten(audience: str) -> None:
+    # 16.1 rule 5 concerns requests to the Principal; a counterpart may be asked to do things, and SELF_NAME must
+    # never be written into external text (16.1 rule 4).
+    line = "Could you please forward the lease to the accountant? Let me know when you have gathered the receipts."
+    result = never_delegate_rewrite(line, audience)
+    assert not result.changed and result.text == line and result.clean and result.rewrites == ()
+    assert "ATLAS" not in result.text
+    assert never_delegate_rewrite(line, "principal").changed
+    with pytest.raises(ValueError, match="unknown audience"):
+        never_delegate_rewrite(line, "everyone")
+
+
 # --- disclosure (16.1 rule 4) ------------------------------------------------------------------------------------
 
 
@@ -138,6 +160,14 @@ def test_disclosure_check_passes_ordinary_correspondence(text: str) -> None:
 def test_disclosure_hits_are_reported_once_each() -> None:
     result = disclosure_check("As an AI I try; as an AI I fail.")
     assert [h.lower() for h in result.hits].count("as an ai") == 1
+
+
+def test_self_reference_is_a_disclosure_in_external_text() -> None:
+    # The system naming itself ("Decision needed: shall ATLAS ...", "ATLAS will follow up") must never reach an
+    # outside recipient (16.1 rule 4); the ordinary word and a company name are not the system's name.
+    assert disclosure_check("Decision needed: shall ATLAS renew the domain for two years?").hits == ("ATLAS",)
+    assert disclosure_check("A.T.L.A.S. will follow up on Monday.").disclosed
+    assert disclosure_check("The road atlas is in the car; Atlas Copco quoted on the compressor.").clean
 
 
 # --- register (6.4) ------------------------------------------------------------------------------------------------
