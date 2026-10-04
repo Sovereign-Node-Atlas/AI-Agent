@@ -46,7 +46,15 @@ Endpoints
     POST /internal/v1/chat/completions {model: <engine key>}: generation for the Celery tasks through the Arbiter
                                        (9.7 C15); loopback only, never listed in /v1/models. Gets its own CHILD ledger
                                        row (parent_task_id = the caller's atlas_task_id); the child id is returned in
-                                       the `atlas` object so the caller can correlate.
+                                       the `atlas` object so the caller can correlate. `atlas_hemisphere` (fix round
+                                       4) declares the hemisphere of the text (one of HEMISPHERES, 422 otherwise):
+                                       OrchestratorClient.generate sends it (Sentinel BLUF = estate, retention = the
+                                       routed hemisphere, Deep Think = the chat's, LightRAG = its workspace). A failed
+                                       internal generation is a 9.4 strike; its scar is written to the DECLARED
+                                       hemisphere only. Without the declaration (phase3/loadtest.py, any older
+                                       caller) the strike is ledger-only with the prompt withheld: a document chunk
+                                       or transcript must never become an estate scar that Arthur's prompts then
+                                       carry across the membrane (7.3, 10.1).
     POST /internal/route               {message} -> the router's decision as JSON (retention needs the hemisphere)
     POST /internal/deep-think/plan     {tier} -> the Arbiter's plan (4.2 rule 8)
 
@@ -65,10 +73,32 @@ ORCH_HOST=127.0.0.1 (the default) remains the supported bind, and Section 11 ("o
 the Principal taps approve") reach these routes THROUGH the host-networked Open WebUI over loopback. POST /vault/open
 carries the passphrase in clear HTTP, so off loopback it is refused unless the request arrived over TLS
 (request.url.scheme == "https"); a LAN/WireGuard bind therefore needs TLS terminated in front of the orchestrator.
+That check covers only the Open WebUI -> orchestrator hop: the passphrase's real wire leg is browser -> Open WebUI,
+which docker/core/compose.yml binds on 0.0.0.0:$OPENWEBUI_PORT in plain HTTP, so the passphrase is protected in
+transit ONLY when Open WebUI itself is reached over TLS or through WireGuard (cross-writer: compose/ufw; fix round 4).
+LOAD-BEARING UVICORN SETTINGS (fix round 4): main() passes proxy_headers=True and forwarded_allow_ips="127.0.0.1"
+EXPLICITLY. A TLS terminator on the node connects from 127.0.0.1, so without X-Forwarded-For rewriting
+request.client every remote client would arrive as a trusted loopback client and reach /internal/* and the token-less
+routes; with it, uvicorn trusts the forwarded address only from a proxy on 127.0.0.1. A terminator MUST run on the
+node and set X-Forwarded-For and X-Forwarded-Proto (the latter decides request.url.scheme == "https" above).
+/internal/* additionally takes its own shared secret when ORCH_INTERNAL_TOKEN_FILE is configured (a file under
+/etc/atlas/secrets, `ORCH_INTERNAL_TOKEN=...` or the bare token; header X-Atlas-Internal-Token or Authorization:
+Bearer, which is what LightRAG's OpenAI client sends its api_key as): address trust alone is not the guard then.
+OrchestratorClient (atlas.tasks) and LightRAGStore (atlas.memory) read the same file. No Day 1 step writes it yet
+(cross-writer: phase2/02-orchestrator.sh), so the default is loopback-only, as before.
 
 Not implemented here, stated so no gate or writer relies on it (fix round, rule §7.4): Section 8.5 task-force
 dispatch (director dispatch, sequential relay, synthesis by the lead). The router's `directors` are echoed in the
-`atlas` object and the hemisphere lead answers with the preset's cards. Phase 2 step 2 calls this a scaffold.
+`atlas` object and the hemisphere lead answers with the preset's cards. Phase 2 step 2 calls this a scaffold. The D7
+graph layer (atlas.memory.LightRAGStore) is installed but fed on Day 1 by ONE writer only, the nightly chat
+summaries (tasks/retention.py); the chat path writes turns to Chroma, not to the graph, and no Docling ingestion task
+exists yet, so no gate relies on graph content.
+
+The one generation slot (GenerationSlot, 4.2 rule 3) covers the router's classifier call too (fix round 4): Eleanor's
+verdict on router-qwen3.5-4b IS a generation, and rule 3 "applies everywhere". Every chat turn and /internal/route
+takes the slot for the classifier, releases it, then takes it again for the generation (the engine load of 4.2 rule 2
+happens INSIDE that second hold, so the Arbiter's swap of rules 4/6 is serialised in the one FIFO and an engine granted
+to a queued request can never be evicted by a later request before it generates).
 
 Wiring: `build_app(deps)` takes an `AppDeps` so tests inject doubles for llama-server, the engine controller, the
 memory probe, docker and the vault helper (CONVENTIONS.md §7.8); the router, the prompt builder and the approval
@@ -130,6 +160,7 @@ DEFAULT_MAX_TOKENS = 4096
 # prune deletes expired chat turns WITHOUT archiving them (prune.py): a purged chat does not live on under /srv/cold.
 CHAT_TURN_TTL_HOURS = 24.0 * 90
 ADMIN_TOKEN_HEADER = "x-atlas-token"
+INTERNAL_TOKEN_HEADER = "x-atlas-internal-token"  # /internal/* secret (ORCH_INTERNAL_TOKEN_FILE; module docstring)
 LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1"})
 # The router's vault-session override key. A session is vault-tagged when the token appears ANYWHERE in a user message
 # (fix round 2), not only at its start: an Open WebUI task call embeds the whole chat history inside one user message
@@ -327,7 +358,8 @@ class GenerationSlot:
     This slot is the superset: a strict FIFO (rule 4) over all generations; a weight-bearing generation takes this
     slot FIRST and then the Arbiter's lock inside it (which is therefore always free), so the Arbiter still records
     every weight-bearing generation for rule 6 (never preempt mid-generation) and its ledger view. The classifier
-    call inside Router.route stays outside: it precedes every generation (7.2 rule 2) and is not one.
+    call inside Router.route takes the slot too (fix round 4, `_classifier_slot`): a 4B verdict is a generation and
+    rule 3 makes no exemption for it; it is a separate, short hold before the generation's own.
     """
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
@@ -403,6 +435,8 @@ class AppDeps:
     # time against X-Atlas-Token; with no token only `trusted_hosts` (loopback) may call them. /internal/* is always
     # limited to `trusted_hosts`.
     admin_token: str | None = None
+    # /internal/*'s own shared secret (ORCH_INTERNAL_TOKEN_FILE; fix round 4): required on top of loopback when set.
+    internal_token: str | None = None
     trusted_hosts: frozenset[str] = LOOPBACK_HOSTS
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -425,6 +459,9 @@ class ChatRequest(BaseModel):
     # /internal only: "principal" when the text will reach the Principal (a Sentinel BLUF pushed to the phone), so the
     # never-delegate rewrite (16.1 rule 5) runs on it too; None/"internal" for text another process consumes.
     atlas_audience: str | None = None
+    # /internal only (fix round 4): the hemisphere of the text being generated on (HEMISPHERES), so a failure's scar
+    # is bound to it; absent = undeclared, strike ledger-only with the prompt withheld (module docstring).
+    atlas_hemisphere: str | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -651,10 +688,24 @@ def build_app(deps: AppDeps) -> FastAPI:
     # --- authentication (fix round) -------------------------------------------------------------------------------
 
     def require_loopback(request: Request) -> None:
-        """/internal/*: loopback only, whatever the bind and whatever the token (engine-keyed generation)."""
+        """/internal/*: loopback only, whatever the bind and whatever the admin token (engine-keyed generation); and
+        the internal shared secret on top when ORCH_INTERNAL_TOKEN_FILE is configured (fix round 4)."""
         host = _client_host(request)
         if host not in deps.trusted_hosts:
             raise HTTPException(403, f"internal routes accept loopback clients only (got {host or 'unknown'})")
+        if deps.internal_token:
+            given = request.headers.get(INTERNAL_TOKEN_HEADER)
+            if not given:
+                auth = request.headers.get("authorization", "")
+                if auth.lower().startswith("bearer "):
+                    given = auth[7:].strip()
+            if not given:
+                raise HTTPException(
+                    401,
+                    f"missing {INTERNAL_TOKEN_HEADER} / Authorization: Bearer (ORCH_INTERNAL_TOKEN_FILE is configured)",
+                )
+            if not hmac.compare_digest(given.encode("utf-8"), deps.internal_token.encode("utf-8")):
+                raise HTTPException(403, "the internal token does not match")
 
     def check_token(request: Request) -> None:
         """X-Atlas-Token, or Authorization: Bearer <token> (what Open WebUI sends OPENAI_API_KEY as)."""
@@ -758,6 +809,10 @@ def build_app(deps: AppDeps) -> FastAPI:
             raise HTTPException(404, f"unknown engine {req.model!r} (CONVENTIONS.md §8 keys)")
         if not req.messages:
             raise HTTPException(422, "messages[] is empty")
+        if req.atlas_hemisphere is not None and req.atlas_hemisphere not in HEMISPHERES:
+            raise HTTPException(
+                422, f"atlas_hemisphere must be one of {sorted(HEMISPHERES)} (got {req.atlas_hemisphere!r})"
+            )
         gen = _chat_pipeline(deps, req, session_id=req.atlas_session or "internal", override=None, internal=True)
         return _respond(gen, req.stream)
 
@@ -766,8 +821,10 @@ def build_app(deps: AppDeps) -> FastAPI:
         task_id = new_task_id()
         text = _routed_message(deps.config, req.force_persona or "atlas", req.message, None)
         try:
-            info = RouteInfo.from_decision(deps.router.route(text, task_id=task_id), req.message)
-        except (ConfigError, RouterError, RuntimeError) as exc:
+            with _classifier_slot(deps, task_id):  # the verdict is a generation (4.2 rule 3; module docstring)
+                decision = deps.router.route(text, task_id=task_id)
+            info = RouteInfo.from_decision(decision, req.message)
+        except (ConfigError, RouterError, RuntimeError, ArbiterError) as exc:
             raise HTTPException(500, f"router: {exc}") from exc
         return {"task_id": task_id, **info.as_dict()}
 
@@ -1006,14 +1063,37 @@ def _error_chunk(cid: str, model: str, created: int, status: int, message: str, 
     }
 
 
+def _classifier_key(deps: AppDeps) -> str:
+    rules = getattr(deps.config, "router_rules", None)
+    return str(getattr(rules, "classifier_engine", None) or "router-qwen3.5-4b")
+
+
+@contextlib.contextmanager
+def _classifier_slot(deps: AppDeps, task_id: str) -> Iterator[None]:
+    """The slot for the router's classifier verdict (7.2 rule 2 on router-qwen3.5-4b): a generation like any other
+    under 4.2 rule 3 (fix round 4), held only for the verdict and released before the generation's own hold. Routing
+    therefore queues behind a running generation exactly as the generation it precedes would have."""
+    with deps.slot.acquire(_classifier_key(deps), task_id=task_id, timeout_s=deps.generation_wait_s):
+        yield
+
+
 @contextlib.contextmanager
 def _generation_lock(deps: AppDeps, spec: EngineSpec, task_id: str) -> Iterator[None]:
     """The single generation slot (4.2 rules 3-4) for EVERY generation, resident small models included (fix round 2):
     `deps.slot` is one strict FIFO over all of them, so a 4B call (Sentinel BLUF, retention summary, LightRAG
     extraction) holds the slot exactly like gpt-oss does and a weight-bearing request queues behind it, and the other
-    way round (9.7 C15 in both directions). A weight-bearing engine additionally takes the Arbiter's own lock inside
-    the slot, so the Arbiter still knows which engine is generating (rule 6, never preempted; its ledger view)."""
+    way round (9.7 C15 in both directions). The Arbiter LOAD of 4.2 rule 2 happens INSIDE the slot (fix round 4): a
+    load granted before the slot could be evicted by a later request's load while the first still waited in the FIFO
+    (the Arbiter protects a generating engine, rule 6, not a merely resident one), and the first would then stream to
+    a stopped unit. Inside the slot the Arbiter's own lock is always free, so request_load returns or swaps at once
+    and the swap of rules 4/6 is serialised in the one FIFO. A weight-bearing engine additionally takes the Arbiter's
+    own lock, so the Arbiter still knows which engine is generating (rule 6, never preempted; its ledger view)."""
     with deps.slot.acquire(spec.key, task_id=task_id, timeout_s=deps.generation_wait_s):
+        _maybe_remeasure(deps)
+        decision_load = deps.arbiter.request_load(spec.key, task_id=task_id, wait_s=deps.load_wait_s)
+        if not decision_load.granted:
+            status = 503 if decision_load.decision is Decision.QUEUED else 507
+            raise ArbiterError(f"engine {spec.key} not loaded: {decision_load.reason}", status)
         if spec.is_resident:
             yield  # outside the Arbiter's residency ledger by design (4.1, 5.3), inside the one slot
             return
@@ -1123,13 +1203,16 @@ def _chat_pipeline(
     # internal generation whose caller declared the audience "principal" (a Sentinel BLUF pushed to the phone).
     # Open WebUI task calls produce JSON/titles the UI parses, never Principal prose: no pass (it would mangle them).
     write_turn = not internal and not owui_task
+    # /internal: the caller's declared hemisphere (fix round 4); "" = undeclared, so a failure records no scar and
+    # withholds the prompt (module docstring; _fail).
+    hemisphere_declared = not internal or req.atlas_hemisphere is not None
     try:
         if internal:
             spec = deps.config.engine(req.model)
             info = RouteInfo(
                 persona=req.atlas_user or "internal",
                 engine=spec.key,
-                hemisphere="estate",
+                hemisphere=req.atlas_hemisphere or "",
                 tier="routine",
                 route="internal",
                 message=message,
@@ -1147,7 +1230,8 @@ def _chat_pipeline(
             )
         else:
             routed = _routed_message(deps.config, req.model, message, override)
-            decision = deps.router.route(routed, task_id=task_id, context={"session_id": session_id})
+            with _classifier_slot(deps, task_id):  # the classifier verdict is a generation (4.2 rule 3)
+                decision = deps.router.route(routed, task_id=task_id, context={"session_id": session_id})
             info = RouteInfo.from_decision(decision, message)
             ledger.update_task(task_id, persona=info.persona, engine=info.engine, tier=info.tier)
             note = ""
@@ -1243,13 +1327,8 @@ def _chat_pipeline(
                     _remember_turn(deps, info, session_id, message, text)
                 return
             yield _chunk(cid, req.model, created, role="assistant", content=note or None, extra={"atlas": head})
-        # Engine Arbiter: load (waits in its queue behind a running generation), then the single generation slot.
-        _maybe_remeasure(deps)
-        decision_load = deps.arbiter.request_load(spec.key, task_id=task_id, wait_s=deps.load_wait_s)
-        if not decision_load.granted:
-            status = 503 if decision_load.decision is Decision.QUEUED else 507
-            raise ArbiterError(f"engine {spec.key} not loaded: {decision_load.reason}", status)
-        streamer = deps.streamer_for(spec)
+        # The single generation slot, then INSIDE it the Engine Arbiter load (4.2 rule 2; _generation_lock) and the
+        # stream: the streamer is built once the engine is resident, never before.
         parts: list[str] = []
         timings: dict[str, Any] | None = None
         finish: str | None = None
@@ -1259,6 +1338,7 @@ def _chat_pipeline(
             # arthur.md says "low-not-zero" (9.1: reasoning models loop at exactly zero).
             temperature = t if isinstance(t, (int, float)) else (0.15 if isinstance(t, str) else None)
         with _generation_lock(deps, spec, task_id):
+            streamer = deps.streamer_for(spec)
             for chunk in streamer.stream(
                 messages, temperature=temperature, max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS
             ):
@@ -1289,14 +1369,17 @@ def _chat_pipeline(
             _remember_turn(deps, info, session_id, message, text)
     except ReleaseTimeout as exc:
         # Rule 5 failure: the Arbiter is halted; nothing more loads until a human looks. Say so, loudly.
-        _fail(deps, task_id, info, message, exc, status=503, session_id=session_id, strike=not owui_task)
+        _fail(deps, task_id, info, message, exc, status=503, session_id=session_id, strike=not owui_task,
+              internal=internal, hemisphere_declared=hemisphere_declared)
         yield _error_chunk(cid, req.model, created, 503, f"engine memory not released; arbiter halted: {exc}", task_id)
     except ArbiterError as exc:
         status = exc.args[1] if len(exc.args) > 1 and isinstance(exc.args[1], int) else 503
-        _fail(deps, task_id, info, message, exc, status=status, session_id=session_id, strike=not owui_task)
+        _fail(deps, task_id, info, message, exc, status=status, session_id=session_id, strike=not owui_task,
+              internal=internal, hemisphere_declared=hemisphere_declared)
         yield _error_chunk(cid, req.model, created, status, str(exc.args[0]), task_id)
     except (EngineError, ConfigError, RouterError, RuntimeError, httpx.HTTPError) as exc:
-        _fail(deps, task_id, info, message, exc, status=502, session_id=session_id, strike=not owui_task)
+        _fail(deps, task_id, info, message, exc, status=502, session_id=session_id, strike=not owui_task,
+              internal=internal, hemisphere_declared=hemisphere_declared)
         yield _error_chunk(cid, req.model, created, 502, f"{type(exc).__name__}: {exc}", task_id)
     finally:
         _close_quietly(streamer)
@@ -1325,6 +1408,7 @@ def _enqueue_deep_think(deps: AppDeps, tier: str, info: RouteInfo, *, task_id: s
                 "parent_task_id": task_id,
                 "session_id": session_id,
                 "audience": "principal",
+                "hemisphere": info.hemisphere,  # declared on every /internal generation the task makes (fix round 4)
             },
         )
     except Exception as exc:  # kombu OperationalError when Redis is down: run inline and say so
@@ -1354,6 +1438,8 @@ def _fail(
     status: int,
     session_id: str | None = None,
     strike: bool = True,
+    internal: bool = False,
+    hemisphere_declared: bool = True,
 ) -> None:
     err = f"{type(exc).__name__}: {exc.args[0] if exc.args else exc}"
     log.error("chat task %s failed (%d): %s", task_id, status, err)
@@ -1362,20 +1448,30 @@ def _fail(
         return  # an Open WebUI title/tags chore that failed is a ledger row, not a 9.4 strike
     persona = info.persona if info else "atlas"
     domain = (info.task_force or info.route) if info else "routing"
+    memory: MemoryStore | None = deps.memory
+    context = message[:500]
+    hemisphere = (info.hemisphere or None) if info else None
+    if internal and not hemisphere_declared:
+        # Fix round 4 (7.3, 10.1): an /internal prompt is a document chunk, a transcript or the Principal's problem
+        # whose hemisphere this process does not know. Ledger row only, prompt withheld, no scar: a scar would be
+        # bound to a guessed hemisphere and injected into that hemisphere's prompts (mirrors the vault branch).
+        memory = None
+        hemisphere = None
+        context = "(internal generation: prompt withheld, no atlas_hemisphere declared; Sections 7.3, 10.1)"
     try:
         # 9.4 automatic strike: a failed generation is a strike. The session id travels with it (fix round): in a
         # vault-tagged session record_strike withholds the context from the ledger and writes no scar (10.5).
         record_strike(
             persona,
             domain,
-            message[:500],
+            context,
             err,
             ledger=deps.ledger,
-            memory=deps.memory,
+            memory=memory,
             kind="failed-generation",
             source="api",
             task_id=task_id,
-            hemisphere=info.hemisphere if info else None,
+            hemisphere=hemisphere,
             session_id=session_id,
             vault=deps.sessions.is_vault(session_id),
         )
@@ -1416,15 +1512,13 @@ def _run_deep_think(deps: AppDeps, tier: str, info: RouteInfo, task_id: str) -> 
         engine: str, persona: str, messages: Sequence[Mapping[str, str]], *, temperature: float, max_tokens: int
     ) -> str:
         spec = deps.config.engine(engine)
-        dec = deps.arbiter.request_load(spec.key, task_id=task_id, wait_s=deps.load_wait_s)
-        if not dec.granted:
-            raise ArbiterError(f"deep think: {engine} not loaded: {dec.reason}")
         persona_prompt = _prompt_text(deps.build_system_prompt(persona, (), None))
         full = [{"role": "system", "content": persona_prompt}, *messages]
-        streamer = deps.streamer_for(spec)
+        streamer: Any = None
         parts: list[str] = []
         try:
-            with _generation_lock(deps, spec, task_id):
+            with _generation_lock(deps, spec, task_id):  # the load (rule 2, the swap of 9.1) happens inside the slot
+                streamer = deps.streamer_for(spec)
                 for chunk in streamer.stream(full, temperature=temperature, max_tokens=max_tokens):
                     for c in chunk.get("choices") or []:
                         d = (c.get("delta") or {}).get("content")
@@ -1503,7 +1597,7 @@ def build_production_deps() -> AppDeps:
     from atlas.personas import PersonaRegistry
     from atlas.prompts import build_system_prompt
     from atlas.router import LlamaClassifier, Router
-    from atlas.tasks import admin_token, notify
+    from atlas.tasks import admin_token, internal_token, notify
     from atlas.vault import build_vault_controller
 
     config = load_config()
@@ -1573,6 +1667,7 @@ def build_production_deps() -> AppDeps:
         load_wait_s=float(os.environ.get("ATLAS_LOAD_WAIT_S") or DEFAULT_LOAD_WAIT_S),
         generation_wait_s=float(os.environ.get("ATLAS_GENERATION_WAIT_S") or DEFAULT_GENERATION_WAIT_S),
         admin_token=token,
+        internal_token=internal_token(),  # None = loopback trust alone on /internal/* (module docstring)
     )
 
 
@@ -1594,7 +1689,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     import uvicorn
 
-    uvicorn.run(build_app(deps), host=args.host, port=args.port, log_level="debug" if args.verbose else "info")
+    # proxy_headers / forwarded_allow_ips are LOAD-BEARING for the loopback trust (module docstring, fix round 4):
+    # typed explicitly, never left to uvicorn's defaults.
+    uvicorn.run(
+        build_app(deps),
+        host=args.host,
+        port=args.port,
+        log_level="debug" if args.verbose else "info",
+        proxy_headers=True,
+        forwarded_allow_ips="127.0.0.1",
+    )
     return 0
 
 

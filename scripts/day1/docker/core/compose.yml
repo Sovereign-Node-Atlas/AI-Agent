@@ -28,12 +28,21 @@
 #     traffic is host traffic: ufw's default-deny OUTPUT with the squid-owner match blocks any direct 80/443, the proxy
 #     variables are blanked below, AND phase2/03-openwebui.sh installs a permanent cgroup fence
 #     (/usr/local/sbin/atlas-openwebui-egress, unit atlas-openwebui-egress.service): every NEW connection whose socket
-#     belongs to this container's cgroup is dropped unless it goes over lo, and on lo the squid proxy (3128), Redis
-#     (6379) and ChromaDB (8000) are dropped too. verify/v12-openwebui-offline.sh proves the start-up window; the fence
-#     enforces the same rule at run time for the lazy paths (RAG loaders, a malicious document naming a proxy).
+#     belongs to this container's cgroup is dropped unless it goes over lo, and on lo only NEW tcp connections to the
+#     orchestrator ($ORCH_PORT), the bge-m3 llama-server ($EMBED_PORT), its own listener ($OPENWEBUI_PORT: the
+#     healthcheck below curls it from inside the container), Kokoro 8880, speaches 8881 and docling 5001 pass; every
+#     other NEW tcp (squid 3128, Redis 6379, ChromaDB 8000, SSH, Cockpit, xrdp, ntfy, WG-Easy, the llama-server engines
+#     8101-8110) and all NEW udp over lo are dropped (allowlist, fix round 3). verify/v12-openwebui-offline.sh proves
+#     the start-up window; the fence enforces the same rule at run time for the lazy paths (RAG loaders, a malicious
+#     document naming a proxy).
 #   * redis and chromadb publish on 127.0.0.1 only (loopback is the subset of "loopback, LAN and WireGuard" that
 #     Section 12.1 needs: Open WebUI is the face). The ChromaDB 1.x Rust server has no authentication (services
-#     research 2.1), so it is never published on the LAN. Redis REQUIRES a password (fix round): every local process
+#     research 2.1), so it is never published on the LAN. ChromaDB and Redis share NO bridge with any container that
+#     handles untrusted input (fix round 3, major): they sit on their own `core-internal` network, which no
+#     compose.voice.yml service (docling parses uploaded documents; kokoro, speaches) joins, so a compromised overlay
+#     container cannot open atlas-chromadb:8000 (the Vector Cortex, no auth) or atlas-redis:6379 by container name;
+#     the host reaches both solely through their 127.0.0.1 publishes. The `atlas` bridge stays for the overlay.
+#     Redis REQUIRES a password (fix round): every local process
 #     could otherwise enqueue Celery tasks with chosen arguments; the password lives in /etc/atlas/secrets/redis.env
 #     (phase2/02-orchestrator.sh writes it, the atlas-* units load it with EnvironmentFile=, never in orchestrator.env
 #     which restic backs up). Containers on the project bridge get no proxy environment: the proxy that
@@ -81,6 +90,20 @@ services:
     image: redis:8.10.2
     container_name: atlas-redis
     restart: unless-stopped
+    # cgroup caps (fix round 3): --maxmemory 2gb below is an application setting, not a cgroup limit. The entrypoint
+    # chowns /data and drops to `redis` through gosu, hence CHOWN, SETUID, SETGID (and DAC_OVERRIDE for the root-owned
+    # /data it reads before the chown); UNVERIFIED minimal set: step 02's 60 s PING wait fails loudly if it is too narrow.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    pids_limit: 512
+    mem_limit: 3g
     env_file:
       - path: ${ATLAS_ETC:-/etc/atlas}/secrets/redis.env
         required: false      # the file is validated by the command below; `required: false` keeps `up -d chromadb` (step 4) loadable
@@ -96,7 +119,7 @@ services:
       <<: *no-proxy
     volumes:
       - ${REDIS_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/redis}:/data
-    networks: [atlas]
+    networks: [core-internal]     # never `atlas`: no bridge shared with the overlay containers (header)
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -115,6 +138,15 @@ services:
     image: chromadb/chroma:1.5.9
     container_name: atlas-chromadb
     restart: unless-stopped
+    # cgroup caps (fix round 3): the Rust server had no limit at all. No cap_add: it binds 8000 (>1024) and writes /data,
+    # which step 02 creates root-owned for the container's UID 0 (UNVERIFIED that the image needs nothing more; step 04's
+    # heartbeat wait fails loudly if it does).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 8g
     environment:
       <<: *no-proxy
       ANONYMIZED_TELEMETRY: "false"      # UNVERIFIED for the Rust server (it is the Python client's switch); harmless
@@ -122,7 +154,7 @@ services:
                                          # phase2/04-memory.sh treats any TCP_DENIED from this container as a failure.
     volumes:
       - ${CHROMA_DATA_DIR:-${ATLAS_SRV:-/srv/atlas}/data/chroma}:/data
-    networks: [atlas]
+    networks: [core-internal]     # never `atlas`: the unauthenticated Vector Cortex shares no bridge with the overlay (header)
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -138,7 +170,10 @@ services:
   # Container hardening (fix round): the image runs as UID 0 on the host network, so capabilities are dropped to the
   # five its start-up needs to own and read its data dir (UNVERIFIED minimal set: CHOWN, SETUID, SETGID, DAC_OVERRIDE,
   # FOWNER — step 03's 300 s /health wait fails loudly if the image needs more), no-new-privileges, a pid and a memory
-  # ceiling. The network fence is the atlas-openwebui-egress unit (header).
+  # ceiling. The network fence is the atlas-openwebui-egress unit (header). redis and chromadb carry the same kind of
+  # caps below (fix round 3): a runaway in either would otherwise compete with the 170 GB GTT budget (Section 4.1).
+  # JWT_EXPIRES_IN=30d (fix round 3): the default -1 made every browser session JWT (the admin's, over LAN and
+  # WireGuard) permanent and revocable only by rotating WEBUI_SECRET_KEY; one re-login a month is the cost.
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.11.4
     container_name: atlas-openwebui
@@ -194,6 +229,7 @@ services:
       # --- auth: one Principal; the first user is created by 03-openwebui.sh through POST /api/v1/auths/signup, which
       #     bypasses ENABLE_SIGNUP=false while the user table is empty (research 1.4, VERIFIED) --------------------------
       WEBUI_AUTH: "true"
+      JWT_EXPIRES_IN: "30d"                      # default -1 = never (header); sessions re-login monthly
       ENABLE_SIGNUP: "false"
       ENABLE_LOGIN_FORM: "true"
       DEFAULT_USER_ROLE: "pending"
@@ -237,6 +273,10 @@ services:
       start_period: 60s
 
 networks:
-  # The project bridge every bridged core service joins; docker/core/compose.voice.yml (kokoro, speaches, docling)
-  # merges into this project and joins the same network by this name (its header states that contract).
+  # `atlas`: the project bridge for the OVERLAY; docker/core/compose.voice.yml (kokoro, speaches, docling) merges into
+  # this project and joins it by this name (its header states that contract). No service in THIS file joins it any
+  # more (fix round 3); open-webui is on the host network.
   atlas: {}
+  # `core-internal`: redis and chromadb only. Nothing that handles untrusted input is ever attached here; the host
+  # reaches both through their 127.0.0.1 publishes. Not `internal: true`: that would also disable the published ports.
+  core-internal: {}

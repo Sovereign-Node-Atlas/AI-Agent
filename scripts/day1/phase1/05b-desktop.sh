@@ -48,9 +48,16 @@ CONF
 # the allowlist does not name). Also off in the component (fix round): the periodic Mozilla/Google services that are
 # not telemetry but still call home at every start (Safe Browsing list updates, Remote Settings-driven suggestions,
 # Push, sponsored top sites / Firefox Suggest, add-on recommendations, the OpenH264/GMP plugin fetch, search
-# suggestions), so they stop instead of being denied and logged by squid at every launch. Policy names VERIFIED
-# against mozilla/policy-templates (Preferences is restricted to the browser./dom./extensions./media. prefixes used
-# here; toolkit.telemetry.* is not allowed there and is covered by DisableTelemetry).
+# suggestions), and (fix round 3) the remaining periodic call-home services: Remote Settings region detection
+# (location.services.mozilla.com), the add-on blocklist fetch, the geolocation provider, the connectivity checker and
+# the search-engine update. Policy names VERIFIED against mozilla/policy-templates (Preferences is restricted to a
+# prefix list that includes browser., dom., extensions., geo., media. and network., all used here; toolkit.telemetry.*
+# is not allowed there and is covered by DisableTelemetry). Not used: the SearchEngines policy (PreventInstallations),
+# which policy-templates marks ESR-only, and Mozilla's apt `firefox` package is the rapid release (UNVERIFIED how a
+# release build treats an ESR-only key, so it is left out rather than risk an about:policies error);
+# browser.search.update=false covers the periodic engine update, and search suggestions are already off.
+# firefox.settings.services.mozilla.com (Remote Settings sync proper) has no supported pref under the allowed prefixes
+# and stays denied-and-logged by squid (not allowlisted).
 # /etc/firefox/policies/policies.json is the documented Linux system path (VERIFIED, mozilla/policy-templates
 # README); UNVERIFIED that Mozilla's own .deb reads it rather than only its install directory, so the same file is
 # also placed at /usr/lib/firefox/distribution/policies.json (the .deb's directory).
@@ -88,14 +95,20 @@ _firefox_policies() {
       "browser.newtabpage.activity-stream.feeds.topsites": { "Value": false, "Status": "locked" },
       "dom.push.enabled":                                  { "Value": false, "Status": "locked" },
       "extensions.getAddons.cache.enabled":                { "Value": false, "Status": "locked" },
-      "media.gmp-manager.updateEnabled":                   { "Value": false, "Status": "locked" }
+      "media.gmp-manager.updateEnabled":                   { "Value": false, "Status": "locked" },
+      "browser.region.network.url":                        { "Value": "", "Status": "locked" },
+      "browser.region.update.enabled":                     { "Value": false, "Status": "locked" },
+      "extensions.blocklist.enabled":                      { "Value": false, "Status": "locked" },
+      "geo.enabled":                                       { "Value": false, "Status": "locked" },
+      "network.connectivity-service.enabled":              { "Value": false, "Status": "locked" },
+      "browser.search.update":                             { "Value": false, "Status": "locked" }
     }
   }
 }
 JSON
     chmod 644 "$d/policies.json"
   done
-  log "Firefox enterprise policy written (telemetry, studies, updates, captive portal, DoH, Safe Browsing, Push, suggestions, GMP fetch off; proxy = system)"
+  log "Firefox enterprise policy written (telemetry, studies, updates, captive portal, DoH, Safe Browsing, Push, suggestions, GMP fetch, region detection, blocklist, geolocation, connectivity checker, search-engine update off; proxy = system)"
 }
 
 _firefox_deb() {
@@ -103,13 +116,23 @@ _firefox_deb() {
   # are the widely published ones). Every failure stops the step with the fix instead of silently keeping the stub.
   _firefox_policies
   install -d -m 0755 /etc/apt/keyrings
-  if [[ ! -s /etc/apt/keyrings/packages.mozilla.org.asc ]]; then
+  # The signing key is pinned by fingerprint (fix round 3): TLS to the vendor host is otherwise the whole trust chain
+  # for every future unattended upgrade from this origin. Mozilla publishes 35BA A0B3 3E9E B396 F59C A838 C0BA 5CE6
+  # DC63 15A3 on support.mozilla.org ("Install Firefox on Linux"); UNVERIFIED from the build sandbox (the page was
+  # unreachable through its proxy), so a mismatch stops the step with the fingerprint seen, never installs.
+  local moz_fpr=35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3 keyf=/etc/apt/keyrings/packages.mozilla.org.asc
+  if [[ ! -s "$keyf" ]]; then
     proxy_env
-    curl -fsSL --max-time 60 https://packages.mozilla.org/apt/repo-signing-key.gpg -o /etc/apt/keyrings/packages.mozilla.org.asc \
+    curl -fsSL --max-time 60 https://packages.mozilla.org/apt/repo-signing-key.gpg -o "$keyf.tmp" \
       || die "could not fetch Mozilla's repo signing key via the proxy (is packages.mozilla.org in config/allowlist.txt? see /var/log/squid/access.log)"
-    grep -q 'BEGIN PGP PUBLIC KEY BLOCK' /etc/apt/keyrings/packages.mozilla.org.asc \
-      || die "the Mozilla key file is not an ASCII-armoured key (UNVERIFIED recipe; check https://packages.mozilla.org/apt/)"
+    grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$keyf.tmp" \
+      || { rm -f "$keyf.tmp"; die "the Mozilla key file is not an ASCII-armoured key (UNVERIFIED recipe; check https://packages.mozilla.org/apt/)"; }
+    mv "$keyf.tmp" "$keyf"; chmod 644 "$keyf"
   fi
+  command -v gpg >/dev/null || apt_install gnupg
+  local got; got="$(gpg --show-keys --with-fingerprint --with-colons "$keyf" 2>/dev/null | awk -F: '$1=="fpr" {print $10}' | tr '\n' ' ')"
+  grep -qw "$moz_fpr" <<<"$got" \
+    || die "Mozilla's apt signing key does not carry the published fingerprint $moz_fpr (got: ${got:-none}); refusing to add the repository. Check https://support.mozilla.org/kb/install-firefox-linux for the current fingerprint; if Mozilla rotated the key, update moz_fpr in phase1/05b-desktop.sh; otherwise the download was tampered with (rm $keyf and re-run)"
   cat >/etc/apt/sources.list.d/mozilla.sources <<'SRC'
 Types: deb
 URIs: https://packages.mozilla.org/apt
@@ -147,7 +170,8 @@ step_05b() {
   sed -i -E 's/^security_layer=.*/security_layer=tls/' /etc/xrdp/xrdp.ini   # mstsc speaks TLS; drop plain RDP crypto
   # Per-user session for the Principal; no display manager means no autologin (Appendix B "no autologin").
   # phase1_write_file (04-system.sh): `install /dev/stdin` fails on re-runs with resolute's rust-coreutils install.
-  printf 'xfce4-session\n' | phase1_write_file 644 "$PRINCIPAL_USER:$PRINCIPAL_USER" "/home/$PRINCIPAL_USER/.xsession"
+  # The account's real primary group, not a same-named group (fix round 3: an LDAP/`users` layout has none).
+  printf 'xfce4-session\n' | phase1_write_file 644 "$PRINCIPAL_USER:$(id -gn "$PRINCIPAL_USER")" "/home/$PRINCIPAL_USER/.xsession"
   systemctl get-default | grep -qx multi-user.target || systemctl set-default multi-user.target >/dev/null
   local dm
   for dm in lightdm gdm3 sddm; do

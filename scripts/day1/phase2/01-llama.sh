@@ -13,8 +13,9 @@
 #   5. llama-server --list-devices must show the Vulkan0 device, also when run as the atlas user (render/video groups).
 #   6. systemd/llama-server@.service installed (render_template), /etc/sudoers.d/atlas-engines written (CONVENTIONS §8:
 #      one explicit line per engine key and verb, 30 lines, no wildcard; proven to parse by `sudo -n -l` as atlas, with
-#      visudo -c first when it exists), $ATLAS_ETC/engines/<key>.env rendered for all ten keys by phase2/engine-env.py,
-#      the slot directory created (atlas:atlas 750).
+#      visudo -c first when it exists; a sudo that cannot list or needs a password for -l only warns, step 04 proves the
+#      policy by executing the granted command), $ATLAS_ETC/engines/<key>.env rendered for all ten keys by
+#      phase2/engine-env.py, $ATLAS_SRV/data and the slot directory created (atlas:atlas 750).
 #   7. V3b recorded (llama-cli --list-devices >= 160000 MiB); a fail is recorded, not fatal here: the gate decides.
 #
 # TODO (Section 3.4, optional, NOT Day 1): a ROCm 7.2.2 container build of llama.cpp for tuned prefill
@@ -56,14 +57,27 @@ _llama_radv_check() {
   fi
 }
 
+# _llama_clone_once DIR — one clean clone attempt (removes a partial DIR first); the unit retry works on.
+_llama_clone_once() {
+  rm -rf "$1" && git clone --quiet "$LLAMA_CPP_REPO" "$1"
+}
+
 _llama_checkout() {
   local src
   src="$(_llama_src)"
   proxy_env
+  # A clone cut off by the proxy leaves a half-written .git that would make the fetch path below inherit a broken tree
+  # (fix round 3): anything that is not a usable repository is removed and cloned afresh.
+  if [[ -e "$src" ]] && ! git -C "$src" rev-parse --git-dir >/dev/null 2>&1; then
+    warn "$src exists but is not a usable git repository (interrupted clone?); removing it"
+    rm -rf "$src"
+  fi
   if [[ ! -d "$src/.git" ]]; then
     log "cloning $LLAMA_CPP_REPO -> $src (through the allowlist proxy)"
     mkdir -p "$(dirname "$src")"
-    retry 3 git clone --quiet "$LLAMA_CPP_REPO" "$src" || die "git clone of llama.cpp failed (is github.com allowlisted?)"
+    # Each attempt starts clean: git refuses to clone into a non-empty directory, so a retry after a partial first
+    # attempt would otherwise fail instantly three times (fix round 3). retry runs a shell function fine.
+    retry 3 _llama_clone_once "$src" || die "git clone of llama.cpp failed (is github.com allowlisted?)"
   fi
   git -C "$src" config --local advice.detachedHead false
   if ! git -C "$src" rev-parse -q --verify "refs/tags/$LLAMA_CPP_TAG^{commit}" >/dev/null 2>&1; then
@@ -203,7 +217,18 @@ _llama_sudoers() {
     done
   } >"$tmp"
   if command -v visudo >/dev/null 2>&1; then
-    visudo -c -f "$tmp" >/dev/null || { rm -f "$tmp"; die "sudoers fragment failed visudo -c; not installed"; }
+    # sudo-rs ships a visudo binary whose support for `-c -f FILE` is UNVERIFIED (platform research, conflict 7): a
+    # usage error is not a syntax error, so it only warns and leaves the proof to sudo's own parse below; any other
+    # non-zero exit is a real parse failure and stops the step (fix round 3).
+    local vout
+    if ! vout="$(visudo -c -f "$tmp" 2>&1)"; then
+      if grep -qiE 'usage:|unknown option|invalid option|unrecognized|unexpected argument' <<<"$vout"; then
+        warn "visudo cannot check a file here (${vout//$'\n'/ }); relying on sudo's own parse below"
+      else
+        rm -f "$tmp"
+        die "sudoers fragment failed visudo -c: ${vout//$'\n'/ }; not installed"
+      fi
+    fi
   else
     warn "visudo not found (sudo-rs without it? UNVERIFIED); installing $frag and proving it by sudo's own parse below"
   fi
@@ -216,14 +241,16 @@ _llama_sudoers() {
   rm -f "$tmp"
   # Implementation-independent proof that the policy still parses with the fragment in place (fix round 2): a syntax
   # error in any sudoers.d file makes sudo refuse EVERY command, so `sudo -n -l` as atlas must exit 0 (sudo(8): list the
-  # caller's own privileges; needs no password with NOPASSWD lines). On failure the previous fragment is restored and the
-  # step stops; a usage error (sudo-rs without -l, UNVERIFIED) is logged and the proof is left to step 04, which can
-  # also prove the policy by executing the granted command.
+  # caller's own privileges; needs no password with NOPASSWD lines under sudo's listpw=any default). On failure the
+  # previous fragment is restored and the step stops. Two outcomes are NOT parse failures and only warn (fix round 3):
+  # a usage error (sudo-rs without -l, UNVERIFIED) and a password demand (`-n` turns it into "a password is required",
+  # exit 1: whether sudo-rs honours listpw=any is UNVERIFIED). In both cases the proof is left to step 04, which proves
+  # the policy implementation-independently by executing the granted command and attempting a refused one.
   local lst rc=0
   lst="$(svc_user_run sudo -n -l 2>&1)" || rc=$?
   if (( rc != 0 )); then
-    if grep -qiE 'usage:|unknown option|invalid option|unrecognized|unexpected argument' <<<"$lst"; then
-      warn "sudo -l is not supported by this sudo (${lst//$'\n'/ }); the fragment's parse is proven in step 04 by running the granted command"
+    if grep -qiE 'usage:|unknown option|invalid option|unrecognized|unexpected argument|password is required|authentication' <<<"$lst"; then
+      warn "sudo -l needs a password or is unsupported here (${lst//$'\n'/ }); the fragment is proven in step 04 by running the granted command"
     else
       install -m 440 -o root -g root "$prev" "$frag"
       rm -f "$prev"
@@ -241,7 +268,10 @@ _llama_sudoers() {
 
 _llama_engine_envs() {
   ensure_dir "$ATLAS_ETC/engines" root:atlas 750
-  ensure_dir "$ATLAS_SRV/data" atlas:atlas 755
+  # 750, not 755 (fix round 3): the Principal-data root needs no world traverse; its readers are root (containers,
+  # restic) and atlas (orchestrator). CONVENTIONS §2 gives /srv/atlas/* to atlas:atlas without requiring world access.
+  # Cross-writer: phase2/02-orchestrator.sh _core_env_write still sets this directory 755 and should use 750 too.
+  ensure_dir "$ATLAS_SRV/data" atlas:atlas 750
   # Appendix B: --slot-save-path /srv/atlas/data/slots, one dir for all. 750, not 755 (fix round 2): slot files are KV
   # snapshots of the Principal's conversations; the unit's UMask=0077 makes the files 0600 and the directory keeps every
   # other local account (atlas-ddns, future service users) from traversing it. engine-env.py applies the same mode.

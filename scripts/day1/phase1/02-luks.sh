@@ -11,21 +11,20 @@
 # terminal scrollback are cleared afterwards (ESC[3J), so the key does not linger in the SSH client's history. The
 # Principal is at the console exactly once. Everything else in this step runs unattended.
 #
-# WHAT STAYS ON THE NODE (D3, R16; fix round): the recovery key's on-node convenience copy ($ATLAS_LUKS_RECOVERY,
-# root 600) when the OS volume is encrypted, because D3 is a closed decision ("on the node and on an external USB
-# drive"; R16 "the on-node copy is convenience only"). The generated keyfile is NOT kept: it authorises the enrolments
-# and is then wiped from the LUKS header and shredded, in both OS cases, because a second full-strength unlock secret
-# on the OS drive is nothing the TPM path needs (re-enrolment after a firmware change authorises with
-# --unlock-tpm2-device=auto, UNVERIFIED flag from systemd 256, or with the recovery key; step 3's fallback open uses
-# the recovery copy). So the ways into the 8 TB volume are: the TPM at boot, the recovery key (USB + on-node copy).
+# WHAT STAYS ON THE NODE (D3, R16): the recovery key's on-node convenience copy ($ATLAS_LUKS_RECOVERY, root 600),
+# always, because D3 is a closed decision ("on the node and on an external USB drive"; R16 "the on-node copy is
+# convenience only") and the OS volume it sits on is LUKS2 itself (Section 3.5; step 1 stops on an unencrypted OS
+# volume, no setting waives that: fix round 3 removed the ATLAS_ALLOW_UNENCRYPTED_OS knob, a change to 3.5/D3 is a
+# Section 23 amendment). The generated keyfile is NOT kept: it authorises the enrolments and is then wiped from the
+# LUKS header and shredded, because a second full-strength unlock secret on the OS drive is nothing the TPM path needs
+# (re-enrolment after a firmware change authorises with --unlock-tpm2-device=auto, UNVERIFIED flag from systemd 256,
+# or with the recovery key; step 3's fallback open uses the recovery copy). So the ways into the 8 TB volume are: the
+# TPM at boot, the recovery key (USB + on-node copy).
 #
-# OS VOLUME NOT ENCRYPTED: Section 3.5 requires LUKS2 on the OS volume too ("nothing transient touches disk
-# unencrypted"). Step 1 already dies on an unencrypted OS volume unless ATLAS_ALLOW_UNENCRYPTED_OS=1 is set in
-# /etc/atlas/atlas.env (a recorded decision of the Principal, not a footnote; the key is documented in step 1's die
-# message and in the phase1-platform.sh header, and config/atlas.env.example should carry it blank with this text).
-# Setting it ALSO waives D3's on-node copy: a plain-text recovery key on an unencrypted OS drive would defeat the data
-# volume's encryption, so with that acknowledgement this step writes NO on-node recovery copy and the USB copy is the
-# only copy (D3/R16). V2 records the deviation and the acknowledgement in its message.
+# PCR 7 WITH SECURE BOOT OFF (fix round 3, major): D2 disables Secure Boot, so PCR 7 carries no image authority and the
+# TPM unseals to any OS booted on this hardware. Step 1 stops until the Principal either enables Secure Boot or records
+# ATLAS_ACCEPT_PCR7_NO_SB=1 in atlas.env; verify/v02-tpm.sh enforces the same and names the Secure Boot state in
+# every V2 row. The mask stays --tpm2-pcrs=7 (S9, adjudicated conflict 1); a stronger mask needs a Section 23 amendment.
 #
 # No package is installed here: cryptsetup, systemd-cryptsetup and dracut are seeded on the 26.04 Server ISO
 # (VERIFIED: the installer itself uses them for the encrypted OS volume); tpm2-tools is not needed because
@@ -42,8 +41,14 @@ ATLAS_LUKS_KEYFILE="$ATLAS_ETC/secrets/luks-data.key"
 ATLAS_LUKS_RECOVERY="$ATLAS_ETC/secrets/luks-data.recovery"
 ATLAS_LUKS_CONFIRMED="$ATLAS_STATE/luks-data.recovery-confirmed"
 
-# _luks_has_token DEVICE TOKEN_NAME — does the LUKS2 header carry a systemd-<name> token?
-_luks_has_token() { cryptsetup luksDump "$1" 2>/dev/null | grep -q "systemd-$2"; }
+# _luks_has_token DEVICE TOKEN_NAME — does the LUKS2 header carry a systemd-<name> token? The dump is read in full
+# first (fix round 3): `luksDump | grep -q` under pipefail can report failure through grep's early exit (SIGPIPE on the
+# writer), and a false negative here would re-enrol a second TPM2 token or wipe and reprint the recovery key.
+_luks_has_token() {
+  local d
+  d="$(cryptsetup luksDump "$1" 2>/dev/null)" || return 1
+  [[ "$d" == *"systemd-$2"* ]]
+}
 
 # _luks_os_device — print the LUKS device backing "/" (empty when the OS volume is not encrypted).
 _luks_os_device() {
@@ -58,9 +63,6 @@ _luks_os_mapping() {
   lsblk -sno NAME,TYPE "$src" 2>/dev/null | awk '$2=="crypt" {print $1; exit}'
 }
 
-# _luks_os_accepted — the Principal acknowledged an unencrypted OS volume (atlas.env, see the header).
-_luks_os_accepted() { [[ "${ATLAS_ALLOW_UNENCRYPTED_OS:-0}" == "1" ]]; }
-
 # _luks_enroll DEVICE ARGS... — run systemd-cryptenroll ARGS DEVICE with whatever authorises a header change: the
 # keyfile while it exists; else the TPM (--unlock-tpm2-device=auto, UNVERIFIED: added in systemd 256 per the release
 # notes and expected on 259); else the recovery key ($PASSWORD is systemd-cryptenroll's documented passphrase source)
@@ -73,7 +75,9 @@ _luks_enroll() {
   if systemd-cryptenroll --unlock-tpm2-device=auto "$@" "$dev" 2>/dev/null; then return 0; fi
   local rec="${LUKS_RECOVERY_INMEM:-}"
   [[ -n "$rec" || ! -s "$ATLAS_LUKS_RECOVERY" ]] || rec="$(tr -d '[:space:]' <"$ATLAS_LUKS_RECOVERY")"
-  [[ -n "$rec" ]] || die "systemd-cryptenroll $* $dev: the keyfile is gone, --unlock-tpm2-device=auto was refused (systemd $(systemctl --version | head -n1)) and no recovery copy is on the node. Run it by hand with the USB recovery key: PASSWORD='<recovery key>' systemd-cryptenroll $* $dev, then re-run: sudo $ATLAS_ENTRY phase1 --force 02"
+  # The by-hand instruction keeps the key out of the shell history (rule §7.2): a leading `PASSWORD=... cmd` would be
+  # written to ~/.bash_history in clear; `read -rs` into an exported variable is not.
+  [[ -n "$rec" ]] || die "systemd-cryptenroll $* $dev: the keyfile is gone, --unlock-tpm2-device=auto was refused (systemd $(systemctl --version | head -n1)) and no recovery copy is on the node. Run it by hand with the USB recovery key, NEVER on the command line (the shell history would keep it):  read -rs PASSWORD; export PASSWORD; systemd-cryptenroll $* $dev; unset PASSWORD   then re-run: sudo $ATLAS_ENTRY phase1 --force 02"
   PASSWORD="$rec" systemd-cryptenroll "$@" "$dev"
 }
 
@@ -99,8 +103,10 @@ step_02() {
   local t missing=()
   for t in cryptsetup systemd-cryptenroll systemd-cryptsetup dracut; do command -v "$t" >/dev/null || missing+=("$t"); done
   (( ${#missing[@]} == 0 )) || die "missing on this host: ${missing[*]} (expected on the 26.04 Server ISO: cryptsetup, systemd-cryptsetup, dracut). Install them from the console (apt-get install cryptsetup systemd-cryptsetup dracut) and re-run; step 2 installs nothing because the allowlist proxy does not exist before step 4 (rule §7.1)"
-  # root:atlas 710 (traverse-only for atlas; phase1/07-remote.sh header, phase2/06c) once the atlas group exists (step 3
-  # creates it); on the first run it is root:root 700 until step 3 widens it.
+  # root:atlas 750 once the atlas group exists (step 3 creates it; root:root 700 until then). ONE value across every
+  # writer (fix round 3): phase2-services.sh, phase2/02,03,06c,07,08,09 assert root:atlas 750 and asked phase1/02,03,07
+  # to match (phase2/02-orchestrator.sh header). CONVENTIONS §2's row still says root:root 700, which cannot hold
+  # together with its atlas:atlas 600 files inside; that row needs the amendment to root:atlas 750 (fix-round notes).
   if getent group atlas >/dev/null 2>&1; then ensure_dir "$ATLAS_ETC/secrets" root:atlas 710
   else ensure_dir "$ATLAS_ETC/secrets" root:root 700; fi
 
@@ -108,13 +114,11 @@ step_02() {
   [[ -b "$dev" ]] || die "DATA_DISK $DATA_DISK does not resolve to a block device"
   [[ ! -e /etc/systemd/tpm2-pcr-public-key.pem ]] || die "/etc/systemd/tpm2-pcr-public-key.pem exists (see step 1)"
 
-  # --- OS volume state, decided once (step 1 already died on an unacknowledged unencrypted OS volume) ------------
+  # --- OS volume state, decided once (step 1 already died on an unencrypted OS volume; no waiver exists) ----------
   local osdev osmap os_note="" need_os_enrol=0
   osdev="$(_luks_os_device)"; osmap="$(_luks_os_mapping)"
   if [[ -z "$osdev" ]]; then
-    _luks_os_accepted || die "the OS volume is not encrypted (Section 3.5). Reinstall with LUKS, or set ATLAS_ALLOW_UNENCRYPTED_OS=1 in $ATLAS_ETC/atlas.env to accept the deviation knowingly, then re-run"
-    os_note="OS volume UNENCRYPTED, ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 (Section 3.5 deviation; D3 on-node copy waived): no on-node recovery copy, USB copy is the only copy (D3, R16)"
-    warn "$os_note"
+    die "the OS volume is not encrypted (Section 3.5 requires LUKS2 on it; Section 22 presumes the encrypted-LVM install). Reinstall with the encrypted-LVM option, then re-run: sudo $ATLAS_ENTRY phase1"
   elif _luks_has_token "$osdev" tpm2; then
     os_note="LUKS $osmap on $osdev, TPM2 already enrolled"
     log "OS volume: $os_note"
@@ -165,7 +169,7 @@ step_02() {
       || die "systemd-cryptenroll --tpm2-device=auto failed on $dev (V2). Check: fTPM enabled, exactly one TPM (systemd-cryptenroll --tpm2-device=list)"
   fi
   local recovery="" show_key=0
-  if _luks_has_token "$dev" recovery && [[ -e "$ATLAS_LUKS_CONFIRMED" ]] && { _luks_os_accepted || [[ -s "$ATLAS_LUKS_RECOVERY" ]]; }; then
+  if _luks_has_token "$dev" recovery && [[ -e "$ATLAS_LUKS_CONFIRMED" && -s "$ATLAS_LUKS_RECOVERY" ]]; then
     log "recovery key already enrolled and confirmed as written down on $(cat "$ATLAS_LUKS_CONFIRMED")"
   else
     if _luks_has_token "$dev" recovery; then
@@ -175,13 +179,10 @@ step_02() {
     recovery="$(_luks_enroll "$dev" --recovery-key 2>/dev/null | tr -d '[:space:]')"
     [[ -n "$recovery" ]] || die "systemd-cryptenroll --recovery-key printed nothing"
     LUKS_RECOVERY_INMEM="$recovery"       # authorises the keyfile wipe below on this run; cleared at the end of the step
-    if _luks_os_accepted; then
-      rm -f "$ATLAS_LUKS_RECOVERY"
-      log "recovery key enrolled; NO on-node copy (accepted unencrypted OS, D3 copy waived): the USB copy is the only copy"
-    else
-      ( umask 077; printf '%s\n' "$recovery" >"$ATLAS_LUKS_RECOVERY" )
-      log "recovery key enrolled; on-node copy at $ATLAS_LUKS_RECOVERY (root, 600; D3 convenience copy)"
-    fi
+    # D3: the on-node convenience copy is always written (root 600, on the LUKS2 OS volume); the USB copy is the one
+    # that matters (R16).
+    ( umask 077; printf '%s\n' "$recovery" >"$ATLAS_LUKS_RECOVERY" )
+    log "recovery key enrolled; on-node copy at $ATLAS_LUKS_RECOVERY (root, 600; D3 convenience copy)"
     rm -f "$ATLAS_LUKS_CONFIRMED"
     show_key=1
   fi
@@ -202,8 +203,8 @@ step_02() {
         echo "#"
         echo "#       $recovery"
         echo "#"
-        if _luks_os_accepted; then echo "#   There is NO copy on the node (unencrypted OS volume, accepted): the USB copy is the only copy."
-        else echo "#   On-node convenience copy (root only): $ATLAS_LUKS_RECOVERY"; fi
+        echo "#   On-node convenience copy (root only, D3): $ATLAS_LUKS_RECOVERY"
+        echo "#   The USB copy is the one that matters (R16): a fire or burglary that takes the node takes this copy too."
         echo "#   The screen and this terminal's scrollback are erased once you confirm; the key is never logged."
         echo "#"
       fi
@@ -281,8 +282,7 @@ step_02() {
       || { ATLAS_LUKS_KEYFILE="$kf"; die "systemd-cryptenroll --wipe-slot=password failed on $dev; the keyfile slot is still present"; }
     ATLAS_LUKS_KEYFILE="$kf"
     shred -u "$ATLAS_LUKS_KEYFILE"
-    _luks_os_accepted && rm -f "$ATLAS_LUKS_RECOVERY"
-    log "keyfile slot wiped and $ATLAS_LUKS_KEYFILE shredded; the TPM and the recovery key$(_luks_os_accepted || printf ' (USB + on-node copy, D3)') are the only ways in"
+    log "keyfile slot wiped and $ATLAS_LUKS_KEYFILE shredded; the TPM and the recovery key (USB + on-node copy, D3) are the only ways in"
   fi
   LUKS_RECOVERY_INMEM=""; recovery=""
 

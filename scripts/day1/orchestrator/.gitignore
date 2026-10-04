@@ -7,12 +7,15 @@ __pycache__/
 .venv/
 build/
 dist/
-# a ledger or local secrets made inside the package tree hold Principal data (rule §7.2: never in git);
-# tests/fixtures/config/atlas.env is tracked on purpose (invented placeholder names, matches none of these)
+# a ledger or local secrets made inside the package tree hold Principal data (rule §7.2: never in git). Every *.env is
+# ignored (a copy of /etc/atlas/orchestrator.env, redis.env, engines/<key>.env taken while debugging on the node would
+# otherwise ride in on `git add -A`); the fixture env files are the one tracked exception (invented placeholder names).
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
 *.db
+*.env
 .env
-*.local.env
+!tests/fixtures/config/atlas.env
+!tests/fixtures/config/**/*.env
 secrets/

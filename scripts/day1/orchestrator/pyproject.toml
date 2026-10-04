@@ -23,11 +23,19 @@
 #                          (fastapi 0.141.1, uvicorn 0.54.0, httpx 0.28.1, pydantic 2.13.5, PyYAML 6.0.3,
 #                          python-frontmatter 1.3.0, pytest 9.1.1). A Day 1 install on the node therefore gets the
 #                          tested set, not whatever is newest that day. Bumping one is a deliberate edit here.
+#   setuptools==80.9.0     RESOLVED PIN (fix round 3): the build backend of the isolated editable build. A lower bound
+#                          here made every `uv pip install -e` on the node download whatever setuptools was newest on
+#                          pypi.org that day, which the header's "a Day 1 install gets the tested set" did not cover.
+#                          80.9.0 is the version the isolated build resolved on 2026-09-26 (PyPI release 2025-05-27;
+#                          >= 77 for the PEP 639 string `license`), re-verified with `uv pip install -e .` on
+#                          CPython 3.12 on 2026-10-04.
+#   ruff==0.15.8           RESOLVED PIN (fix round 3, dev extra only, never on the node): the version `ruff check src
+#                          tests` was run with; an unpinned ruff drifted between writer and reviewer (new E501 rules).
 # SQLite comes from the standard library (sqlite3); no dependency.
 # `license` uses the PEP 639 string form: setuptools >= 77 warns on the TOML-table form and rejects it from 2027-02.
 
 [build-system]
-requires = ["setuptools>=77"]  # PEP 639 string `license` needs >= 77; pip builds isolated, so it takes the newest
+requires = ["setuptools==80.9.0"]  # exact: the isolated build must not take whatever is newest that day (rule §7.9)
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -51,7 +59,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.6"]
+dev = ["ruff==0.15.8"]  # rule §7.9: the version the suite was checked with (header)
 
 [project.scripts]
 # atlas-admin and atlas-api are the names in the writer brief; atlas-orchestrator is the name phase2/02-orchestrator.sh

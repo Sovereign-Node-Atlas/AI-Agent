@@ -11,13 +11,14 @@ Settings (orchestrator.env, phase2/02 and 03): OPENWEBUI_URL, OPENWEBUI_ADMIN_TO
 one line, phase2/03-openwebui.sh), OPENWEBUI_CHAT_RETENTION_DAYS (90).
 
 Rules. D9 (10.4) is binding without exception: "chats are retained 90 days in Open WebUI, then summarised into the
-Vector Cortex and purged". PINNED chats are a recorded DEVIATION from D9's second half (fix round 2):
-phase2/03-openwebui.sh keeps the Open WebUI record of a pinned chat, and this task honours that, but D9's memory half
-still holds: an expired pinned chat IS summarised into the Vector Cortex at 90 days (once per version of the chat: the
-summary document records `chat_updated_at`, and a chat whose summary is already current is skipped), only its Open
-WebUI record is kept.
-Keeping the record is a Section 23-style correction for the Principal to confirm or reverse, not a rule of the
-baseline; `kept_pinned` in the result counts them so the deviation is visible in the ledger.
+Vector Cortex and purged". PINNED chats follow D9 by default (fix round 4): an expired pinned chat is summarised and
+its Open WebUI record deleted like any other. Keeping the record of a pinned chat is an OPT-IN deviation,
+OPENWEBUI_KEEP_PINNED=1 in orchestrator.env, which no Day 1 step writes: with it, the pinned chat is still summarised
+at 90 days (once per version of the chat: the summary document records `chat_updated_at`, and a chat whose summary is
+already current is skipped) and only its Open WebUI record is kept, counted as `kept_pinned` so the deviation is
+visible in the ledger. The opt-in is recorded for scripts/day1/README.md "Baseline deviations" and a Section 23 row
+(the Principal confirms or reverses it); phase2/03-openwebui.sh's header still says the task "keeps pinned chats" and
+is asked to adopt the D9 wording (cross-writer).
 Vault-tagged chats (the `[VAULT]` token anywhere in a user message, `meta.tags` containing "vault", or a session the
 orchestrator's SessionTags marks vault through the durable store, fix round 2) are deleted WITHOUT a summary: "vault
 sessions are never retained" (10.4, 10.5). Every summary goes through the orchestrator: /internal/route decides the
@@ -27,9 +28,11 @@ summary; that call holds the orchestrator's one generation slot like any other g
 
 The admin token file (OPENWEBUI_ADMIN_TOKEN_FILE, atlas:atlas 600) must be readable by the gpu worker: a failure names
 the path and the owner:mode of the file and its directory (fix round), because the directory's mode is the usual
-cause and the journal must say so. The §2-compatible layout is /etc/atlas/secrets root:root 700 with atlas-read
-secrets in /etc/atlas/secrets/atlas/ (atlas:atlas 700, files 600) and the *_TOKEN_FILE keys pointing there;
-phase2/02-orchestrator.sh currently widens the directory to root:atlas 750 instead (cross-writer item).
+cause and the journal must say so. The implemented layout (phase2/02-orchestrator.sh header, phase2/06c, 09b;
+README-contracts.md §3 item 10): /etc/atlas/secrets is root:atlas 710 (traversable by atlas, nothing listed) and every
+file inside is 600 owned by its one reader; atlas-celery-gpu.service's ExecStartPre asserts exactly that before the
+worker starts. CONVENTIONS.md §2's `root:root 700` row cannot hold beside its own atlas:atlas entries and is the item
+asked to be amended (not a layout this package recommends at run time; fix round 4).
 """
 
 from __future__ import annotations
@@ -70,8 +73,11 @@ class RetentionResult:
     summarised: int = 0
     deleted: int = 0
     vault_deleted: int = 0
-    kept_pinned: int = 0  # expired pinned chats whose Open WebUI record was kept (the D9 deviation, module docstring)
+    keep_pinned: bool = False  # the OPENWEBUI_KEEP_PINNED=1 opt-in (module docstring); False = D9 as written
+    kept_pinned: int = 0  # expired pinned chats whose Open WebUI record was kept (opt-in mode only)
     pinned_summarised: int = 0  # ... of which a (new or refreshed) summary was written this run
+    graph_written: int = 0  # summaries also inserted into the D7 graph layer (store.graph), when one is configured
+    graph_failed: int = 0  # graph inserts that failed; logged, never blocks the D9 purge (the summary IS in Chroma)
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -83,8 +89,11 @@ class RetentionResult:
             "summarised": self.summarised,
             "deleted": self.deleted,
             "vault_deleted": self.vault_deleted,
+            "keep_pinned": self.keep_pinned,
             "kept_pinned": self.kept_pinned,
             "pinned_summarised": self.pinned_summarised,
+            "graph_written": self.graph_written,
+            "graph_failed": self.graph_failed,
             "errors": self.errors,
         }
 
@@ -163,7 +172,7 @@ def transcript(chat: Mapping[str, Any], max_chars: int = MAX_CHARS_PER_CHAT) -> 
 
 
 def select_expired(chats: Sequence[Mapping[str, Any]], cutoff: float, result: RetentionResult) -> list[dict[str, Any]]:
-    """Every chat older than the cutoff, pinned ones included (they are summarised, not deleted; run_retention)."""
+    """Every chat older than the cutoff, pinned ones included (D9 makes no exception; run_retention)."""
     out: list[dict[str, Any]] = []
     for c in chats:
         result.scanned += 1
@@ -195,6 +204,35 @@ def _summary_is_current(memory: Any, cid: str, updated_at: float) -> bool:
     return False
 
 
+def _graph_insert(
+    memory: Any, cid: str, title: str, summary: str, hemisphere: str, updated_at: float, result: RetentionResult
+) -> None:
+    """The D7 graph layer's one Day 1 feeder (fix round 4; memory.py module docstring): each chat summary goes into
+    the hemisphere's LightRAG as a permanent document, when the store carries a graph (LIGHTRAG_WORKING_DIR set). A
+    failure (lightrag missing, the tokenizer table not seeded, the orchestrator down) is logged and counted; it never
+    blocks the D9 purge, because the summary is already in the Vector Cortex. The extraction generations queue behind
+    the orchestrator's one slot like every other (LightRAGStore docstring)."""
+    graph = getattr(memory, "graph", None)
+    if graph is None:
+        return
+    try:
+        wr = graph.insert(
+            f"Chat summary ({title}):\n{summary.strip()}",
+            doc_id=f"chat-summary-{cid}",
+            hemisphere=hemisphere,
+            metadata={"kind": "chat-summary", "chat_id": cid, "chat_updated_at": updated_at},
+            temporal=False,
+        )
+        if wr.written or wr.spooled:
+            result.graph_written += 1
+        else:
+            result.graph_failed += 1
+            log.error("retention: graph insert of chat %s not written: %s", cid, wr.reason)
+    except Exception as exc:  # the summary is in Chroma; the graph is reported, not pretended
+        result.graph_failed += 1
+        log.error("retention: graph insert of chat %s failed: %s: %s", cid, type(exc).__name__, exc)
+
+
 def summary_messages(title: str, text: str) -> list[dict[str, str]]:
     return [
         {
@@ -221,11 +259,13 @@ def run_retention(
     task_id: str | None = None,
     dry_run: bool = False,
     sessions: Any | None = None,
+    keep_pinned: bool = False,
 ) -> RetentionResult:
     """`orchestrator` is atlas.tasks.OrchestratorClient (route + generate); `memory` an atlas.memory.MemoryStore;
-    `sessions` an atlas.vault.SessionTags (vault tags set through the flag/header, module docstring)."""
+    `sessions` an atlas.vault.SessionTags (vault tags set through the flag/header, module docstring); `keep_pinned`
+    the OPENWEBUI_KEEP_PINNED opt-in (False = D9 as written: pinned chats are purged after their summary too)."""
     now = now or time.time()
-    result = RetentionResult(days=days, cutoff=now - days * 86400.0)
+    result = RetentionResult(days=days, cutoff=now - days * 86400.0, keep_pinned=keep_pinned)
     chats = owui.all_chats()
     for chat in select_expired(chats, result.cutoff, result):
         cid = str(chat.get("id"))
@@ -239,8 +279,9 @@ def run_retention(
                 result.deleted += 1
                 log.info("retention: vault-tagged chat %s deleted without summary (10.4, 10.5)", cid)
                 continue
-            if pinned:
-                # The D9 deviation (module docstring): the record stays, the memory half of D9 still happens.
+            keep = pinned and keep_pinned
+            if keep:
+                # The opt-in deviation (module docstring): the record stays, the memory half of D9 still happens.
                 result.kept_pinned += 1
                 if _summary_is_current(memory, cid, float(chat.get("updated_at") or 0)):
                     continue
@@ -249,8 +290,15 @@ def run_retention(
                 route = orchestrator.route(text[:4000])
                 hemisphere = str(route.get("hemisphere") or "estate")  # the safer default when routing is unsure
                 collection = "estate" if hemisphere == "estate" else "corporate"
+                # The summary generation declares the chat's hemisphere (fix round 4): a failure's scar then lands
+                # in that hemisphere's scars, never as an estate scar carrying a corporate transcript.
                 summary = orchestrator.generate(
-                    engine, summary_messages(title, text), max_tokens=600, temperature=0.2, task_id=task_id
+                    engine,
+                    summary_messages(title, text),
+                    max_tokens=600,
+                    temperature=0.2,
+                    task_id=task_id,
+                    hemisphere=hemisphere,
                 )
                 if not summary.strip():
                     raise RuntimeError("empty summary from the resident model; chat kept")
@@ -273,11 +321,12 @@ def run_retention(
                     )
                     if not wr.written:
                         raise RuntimeError(f"summary not written ({wr.reason}); chat kept")
+                    _graph_insert(memory, cid, title, summary, hemisphere, float(chat.get("updated_at") or 0), result)
                 result.summarised += 1
                 if pinned:
                     result.pinned_summarised += 1
-            if pinned:
-                log.info("retention: pinned chat %s summarised, Open WebUI record kept (D9 deviation)", cid)
+            if keep:
+                log.info("retention: pinned chat %s summarised, Open WebUI record kept (OPENWEBUI_KEEP_PINNED)", cid)
                 continue
             if not dry_run:
                 owui.delete_chat(cid)
@@ -286,15 +335,18 @@ def run_retention(
             result.errors.append(f"{cid}: {type(exc).__name__}: {exc}")
             log.error("retention: chat %s not processed: %s", cid, exc)
     log.info(
-        "retention: scanned %d, expired %d, summarised %d, deleted %d (vault %d), pinned kept %d (%d summarised), "
-        "errors %d",
+        "retention: scanned %d, expired %d, summarised %d (graph %d, graph failed %d), deleted %d (vault %d), pinned "
+        "kept %d (%d summarised; keep_pinned=%s), errors %d",
         result.scanned,
         result.expired,
         result.summarised,
+        result.graph_written,
+        result.graph_failed,
         result.deleted,
         result.vault_deleted,
         result.kept_pinned,
         result.pinned_summarised,
+        keep_pinned,
         len(result.errors),
     )
     return result
@@ -316,14 +368,15 @@ def chat_retention(self: Any) -> dict[str, Any]:
         except RuntimeError as exc:
             raise RuntimeError(
                 f"OPENWEBUI_ADMIN_TOKEN_FILE={token_file} unreadable by this worker ({exc}; "
-                f"{_owner_mode(token_file)}). CONVENTIONS.md §2 keeps /etc/atlas/secrets root:root 700, so put the "
-                "atlas-read secrets in /etc/atlas/secrets/atlas/ (atlas:atlas 700, files atlas:atlas 600) and point "
-                "OPENWEBUI_ADMIN_TOKEN_FILE there in orchestrator.env"
+                f"{_owner_mode(token_file)}). /etc/atlas/secrets must be traversable by atlas (root:atlas 710 per "
+                "phase2/02-orchestrator.sh and phase2/06c; 750 also traverses) and the token file atlas:atlas 600; "
+                "see the ExecStartPre check in atlas-celery-gpu.service"
             ) from exc
         owui = OpenWebUIClient(url, token)
         orch = OrchestratorClient()
         try:
-            store = build_memory_store(with_graph=False)
+            # WITH the graph layer (fix round 4): the chat summary is the D7 graph's Day 1 feeder (_graph_insert).
+            store = build_memory_store()
             result = run_retention(
                 owui,
                 orch,
@@ -332,6 +385,7 @@ def chat_retention(self: Any) -> dict[str, Any]:
                 engine=env.get("ATLAS_CLASSIFIER_ENGINE") or "router-qwen3.5-4b",
                 task_id=self.request.id,
                 sessions=store.sessions,
+                keep_pinned=(env.get("OPENWEBUI_KEEP_PINNED") or "").strip() == "1",
             )
         finally:
             owui.close()

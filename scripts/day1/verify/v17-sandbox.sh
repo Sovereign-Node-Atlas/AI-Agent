@@ -4,7 +4,10 @@
 # under 10 minutes; safe to re-run. Must run as root or as a docker-group member.
 # Usage: v17-sandbox.sh [IMAGE=atlas-sandbox:py3.12] [TIMEOUT_S=120]
 #
-# Method, two runs under the run line of docker/sandbox/Dockerfile (--init, --read-only, --cap-drop ALL, nobody, ...):
+# Method, two runs under the run line of docker/sandbox/Dockerfile (--init, --read-only, --cap-drop ALL, --user
+# 65534:<atlas gid> — the gid the package's run line uses (orchestrator/src/atlas/sandbox.py build_argv), resolved from
+# getent so a gid-dependent failure of the real line is caught here, fix round 4; falls back to 65534 only when the atlas
+# group does not exist, and says so):
 #   1. Memory cap: a python one-liner that appends 64 MiB of non-zero bytes to a list forever (non-zero so every page
 #      is really touched and charged to the cgroup) under --memory=512m --memory-swap=512m. The kernel's OOM killer
 #      inside the memory cgroup sends SIGKILL, which docker reports as exit 137 (128 + 9; services-tools.md §6: the
@@ -17,7 +20,7 @@
 #      seconds of 5 s) and the container must be gone afterwards, so a program that ignores the host-side signal has
 #      no way to outlive its time bound. The host-side GNU timeout is only the backstop and must not be what fired.
 # The exit codes and the elapsed seconds of both runs are printed, with the image id and the base image the Dockerfile
-# pinned by digest (label org.atlas.sandbox.base; fix round 2, rule §7.9).
+# pinned by digest (label org.atlas.sandbox.base; fix round 2, rule §7.9). The image is built by phase2/06d-sandbox.sh.
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -29,12 +32,12 @@ command -v docker >/dev/null || { echo "V17 fail: docker not installed (Phase 1 
 command -v timeout >/dev/null || { echo "V17 fail: GNU timeout missing (coreutils)"; exit 1; }
 docker info >/dev/null 2>&1 || { echo "V17 fail: the docker daemon does not answer (run as root or a docker-group member)"; exit 1; }
 if ! docker image inspect "$image" >/dev/null 2>&1; then
-  echo "V17 fail: image $image does not exist; build it: docker build -t $image $ATLAS_DAY1_DIR/docker/sandbox (phase2/10-gate.sh does this)"
+  echo "V17 fail: image $image does not exist; build it: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06d (phase2/06d-sandbox.sh runs docker build -t $image $ATLAS_DAY1_DIR/docker/sandbox)"
   exit 1
 fi
 image_id="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null | cut -c8-19 || true)"
 image_ver="$(docker image inspect -f '{{index .Config.Labels "org.atlas.sandbox.version"}}' "$image" 2>/dev/null || true)"
-[[ "$image_ver" == 3 ]] || { echo "V17 fail: $image carries label org.atlas.sandbox.version='${image_ver:-none}', expected 3 (digest-pinned base + the in-container timeout entrypoint); rebuild: docker rmi $image; docker build -t $image $ATLAS_DAY1_DIR/docker/sandbox (phase2/10-gate.sh does this)"; exit 1; }
+[[ "$image_ver" == 4 ]] || { echo "V17 fail: $image carries label org.atlas.sandbox.version='${image_ver:-none}', expected 4 (digest-pinned base + the in-container timeout entrypoint + telemetry opt-outs); rebuild: docker rmi $image; sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06d"; exit 1; }
 image_base="$(docker image inspect -f '{{index .Config.Labels "org.atlas.sandbox.base"}}' "$image" 2>/dev/null || true)"
 
 meminfo() { awk -v k="$1" '$1 == k ":" { print $2; exit }' /proc/meminfo; }   # kB
@@ -53,10 +56,14 @@ name2="atlas-v17-timeout-$stamp"
 errf="$(mktemp)"
 trap 'rm -f "$errf"; docker rm -f "$name" "$name2" >/dev/null 2>&1 || true' EXIT
 
-# The run line of docker/sandbox/Dockerfile minus the job mount (nothing to mount here).
+# The run line of docker/sandbox/Dockerfile minus the job mount (nothing to mount here). The gid is the atlas group's,
+# as the package's build_argv passes it (header).
+atlas_gid="$(getent group atlas 2>/dev/null | cut -d: -f3 || true)"
+gid_note=""
+if [[ -z "$atlas_gid" ]]; then atlas_gid=65534; gid_note=" (atlas group absent: ran as 65534:65534, not the package's gid)"; fi
 run_flags=(--init --pull never --cpus=1 --pids-limit=64 --network none --read-only
   --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=64m" --ulimit fsize=1048576
-  --cap-drop ALL --security-opt no-new-privileges --user 65534:65534)
+  --cap-drop ALL --security-opt no-new-privileges --user "65534:$atlas_gid")
 
 # --- 1. the memory cap ------------------------------------------------------------------------------------------------
 bomb='a = []
@@ -143,5 +150,5 @@ if awk -v e="$elapsed2" -v t="$in_limit" 'BEGIN { exit (e < t + 10) ? 0 : 1 }'; 
   exit 1
 fi
 
-echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); SIGTERM-ignoring job killed by the in-container timeout: exit 137 after ${elapsed2}s (limit ${in_limit}s), container gone; $host (Δload1 $load_delta)$llama_note; image $image ${image_id:-?} (base ${image_base:-unlabelled})"
+echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); SIGTERM-ignoring job killed by the in-container timeout: exit 137 after ${elapsed2}s (limit ${in_limit}s), container gone; $host (Δload1 $load_delta)$llama_note; runs as 65534:$atlas_gid$gid_note; image $image ${image_id:-?} (base ${image_base:-unlabelled})"
 exit 0

@@ -31,6 +31,13 @@ workspace field isolates the storages, VERIFIED in the fix-round wheel review), 
 graph as it does for Chroma, and drives every coroutine on ONE long-lived event loop per store (a daemon thread):
 LightRAG's shared asyncio locks bind to the loop of their first contended acquire, and a fresh asyncio.run() per
 call would trip "bound to a different event loop" on the second insert.
+
+What feeds the graph on Day 1 (fix round 4, stated so no gate relies on more): ONE writer, the nightly chat summaries
+of tasks/retention.py (`graph.insert(summary, doc_id="chat-summary-<id>", hemisphere=<routed>)`, permanent). The chat
+path writes raw turns to Chroma only, scars and Sentinel BLUFs are Chroma-only, and the Docling ingestion task that
+will feed documents into the graph does not exist yet. The spool/thaw/prune plumbing is exercised by that one feeder
+and by the tests. Every extraction generation LightRAG makes goes to the orchestrator's /internal/v1 and declares its
+workspace as `atlas_hemisphere` (extra_body), so a failed extraction's scar is bound to that hemisphere (api.py).
 """
 
 from __future__ import annotations
@@ -74,9 +81,13 @@ DEFAULT_GRAPH_INDEX = "atlas-graph-index.sqlite3"
 DEFAULT_SPOOL_DIR = "/srv/atlas/data/orchestrator/spool"
 GRAPH_HEMISPHERES: tuple[str, ...] = ("corporate", "estate")
 # LightRAG's tokenizer: "gpt-4" maps to cl100k_base, the one table phase2/04-memory.sh seeds into TIKTOKEN_CACHE_DIR
-# (the 1.5.7 default "gpt-4o-mini" needs o200k_base, which is not cached and whose host is not allowlisted).
+# (the 1.5.7 default "gpt-4o-mini" needs o200k_base, which is not cached and whose host is not allowlisted). The blob
+# URL is NEVER fetched by this package: it is the key tiktoken derives the cache file name from (tiktoken_cache_file);
+# the table itself is delivered OFFLINE (a vendored repository copy or the Principal's inbox drop, 04's header).
 TIKTOKEN_MODEL_NAME = "gpt-4"
 TIKTOKEN_BLOB_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+TIKTOKEN_FILE = "cl100k_base.tiktoken"
+TIKTOKEN_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"  # tiktoken 0.14.0's own pin
 
 __all__ = [
     "COLLECTIONS",
@@ -540,13 +551,11 @@ class MemoryStore:
                     raise MemoryStoreError(f"unknown collection {name!r}")
                 try:
                     # embedding_function=None: vectors are ALWAYS supplied by this module (every add/upsert/query call
-                    # carries `embeddings`; tests/test_vault_tagging.py asserts it). UNVERIFIED: that chromadb-client
-                    # 1.5.9 records "no embedding function" for None and raises on a documents-only call instead of
-                    # instantiating its default ONNX function (whose model download the allowlist would deny, so the
-                    # failure would be loud either way). A custom EmbeddingFunction subclass was considered and not
-                    # adopted: its persisted-config interface (name/get_config/build_from_config) is UNVERIFIED for
-                    # 1.5.9 and a mismatch would break collection creation at Phase 2 step 4 (rule §7.4: do not
-                    # automate what may fail).
+                    # carries `embeddings`; tests/test_vault_tagging.py asserts it). VERIFIED against the pinned
+                    # chromadb-client 1.5.9 wheel (fix-round-4 review): get_or_create_collection(name,
+                    # embedding_function=None) is accepted, the thin client's DefaultEmbeddingFunction is a no-op (no
+                    # ONNX model download), and CollectionCommon._embed is never reached when embeddings are supplied,
+                    # so a documents-only call could never silently embed with a downloaded model either.
                     col = self.backend.get_or_create_collection(name, embedding_function=None)
                 except TypeError:
                     col = self.backend.get_or_create_collection(name)
@@ -759,10 +768,10 @@ class _LoopThread:
 
 
 def tiktoken_cache_file(cache_dir: str | Path) -> Path:
-    """Where tiktoken keeps cl100k_base under TIKTOKEN_CACHE_DIR.
-    # UNVERIFIED: the cache file name is sha1(blob URL).hexdigest() — tiktoken/load.py read_file_cached as read in
-    # the fix round, not in the research; a wrong assumption makes _build_rag fail loudly with the seeding command,
-    # never reach for the network."""
+    """Where tiktoken keeps cl100k_base under TIKTOKEN_CACHE_DIR: `sha1(blob URL).hexdigest()` (VERIFIED: tiktoken
+    0.14.0 tiktoken/load.py read_file_cached, read from the PyPI sdist on 2026-10-04 by phase2/04-memory.sh's writer,
+    whose _mem_tiktoken_seed derives the same name). A mismatch makes _build_rag fail loudly with the seeding remedy,
+    never reach for the network."""
     return Path(cache_dir) / hashlib.sha1(TIKTOKEN_BLOB_URL.encode("utf-8")).hexdigest()
 
 
@@ -780,10 +789,16 @@ class LightRAGStore:
     `spool_dir` (the same directory as MemoryStore's; ops `graph-insert` / `graph-delete`) and replayed by
     MemoryStore.replay_spool through `commit_spooled` at thaw. With no spool_dir it raises MemoryFrozen after the wait.
 
-    LightRAG 1.5.7 API (services-tools.md §2.2 verified `openai_complete_if_cache`, `initialize_storages` and the
-    env keys; the fix-round wheel review confirmed the rest): `LightRAG(working_dir=, workspace=, llm_model_func=,
-    embedding_func=EmbeddingFunc(embedding_dim, max_token_size, func), tiktoken_model_name=)`, `ainsert(input,
-    ids=[...])`, `aquery(q, param=QueryParam(mode=...))`, `adelete_by_doc_id(id)`, `finalize_storages()`.
+    LightRAG 1.5.7 API, VERIFIED against the pinned lightrag-hku 1.5.7 wheel (services-tools.md §2.2 for
+    `openai_complete_if_cache`, `initialize_storages` and the env keys; the fix-round-4 review for the rest):
+    `LightRAG(working_dir=, workspace=, llm_model_func=, embedding_func=EmbeddingFunc(embedding_dim, max_token_size,
+    func), tiktoken_model_name=)` (the `workspace` and `tiktoken_model_name` fields exist), `ainsert(input, ids=[...])`,
+    `aquery(q, param=QueryParam(mode=...))`, `adelete_by_doc_id(id)`, `finalize_storages()`, and `initialize_storages()`
+    auto-runs initialize_pipeline_status. `openai_complete_if_cache(model, prompt, ..., base_url=, api_key=, **kwargs)`
+    forwards the remaining kwargs to `chat.completions.create` (lightrag/llm/openai.py lines 505-506 in the wheel), so
+    `extra_body={"atlas_hemisphere": <workspace>}` reaches the orchestrator's /internal body (fix round 4): every
+    extraction declares the hemisphere its text belongs to. `api_key` is the /internal shared secret
+    (ORCH_INTERNAL_TOKEN_FILE, sent as Authorization: Bearer) when the node has one, else the placeholder.
     """
 
     def __init__(
@@ -804,10 +819,12 @@ class LightRAGStore:
         tiktoken_cache_dir: str | Path | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        internal_token: str | None = None,
     ) -> None:
         self.working_dir = Path(working_dir)
         self.llm_base_url = llm_base_url.rstrip("/")
         self.llm_model = llm_model
+        self.internal_token = internal_token
         self.embedding_url = embedding_url
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
@@ -880,12 +897,16 @@ class LightRAGStore:
             )
         f = tiktoken_cache_file(cache_dir)
         if not f.is_file():
+            # Fix round 4: the remedy is the OFFLINE delivery phase2/04-memory.sh implements, never an allowlist entry
+            # (16.3 item 6: no new egress host for a 1.7 MB public table).
             raise MemoryStoreError(
-                f"tiktoken table cl100k_base is not cached at {f}. The table is seeded by phase2/04-memory.sh ONLY "
-                "after the Principal adds openaipublic.blob.core.windows.net to config/allowlist.txt under a "
-                "'build-time, one-time' group (16.3 item 6: the allowlist is the Principal's to change) and the proxy "
-                "is re-rendered; config/allowlist.txt does not carry that host today. Never fetched at run time: the "
-                "graph refuses to start instead"
+                f"tiktoken table cl100k_base is not cached at {f}; LightRAG would fetch it from the network, which the "
+                f"allowlist denies, so the graph refuses to start instead. Remedy (phase2/04-memory.sh header item 4): "
+                f"on any machine with internet access `curl -fsSL -o {TIKTOKEN_FILE} {TIKTOKEN_BLOB_URL}` and check "
+                f"`sha256sum {TIKTOKEN_FILE}` prints {TIKTOKEN_SHA256}; copy it to /srv/atlas/staging/inbox/"
+                f"{TIKTOKEN_FILE} on this node (or commit it as scripts/day1/config/tiktoken/{TIKTOKEN_FILE}); then "
+                "`sudo ./atlas-day1.sh phase2 --force 04` seeds it into TIKTOKEN_CACHE_DIR under this name. No "
+                "allowlist change is needed or wanted"
             )
         os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(cache_dir))
 
@@ -906,18 +927,23 @@ class LightRAGStore:
         self._check_tokenizer_cache()
         embed = llama_embedding_fn(self.embedding_url, self.embedding_model)
         llm_base, llm_model = self.llm_base_url, self.llm_model
+        api_key = self.internal_token or "atlas-local"  # the /internal secret when the node has one (class docstring)
 
         async def llm_func(
             prompt: str, system_prompt: str | None = None, history_messages: list[Any] | None = None, **kw: Any
         ) -> str:
             kw.pop("hashing_kv", None)
+            # One llm_func per hemisphere (this closure is built per workspace): the extraction declares the
+            # hemisphere of its text on every /internal generation (fix round 4; atlas.api atlas_hemisphere).
+            extra_body = {**(kw.pop("extra_body", None) or {}), "atlas_hemisphere": hemisphere}
             return await openai_complete_if_cache(
                 llm_model,
                 prompt,
                 system_prompt=system_prompt,
                 history_messages=history_messages or [],
                 base_url=llm_base,
-                api_key="atlas-local",
+                api_key=api_key,
+                extra_body=extra_body,
                 **kw,
             )
 
@@ -1190,6 +1216,8 @@ def build_memory_store(
         except ValueError as exc:
             raise MemoryStoreError(f"EMBEDDING_DIM={env.get('EMBEDDING_DIM')!r} is not an integer") from exc
         orch = (env.get("ORCH_URL") or f"http://127.0.0.1:{env.get('ORCH_PORT') or 8800}").rstrip("/")
+        from atlas.tasks import internal_token  # the same ORCH_INTERNAL_TOKEN_FILE reader as OrchestratorClient
+
         graph = LightRAGStore(
             env["LIGHTRAG_WORKING_DIR"],
             llm_base_url=f"{orch}/internal/v1",
@@ -1201,5 +1229,6 @@ def build_memory_store(
             freeze_flag=freeze_flag,
             spool_dir=spool_dir,
             tiktoken_cache_dir=env.get("TIKTOKEN_CACHE_DIR") or None,
+            internal_token=internal_token(env),
         )
     return MemoryStore(backend, embed, sessions=sessions, freeze_flag=freeze_flag, graph=graph, spool_dir=spool_dir)

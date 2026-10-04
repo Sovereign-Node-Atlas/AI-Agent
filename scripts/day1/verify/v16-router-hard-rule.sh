@@ -23,7 +23,7 @@ py="$ATLAS_OPT/venv/bin/python"
 pkg="$ATLAS_OPT/orchestrator"
 [[ -f "$pkg/tests/$TEST" ]] || pkg="$ATLAS_DAY1_DIR/orchestrator"
 [[ -f "$pkg/tests/$TEST" ]] || { echo "$ID fail: tests/$TEST not found under $ATLAS_OPT/orchestrator or $ATLAS_DAY1_DIR/orchestrator (contract: orchestrator/tests/$TEST)"; exit 1; }
-"$py" -m pytest --version >/dev/null 2>&1 || { echo "$ID fail: pytest is not installed in $ATLAS_OPT/venv (pyproject.toml declares pytest>=8 as a runtime dependency; the gate installs nothing): re-run Phase 2 step 2: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 02"; exit 1; }
+"$py" -m pytest --version >/dev/null 2>&1 || { echo "$ID fail: pytest is not installed in $ATLAS_OPT/venv (pyproject.toml pins pytest==9.1.1 as a runtime dependency, a resolved pin; the gate installs nothing): re-run Phase 2 step 2: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 02"; exit 1; }
 
 if [[ -r "$ATLAS_ETC/orchestrator.env" ]]; then
   set -a

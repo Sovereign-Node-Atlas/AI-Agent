@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # docker/rocm-base/Dockerfile — the ONE ROCm/PyTorch base image for gfx1151 (ATLAS_FRAMEWORK_REVIEW.md Section 3.4,
 # Appendix B "Containers needing the GPU"; Section 17 Phase 4 step 1; CONVENTIONS.md §1). Built by phase4-engines.sh
 # step 01 as atlas/rocm-base:10.0.0 (label org.atlas.rocm-base.version, see config/phase4-engines.json base_image) and
@@ -19,12 +18,28 @@
 #     (research §4 item 2: a venv made from a venv does not see the parent venv's packages).
 #   * HF_HUB_ENABLE_HF_TRANSFER=0: hf_transfer ignores proxies (lib/common.sh proxy_env, platform research §6), and
 #     every outbound request must go through the allowlist proxy (rule §7.1). The research Dockerfile set it to 1;
-#     this file follows the rule.
+#     this file follows the rule. HF_HUB_DISABLE_XET=1 (fix round 3): huggingface_hub >= 1.0 (2.0.0 VERIFIED) downloads
+#     LFS/Xet files through the hf_xet Rust client by default; whether it honours https_proxy is UNVERIFIED, and a
+#     bypass would be dropped by DOCKER-USER (no direct egress) as a hung download, so the plain HTTP client, which
+#     honours the proxy, is forced (the constant HF_HUB_DISABLE_XET is VERIFIED in huggingface_hub constants.py).
+#     Remove it only after one pull is observed in /var/log/squid/access.log going through cas-bridge.xethub.hf.co.
+#   * No `# syntax=docker/dockerfile:1` line (fix round 3): it would make BuildKit pull and run the floating
+#     docker/dockerfile:1 frontend image on every fresh build (unpinned third-party code, rule §7.9); nothing here
+#     needs more than the built-in frontend.
 #
 # UNVERIFIED (each fails the build loudly rather than silently when wrong):
 #   * that the stable index serves cp312 wheels for the "==" pins above (research §1.1: exact cp-tag list unverified).
 #     If pip cannot resolve "torch==2.13.0+rocm10.0.0" the RUN fails and the error names the pin; drop the "==" pins
 #     and let the extras resolve, then record the resolved versions from /opt/atlas/constraints-rocm.txt.
+#   * that the stable index ALONE (--index-url, the research-VERIFIED pattern) also serves torch's third-party
+#     dependencies (sympy, filelock, jinja2, networkx, fsspec, typing-extensions, setuptools). If pip reports "no
+#     matching distribution" for one of them, add `--extra-index-url https://pypi.org/simple` to that RUN (pypi.org is
+#     allowlisted) and pin torchaudio to the +rocm${ROCM_VER} build it resolves, so PyPI cannot substitute a CUDA
+#     torchaudio; phase4-engines.sh's build failure message says the same.
+#   * The constraints file is generated IMMEDIATELY after the ROCm install, from what pip resolved there, and every
+#     later install in this image runs under it (fix round 3): a shared library that dragged in another torch would
+#     fail that install loudly instead of replacing the gfx1151 wheel and poisoning the constraints for every venv.
+#     The ROCm build is re-asserted after the shared libraries (torch.version.hip and the exact +rocm version).
 #   * `rocm-sdk path --root` flag spelling (research §1.2): the rocminfo step tries it first, then searches the wheel
 #     install for an executable rocminfo, and FAILS THE BUILD when none is found (V11 requires rocminfo itself,
 #     Section 21; selftest.py no longer accepts torch's gcnArchName as a substitute).
@@ -32,7 +47,7 @@
 #     DO_NOT_TRACK, HF_HUB_DISABLE_IMPLICIT_TOKEN in the ENV block (lib-engine.sh repeats them at run time).
 #   * torchaudio, diffusers, transformers, accelerate, huggingface_hub, safetensors, einops, pillow, numpy, scipy carry
 #     no research pin (rule §7.9; the README must say so). The resolved versions are frozen into
-#     /opt/atlas/base-freeze.txt at build time and copied to /srv/atlas/engines/manifests/ by the driver.
+#     /opt/atlas/base-freeze.txt at build time and copied to /srv/atlas/engines/manifests/ by the driver (as atlas).
 FROM ubuntu:24.04
 
 ARG ROCM_INDEX=https://stable.repo.amd.com/rocm/whl-next/
@@ -69,8 +84,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1 libxkbcommon0 libsm6 libice6 \
     && rm -rf /var/lib/apt/lists/*
 
-# ROCm SDK + torch for gfx1151 into the SYSTEM python (see header). The last line fails the build when the gfx1151
-# kernel pack did not come with torch (hipErrorInvalidImage at run time otherwise, TheRock #7839).
+# ROCm SDK + torch for gfx1151 into the SYSTEM python (see header). The pip show line fails the build when the gfx1151
+# kernel pack did not come with torch (hipErrorInvalidImage at run time otherwise, TheRock #7839). The constraints file
+# every later install runs under (research §6.6) is generated HERE, from exactly what this step resolved, so no later
+# step and no engine pin (OpenVLA torch==2.2.0, CosyVoice requirements) can replace the ROCm torch (header).
 RUN python3.12 -m pip install --break-system-packages --upgrade pip \
     && python3.12 -m pip install --break-system-packages --index-url "${ROCM_INDEX}" \
       "rocm[libraries,devel,device-gfx1151]==${ROCM_VER}" \
@@ -78,22 +95,24 @@ RUN python3.12 -m pip install --break-system-packages --upgrade pip \
       "torchvision[device-gfx1151]==${TORCHVISION_VER}+rocm${ROCM_VER}" \
       torchaudio \
     && python3.12 -m pip show amd-torch-device-gfx1151 >/dev/null \
-    && python3.12 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('torch', torch.__version__, 'hip', torch.version.hip)"
-
-# Shared pure-python libraries every engine venv inherits (no research pins; see header). diffusers is needed by the
-# V11 self-test's two-step UNet (research §2.3 item 4).
-RUN python3.12 -m pip install --break-system-packages \
-      "huggingface_hub" safetensors accelerate einops pillow numpy scipy diffusers transformers \
-    && python3.12 -m pip freeze > /opt/atlas-base-freeze.txt
-
-# The constraints file every engine install runs under (research §6.6): generated from what pip actually resolved,
-# so an engine pin (OpenVLA torch==2.2.0, CosyVoice requirements) can never replace the ROCm torch.
-RUN mkdir -p /opt/atlas \
-    && mv /opt/atlas-base-freeze.txt /opt/atlas/base-freeze.txt \
-    && grep -E '^(torch|torchaudio|torchvision|amd-|rocm)[A-Za-z0-9_.-]*==' /opt/atlas/base-freeze.txt > /opt/atlas/constraints-rocm.txt \
+    && python3.12 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; assert torch.__version__ == '${TORCH_VER}+rocm${ROCM_VER}', torch.__version__; print('torch', torch.__version__, 'hip', torch.version.hip)" \
+    && mkdir -p /opt/atlas \
+    && python3.12 -m pip freeze | grep -E '^(torch|torchaudio|torchvision|amd-|rocm)[A-Za-z0-9_.-]*==' > /opt/atlas/constraints-rocm.txt \
     && test -s /opt/atlas/constraints-rocm.txt \
-    && grep -q '^torch==' /opt/atlas/constraints-rocm.txt \
+    && grep -q "^torch==${TORCH_VER}+rocm${ROCM_VER}$" /opt/atlas/constraints-rocm.txt \
+    && grep -q '^torchaudio==' /opt/atlas/constraints-rocm.txt \
     && cat /opt/atlas/constraints-rocm.txt
+
+# Shared pure-python libraries every engine venv inherits (no research pins; see header), installed UNDER the
+# constraints file: a resolver that wanted another torch fails here, loudly (rule §7.4), instead of replacing the
+# gfx1151 wheel. diffusers is needed by the V11 self-test's two-step UNet (research §2.3 item 4). The ROCm build is
+# then re-asserted and the full resolved set frozen as the image's manifest.
+RUN python3.12 -m pip install --break-system-packages -c /opt/atlas/constraints-rocm.txt \
+      "huggingface_hub" safetensors accelerate einops pillow numpy scipy diffusers transformers \
+    && python3.12 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build after the shared libraries'; assert torch.__version__ == '${TORCH_VER}+rocm${ROCM_VER}', torch.__version__" \
+    && python3.12 -m pip show amd-torch-device-gfx1151 >/dev/null \
+    && python3.12 -m pip freeze > /opt/atlas/base-freeze.txt \
+    && test -s /opt/atlas/base-freeze.txt
 
 # rocminfo (and rocm-smi when present) from the wheel install on PATH. `rocm-sdk path --root` spelling is UNVERIFIED
 # (research §1.2), so the wheel tree is searched as well; the build stops when no rocminfo exists, because V11's
@@ -123,6 +142,7 @@ ENV TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
     HIP_VISIBLE_DEVICES=0 \
     HF_HOME=/srv/atlas/engines/hf \
     HF_HUB_ENABLE_HF_TRANSFER=0 \
+    HF_HUB_DISABLE_XET=1 \
     MIOPEN_USER_DB_PATH=/srv/atlas/engines/miopen \
     MIOPEN_CUSTOM_CACHE_DIR=/srv/atlas/engines/miopen \
     HOME=/srv/atlas/engines/home \

@@ -10,7 +10,7 @@
 #
 # Secrets the WORKER itself opens at run time (fix round 2, blocker): the Sentinel BLUF push reads NTFY_TOKEN_FILE
 # (/etc/atlas/secrets/ntfy.env) and, on the gpu worker, the D9 retention task reads OPENWEBUI_ADMIN_TOKEN_FILE. Both
-# files are atlas:atlas 600 inside /etc/atlas/secrets, which must be root:atlas 750 (phase2/02-orchestrator.sh header,
+# files are atlas:atlas 600 inside /etc/atlas/secrets, which must be root:atlas 710 (phase2/02-orchestrator.sh header,
 # adjudication item). The first ExecStartPre runs AS ATLAS and fails the unit when the directory cannot be traversed or
 # the token files cannot be read, so a writer that tightens the directory to 700 (phase2/09b-vault.sh today) is seen in
 # the journal at the next start, not as a silent nightly failure of the alert path (§7.4).
@@ -41,7 +41,7 @@ EnvironmentFile=-${ATLAS_ETC}/memory.env
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/var/lib/atlas/home
-ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env && { test ! -e ${ATLAS_ETC}/secrets/openwebui-admin.token || test -r ${ATLAS_ETC}/secrets/openwebui-admin.token; } || { echo "atlas-celery-cpu: ${ATLAS_ETC}/secrets is not traversable by atlas, or ntfy.env / openwebui-admin.token are unreadable (directory must be root:atlas 750, files atlas:atlas 600; phase2/02-orchestrator.sh header)" >&2; exit 1; }'
+ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env && { test ! -e ${ATLAS_ETC}/secrets/openwebui-admin.token || test -r ${ATLAS_ETC}/secrets/openwebui-admin.token; } || { echo "atlas-celery-cpu: ${ATLAS_ETC}/secrets is not traversable by atlas, or ntfy.env / openwebui-admin.token are unreadable (directory must be root:atlas 710, files atlas:atlas 600; phase2/02-orchestrator.sh header)" >&2; exit 1; }'
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-celery-cpu: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
 ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app worker -Q cpu -n cpu@%H --loglevel=INFO --concurrency=${CELERY_CPU_CONCURRENCY} --max-tasks-per-child=50
 Restart=always

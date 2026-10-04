@@ -9,21 +9,45 @@ Exit status 0 means "measured and recorded" (a failed engine is a recorded fail,
 infrastructure error the driver must stop on.
 
 Subcommands (global options first, see main()):
-    prepare                 unload every resident weight-bearing engine through the Arbiter, wait for the GTT
-                            counter, write baseline.json
+    prepare                 unload every resident weight-bearing engine through the Arbiter (every answer granted:
+                            its rule-5 check is the authority), poll the GTT counter ONCE against the earlier run's
+                            baseline after the last one (a multi-resident counter is never attributed to a single
+                            unload), settle, write baseline.json
     engine KEY [--previous PREV]
                             swap PREV out (unload + release check, credited to PREV) and KEY in through the Arbiter,
                             prove V4 from the journal, measure decode/prefill at 512 and 8k prompt tokens, register
                             the measured footprint with the Arbiter (rule 1), leave KEY resident.
                             DeepSeek (kv_ladder) runs the engines.json ladder with a coherence prompt instead.
+                            A result whose engine is NOT resident afterwards (not loaded, failed, the ladder) says
+                            so in "resident_after": the driver reads it to know what the next swap releases.
     finish [--previous PREV]
                             unload the last resident engine and credit its release check
     summarize               print the V10 lines (one per engine, then the summary the gate reads) and V22
     coresident --text KEY --vision KEY
-                            Section 17 step 3: both resident (vision at parallel_coresident), GTT ~142 GB + caches,
-                            two generation requests through the orchestrator, the second proven to queue (V21), then
-                            the real-engine refusal and Deep Think downgrade of Section 21 V14 (V14b)
+                            Section 17 step 3: both resident (vision at parallel_coresident / ctx_size_coresident,
+                            asserted on the rendered env before the load), GTT delta within [0.85 x 142 GB,
+                            min(142 + 28 + 10 GB, the Arbiter's live budget)], two generation requests through the
+                            orchestrator, the second proven to queue (V21), then the real-engine refusal and Deep
+                            Think downgrade of Section 21 V14 (V14b). A rule-5 leak in its cleanup fails V21 AND
+                            stops the phase (exit 2) after the records are written, as step 02 does.
     table                   the Section 17 step 4 table from the result files, plus every baseline_deviation
+
+Verdicts fixed by the baseline (the document wins over this file and over engines.json, CONVENTIONS.md preamble):
+  * Section 21 V10 "measured tok/s within the expected bands": a decode rate under the band's lower bound is a V10
+    fail for that engine (no tolerance factor; a tolerance would have to be a declared baseline_deviation).
+  * Section 23 S6 / engines.json known_issue (nemotron-3-super): the 8k prefill is followed by an alive check; a
+    server that died is a V10 FAIL carrying the issue number #20732 in its message (engines.json: "fail when it does
+    not" answer /health), never a hang and never a silent pass; alive with the request failed is a fail too.
+  * Section 4.3 / Section 23 S2: the DeepSeek ladder loads f16, then q8_0, then q4_0, "running a coherence prompt at
+    each rung", and keeps the LOWEST rung that loaded, proved its K/V types and answered coherently. Every rung is
+    tried whatever the rung above did (a q8_0 that failed to load for memory does not hide a q4_0 that fits); only a
+    missing model file or a rule-5 leak ends the ladder early. engines.json kv_ladder_rule items (3)/(4) still say
+    "stops at the first failing rung": the document wins; its writer is asked to align the text (see notes).
+  * Section 4.2 rule 3 for the requests this script sends straight to a llama-server port (POST /completion timing
+    points, the coherence prompts, the solo timings): the driver stops every other path to a generation (the
+    Sentinel/prune timers, atlas-celery-gpu, the atlas-openwebui container) for steps 02/03, and this script waits
+    for the orchestrator's single generation slot to be free (GET /health "generating"/"generation_queue", api.py)
+    before each such request and stops (Infra) when it is not free within GENERATION_IDLE_WAIT_S.
 
 Result files: <results-dir>/<key>.json, one per engine (schema: EngineResult below), plus baseline.json and
 coresident.json. A result with "ok": true AND "released": true makes the driver skip that engine on a re-run
@@ -68,13 +92,18 @@ ORCH_ADMIN_TOKEN_FILE is configured (--admin-token-file), else loopback is enoug
   * GET  {ORCH_URL}/arbiter/status -> 200 Arbiter.status(): gtt_used_bytes, budget_bytes, free_bytes,
          resident[{engine, projected_bytes, measured_bytes, ctx, parallel, kv_class, loading, unloading}], busy,
          generating {engine, task_id} | null, generation_queue [...], halted.
+  * GET  {ORCH_URL}/health also carries "generating" (the holder of the single generation slot or null) and
+         "generation_queue" (api.py health()); unauthenticated; the rule-3 idle check above reads it.
   * POST {ORCH_URL}/arbiter/load {"engine": KEY, "ctx": N, "parallel": N, "task_id": ...}
          -> 200 {"engine", "decision": "granted"|"queued"|"refused"|"error", "granted", "reason", "projected_bytes",
          "task_id"}. The Arbiter projects against the unit's env file (a ctx/parallel argument that disagrees with it
          is refused), plans LRU evictions (rule 3), waits load_wait_s behind a running generation (rules 4, 6), starts
          the unit through the sudoers path and returns granted only when it serves. 404 unknown engine, 503 halted
-         after a rule-5 failure, 500 controller error. queued here means "still blocked after load_wait_s": this
-         script waits and retries until LOAD_TIMEOUT_S; refused is a real decision and fails the engine loudly.
+         after a rule-5 failure, 500 controller error. queued here means "still blocked after load_wait_s" (arbiter.py
+         _plan_load: "arbiter busy: ...", "generation in progress on ...", "load of KEY already in progress"): the
+         Arbiter's own wait IS the queue, so this script re-POSTs after QUEUED_RETRY_S (the ledger only tells it
+         anything when another caller is loading this very engine, "already in progress", and then it is watched)
+         until LOAD_TIMEOUT_S; refused is a real decision and fails the engine loudly.
   * POST {ORCH_URL}/arbiter/unload {"engine": KEY, "task_id": ...} -> the same shape; the rule-5 release check runs
          inside (503 when the counter did not drop: the Arbiter halts). Anything but 200/granted is a refusal: this
          script never stops a unit behind a serving Arbiter (Section 4.2, 9.3).
@@ -139,7 +168,16 @@ REQUEST_TIMEOUT_S = 1200.0  # an 8k prefill on a dense 72B at Q8_0 plus 128 deco
 PREFILL_SHORT = 512
 PREFILL_LONG = 8192
 N_PREDICT = 128
-BAND_FAIL_FACTOR = 0.7  # Section 21 V10 "within the expected bands": below 70 % of the lower bound is a fail
+# Section 21 V10 "measured tok/s within the expected bands" (Section 5.1 figures in engines.json): a decode rate
+# under the band's lower bound is a V10 fail; there is no tolerance factor (one would be a baseline_deviation the
+# gate table must show, engines.json baseline_deviation_rule). Above the band is informational.
+QUEUED_RETRY_S = 15.0  # re-POST interval after an Arbiter "queued" answer (its own load_wait_s is the real queue)
+SETTLE_DELTA_BYTES = 256 * 1024 * 1024  # two GTT readings 10 s apart closer than this = the counter has settled
+GENERATION_IDLE_WAIT_S = 600.0  # Section 4.2 rule 3 belt: how long a direct request waits for the generation slot
+RESIDENCY_CACHE_BYTES = 28 * GB  # Section 4.1/4.3: "~28 GB for both caches" beside the 142 GB pair
+RESIDENCY_SLACK_BYTES = 10 * GB  # allocator overhead on top of the caches before the delta is out of tolerance
+RESIDENCY_LOW_FACTOR = 0.85  # less than this fraction of the weights on the counter = the pair is not resident
+DEFAULT_BUDGET_BYTES = 170 * GB  # Section 4.1 engine budget, used only when /arbiter/status carries no budget_bytes
 TASK_ID = "phase3-loadtest"
 UNIT_PREFIX = "llama-server@"
 P3_CLASSES = {"core", "apex", "vision", "crosscheck"}
@@ -509,7 +547,7 @@ class EngineResult:
     prefill_tps_8k: float | None = None
     prefill_8k_note: str = ""
     crashed_at_8k: bool = False
-    known_issue_note: str = ""  # set when a death at 8k is tolerated as a warning (Section 23 S6, nemotron #20732)
+    known_issue_note: str = ""  # the Section 23 S6 note with the issue number (#20732) recorded BESIDE the V10 fail
     stopped_externally: bool = False
     band_note: str = ""
     band_fail: str = ""
@@ -764,12 +802,19 @@ class Control:
                     f"(projected {fmt_gb(resp.get('projected_bytes') or 0)})")
                 break
             if decision == "queued":
-                # Rules 4 and 6: never a failure; wait for the ledger, then ask again until the deadline.
+                # Rules 4 and 6: never a failure. api.py blocks load_wait_s inside the Arbiter's own queue and answers
+                # queued as "retry later" (arbiter.py _plan_load: busy, a generating victim); nothing in the ledger
+                # changes until the retry, so the retry re-enters that queue after a short sleep. Only "load of KEY
+                # already in progress" (another caller loading this very engine) is a ledger wait.
                 if time.monotonic() > deadline:
                     raise RuntimeError(f"Arbiter kept {key} queued for {deadline - t0:.0f}s: {reason}")
-                log(f"control: Arbiter queued {key}: {reason}; waiting for the ledger")
-                if self._wait_resident(key, min(deadline, time.monotonic() + 300)):
-                    break
+                if "already in progress" in reason:
+                    log(f"control: Arbiter queued {key}: {reason}; watching the ledger for it to serve")
+                    if self._wait_resident(key, min(deadline, time.monotonic() + 300)):
+                        break
+                else:
+                    log(f"control: Arbiter queued {key}: {reason}; asking again in {QUEUED_RETRY_S:.0f}s")
+                    time.sleep(QUEUED_RETRY_S)
                 continue
             raise RuntimeError(f"Arbiter {decision or 'answered without a decision'} for {key}: {reason} "
                                f"({short(resp, 200)})")
@@ -842,6 +887,84 @@ def wait_release(baseline: int, label: str) -> tuple[bool, float, str]:
             log(f"release {label}: FAIL {note}")
             return False, time.monotonic() - t0, note
         time.sleep(2)
+
+
+def settle_counter() -> int:
+    """The GTT counter once it stopped moving: two readings 10 s apart within SETTLE_DELTA_BYTES (or RELEASE_TIMEOUT_S
+    elapsed), so a baseline is never taken mid-release."""
+    deadline = time.monotonic() + RELEASE_TIMEOUT_S
+    prev = gtt_used_bytes()
+    while True:
+        time.sleep(10)
+        cur = gtt_used_bytes()
+        if abs(cur - prev) < SETTLE_DELTA_BYTES or time.monotonic() > deadline:
+            return cur
+        prev = cur
+
+
+def clear_residents(ctl: Control, keys: Sequence[str], baseline: int | None, who: str,
+                    ) -> tuple[bool, float, str, int]:
+    """Unload several resident engines through the Arbiter and measure the release ONCE, against BASELINE, after the
+    last one: with two engines resident the counter cannot be back at the baseline after the first unload, so a
+    per-engine poll against it would report a leak that does not exist (fix round, major). Every /arbiter/unload must
+    answer granted (its own rule-5 check is the authority; a refusal or 503 is an Infra error here: nothing is stopped
+    behind the Arbiter). When the measurement window against BASELINE fails although every unload was granted, the
+    baseline is treated as stale (the resident set grew since it was taken: voice containers, a desktop session, a
+    Phase 2 model) and the settled counter is reported instead of a false leak.
+    Returns (window_ok, seconds, note, settled_bytes); window_ok is False only in that stale-baseline case."""
+    t0 = time.monotonic()
+    reasons: list[str] = []
+    for k in keys:
+        log(f"{who}: {k} is resident; unloading it through the Arbiter")
+        try:
+            reasons.append(f"{k}: {ctl.unload(k)}")
+        except RuntimeError as exc:
+            raise Infra(f"{who}: cannot clear the resident engines: {exc}") from exc
+    if not keys:
+        return True, 0.0, "nothing was resident", settle_counter()
+    label = "+".join(keys)
+    if baseline is None:
+        settled = settle_counter()
+        return True, time.monotonic() - t0, (f"Arbiter release check passed for {label} ({'; '.join(reasons)}); no "
+                                             f"earlier baseline to poll against; settled at {fmt_gb(settled)}"), settled
+    ok, secs, note = wait_release(baseline, label)
+    settled = settle_counter()
+    if ok:
+        return True, secs, f"{note} (measured once after {label}); Arbiter: {'; '.join(reasons)}", settled
+    log(f"{who}: the counter did not come back to the earlier baseline {fmt_gb(baseline)} but the Arbiter's own "
+        f"release check passed for {label}: treating the baseline as stale (settled at {fmt_gb(settled)})")
+    return False, secs, (f"Arbiter release check passed for {label} ({'; '.join(reasons)}); stale baseline "
+                         f"{fmt_gb(baseline)} vs settled {fmt_gb(settled)} ({note})"), settled
+
+
+def require_generation_idle(orch_url: str, label: str) -> None:
+    """Section 4.2 rule 3 ("exactly one may generate at any moment ... everywhere") for a request this script sends
+    straight to a llama-server port, which the Arbiter's generation lock cannot see. The driver has stopped every
+    other path to a generation (timers, atlas-celery-gpu, the Open WebUI container); this belt waits for the
+    orchestrator's single generation slot to be free (GET /health "generating" / "generation_queue", api.py) and
+    stops the phase when it is not within GENERATION_IDLE_WAIT_S: someone is using the assistant beside the tests."""
+    deadline = time.monotonic() + GENERATION_IDLE_WAIT_S
+    said = False
+    while True:
+        try:
+            code, body = http("GET", f"{orch_url.rstrip('/')}/health", timeout=10)
+        except HttpFail as exc:
+            raise Infra(f"{label}: GET /health failed while checking the generation slot (rule 3): {exc}") from exc
+        if code != 200 or not isinstance(body, dict):
+            raise Infra(f"{label}: GET /health answered {code} while checking the generation slot (rule 3): "
+                        f"{short(body, 200)}")
+        gen, queue = body.get("generating"), body.get("generation_queue") or []
+        if not gen and not queue:
+            return
+        if time.monotonic() > deadline:
+            raise Infra(f"{label}: the orchestrator is still generating ({short(gen, 120)}; queue {short(queue, 120)}) "
+                        f"after {GENERATION_IDLE_WAIT_S:.0f}s: something uses the assistant during the load tests "
+                        "(Section 4.2 rule 3); stop it and re-run")
+        if not said:
+            log(f"{label}: waiting for the orchestrator's generation slot ({short(gen, 120)}) before a direct request "
+                "(Section 4.2 rule 3)")
+            said = True
+        time.sleep(5)
 
 
 # --- V4 proof ---------------------------------------------------------------------------------------------------------
@@ -1174,11 +1297,9 @@ def check_band(res: EngineResult, spec: dict[str, Any]) -> None:
         return
     lo, hi = float(band[0]), float(band[1])
     d = res.decode_tps_512
-    if d < lo * BAND_FAIL_FACTOR:
-        res.band_fail = f"decode {d} tok/s below the expected band {band[0]}-{band[1]} (Section 5.1)"
-    elif d < lo:
-        res.band_note = f"decode {d} tok/s under the expected band {band[0]}-{band[1]} (within 30 %)"
-        res.warn(res.band_note)
+    if d < lo:
+        # V10 fail, no tolerance: the baseline says "within the expected bands" and declares no deviation.
+        res.band_fail = f"decode {d} tok/s below the expected band {band[0]}-{band[1]} (Section 5.1; V10 fail)"
     elif d > hi:
         res.band_note = f"decode {d} tok/s above the expected band {band[0]}-{band[1]} (informational)"
     else:
@@ -1187,6 +1308,7 @@ def check_band(res: EngineResult, spec: dict[str, Any]) -> None:
 
 def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict[str, str]) -> None:
     spec = ctx.spec(key)
+    require_generation_idle(ctx.orch_url, f"{key} 512-token point")  # rule 3: a direct request to the port
     r, note = measure_point(port, PREFILL_SHORT, "512")
     log(f"{key}: {note}")
     if r["error"]:
@@ -1207,13 +1329,16 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
         res.prefill_8k_note = f"skipped: {per_slot} tokens per slot ({ctx_size}/{parallel}) cannot hold an 8k prompt"
         log(f"{key}: 8k point {res.prefill_8k_note}")
         return
+    require_generation_idle(ctx.orch_url, f"{key} 8k point")
     r, note = measure_point(port, PREFILL_LONG, "8k")
     log(f"{key}: {note}")
-    # Section 23 S6 (folded into the baseline; engines.json known_issue of nemotron-3-super names #20732): the 8k
-    # prefill test checks the server is still alive afterwards and records a WARNING with the issue number, not a hang
-    # and not a phase-blocking fail; for every other engine a server that dies at 8k is a fail (Section 21 V10 wants
-    # load, generate and swap at 8k as at 512). The document wins (CONVENTIONS.md preamble).
-    tolerated = NEMOTRON_ISSUE_ID in str(spec.get("known_issue") or "")
+    # Section 23 S6 (engines.json known_issue of nemotron-3-super names #20732): the 8k prefill test checks the server
+    # is still alive afterwards (never a hang) and records the issue number. The verdict is engines.json's: "pass with
+    # the '#20732 checked, server alive' note when /health answers, fail when it does not". Section 21 V10 wants load,
+    # generate, swap and release at 8k as at 512: a server that is dead after 8k has not shown that, and its footprint
+    # is never registered (rule 1), so for every engine a death at 8k is a V10 FAIL; Nemotron's carries the issue
+    # number in the message (the S6 "warning with the issue number" is recorded beside the fail, not instead of it).
+    known = NEMOTRON_ISSUE_ID in str(spec.get("known_issue") or "")
     if r["error"]:
         time.sleep(3)
         alive = unit_active(key) and health_code(port) == 200
@@ -1228,13 +1353,15 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
             else:
                 res.crashed_at_8k = True
                 lost = f" [{DEVICELOST_ISSUE}]" if "ErrorDeviceLost" in tail_full else ""
-                if tolerated:
-                    res.prefill_8k_note = f"crashed (llama.cpp issue {NEMOTRON_ISSUE_ID}): warning per Section 23 S6"
-                    res.known_issue_note = (f"8k prefill crashed the server: {NEMOTRON_ISSUE}; Section 23 S6 records "
-                                            f"a warning with the issue number, not a fail (the 512 point passed; "
-                                            f"the server was alive-checked, not hung); journal: {tail}{lost}")
+                if known:
+                    res.prefill_8k_note = f"crashed ({NEMOTRON_ISSUE_ID} checked, server dead): V10 fail"
+                    res.known_issue_note = (f"8k prefill crashed the server: {NEMOTRON_ISSUE}; Section 23 S6: the "
+                                            "alive check ran and the server was found dead, not hung (the 512 point "
+                                            "passed); engines.json known_issue: fail when /health does not answer")
                     res.warn(res.known_issue_note)
-                    log(f"{key}: WARNING {res.known_issue_note}")
+                    res.load_error = (f"8k prefill crashed the server ({NEMOTRON_ISSUE}; S6 alive check: dead); "
+                                      f"journal: {tail}{lost}")
+                    log(f"{key}: FAIL {res.load_error}")
                 else:
                     res.prefill_8k_note = "crashed"
                     res.load_error = f"8k prefill crashed the server (died during the prefill); journal: {tail}{lost}"
@@ -1245,7 +1372,7 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
     t = r["timings"]
     res.prefill_tps_8k = round(float(t.get("prompt_per_second") or 0), 2)
     res.decode_tps_8k = round(float(t.get("predicted_per_second") or 0), 2)
-    if tolerated:
+    if known:
         res.prefill_8k_note = f"{NEMOTRON_ISSUE_ID} checked, server alive"  # engines.json known_issue wording
 
 
@@ -1263,17 +1390,21 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     # register the 2-slot / 65536 profile as the vision engine's footprint (rule 1) and print it as its row.
     env = ctx.render(key, [], ["coresident"])
     res.kv_requested = env.get("ATLAS_KV_TYPE", spec.get("kv_class", ""))
+    # The previous engine is released BEFORE the model-file check: an engine that never loads must not leave the
+    # earlier one resident with the driver believing this one is (its --previous would then name the wrong engine and
+    # the next release would be polled against the empty baseline with the real engine still loaded).
+    t_swap = time.monotonic()
+    _, res.swap_note = swap_out(ctx, ctl, previous, baseline)
     if env.get("ATLAS_MODEL_PRESENT") != "1":
         res.load_error = (f"ATLAS_MODEL_PRESENT=0 in {key}.env: model file {env.get('ATLAS_MODEL_FILE')} "
                           "not found (step 01)")
+        res.resident_after = False
         finalize_control(res, ctl)
         res.save(ctx)
         record("V4", "fail", f"{key}: not loaded ({res.load_error})")
         return
     port = int(env["LLAMA_ARG_PORT"])
     proof_lines = int(env.get("ATLAS_KV_PROOF_LINES", spec.get("kv_proof_lines", 0)) or 0)
-    t_swap = time.monotonic()
-    _, res.swap_note = swap_out(ctx, ctl, previous, baseline)
     since = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         res.load_s = round(ctl.load(key, int(env["ATLAS_CTX_SIZE"]), int(env["ATLAS_PARALLEL"]), port), 1)
@@ -1305,7 +1436,7 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
             res.footprint_note = "not measured: the server died at 8k (see warnings)"
         stop_and_release(ctx, ctl, key, baseline, res)
     res.ok = (res.load_ok and res.generated and not res.load_error and not res.band_fail
-              and (not res.crashed_at_8k or bool(res.known_issue_note)) and res.released is not False)
+              and not res.crashed_at_8k and res.released is not False)
     finalize_control(res, ctl)
     res.save(ctx)
     log(f"{key}: result ok={res.ok} decode512={res.decode_tps_512} decode8k={res.decode_tps_8k} "
@@ -1341,17 +1472,18 @@ def rung_verdict(r: dict[str, Any]) -> str:
 def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any]], base_kv: str,
                   f16_cap: int | None, stop_reason: str, released: bool | None, release_note: str,
                   decode_512: float | None, prefill_512: float | None) -> LadderVerdict:
-    """Pure decision of the ladder (engines.json kv_ladder_rule; Section 4.3; Section 23 S2; Section 21 V4/V22; R19).
-    The ladder DESCENDS in list order f16 -> q8_0 -> q4_0 and stops at the first rung that fails to load or is
-    incoherent, so the winner is the LAST rung that loaded, printed its proof lines and answered coherently (the lowest
-    coherent rung reached, never a rung below a failure):
+    """Pure decision of the ladder (Section 4.3; Section 23 S2; Section 21 V4/V22; R19; engines.json kv_ladder_rule
+    where it agrees with the document). Every rung f16 -> q8_0 -> q4_0 is tried (a coherence prompt "at each rung");
+    the winner is the LOWEST rung (last in list order) that loaded, printed its proof lines and answered coherently,
+    whatever the rungs above it did (a q8_0 that failed to load for memory does not hide a q4_0 that fits):
       * q4_0 (the Section 4.3 target) -> V4 pass, overrides cleared (the rungs above were the path down);
       * q8_0 -> V4 pass with the note that q4_0 was refused or incoherent (issues #25382, #26423), written to overrides;
       * f16 only -> V4 DEFERRED (unquantised KV is exactly the fallback V4 exists to catch), kv_type=f16 and
         ctx_size=ctx_size_f16_cap written to overrides, V22 still passes with the note (S2);
-      * no coherent rung (f16 itself fails) -> V4 and V22 deferred with the reason (R19 keeps the phase unblocked);
+      * no coherent rung at all -> V4 and V22 deferred with the reason (R19 keeps the phase unblocked);
       * a winner whose measurement failed (request error, death at 8k) is still the winner (a measurement failure is
-        not incoherence) but V22 records deferred with that reason (R19)."""
+        not incoherence) but V22 records deferred with that reason (R19).
+    A rung the loop never reached (model file missing, a rule-5 leak ended the ladder) is listed as "not tried"."""
     summary = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in rungs)
     untried = [kv for kv in ladder if kv not in {r["kv"] for r in rungs}]
     if untried:
@@ -1365,10 +1497,15 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
             v22_result="deferred",
             v22_msg=f"DeepSeek V4 Flash deferred without blocking the phase (R19): {reason}; ladder: {summary}",
             set_ov=[], clear_ov=["kv_type", "ctx_size"], note="overrides cleared", deviation="", summary=summary)
-    wrung = winners[-1]
+    wrung = winners[-1]  # rungs are in list order, so the last winner is the lowest coherent rung
     winner = str(wrung["kv"])
     below = [r for r in rungs if ladder.index(r["kv"]) > ladder.index(winner)]
     detail = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in below) or "not reached"
+    above_failed = [r for r in rungs if ladder.index(r["kv"]) < ladder.index(winner) and r not in winners]
+    if above_failed:
+        # The document keeps the lowest coherent setting; a failure above it is recorded, not a reason to stop.
+        summary += "; note: rungs above the winner failed (" + ", ".join(
+            f"{r['kv']}={rung_verdict(r)}" for r in above_failed) + "), the lowest coherent rung stands (Section 4.3)"
     base_rung = next((r for r in rungs if r["kv"] == base_kv), None)
     base_state = rung_verdict(base_rung) if base_rung else "not tried"
     measure_error = str(wrung.get("measure_error") or "")
@@ -1386,7 +1523,7 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
         deviation = (f"KV f16 instead of Section 4.3 q4_0: no quantised rung usable on this build ({detail}; "
                      f"{DEEPSEEK_KV_ISSUES}); {note}")
         v = LadderVerdict(winner, "deferred",
-                          f"{key}: unquantised KV: the first quantised rung below f16 failed ({detail}; "
+                          f"{key}: unquantised KV: every quantised rung below f16 failed ({detail}; "
                           f"{DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
                           "pass" if ok else "deferred", "", set_ov, [], note, deviation, summary)
     else:
@@ -1410,15 +1547,17 @@ LADDER_RUNG_FIELDS = ("decode_tps_512", "decode_tps_8k", "prefill_tps_512", "pre
 
 
 def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseline: int, res: EngineResult) -> None:
-    """DeepSeek V4 Flash (research conflict b; engines.json kv_ladder_rule; Section 4.3; Section 23 S2): the rungs in
-    list order f16 -> q8_0 -> q4_0, DOWN from the unquantised cache towards the q4_0 target. A rung that loads, prints
-    its proof lines and answers the coherence prompt becomes the current winner and the next rung is tried; the ladder
-    stops at the first rung that fails to load or is incoherent and keeps the previous winner (the lowest coherent rung
-    reached). A coherent rung whose measurement fails (request error, death at 8k) is not incoherence: the ladder stops
-    with that rung as the winner and V22 records deferred with the reason (R19). The f16 rung is the control that
-    attributes an incoherent quantised rung to KV quantisation rather than to the build or the model. Every rung's
-    overrides are journalled (pending-overrides.json) so an interrupted ladder cannot leave an f16 profile behind; a
-    rule-5 release failure stops the phase (Infra) after the result is saved."""
+    """DeepSeek V4 Flash (research conflict b; Section 4.3; Section 23 S2): "Phase 3 loads f16, then q8_0, then q4_0,
+    running a coherence prompt at each rung, and keeps the lowest coherent setting". EVERY rung is loaded, proved (V4
+    lines) and asked the coherence prompt, whatever the rung above did: a q8_0 that fails to load (its KV at 32768 is
+    about the bytes of the f16 rung at its 16384 cap) must not hide a q4_0 that fits, and the document says "at each
+    rung". The winner is the lowest rung that loaded, proved and answered coherently (decide_ladder); a coherent rung
+    whose measurement fails (request error, death at 8k) is not incoherence and still counts, with V22 deferred when it
+    is the winner (R19). The f16 rung is the control that attributes an incoherent quantised rung to KV quantisation
+    rather than to the build or the model. Only a missing model file or a rule-5 leak ends the ladder early (the leak
+    stops the phase, Infra, after the result is saved). Every rung's overrides are journalled (pending-overrides.json)
+    so an interrupted ladder cannot leave an f16 profile behind. engines.json kv_ladder_rule (3)/(4) still describe an
+    early stop; the document wins (CONVENTIONS.md preamble) and its writer is asked to align the text."""
     spec = ctx.spec(key)
     ladder: list[str] = list(spec["kv_ladder"])
     f16_cap = spec.get("ctx_size_f16_cap")
@@ -1453,12 +1592,14 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
             rung["note"] = f"load failed: {exc}"
             if "ErrorDeviceLost" in str(exc):
                 rung["note"] += f" [{DEVICELOST_ISSUE}]"
-            log(f"{key}: rung {kv} {rung['note']}; the ladder stops here and keeps the rung above (kv_ladder_rule 3)")
+            log(f"{key}: rung {kv} {rung['note']}; the next rung is still tried (Section 4.3: a coherence prompt at "
+                "each rung, the lowest coherent setting is kept)")
             stop_and_release(ctx, ctl, key, baseline, res)  # rule 5: polled even when the unit never came up
             rung["released"] = res.released
             if res.released is False:
                 stop_reason = f"memory not released after the failed {kv} rung: {res.release_note}"
-            break
+                break
+            continue
         rung["load_ok"] = True
         res.load_ok = True
         if not swap_measured:
@@ -1469,6 +1610,7 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         ok, msg, applied = prove_kv(key, kv, proof_lines, inv, since, port)
         rung["kv_proof_ok"], rung["kv_proof_msg"], rung["applied"] = ok, msg, applied
         log(f"{key}: rung {kv} proof {'ok' if ok else 'NOT ok'}: {msg}")
+        require_generation_idle(ctx.orch_url, f"{key} rung {kv} coherence prompt")  # rule 3: direct to the port
         coherent, detail = coherence_check(port, key)
         rung["coherent"], rung["coherence"] = coherent, detail
         log(f"{key}: rung {kv} coherence {'ok' if coherent else 'FAIL'}: {detail}")
@@ -1489,14 +1631,13 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
             stop_reason = f"memory not released after the {kv} rung: {res.release_note}"
             break
         if not won:
-            log(f"{key}: rung {kv} {rung_verdict(rung)}; the ladder stops here and keeps the rung above "
-                "(kv_ladder_rule 3)")
-            break
-        if rung.get("measure_error"):
-            log(f"{key}: rung {kv} is coherent but its measurement failed ({rung['measure_error'][:160]}); the ladder "
-                "stops with this rung as the winner and V22 records deferred (R19)")
-            break
-        log(f"{key}: rung {kv} coherent and proven: current winner; descending (kv_ladder_rule 2)")
+            log(f"{key}: rung {kv} {rung_verdict(rung)}; the next rung is still tried (Section 4.3: a coherence "
+                "prompt at each rung)")
+        elif rung.get("measure_error"):
+            log(f"{key}: rung {kv} is coherent and proven but its measurement failed ({rung['measure_error'][:160]}): "
+                "it stands as a winner (V22 deferred if it is the lowest, R19); the next rung is still tried")
+        else:
+            log(f"{key}: rung {kv} coherent and proven: current winner; descending")
     standing = next((r for r in reversed(res.ladder) if r.get("coherent") and r.get("kv_proof_ok")), {})
     v = decide_ladder(key, ladder, res.ladder, base_kv, f16_cap, stop_reason, res.released, res.release_note,
                       standing.get("decode_tps_512"), standing.get("prefill_tps_512"))
@@ -1539,33 +1680,21 @@ def cmd_prepare(ctx: Ctx, _args: argparse.Namespace) -> int:
                     f"does not own is never stopped behind it: restart {ORCH_UNIT}.service (its startup "
                     "stops unowned units) or stop the unit by hand")
     to_unload = [k for k in ctx.core_keys() if k in ledger or k in active]
+    # Every resident engine is unloaded through the Arbiter (each answer granted: its rule-5 check is the authority)
+    # and the counter is polled ONCE against the earlier run's baseline after the last one: with two engines resident
+    # (an interrupted step 03) a per-engine poll against the empty baseline would report a leak that does not exist.
+    # A window that fails although every unload was granted means the earlier baseline is stale (the resident set
+    # grew since); the fresh baseline below is what the tests use, and no false leak stops the phase.
+    window_ok, secs, note, cur = clear_residents(ctl, to_unload, prev_baseline, "prepare")
     for k in to_unload:
         res = load_result(ctx, k)
-        log(f"prepare: {k} is resident before the tests; unloading it through the Arbiter")
-        if prev_baseline is None:
-            try:
-                ctl.unload(k)
-            except RuntimeError as exc:
-                raise Infra(f"cannot establish the baseline: {exc}") from exc
-            continue
-        ok, secs, note = unload_and_release(ctl, k, prev_baseline)
         if res is not None and res.resident_after:
             # File-level resumability (CONVENTIONS.md §7.3): the engine passed in an interrupted run and was left
-            # resident for the next swap to measure; this IS that measurement, credited so its V10 line can pass.
-            credit_release(ctx, k, ok, secs, f"credited by prepare on a re-run (baseline of the earlier run): {note}")
-        if not ok:
-            raise Infra(f"cannot establish the baseline: {k} did not release ({note}) (Section 4.2 rule 5)")
-    if to_unload:
-        time.sleep(5)
-    # Settle: two readings 10 s apart within tolerance, so the baseline is not taken mid-release.
-    deadline = time.monotonic() + RELEASE_TIMEOUT_S
-    prev = gtt_used_bytes()
-    while True:
-        time.sleep(10)
-        cur = gtt_used_bytes()
-        if abs(cur - prev) < 256 * 1024 * 1024 or time.monotonic() > deadline:
-            break
-        prev = cur
+            # resident for the next swap to measure; this IS that measurement, credited so its V10 line can pass. With
+            # several engines resident the measurement is cumulative and the note says so (never attributed to one).
+            how = "cumulative after " + "+".join(to_unload) if len(to_unload) > 1 else "baseline of the earlier run"
+            window = "window ok" if window_ok else "Arbiter release check passed, earlier baseline stale"
+            credit_release(ctx, k, True, secs, f"credited by prepare on a re-run ({how}; {window}): {note}")
     total = gtt_total_bytes()
     log(f"prepare: baseline GTT used {fmt_gb(cur)} of {fmt_gb(total)} (residents only; control via {ctl.mode})")
     if cur > 40 * GB:
@@ -1628,9 +1757,11 @@ def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
         parts.append("warn: " + " | ".join(w[:160] for w in res.warnings))
     if res.load_error:
         parts.append(f"error: {res.load_error[:200]}")
-    # A death at 8k fails the engine unless Section 23 S6 tolerates it as a warning (known_issue_note, nemotron #20732).
-    crash_fail = res.crashed_at_8k and not res.known_issue_note
-    ok = (res.generated and not res.load_error and not crash_fail and not res.stopped_externally
+    # A death at 8k fails the engine; for nemotron-3-super the issue number rides in the message (known_issue_note,
+    # Section 23 S6 / engines.json known_issue: "fail when it does not" answer /health).
+    if res.crashed_at_8k and res.known_issue_note and NEMOTRON_ISSUE_ID not in "; ".join(parts):
+        parts.append(f"S6: {res.known_issue_note[:160]}")
+    ok = (res.generated and not res.load_error and not res.crashed_at_8k and not res.stopped_externally
           and not res.band_fail and res.released is True)
     return ("pass" if ok else "fail"), "; ".join(parts)
 
@@ -1706,7 +1837,7 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
         if res.prefill_8k_note:
             notes.append(f"8k {res.prefill_8k_note.split(':')[0]}")
         if res.known_issue_note:
-            notes.append(f"S6 warning {NEMOTRON_ISSUE_ID}")
+            notes.append(f"S6 {NEMOTRON_ISSUE_ID} (fail)")
         if res.load_error:
             notes.append(res.load_error[:40])
         rows.append((key, "ok" if res.load_ok else "FAIL", res.kv_applied or res.kv_requested or "-",
@@ -1753,6 +1884,16 @@ def queue_proof(a: dict[str, Any], b: dict[str, Any], solo_second_s: float) -> t
     proof = (f"wall-clock (no timings passed through): second took {wall_b:.1f}s vs {solo_second_s:.1f}s solo while "
              f"the first took {wall_a:.1f}s")
     return ok, proof
+
+
+def residency_bounds(weights_bytes: int, budget_bytes: int) -> tuple[int, int]:
+    """Pure V21 window for the GTT delta of the resident pair (Section 17 step 3 "confirm both hold at ~142 GB"):
+    at least RESIDENCY_LOW_FACTOR of the weights (less means one engine is not really resident), at most the weights
+    plus the ~28 GB of both caches (Section 4.1/4.3) plus allocator slack, CAPPED at the live engine budget: a pair
+    that overflowed the ~170 GB budget can never pass the residency half of V21."""
+    low = int(RESIDENCY_LOW_FACTOR * weights_bytes)
+    high = min(weights_bytes + RESIDENCY_CACHE_BYTES + RESIDENCY_SLACK_BYTES, int(budget_bytes))
+    return low, high
 
 
 def pick_probe_key(ctx: Ctx, exclude: Sequence[str]) -> str:
@@ -1855,14 +1996,22 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     tspec, vspec = ctx.spec(text_key), ctx.spec(vision_key)
     ctl = Control(ctx.orch_url, ctx.admin_token)
     pending_recover(ctx)
-    baseline = read_baseline(ctx)
+    saved_baseline = read_baseline(ctx)
     out: dict[str, Any] = {"text": text_key, "vision": vision_key, "control_mode": ctl.mode, "tested_at": now_iso()}
-    for k in ctx.core_keys():
-        if unit_active(k) or k in ctl.resident_keys():
-            log(f"coresident: {k} is resident; unloading it first")
-            ok, _, note = unload_and_release(ctl, k, baseline)
-            if not ok:
-                raise Infra(f"cannot start the two-residency test: {k} did not release: {note}")
+    # Whatever is resident (an interrupted step 03 leaves BOTH engines) goes through the Arbiter first and the counter
+    # is polled once against the saved baseline after the last unload (clear_residents: never a multi-resident counter
+    # attributed to a single unload). The test's own baseline is the SETTLED counter measured now: the saved one may
+    # be hours old, and the delta that proves ~142 GB must not include whatever else was loaded since.
+    ledger = ctl.resident_keys()
+    resident = [k for k in ctx.core_keys() if unit_active(k) or k in ledger]
+    _, _, clear_note, baseline = clear_residents(ctl, resident, saved_baseline, "coresident")
+    out["cleared_first"] = {"engines": resident, "note": clear_note}
+    out["baseline_bytes"] = baseline
+    out["saved_baseline_bytes"] = saved_baseline
+    if abs(baseline - saved_baseline) > RELEASE_TOLERANCE_BYTES:
+        log(f"coresident: baseline for this test {fmt_gb(baseline)} (settled now) differs from baseline.json "
+            f"{fmt_gb(saved_baseline)}: the resident set changed since step 02; the settled figure is used")
+    budget = int((ctl.status() or {}).get("budget_bytes") or 0) or DEFAULT_BUDGET_BYTES
     loaded: list[str] = []
     # The vision engine's co-resident profile (parallel_coresident / ctx_size_coresident) is a TEMPORARY override:
     # journalled before it is written, cleared in cleanup(); the orchestrator decides co-residency live.
@@ -1899,12 +2048,28 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
                                                           encoding="utf-8")
         record("V21", *v21)
         record("V14b", *v14b)
+        if problems:
+            # Rule 5, as in step 02 (halt_if_leaked): the records are written, then the phase STOPS, so the driver
+            # does not mark step 03 done and resume background generation with memory still held.
+            raise Infra(f"two-residency cleanup: {' | '.join(problems)}: the phase stops here, as the Arbiter halts "
+                        f"(Section 4.2 rule 5); recorded in {ctx.results_dir / 'coresident.json'}. Check the GTT "
+                        f"counter and the llama-server@ units, restart {ORCH_UNIT}.service, then re-run step 03")
         return 0
 
     tenv = ctx.render(text_key, [], ["coresident"])
     venv = ctx.render(vision_key, [("coresident", "true")], [])  # parallel_coresident / ctx_size_coresident
     if venv.get("ATLAS_CORESIDENT") != "1":
         raise Infra(f"engine-env.py did not render {vision_key} with ATLAS_CORESIDENT=1")
+    # Section 4.3: the vision engine runs 2 slots while co-resident "keeping the pair inside the ~28 GB of cache the
+    # 142 GB combination leaves". The rendered profile must BE engines.json's parallel_coresident / ctx_size_coresident
+    # before anything is loaded, or the delta accepted below would be an 8-slot profile's.
+    want_par, want_ctx = vspec.get("parallel_coresident"), vspec.get("ctx_size_coresident")
+    if want_par is None or want_ctx is None:
+        raise Infra(f"engines.json: {vision_key} has no parallel_coresident/ctx_size_coresident (Section 4.3)")
+    if venv.get("ATLAS_PARALLEL") != str(int(want_par)) or venv.get("ATLAS_CTX_SIZE") != str(int(want_ctx)):
+        raise Infra(f"engine-env.py rendered {vision_key} co-resident as parallel {venv.get('ATLAS_PARALLEL')}, ctx "
+                    f"{venv.get('ATLAS_CTX_SIZE')}; engines.json says parallel_coresident {want_par}, "
+                    f"ctx_size_coresident {want_ctx} (Section 4.3)")
     for key, env in ((text_key, tenv), (vision_key, venv)):
         if env.get("ATLAS_MODEL_PRESENT") != "1":
             return finish(("fail", f"{key}: model file not present ({env.get('ATLAS_MODEL_FILE')})"),
@@ -1934,23 +2099,27 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     time.sleep(5)
     used = gtt_used_bytes()
     delta = used - baseline
-    weights = (float(tspec["footprint_gb"]) + float(vspec["footprint_gb"])) * GB  # Section 4.1: 63 + 79 = 142 GB
-    low, high = 0.85 * weights, weights + 28 * GB + 10 * GB  # 4.1: "~28 GB for both caches", plus slack
+    weights = int((float(tspec["footprint_gb"]) + float(vspec["footprint_gb"])) * GB)  # Section 4.1: 63 + 79 = 142 GB
+    low, high = residency_bounds(weights, budget)
     residency_ok = low <= delta <= high
-    mem_msg = (f"GTT delta {fmt_gb(delta)} for {text_key}+{vision_key} (weights {fmt_gb(weights)}, tolerance "
-               f"{fmt_gb(low)}-{fmt_gb(high)}; used {fmt_gb(used)}, baseline {fmt_gb(baseline)}, "
-               f"vision at parallel {venv['ATLAS_PARALLEL']}, ctx {venv['ATLAS_CTX_SIZE']})")
-    out.update({"gtt_used_bytes": used, "gtt_delta_bytes": delta, "weights_bytes": int(weights),
-                "residency_ok": residency_ok})
+    mem_msg = (f"GTT delta {fmt_gb(delta)} for {text_key}+{vision_key} (weights {fmt_gb(weights)} + ~28 GB for both "
+               f"caches expected; accepted {fmt_gb(low)}-{fmt_gb(high)}, the upper bound capped at the Arbiter's "
+               f"budget {fmt_gb(budget)}; used {fmt_gb(used)}, baseline {fmt_gb(baseline)}, vision at parallel "
+               f"{venv['ATLAS_PARALLEL']}, ctx {venv['ATLAS_CTX_SIZE']})")
+    out.update({"gtt_used_bytes": used, "gtt_delta_bytes": delta, "weights_bytes": weights, "budget_bytes": budget,
+                "accepted_low_bytes": low, "accepted_high_bytes": high, "residency_ok": residency_ok})
     log(f"coresident: {'OK' if residency_ok else 'OUT OF TOLERANCE'}: {mem_msg}")
 
     # Solo timings of each engine (direct to the llama-server port) give the wall-clock reference for the concurrent
-    # run. Nothing else generates meanwhile: the driver stops atlas-sentinel.timer, atlas-prune.timer and
-    # atlas-celery-gpu.service around steps 02/03 (Section 4.2 rule 3: one generation at a time, background work too).
+    # run. Nothing else generates meanwhile: the driver stops atlas-sentinel.timer, atlas-prune.timer,
+    # atlas-celery-gpu.service and the atlas-openwebui container around steps 02/03 (Section 4.2 rule 3: one
+    # generation at a time, background work too), and the generation slot is checked free before each direct request.
     tport, vport = int(tenv["LLAMA_ARG_PORT"]), int(venv["LLAMA_ARG_PORT"])
     q_text = [{"role": "user", "content": "Write a 250-word essay about the history of lighthouses."}]
     q_vision = [{"role": "user", "content": "Describe, in about 150 words, how a suspension bridge carries its load."}]
+    require_generation_idle(ctx.orch_url, f"coresident solo timing {text_key}")
     solo_t = chat(f"http://127.0.0.1:{tport}", text_key, q_text, 256)
+    require_generation_idle(ctx.orch_url, f"coresident solo timing {vision_key}")
     solo_v = chat(f"http://127.0.0.1:{vport}", vision_key, q_vision, 160)
     if solo_t["error"] or solo_v["error"]:
         why = f"solo generation failed: text={solo_t['error'][:120]!r} vision={solo_v['error'][:120]!r}"

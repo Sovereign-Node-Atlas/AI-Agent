@@ -23,18 +23,41 @@ Order of evaluation, fixed (7.2; Appendix A "keyword hard rules -> Eleanor class
      card, or the card's own name phrases in the text); Tier C stays explicit-only (8.4 rule 4).
   4. Manual overrides (7.2 rule 4): a prefix from config/router-rules.json `overrides`, typed at the start of the
      message; longest matching key wins, case-sensitive (config/README.md). An override is the Principal's explicit
-     order, so it is honoured only on Principal-typed messages: callers that route stored or inbound content
-     (retention re-routing, /internal/route, email ingestion) pass `allow_overrides=False` and the prefix is
-     recorded as "override-ignored:<key>" and treated as text; the classifier's Deep Think depth (9.1 task-weight
-     estimate) is likewise ignored on such text ("deep-think-ignored:<depth>"), so an inbound document cannot
-     commandeer the Apex engine.
+     order, so it is honoured only on Principal-typed messages, and the gate is DEFAULT-DENY: `route()` honours a
+     prefix only when the caller says the message is the Principal's, with `allow_overrides=True` or a `context`
+     that marks it so (`context["principal_typed"] is True`, or the chat session id the Open WebUI relay passes as
+     `context["session_id"]`: /v1/chat/completions is the one Principal-typed entry point, api.py `_routed_message`
+     builds the prefix there). Every other caller (`/internal/route` with no context, retention re-routing through
+     it, email ingestion) gets the deny default: the prefix is recorded as "override-ignored:<key>" and treated as
+     text, and the classifier's Deep Think depth (9.1 task-weight estimate) is likewise ignored on such text
+     ("deep-think-ignored:<depth>"), so an inbound document cannot commandeer the Apex engine or choose the
+     abliterated engine (16.3 rules 6/8 in spirit; 9.1 sanctions the estimate for the Principal's messages only).
+     Contract for the API writer (not in CONVENTIONS.md): `/internal/route` must call `route()` with no
+     `principal_typed`/`session_id` context (or `allow_overrides=False`); a `force_persona` there is legitimate only
+     as `allow_overrides=req.force_persona is not None`. A typed persona override that contradicts the classifier's
+     verdict is an "overridden routing decision" (9.4 automatic strike input): the router writes the `strikes` row
+     (kind "overridden-routing", as tasks/ouroboros.STRIKE_KINDS spells it) because it is the only component that
+     sees both routes; a hard-rule overrule of a [REN*] prefix is the document's own rule, not a strike.
 
 Tier (16.2) is the maximum of: the preset's default; sensitive on a hard hit, a sensitive privacy tag, a hit on the
-sensitive lexicon (payment, legal, financial, security words) or a security-adjacent domain card (8.2 posture:
-31, 32, 34); and never below standard on an abliterated engine (6.1 C6 / R13: its output always passes the gate).
+sensitive lexicon (money-movement and two-factor words only: 16.2 "any payment", 16.1 rule 8; "contract" and
+"signature" are 16.3 rule 2 ACTIONS of an outbound item, floored by approval.SENSITIVE_KINDS, never a word that
+overrides an 8.3 preset default), a [VAULT] session (10.5, 16.3 rule 5) or a security-adjacent domain card (8.2
+posture: 31, 32, 34); and never below standard on an abliterated engine (6.1 C6 / R13: its output always passes the
+gate).
+
+What the Arbiter loads: `dispatch_persona` / `dispatch_engine` (aliases `inference_persona` / `inference_engine`) are
+the session that runs (8.5 step 4: the owning director on the director's engine; the lead outside a task force); the
+chat pipeline MUST load `inference_engine` and build the prompt for `inference_persona`. `persona` / `engine` are the
+synthesising hemisphere lead and the lead's engine, for the 8.5 step 7 synthesis call only; loading `engine` for the
+dispatch runs a director's prompt on the wrong model (api.py RouteInfo.from_decision: read `dispatch_engine`).
 
 Every decision is written to ledger.routing_decisions with its reason (7.2 rule 5). The reason string and the logs
-carry categories only, never the message or the classifier's raw output (the ledger stores message_sha256, not text).
+carry categories only, never the message or the classifier's raw output (the ledger stores message_sha256, not text):
+privacy tags are kept only from the fixed vocabulary KNOWN_TAGS (a free-form tag from a 4B model can quote the
+message), the classifier's reply text is never logged (only its length and the decode offset at DEBUG), a
+classifier exception is logged by type name only (its args can embed the message; the journal is not the 0640
+ledger), and a llama-server 4xx is logged by status code only.
 A hit on one of FAMILY_NAMES is the category "family-name" in the reason, the privacy tags and the journal line; the
 literal name is kept only in the ledger's hard_keyword_hit column (the ledger file is mode 0640, the journal is not;
 10.4) and on the in-memory decision's `hard_keyword_hits`.
@@ -64,6 +87,7 @@ from atlas.config import (
     DomainCard,
     RouterRules,
     TaskForce,
+    owner_persona_key,
 )
 from atlas.engines import EngineError, LlamaClient
 from atlas.ledger import Ledger
@@ -72,6 +96,7 @@ from atlas.personas import HEMISPHERE_LEADS, PersonaRegistry
 log = logging.getLogger("atlas.router")
 
 __all__ = [
+    "KNOWN_TAGS",
     "SENSITIVE_DOMAINS",
     "SENSITIVE_KEYWORDS",
     "SENSITIVE_TAGS",
@@ -114,15 +139,23 @@ SENSITIVE_DOMAINS: frozenset[int] = frozenset({31, 32, 34})
 # family and health are the hard-rule words, sensitive for the same reason a hard hit is).
 SENSITIVE_TAGS: frozenset[str] = frozenset({"family", "medical", "health", "estate", "legal", "financial",
                                             "security", "payment"})
-# The sensitive lexicon (16.2 "any payment"; 16.3 rules 1-2: money never moves and nothing is signed without the
-# Principal). Matched like task-force triggers (whole word or phrase, plural-tolerant); a hit raises the tier only,
-# never the route. Overridable from config/router-rules.json `sensitive_keywords` once atlas.config.RouterRules
-# carries that key (contract for the config writer: a list of strings; until then this default applies).
+# The only privacy tags a verdict may carry into the reason string, the decision and the journal (module docstring):
+# the 16.2 categories plus the three neutral labels the classifier prompt allows. Anything else the 4B model emits
+# ("my mother Jane", a diagnosis) stays in `ClassifierVerdict.raw`, which is never logged above DEBUG.
+KNOWN_TAGS: frozenset[str] = SENSITIVE_TAGS | frozenset({FAMILY_NAME_CATEGORY, "privacy", "corporate", "public"})
+# The sensitive lexicon: money-movement words (16.2 "any payment"; 16.3 rule 1: money never moves without the
+# Principal) and the two-factor words (16.1 rule 8: "Two-factor prompts are never automated"). Matched like
+# task-force triggers (whole word or phrase, plural-tolerant); a hit raises the tier only, never the route. It is
+# deliberately NOT a legal lexicon: "contract", "sign", "signature", "guarantee", "indemnity", "loan", "mortgage" are
+# the subject matter of TF_KAPPA / TF_IOTA / TF_DELTA, whose 8.3 default tiers are closed; a contract or signature as
+# an outbound ACTION is 16.3 rule 2 and is floored by approval.SENSITIVE_KINDS (kind "contract" / "signature"), and
+# a credential in a request is a security matter the security privacy tag and the 8.2 security-adjacent cards
+# cover. Overridable from config/router-rules.json `sensitive_keywords` once atlas.config.RouterRules carries that
+# key (contract for the config writer: a list of strings; until then this default applies).
 SENSITIVE_KEYWORDS: tuple[str, ...] = (
     "payment", "pay", "paid", "invoice", "transfer", "wire", "deposit", "refund", "remittance", "direct debit",
     "credit card", "debit card", "card number", "card details", "bank account", "account number", "bsb", "iban",
-    "swift code", "payroll", "loan", "mortgage", "guarantee", "indemnity", "contract", "sign", "signature",
-    "signing", "tax return", "password", "credential", "two-factor", "2fa", "one-time code", "otp",
+    "swift code", "payroll", "two-factor", "2fa", "one-time code", "otp",
 )
 
 
@@ -171,7 +204,13 @@ class ClassifierVerdict:
         if tf in {"", "NONE", "NULL"} or (task_force_codes and tf not in task_force_codes):
             tf = None
         tags_raw = data.get("privacy_tags") or ()
-        tags = tuple(str(t).strip().lower() for t in tags_raw if str(t).strip()) if isinstance(tags_raw, list) else ()
+        # Fixed vocabulary only (KNOWN_TAGS): a free-form tag can quote the Principal's message and the tags reach
+        # the reason string, the ledger and the journal. The rest stays in `raw` (DEBUG at most, never logged here).
+        tags = (
+            tuple(dict.fromkeys(t for t in (str(x).strip().lower() for x in tags_raw) if t in KNOWN_TAGS))
+            if isinstance(tags_raw, list)
+            else ()
+        )
         depth = data.get("deep_think_depth") or data.get("depth")
         depth = depth.strip().lower() if isinstance(depth, str) else None
         if depth not in DEEP_THINK_DEPTHS:
@@ -258,6 +297,11 @@ class LlamaClassifier:
             half = self._max_message_chars // 2
             text = f"{text[:half]}\n[...]\n{text[-half:]}"
         messages = [{"role": "system", "content": self._system}, {"role": "user", "content": text}]
+        # VERIFIED (research tools_server_README.md, "The response_format parameter supports both plain JSON output
+        # (e.g. {"type": "json_object"}) and schema-constrained JSON"): llama-server accepts the OpenAI-style
+        # json_object grammar. The 4xx retry below is a defence against an older build only. The router engine is
+        # launched with `--jinja --reasoning off --temp 0.2` (config/engines.json; gguf-models.md: `--reasoning off`
+        # also injects enable_thinking=false), so the 200-token budget is not eaten by Qwen3.5 thinking.
         try:
             try:
                 result = self._client.chat(
@@ -268,23 +312,26 @@ class LlamaClassifier:
                 )
             except EngineError as first:
                 # engines._raise_for_status formats "chat: <url> -> HTTP <code> <detail>"; only a 4xx (a rejected
-                # parameter) earns the retry; a 5xx (loading, crashed) is a real outage.
-                if not _HTTP_4XX_RE.search(str(first)):
+                # parameter) earns the retry; a 5xx (loading, crashed) is a real outage. Only the status code is
+                # logged: the EngineError text carries up to 500 bytes of the server's response body.
+                status = _HTTP_4XX_RE.search(str(first))
+                if not status:
                     raise
-                log.warning("classifier: retrying without response_format (%s)", first)
+                log.warning("classifier: retrying without response_format (%s)", status.group(0))
                 result = self._client.chat(messages, max_tokens=self._max_tokens, temperature=self._temperature)
         except EngineError as exc:
             raise ClassifierError(f"resident classifier unreachable or failed: {exc}") from exc
         text = result.text or ""
-        # The model's raw output can quote the Principal's message; it goes to DEBUG only, never into an exception
-        # message (which the router copies into the ledger reason and the ERROR log).
+        # The model's raw output can quote the Principal's message: it is never logged (not even at DEBUG; the
+        # systemd journal is persistent and not the 0640 ledger) and never rides in an exception message (which the
+        # router copies into the ledger reason and the ERROR log). Only its length and the decode offset are kept.
         try:
             found = _first_json_object(text)
         except json.JSONDecodeError as exc:
-            log.debug("classifier: invalid JSON in the reply: %r", text[:500])
+            log.debug("classifier: invalid JSON in the reply (len=%d, offset=%d)", len(text), exc.pos)
             raise ClassifierError(f"resident classifier returned invalid JSON (offset {exc.pos})") from exc
         if found is None:
-            log.debug("classifier: no JSON object in the reply: %r", text[:500])
+            log.debug("classifier: no JSON object in the reply (len=%d)", len(text))
             raise ClassifierError(f"resident classifier returned no JSON object (len={len(text)})")
         data, _span = found
         if not isinstance(data, dict):
@@ -333,27 +380,34 @@ def parse_override(message: str, overrides: Mapping[str, str]) -> OverrideMatch 
 # 7.2 rule 1 lists "will" verbatim, meaning the testamentary document. As a bare whole word it is also the modal verb
 # ("the vendor will send the draft"), and matching that would route most ordinary corporate traffic to Arthur at
 # sensitive tier, so the 4-Way Router would mostly not route. The noun sense is matched instead: a determiner or
-# possessive before it ("my will", "the will", "his will", "a new will", "updated will"), the fixed phrase
-# "will and testament", or the plural "wills". If the Principal wants the bare word, that is a config/README.md
-# decision, not a silent default.
+# possessive before it ("my will", "the will", "his will", "a new will", "updated will"), a possessive noun ("Dad's
+# will", "the Testwoods' will"), the fixed phrase "will and testament", the plural "wills", or the document's own
+# apparatus ("will's executor", "will beneficiaries", "will probate", "will codicil"). If the Principal wants the
+# bare word, that is a config/README.md decision, not a silent default.
 _WILL_NOUN_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:(?:my|the|his|her|their|our|your|a|new|last|latest|old|updated?|revised|existing|"
-    r"current|original|signed|draft|living)\s+will|will\s+and\s+testament|wills)(?![A-Za-z0-9])"
+    r"current|original|signed|draft|living|[A-Za-z]+'s|[A-Za-z]+s')\s+will|will\s+and\s+testament"
+    r"|will'?s?\s+(?:executor|beneficiar\w*|probate|codicil)|wills)(?![A-Za-z0-9])"
 )
 
 
-def _keyword_regex(keyword: str) -> re.Pattern[str]:
-    # Whole-word, case-insensitive; multi-word keywords (a family name with a space) match as a phrase.
-    if keyword.strip().lower() == "will":
+def _keyword_regex(keyword: str, *, plain: bool = False) -> re.Pattern[str]:
+    # Whole-word, case-insensitive; multi-word keywords (a family name with a space) match as a phrase. The noun-sense
+    # special case applies to the 7.2 rule word "will" only, never to a FAMILY_NAMES entry that spells it (`plain`).
+    if not plain and keyword.strip().lower() == "will":
         return _WILL_NOUN_RE
     return re.compile(r"(?<![A-Za-z0-9])" + re.escape(keyword.strip()) + r"(?![A-Za-z0-9])", re.IGNORECASE)
 
 
-def find_hard_keywords(text: str, keywords: Sequence[str]) -> list[str]:
-    """Every configured hard keyword (in config order) that occurs in the text as a whole word or phrase."""
+def find_hard_keywords(text: str, keywords: Sequence[str], family_names: Sequence[str] = ()) -> list[str]:
+    """Every configured hard keyword (in config order) that occurs in the text as a whole word or phrase.
+
+    `family_names` (FAMILY_NAMES from atlas.env) are matched as plain whole words even when one spells "will": a
+    family member called Will is a hard keyword in his own right (7.2 rule 1), not the testamentary noun."""
+    family = {n.strip().lower() for n in family_names if n.strip()}
     hits: list[str] = []
     for kw in keywords:
-        if kw.strip() and _keyword_regex(kw).search(text):
+        if kw.strip() and _keyword_regex(kw, plain=kw.strip().lower() in family).search(text):
             hits.append(kw)
     return hits
 
@@ -498,12 +552,22 @@ def select_domain_cards(
 
 @dataclass
 class RoutingDecision:
-    """One routing decision (7.2 rule 5); `reason` is the human-readable why, `ledger_id` the routing_decisions row."""
+    """One routing decision (7.2 rule 5); `reason` is the human-readable why, `ledger_id` the routing_decisions row.
+
+    Two pairs of fields, deliberately distinct (module docstring "What the Arbiter loads"):
+      * `dispatch_persona` / `dispatch_engine` (aliases `inference_persona` / `inference_engine`): the session that
+        RUNS: the owning director on the director's engine for a task force (8.5 steps 3-4), else the lead. The
+        pipeline builds the system prompt for this persona and the Arbiter loads this engine; the ledger's
+        routing_decisions.engine column carries it.
+      * `persona` / `engine`: the hemisphere lead that synthesises and speaks (16.1 rule 1, 8.5 step 7) and the
+        lead's engine, for the synthesis call only. Loading `engine` for the dispatch is the bug this note exists
+        to prevent (a director's prompt on the lead's model).
+    """
 
     route: str  # a `routes` key of router-rules.json: ren, arthur, ren-abliterated, arthur-qwen, ...
     persona: str  # the hemisphere lead that synthesises and speaks: ren | arthur (16.1 rule 1, 8.5 step 7)
     hemisphere: str
-    engine: str  # CONVENTIONS.md §8 engine key of the lead's route (or the Apex engine for TF_OMEGA / deep tier)
+    engine: str  # the LEAD's engine (CONVENTIONS.md §8 key; the Apex engine for TF_OMEGA / deep tier): synthesis only
     tier: str  # routine | standard | sensitive (16.2)
     reason: str
     body: str  # the message with any override prefix removed
@@ -536,11 +600,23 @@ class RoutingDecision:
     def hard_rule_hit(self) -> bool:
         return bool(self.hard_keyword_hits)
 
+    @property
+    def inference_persona(self) -> str:
+        """The persona whose prompt the dispatch runs under (== dispatch_persona; 8.5 step 3)."""
+        return self.dispatch_persona
+
+    @property
+    def inference_engine(self) -> str:
+        """The engine the Arbiter must load for the dispatch (== dispatch_engine; 8.5 step 4). Never `engine`."""
+        return self.dispatch_engine
+
     def to_dict(self) -> dict[str, Any]:
+        # `engine` is the lead's engine for synthesis only; `dispatch_engine` / `inference_engine` is what runs.
         return {
             "route": self.route, "persona": self.persona, "hemisphere": self.hemisphere, "engine": self.engine,
             "tier": self.tier, "reason": self.reason, "task_force": self.task_force, "directors": list(self.directors),
             "dispatch_persona": self.dispatch_persona, "dispatch_engine": self.dispatch_engine,
+            "inference_persona": self.dispatch_persona, "inference_engine": self.dispatch_engine,
             "domain_cards": list(self.domain_cards), "dropped_cards": list(self.dropped_cards),
             "privacy_tags": list(self.privacy_tags), "hard_keyword_hits": list(self.hard_keyword_hits),
             "sensitive_hits": list(self.sensitive_hits),
@@ -605,13 +681,19 @@ class Router:
         task_force: str | None = None,
         explicit_domains: Sequence[int] = (),
         context: Mapping[str, Any] | None = None,
-        allow_overrides: bool = True,
+        allow_overrides: bool | None = None,
     ) -> RoutingDecision:
         """Decide where a message goes and log it. `task_force` and `explicit_domains` are the explicit-command path
-        (8.5 step 1 "or an explicit command"); TF_OMEGA can only arrive that way. `allow_overrides=False` is for
-        text the Principal did not type (stored transcripts, inbound documents): a prefix is text, not an order."""
+        (8.5 step 1 "or an explicit command"); TF_OMEGA can only arrive that way.
+
+        `allow_overrides` is default-deny (module docstring, point 4): None resolves from `context` through
+        `principal_typed()` (True only for a message the context marks as the Principal's own chat turn), so a
+        caller that passes nothing gets a prefix treated as text ("override-ignored:<key>") and the classifier's
+        Deep Think depth ignored. True/False state the caller's intent explicitly and win over the context."""
         reasons: list[str] = []
         digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        if allow_overrides is None:
+            allow_overrides = self.principal_typed(context)
 
         # 1. overrides (7.2 rule 4): parsed here, applied after the hard rules (7.2 rule 1 wins over them)
         ov: OverrideMatch | None = None
@@ -638,7 +720,7 @@ class Router:
 
         # 2. hard keywords (7.2 rule 1: "regardless of anything else", so a [REN*] override on a hit is overruled).
         # A FAMILY_NAMES hit is spoken of as "family-name" everywhere but the ledger column (module docstring).
-        hits = find_hard_keywords(body, self.rules.hard_keywords)
+        hits = find_hard_keywords(body, self.rules.hard_keywords, self.config.settings.family_names)
         family = {n.strip().lower() for n in self.config.settings.family_names}
         labels = list(dict.fromkeys(FAMILY_NAME_CATEGORY if h.lower() in family else h for h in hits))
         if hits:
@@ -646,6 +728,7 @@ class Router:
             if forced_route is not None and not forced_route.startswith(self._hard_route):
                 reasons.append(f"overruled-by-hard-rule:{labels[0]}(7.2 rule 1)")
                 forced_route = None
+        forced_honoured = forced_route is not None  # a typed persona override the hard rule did not overrule
 
         # 3. classifier (always consulted; its verdict is overruled by 1 and 2 but recorded, V16). Only the error's
         # category reaches the reason string: a ClassifierError message is built without model text, and a bug's
@@ -658,10 +741,16 @@ class Router:
             classifier_error = type(exc).__name__
             log.error("router: classifier failed: %s", exc)
         except Exception as exc:  # a classifier bug must not take the router down silently
+            # Type name only, at every level: the exception's args can embed the Principal's message (a KeyError on
+            # a dict built from it, a ValueError quoting it) and the journal is not the 0640 ledger. The ledger row
+            # carries message_sha256 for reproduction; a traceback is never attached (no exc_info).
             classifier_error = type(exc).__name__
-            log.error("router: classifier raised %s (details at DEBUG)", type(exc).__name__)
-            log.debug("router: classifier exception", exc_info=exc)
+            log.error("router: classifier raised %s (message length %d; traceback withheld, module docstring)",
+                      type(exc).__name__, len(body))
         classifier_route = None
+        # A verdict built elsewhere (not through from_json) is held to the same fixed tag vocabulary: the tags reach
+        # the reason string, the ledger and the journal line (module docstring).
+        verdict_tags: tuple[str, ...] = tuple(t for t in verdict.privacy_tags if t in KNOWN_TAGS) if verdict else ()
         if verdict is not None:
             # Only a lead is a route (from_json already drops a director's name; a verdict built elsewhere is held to
             # the same rule here rather than becoming a route that names no lead).
@@ -682,7 +771,7 @@ class Router:
             route = classifier_route
             reasons.append(
                 f"classifier:{verdict.hemisphere or classifier_route}"
-                + (f"(tags {','.join(verdict.privacy_tags)})" if verdict and verdict.privacy_tags else "")
+                + (f"(tags {','.join(verdict_tags)})" if verdict_tags else "")
             )
         else:
             if self.on_classifier_error == "raise":
@@ -779,7 +868,10 @@ class Router:
             reasons.append(f"engine:{tf.engine}(apex, 6.1 {tf.code})")
         directors: tuple[str, ...] = ()
         if tf is not None:
-            directors = tuple(self.personas.key_for_name(o) for o in tf.owners)
+            # Owners are resolved exactly as atlas.config validates them at load (owner_persona_key: the first token
+            # before whitespace/comma/semicolon), so a preset owner written "Gideon, with Silas" cannot pass
+            # load_config and then raise here on the first message that hits the preset.
+            directors = tuple(self.personas.key_for_name(owner_persona_key(o)) for o in tf.owners)
 
         # dispatch (8.5: "the director is the sole lead and the sole inference session for a task force"; step 4
         # "the Engine Arbiter loads the director's engine"). Commands (Deep Think, vault, strike, AEGIS) are the
@@ -817,7 +909,7 @@ class Router:
         # (family/medical/estate are 16.2's sensitive examples), a sensitive privacy tag, a sensitive-lexicon hit
         # (any payment, legal, financial, security), a security-adjacent card (8.2 posture), and never routine on an
         # abliterated engine (6.1 C6 addendum / R13: "its output passes the same approval gate").
-        tags = list(dict.fromkeys([lab.lower() for lab in labels] + list(verdict.privacy_tags if verdict else ())))
+        tags = list(dict.fromkeys([lab.lower() for lab in labels] + list(verdict_tags)))
         tag_hits = sorted(set(tags) & SENSITIVE_TAGS)
         lexicon_hits = find_sensitive_keywords(body, self.sensitive_keywords)
         domain_hits = sorted(set(selected) & SENSITIVE_DOMAINS)
@@ -830,10 +922,16 @@ class Router:
             "sensitive" if tag_hits else None,
             "sensitive" if lexicon_hits else None,
             "sensitive" if domain_hits else None,
+            # The prefix is stripped before the hard-keyword scan, so the configured word "vault" never hits on a
+            # [VAULT] command; the session is sensitive by its nature (16.2 estate matters; 16.3 rule 5 vault
+            # contents; 10.5 everything read from the vault is tagged for the session).
+            "sensitive" if command == "vault-session" else None,
             "standard" if abliterated else None,
         )
         if hits and tier == "sensitive":
             reasons.append("tier:sensitive(hard-rule)")
+        if command == "vault-session" and not hits:
+            reasons.append("tier:sensitive(vault-session, 10.5/16.3 rule 5)")
         if tag_hits and not hits and tier == "sensitive":
             reasons.append(f"tier:sensitive(privacy-tags {','.join(tag_hits)}, 16.2)")
         if lexicon_hits and tier == "sensitive":
@@ -844,6 +942,18 @@ class Router:
             reasons.append("tier:standard(abliterated, R13)")
         if tf and not any(r.startswith("tier:") for r in reasons):
             reasons.append(f"tier:{tier}({tf.code})")
+
+        # 9.4 "Strike input ... automatic: ... overridden routing decision": the Principal typed a persona override
+        # that contradicts what the router would have decided (the classifier's verdict, with no hard hit). The
+        # hard-rule case is excluded twice over: an overruled [REN*] is the document's own rule, and an [ARTHUR*] on a
+        # hit agrees with the router. The engine variant is not a routing override ([REN:UNCENSORED] on a Ren
+        # verdict picks an engine, not a route). The row is written after the decision's own (it names it).
+        overridden_routing = (
+            forced_honoured and not hits and ov is not None and classifier_route is not None
+            and lead_for_route != classifier_route
+        )
+        if overridden_routing:
+            reasons.append(f"strike:overridden-routing(classifier {classifier_route}, 9.4)")
 
         decision = RoutingDecision(
             route=route,
@@ -874,7 +984,30 @@ class Router:
             dual_sign_off=bool(tf and tf.dual_sign_off),
         )
         self._log(decision)
+        if overridden_routing and ov is not None:
+            self.ledger.insert_strike(
+                task_id=task_id,
+                kind="overridden-routing",  # tasks/ouroboros.STRIKE_KINDS (not imported: that module pulls Celery)
+                source="router",
+                description=f"classifier said {classifier_route}, Principal typed {ov.key} -> {lead_for_route} "
+                f"(9.4 overridden routing decision; routing_decisions id {decision.ledger_id})",
+            )
+            log.info("route: overridden-routing strike written (classifier %s, typed %s)", classifier_route, ov.key)
         return decision
+
+    @staticmethod
+    def principal_typed(context: Mapping[str, Any] | None) -> bool:
+        """Whether a `context` marks the message as one the Principal typed (module docstring, point 4).
+
+        True for `context["principal_typed"] is True` (the explicit key callers should pass) or a non-empty
+        `context["session_id"]` (the Open WebUI chat relay, the one Principal-typed entry point, passes its chat
+        session id and nothing else does; an ingestion path must never pass one). No context, or any other
+        context, is False: overrides and the classifier's Deep Think depth are then ignored."""
+        if not context:
+            return False
+        if context.get("principal_typed") is True:
+            return True
+        return bool(str(context.get("session_id") or "").strip())
 
     # --- ledger (7.2 rule 5) ------------------------------------------------------------------------------------------
 

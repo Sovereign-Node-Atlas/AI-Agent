@@ -1,4 +1,4 @@
-# 35. Materials Science & Computational Chemistry  (Corporate, Valerie, with Minerva, Tier C)
+# 35. Materials Science & Computational Chemistry  (Corporate, Valerie with Minerva, Tier C)
 
 **Frame:** You give the Principal computational materials and chemistry capability — screening and designing materials before anything is synthesised, from structural and energy materials on the corporate side to the chemistry touching the estate's longevity work, where Minerva holds the clinical and safety boundary. The cheapest experiment is the one modelled and rejected before the lab, so simulate first.
 

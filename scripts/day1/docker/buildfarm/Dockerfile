@@ -1,6 +1,7 @@
 # docker/buildfarm/Dockerfile — the cross-platform build container of Section 15.1 ("OmniBuild-KVM": Android .apk via
 # NDK + Gradle, Windows .exe via MinGW-w64; Android and Windows targets only, D11). Built by phase2/06-tools.sh as
-# atlas-buildfarm:1 (label org.atlas.buildfarm.version="3" marks this revision of the image).
+# atlas-buildfarm:1 (label org.atlas.buildfarm.version="4" marks this revision of the image: 4 = the apt pins are
+# strict, no fallback to the archive's current versions; an image built as revision 3 with drift=yes is rebuilt).
 #
 # THE run line is executed by ONE root-owned program, /usr/local/sbin/atlas-buildfarm-run JOBDIR CMD... (written by
 # phase2/06-tools.sh, granted to atlas through /etc/sudoers.d/atlas-buildfarm and nothing else): it reads the BUILDFARM_*
@@ -24,7 +25,11 @@
 # Every version and checksum is typed from services-tools.md §4.8 / S11 (VERIFIED on developer.android.com and
 # services.gradle.org unless marked UNVERIFIED). Build-time network: archive.ubuntu.com, dl.google.com,
 # services.gradle.org through the allowlist proxy (the daemon and /root/.docker/config.json inject it; the step also
-# passes http_proxy/https_proxy build args). Runtime builds run with --network none.
+# passes http_proxy/https_proxy build args). On dl.google.com this image fetches the WHOLE /android/repository/ path:
+# the command-line tools zip, the NDK zip, and, through sdkmanager, the repository XMLs and the platform-tools /
+# platforms / build-tools packages (Phase 2 step 6 only). config/allowlist.txt's comment names only the command-line
+# tools zip; an operator auditing access.log must expect every /android/repository/ line from this build (the
+# allowlist writer is asked to widen that comment). Runtime builds run with --network none.
 #
 # ANDROID SDK LICENCE (Section 16.3 item 2: terms are accepted by the Principal, never by a script on their behalf):
 # `sdkmanager --licenses` runs ONLY when the build arg ACCEPT_ANDROID_SDK_LICENCE=yes is passed, which
@@ -58,22 +63,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # apt pins VERIFIED on packages.ubuntu.com/resolute (services-tools.md §4.8): openjdk-21-jdk-headless
 # 21.0.12.1+1-1~26.04.4, gcc/g++-mingw-w64-x86-64 13.2.0-6ubuntu1+26.1, mingw-w64 13.0.0-2ubuntu1. apt's gradle (4.4.1)
-# is deliberately NOT installed. If the archive has moved on (a security update replaces the pinned version), the
-# unpinned install runs instead and the DRIFT IS RECORDED in /opt/buildfarm/versions.txt (drift=yes plus the installed
-# versions), which phase2/06-tools.sh reads after the build, WARNs on and stores in tools.env (BUILDFARM_JDK_VERSION,
-# BUILDFARM_MINGW_VERSION, BUILDFARM_APT_DRIFT) — the drift is visible after the build, not only in its log (§7.9).
-RUN apt-get update && mkdir -p /opt/buildfarm && ( \
-      ( apt-get install -y --no-install-recommends \
-          openjdk-21-jdk-headless=21.0.12.1+1-1~26.04.4 \
-          gcc-mingw-w64-x86-64=13.2.0-6ubuntu1+26.1 g++-mingw-w64-x86-64=13.2.0-6ubuntu1+26.1 mingw-w64=13.0.0-2ubuntu1 \
-          unzip curl ca-certificates git python3 make cmake ninja-build \
-        && echo "drift=no" > /opt/buildfarm/versions.txt ) \
-      || ( echo "atlas-buildfarm: PINNED apt versions unavailable (archive moved on); installing the current versions — VERSION DRIFT:" \
-           && apt-get install -y --no-install-recommends \
-                openjdk-21-jdk-headless gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64 \
-                unzip curl ca-certificates git python3 make cmake ninja-build \
-           && echo "drift=yes" > /opt/buildfarm/versions.txt ) \
-    ) \
+# is deliberately NOT installed. The pins are STRICT (rule §7.9, fix round 3): when the archive has moved on (a security
+# update replaced a pinned version) `apt-get install ...=<pin>` fails and so does the build; an unpinned fallback would
+# turn a pinned image into a floating one as root in an image that later runs untrusted build scripts. phase2/06-tools.sh
+# then stops and names the two pins to bump here (and the version label) after the changelog has been read.
+# /opt/buildfarm/versions.txt records what dpkg installed (read back by 06-tools.sh into tools.env as
+# BUILDFARM_JDK_VERSION / BUILDFARM_MINGW_VERSION and compared with the pins; drift=no is kept for that reader).
+RUN apt-get update && mkdir -p /opt/buildfarm \
+    && apt-get install -y --no-install-recommends \
+         openjdk-21-jdk-headless=21.0.12.1+1-1~26.04.4 \
+         gcc-mingw-w64-x86-64=13.2.0-6ubuntu1+26.1 g++-mingw-w64-x86-64=13.2.0-6ubuntu1+26.1 mingw-w64=13.0.0-2ubuntu1 \
+         unzip curl ca-certificates git python3 make cmake ninja-build \
+    && echo "drift=no" > /opt/buildfarm/versions.txt \
     && dpkg-query -W -f='${Package} ${Version}\n' openjdk-21-jdk-headless gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64 \
          | tee -a /opt/buildfarm/versions.txt \
     && chmod 644 /opt/buildfarm/versions.txt \
@@ -150,13 +151,13 @@ ENV HOME=/tmp \
 # Proxies must not leak into runtime builds (they run with --network none anyway); ARG values never persist as ENV.
 ENV http_proxy= https_proxy= no_proxy= HTTP_PROXY= HTTPS_PROXY= NO_PROXY=
 
-LABEL org.atlas.buildfarm.version="3" \
+LABEL org.atlas.buildfarm.version="4" \
       org.atlas.buildfarm.base="ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7" \
       org.atlas.buildfarm.gradle="9.7.1" \
       org.atlas.buildfarm.cmdline-tools="15859902" \
       org.atlas.buildfarm.ndk="r30" \
-      org.atlas.buildfarm.jdk="openjdk-21-jdk-headless 21.0.12.1+1-1~26.04.4 (pin asked for; installed version in /opt/buildfarm/versions.txt)" \
-      org.atlas.buildfarm.mingw="gcc-mingw-w64-x86-64 13.2.0-6ubuntu1+26.1 (pin asked for; installed version in /opt/buildfarm/versions.txt)" \
+      org.atlas.buildfarm.jdk="openjdk-21-jdk-headless 21.0.12.1+1-1~26.04.4 (strict pin; dpkg record in /opt/buildfarm/versions.txt)" \
+      org.atlas.buildfarm.mingw="gcc-mingw-w64-x86-64 13.2.0-6ubuntu1+26.1 (strict pin; dpkg record in /opt/buildfarm/versions.txt)" \
       org.atlas.buildfarm.licences="Android SDK licence terms accepted by the Principal through BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes (Section 16.3 item 2)"
 
 WORKDIR /work

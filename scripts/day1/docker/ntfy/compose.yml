@@ -30,8 +30,10 @@ services:
     volumes:
       - ${NTFY_DATA_DIR}/etc:/etc/ntfy          # server.yml (/srv/atlas/data/ntfy, backed up)
       - ${NTFY_DATA_DIR}/cache:/var/cache/ntfy  # message cache and attachments (backed up)
-      # user.db: password hashes and the node access token (the same secret as secrets/ntfy.env). /var/lib/atlas-ntfy on
-      # the OS volume, atlas 700, outside /srv/atlas and outside restic's include set (CONVENTIONS §7.2).
+      # user.db: password hashes and the node access token (the same secret as secrets/ntfy.env), so it lives under
+      # /etc/atlas/secrets/ntfy (atlas:atlas 700; NTFY_AUTH_DIR, fix round 3: CONVENTIONS §7.2 "secrets live only under
+      # /etc/atlas/secrets/"), outside /srv/atlas and outside restic's include set. Step 7 migrates an earlier
+      # revision's /var/lib/atlas-ntfy once.
       - ${NTFY_AUTH_DIR}:/var/lib/ntfy
     ports:
       - "${LAN_IP}:8090:80"

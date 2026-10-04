@@ -28,12 +28,12 @@ entry="${ATLAS_ENTRY:-./atlas-day1.sh}"
 [[ -d "$LISTENING_TEST_DIR" ]] || { echo "V7 fail: $LISTENING_TEST_DIR does not exist (phase2/05-voice.sh creates it); re-run: sudo $entry phase2 --force 05"; exit 1; }
 [[ -s "$summary" ]] || { echo "V7 fail: no render summary at $summary (phase2/05-voice.sh runs voice_render.py once); re-run: sudo $entry phase2 --force 05"; exit 1; }
 
-# Files must be readable from the Principal's desktop session and from nobody else (clones of real voices: 2770).
-principal="$(awk -F= '$1=="PRINCIPAL_USER" {print $2; exit}' "$ATLAS_ETC/atlas.env" 2>/dev/null || true)"
-if [[ "${EUID:-$(id -u)}" -eq 0 && -n "$principal" ]] && id -u "$principal" >/dev/null 2>&1; then
-  chown -R "$principal:atlas" "$LISTENING_TEST_DIR" 2>/dev/null || true
-  chmod -R o-rwx,g+rX "$LISTENING_TEST_DIR" 2>/dev/null || true
-fi
+# This script changes NOTHING under $LISTENING_TEST_DIR (fix round 3, major): an earlier revision re-applied
+# `chmod -R o-rwx,g+rX` here, which stripped the group-write bit phase2/05-voice.sh sets (`g+rwX`: the atlas renderer
+# rewrites v7-listening-test.json and replaces WAVs on a `--force 05` re-run), so after one gate run the documented
+# remediation of a deferred V7 failed with PermissionError and recorded the STALE summary. Ownership
+# ($PRINCIPAL_USER:atlas) and modes (dir 2770, files o-rwx,g+rwX) are 05-voice.sh's job, set before and after every
+# render; a verify script reads what it judges.
 
 line="$(python3 - "$summary" "$LISTENING_TEST_DIR" "$entry" <<'PY'
 import json, sys, wave

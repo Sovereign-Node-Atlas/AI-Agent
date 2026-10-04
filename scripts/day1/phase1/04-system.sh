@@ -12,17 +12,27 @@
 # DNS (fix round, Section 12.5 "everything else denied and logged"): the home router's recursive resolver answers ANY
 # name, so plain "DNS to the pinned LAN resolvers" was a data channel around the allowlist (<chunk>.exfil.example
 # queries carry data out, answers carry instructions in). Now: dnsmasq listens on 127.0.0.1:53 and forwards ONLY the
-# allowlist.txt names (plus the node's own DOMAIN, ntp.ubuntu.com and the Windows share host) to the LAN resolvers,
-# answering NXDOMAIN for everything else (dnsmasq `address=/#/`, VERIFIED on dnsmasq 2.91 during the fix round);
+# config/allowlist.txt names (ntp.ubuntu.com included, listed there for this purpose) plus exactly two names derived
+# from atlas.env settings, $DOMAIN and the Windows share host when it is a name, to the LAN resolvers, answering
+# NXDOMAIN for everything else (dnsmasq `address=/#/`, VERIFIED on dnsmasq 2.91 during the fix round);
 # systemd-resolved is pointed at it (global DNS=127.0.0.1, the LAN link's DHCP DNS switched off); ufw lets only the
-# dnsmasq user open port 53 to those resolvers (owner match in before.rules); containers get no port 53 at all (the
-# proxy receives the hostname in CONNECT/absolute-URI form, so nothing behind squid needs DNS; Docker's embedded DNS
-# still resolves compose service names locally). `--reload-allowlist` re-renders squid and dnsmasq together.
+# dnsmasq user open port 53 to those resolvers (owner match in before.rules) and DROPS port 53 on the LAN interface
+# for every other uid right behind it (fix round 3, major: the broad "LAN: router, share, phone" allow in the user
+# rules would otherwise let any host process ask the router, which IS a LAN address, about any name); a self-test
+# proves the fence as uid nobody. Containers get no port 53 at all (the proxy receives the hostname in
+# CONNECT/absolute-URI form, so nothing behind squid needs DNS; Docker's embedded DNS still resolves compose service
+# names locally). `--reload-allowlist` re-renders squid and dnsmasq together.
+#
+# PHASE-1-OWNED SETTINGS FILE (fix round 3): the derived resolver list is persisted as LAN_DNS_SERVERS in
+# $ATLAS_ETC/network.env (root 644, non-secret), read by phase1_lan_resolvers (steps 4, 7, --reload-allowlist) and by
+# docker-egress-rules.sh. It is NOT written into atlas.env: CONVENTIONS §3 fixes that file's key set and
+# config/atlas.env.example does not list it. An earlier revision's LAN_DNS_SERVERS line in atlas.env is removed.
 #
 # Facts typed literally from the platform research items 2, 5, 6 (VERIFIED unless marked). Defines step_04 and the
 # helpers shared with later steps (Phase 1 internal contract; nothing in Phase 2 depends on them):
 #   phase1_write_file MODE OWNER DST   write stdin to DST atomically (never `install /dev/stdin`, see below)
 #   phase1_lan_resolvers               the LAN's IPv4 resolvers (ufw owner rules, dnsmasq upstreams, WG INIT_DNS)
+#   phase1_network_env_save KEY VALUE  persist a derived, non-secret value in $ATLAS_ETC/network.env (never atlas.env)
 #   phase1_listen_addrs ADDR...        bind SSH and Cockpit to exactly these addresses (step 7 adds the WG bridge)
 #   phase1_reload_allowlist [FILE]     re-render squid + dnsmasq from the allowlist and reload both (driver option)
 #   _squid_render                      also called by step 6 once the docker0 gateway is known (second http_port)
@@ -64,15 +74,40 @@ phase1_write_file() {
   rm -f "$tmp"
 }
 
+# Phase-1-owned derived settings (header): KEY=VALUE lines, root 644, sourceable; also read by docker-egress-rules.sh.
+ATLAS_NETWORK_ENV="$ATLAS_ETC/network.env"
+
+# phase1_network_env_save KEY VALUE — persist a derived, non-secret value in $ATLAS_NETWORK_ENV. The same key is removed
+# from atlas.env if an earlier revision put it there (the Principal's settings file carries §3 keys only).
+phase1_network_env_save() {
+  local key="$1" value="$2"
+  if [[ ! -e "$ATLAS_NETWORK_ENV" ]]; then
+    {
+      echo "# Written by ATLAS Phase 1 step 4: derived, non-secret network facts (not atlas.env: CONVENTIONS §3 fixes its keys)."
+      echo "# LAN_DNS_SERVERS: the LAN resolvers dnsmasq forwards to, the ufw owner rules allow for the dnsmasq uid, the"
+      echo "# DOCKER-USER rules let the WireGuard bridge reach, and WG-Easy hands its clients (INIT_DNS). Re-detected by"
+      echo "# a '--force 04' run; read by phase1/07-remote.sh, phase1/docker-egress-rules.sh and --reload-allowlist."
+    } | phase1_write_file 644 '' "$ATLAS_NETWORK_ENV"
+  fi
+  ensure_kv "$ATLAS_NETWORK_ENV" "$key" "$value"
+  if [[ -f "$ATLAS_ETC/atlas.env" ]] && grep -q "^${key}=" "$ATLAS_ETC/atlas.env"; then
+    sed -i "/^${key}=/d" "$ATLAS_ETC/atlas.env"
+    log "removed $key from $ATLAS_ETC/atlas.env (earlier layout); it lives in $ATLAS_NETWORK_ENV now"
+  fi
+}
+
 # phase1_lan_resolvers — the LAN's IPv4 DNS servers, one per line. Order of trust: LAN_DNS_SERVERS persisted in
-# atlas.env by an earlier run (after this step points resolved at 127.0.0.1 the live resolvectl view no longer shows
-# the router), then resolvectl's per-link servers for LAN_IFACE, then the DHCP lease file, then the global resolvectl
-# list, then the default gateway. Loopback addresses are never a resolver (that would be dnsmasq itself: a loop).
-# Everything that forwards names (dnsmasq upstreams, the ufw owner rules, the WireGuard clients' INIT_DNS) is pinned
-# to exactly this list.
+# $ATLAS_NETWORK_ENV by an earlier run (after this step points resolved at 127.0.0.1 the live resolvectl view no
+# longer shows the router), then resolvectl's per-link servers for LAN_IFACE, then the DHCP lease file, then the
+# global resolvectl list, then the default gateway. Loopback addresses are never a resolver (that would be dnsmasq
+# itself: a loop). Everything that forwards names (dnsmasq upstreams, the ufw owner rules, the WireGuard clients'
+# INIT_DNS) is pinned to exactly this list.
 phase1_lan_resolvers() {
-  local list=() gw r
-  for r in ${LAN_DNS_SERVERS:-}; do [[ "$r" =~ ^[0-9]+(\.[0-9]+){3}$ && "$r" != 127.* ]] && list+=("$r"); done
+  local list=() gw r saved=""
+  if [[ -r "$ATLAS_NETWORK_ENV" ]]; then
+    saved="$(awk -F= '$1=="LAN_DNS_SERVERS" {print $2; exit}' "$ATLAS_NETWORK_ENV" | tr -d '"')"
+  fi
+  for r in $saved; do [[ "$r" =~ ^[0-9]+(\.[0-9]+){3}$ && "$r" != 127.* ]] && list+=("$r"); done
   if (( ${#list[@]} == 0 )); then
     mapfile -t list < <(resolvectl dns "$LAN_IFACE" 2>/dev/null | awk -F': ' 'NF>1 {print $2}' | tr ' ' '\n' \
                           | grep -E '^[0-9]+(\.[0-9]+){3}$' | grep -v '^127\.' || true)
@@ -91,7 +126,7 @@ phase1_lan_resolvers() {
     gw="$(ip -o route show default 2>/dev/null | awk '{print $3; exit}')"
     [[ -n "$gw" ]] && list=("$gw")
   fi
-  (( ${#list[@]} > 0 )) || die "phase1_lan_resolvers: no IPv4 resolver for $LAN_IFACE (LAN_DNS_SERVERS in atlas.env, resolvectl dns, the DHCP lease) and no default gateway"
+  (( ${#list[@]} > 0 )) || die "phase1_lan_resolvers: no IPv4 resolver for $LAN_IFACE (LAN_DNS_SERVERS in $ATLAS_NETWORK_ENV, resolvectl dns, the DHCP lease) and no default gateway"
   printf '%s\n' "${list[@]}"
 }
 
@@ -184,9 +219,12 @@ _squid_render() {
     (( ${#missing[@]} == 0 )) || die "config/sentinel-feeds.json names hosts that config/allowlist.txt does not admit: ${missing[*]} (add them to the Sentinel block of the allowlist)"
   fi
   [[ -f /etc/squid/squid.conf.dist ]] || cp -n /etc/squid/squid.conf /etc/squid/squid.conf.dist
-  # Binding (CONVENTIONS §8 "loopback only" + rule §7.1 for containers): 127.0.0.1 always; the docker0 gateway as the
-  # one extra listener once step 6 has recorded it in docker.env (DOCKER_GW). The LAN address and the WireGuard bridge
-  # are never bound: VPN clients must never use the node as an outbound proxy, and wg-easy itself needs no egress.
+  # Binding: 127.0.0.1 always; the docker0 gateway as the one extra listener once step 6 has recorded it in docker.env
+  # (DOCKER_GW). S12 (Section 23) requires container egress to go through squid and a bridge container cannot reach
+  # host loopback, so the document wins over CONVENTIONS §8's "squid 3128 (loopback only)"; §8's port line needs the
+  # amendment "loopback and the docker0 gateway only; containers per S12" (recorded in the fix-round notes). The LAN
+  # address and the WireGuard bridge are never bound: VPN clients must never use the node as an outbound proxy, and
+  # wg-easy itself needs no egress.
   # Clients acl: loopback plus the Docker bridge ranges (where every container's gateway address sits).
   local gw="" extra=""
   if [[ -r "$ATLAS_ETC/docker.env" ]]; then gw="$(awk -F= '$1=="DOCKER_GW" {print $2; exit}' "$ATLAS_ETC/docker.env")"; fi
@@ -205,21 +243,23 @@ _squid_render() {
 }
 
 # _dns_render — /etc/dnsmasq.d/90-atlas.conf from the rendered allowlist: every entry (leading dot stripped; dnsmasq's
-# server=/domain/ covers the domain and its subdomains, which is also what squid's dotted form means), the node's own
-# DOMAIN (V5 resolves VPN_HOST), ntp.ubuntu.com (timesyncd re-resolution) and the Windows share host when it is a
-# name; forwarded to every LAN resolver; everything else NXDOMAIN. Requires /etc/squid/allowlist.txt (_squid_render).
+# server=/domain/ covers the domain and its subdomains, which is also what squid's dotted form means; ntp.ubuntu.com
+# is an allowlist.txt entry, not an addition here) plus exactly two names derived from atlas.env: the node's own
+# DOMAIN (V5 resolves VPN_HOST) and the Windows share host when it is a name (rule §7.1: the allowlist file and
+# nothing else; the two derived names are declared in the allowlist.txt header and in the log line below). Forwarded
+# to every LAN resolver; everything else NXDOMAIN. Requires /etc/squid/allowlist.txt (_squid_render).
 _dns_render() {
-  local resolvers=() names=() e r
+  local resolvers=() names=() derived=() e r
   mapfile -t resolvers < <(phase1_lan_resolvers)
-  # Persist and export the list now: once resolved points at 127.0.0.1 the live resolvectl view no longer shows the
-  # router, so every later caller (ufw owner rules, DOCKER-USER, WG INIT_DNS, re-runs) reads LAN_DNS_SERVERS instead.
-  ensure_kv "$ATLAS_ETC/atlas.env" LAN_DNS_SERVERS "\"${resolvers[*]}\""
-  export LAN_DNS_SERVERS="${resolvers[*]}"
+  # Persist the list now: once resolved points at 127.0.0.1 the live resolvectl view no longer shows the router, so
+  # every later caller (ufw owner rules, DOCKER-USER, WG INIT_DNS, re-runs) reads LAN_DNS_SERVERS from network.env.
+  phase1_network_env_save LAN_DNS_SERVERS "\"${resolvers[*]}\""
   mapfile -t names < <(sed -e 's/^\.//' /etc/squid/allowlist.txt | grep -E '^[A-Za-z0-9.-]+$' | sort -u)
   (( ${#names[@]} > 10 )) || die "_dns_render: the rendered allowlist has only ${#names[@]} usable names"
-  names+=("$DOMAIN" ntp.ubuntu.com)
+  derived=("$DOMAIN")
   local share="${WINDOWS_SHARE:-}"; share="${share#//}"; share="${share%%/*}"
-  [[ -n "$share" && ! "$share" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && names+=("$share")
+  [[ -n "$share" && ! "$share" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && derived+=("$share")
+  names+=("${derived[@]}")
   install -d -m 755 /etc/dnsmasq.d
   {
     echo "# Written by ATLAS Phase 1 step 4 (and --reload-allowlist): the host resolves ONLY the allowlisted names"
@@ -240,7 +280,7 @@ _dns_render() {
     done < <(printf '%s\n' "${names[@]}" | sort -u)
     echo "address=/#/"
   } | phase1_write_file 644 '' /etc/dnsmasq.d/90-atlas.conf
-  log "dnsmasq: $(grep -c '^server=' /etc/dnsmasq.d/90-atlas.conf) forwarding rules for $(printf '%s\n' "${names[@]}" | sort -u | wc -l) names -> ${resolvers[*]}; all else NXDOMAIN (sha256 $(sha256sum /etc/dnsmasq.d/90-atlas.conf | cut -c1-16)...)"
+  log "dnsmasq: $(grep -c '^server=' /etc/dnsmasq.d/90-atlas.conf) forwarding rules for $(printf '%s\n' "${names[@]}" | sort -u | wc -l) names (config/allowlist.txt + derived from atlas.env: ${derived[*]}) -> ${resolvers[*]}; all else NXDOMAIN (sha256 $(sha256sum /etc/dnsmasq.d/90-atlas.conf | cut -c1-16)...)"
 }
 
 # _dns_selftest — through resolved: an allowlisted name resolves, a forbidden one is NXDOMAIN, no stray servers.
@@ -258,6 +298,38 @@ _dns_selftest() {
   local link; link="$(resolvectl dns "$LAN_IFACE" 2>/dev/null | awk -F': ' 'NF>1 {print $2}')"
   [[ -z "${link// /}" ]] || warn "DNS self-test: $LAN_IFACE still lists DNS servers ($link); ufw drops resolved's queries to them (only dnsmasq may reach port 53) and the networkd drop-in removes them at the reboot"
   log "DNS self-test: allowlisted name resolves, forbidden name is NXDOMAIN, resolved -> 127.0.0.1 (dnsmasq)"
+}
+
+# _dns_fence_selftest — the dnsmasq owner match must be the ONLY way out on port 53 (fix round 3, major): a raw query
+# from an ordinary uid (nobody) to the first LAN resolver must be refused by the kernel (EPERM: OUTPUT DROP on a
+# locally generated packet) or go unanswered, while the host still resolves an allowlisted name through dnsmasq.
+# Runs after _ufw_rules; python3 is on every Ubuntu Server image (apt tooling depends on it).
+_dns_fence_selftest() {
+  local r out rc=0
+  r="${ATLAS_LAN_RESOLVERS[0]}"
+  command -v python3 >/dev/null || die "python3 is missing (Ubuntu Server ships it); the DNS fence self-test needs it"
+  out="$(runuser -u nobody -- python3 - "$r" <<'PY' 2>&1
+import socket, sys
+name = b"api.openai.com"
+q = bytes.fromhex("abcd01000001000000000000") + b"".join(bytes([len(l)]) + l for l in name.split(b".")) + b"\x00\x00\x01\x00\x01"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.sendto(q, (sys.argv[1], 53))
+    s.recv(512)
+except PermissionError:
+    print("EPERM"); sys.exit(0)
+except socket.timeout:
+    print("TIMEOUT"); sys.exit(0)
+print("ANSWERED"); sys.exit(2)
+PY
+)" || rc=$?
+  [[ "$rc" == 0 && "$out" =~ ^(EPERM|TIMEOUT)$ ]] \
+    || die "DNS fence self-test: uid nobody could query the LAN resolver $r directly (result '$out', rc $rc): the port-53 DROP behind the dnsmasq owner rules in /etc/ufw/before.rules is not in effect (iptables -S ufw-before-output | grep 'dport 53')"
+  local ok; ok="$(resolvectl query --legend=no -4 archive.ubuntu.com 2>&1 || true)"
+  grep -qE '\b[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\b' <<<"$ok" \
+    || die "DNS fence self-test: archive.ubuntu.com no longer resolves through dnsmasq after the fence ($ok); the dnsmasq owner ACCEPT must precede the DROP (iptables -S ufw-before-output)"
+  log "DNS fence self-test: direct port 53 from uid nobody to $r -> $out; dnsmasq path still resolves (only the dnsmasq uid reaches the LAN resolvers)"
 }
 
 # _dns_forwarder_install — dnsmasq as the host's allowlisting resolver; systemd-resolved pointed at it; the LAN link's
@@ -329,8 +401,8 @@ CONF
 
 # phase1_reload_allowlist [FILE] — the lightweight path after an allowlist edit (config/allowlist.txt comment):
 # copy FILE over $ATLAS_DAY1_DIR/config/allowlist.txt when given, re-render squid and dnsmasq, reload both. No ufw
-# reset, no dist-upgrade, no reboot (all of which a `--force 04` would do). Runs without load_env: DOMAIN and
-# WINDOWS_SHARE are read from atlas.env here, LAN_DNS_SERVERS/LAN_IFACE likewise.
+# reset, no dist-upgrade, no reboot (all of which a `--force 04` would do). Runs without load_env: DOMAIN,
+# WINDOWS_SHARE and LAN_IFACE are read from atlas.env here, LAN_DNS_SERVERS from network.env (phase1_lan_resolvers).
 phase1_reload_allowlist() {
   local src="${1:-}" dst="$ATLAS_DAY1_DIR/config/allowlist.txt"
   [[ -e "$ATLAS_ETC/proxy.env" ]] || die "the proxy has not been set up yet (step 4 has not run); nothing to reload"
@@ -394,7 +466,8 @@ _proxy_environment() {
 }
 
 # _ntp_servers — the IPv4 addresses systemd-timesyncd will use, one per line: its current ServerAddress plus every
-# A record of its configured server names (ntp.ubuntu.com by default). timesyncd is then pinned to exactly these
+# A record of its configured server names (ntp.ubuntu.com by default; it is resolved through dnsmasq, which forwards
+# it because config/allowlist.txt lists it for exactly this purpose). timesyncd is then pinned to exactly these
 # addresses (timesyncd.conf.d drop-in) so the ufw NTP rules and the client agree. UNVERIFIED: Canonical's
 # ntp.ubuntu.com addresses are treated as long-lived; if they ever change, `timedatectl timesync-status` shows the
 # failure and `--force 04` re-pins them.
@@ -416,13 +489,16 @@ _ntp_servers() {
 # so the chain exists from `ufw enable` at boot, BEFORE dockerd starts restart:unless-stopped containers.
 # atlas-docker-egress.service (step 6) then flushes and rebuilds the full rule set (DNAT accept for published ports,
 # logging) after dockerd is up; if that unit ever fails, this base still drops everything leaving a bridge for the
-# LAN interface. Containers get NO port 53 (header: nothing behind the proxy needs DNS); the WireGuard bridge may
-# reach the LAN subnet and the LAN resolvers because that is the Principal's phone's traffic (INIT_DNS), not a
-# container's.
-# REVERSE INTERACTION (fix round): `ufw reload`, `ufw enable` and `ufw --force reset` run iptables-restore over
-# after.rules, which flushes the live DOCKER-USER chain back to this baseline (the DNAT accepts and the logging are
-# gone until docker restarts: VPN clients lose ntfy and Open WebUI, availability only, the fallback is stricter).
-# So every `ufw reload|enable|reset` must be followed by `systemctl restart atlas-docker-egress.service`: _ufw_rules
+# any non-bridge interface. Containers get NO port 53 (header: nothing behind the proxy needs DNS); the WireGuard
+# bridge may reach the LAN subnet and the LAN resolvers because that is the Principal's phone's traffic (INIT_DNS),
+# not a container's. The terminal rules are interface-agnostic (fix round 3): `-i br-+ -o br-+|docker0 RETURN` then
+# `-i br-+ DROP` (same for docker0), so a second uplink (Ethernet beside Wi-Fi, a USB tether, a host wg/tun) gives
+# containers no unlogged way out; Docker's own FORWARD ACCEPT sits behind DOCKER-USER and never gets the packet.
+# INTERACTION WITH ufw reload (fix round 3, corrected): ufw restores after.rules with `iptables-restore -n`
+# (VERIFIED in ufw 0.36.2, usr/lib/ufw/ufw-init-functions). On a cold boot this CREATES DOCKER-USER with the baseline
+# before dockerd exists; on a later `ufw reload|enable|reset` the existing chain is neither flushed nor recreated
+# (--noflush), so the baseline is APPENDED after the live set's final `-j RETURN` (unreachable duplicates) and the full
+# set stays in force. Restart atlas-docker-egress.service afterwards anyway so the chain is rebuilt cleanly: _ufw_rules
 # does it itself, and a ufw.service drop-in (below) does it at boot and on `systemctl restart ufw`.
 _ufw_docker_user_base() {
   local f="$1" v6="$2" lan="$LAN_IFACE" tmp r
@@ -443,8 +519,12 @@ _ufw_docker_user_base() {
         echo "-A DOCKER-USER -i $ATLAS_WG_BRIDGE -o $lan -d $r -p tcp --dport 53 -j RETURN"
       done
     fi
-    echo "-A DOCKER-USER -i br-+ -o $lan -j DROP"
-    echo "-A DOCKER-USER -i docker0 -o $lan -j DROP"
+    local br
+    for br in 'br-+' docker0; do
+      echo "-A DOCKER-USER -i $br -o br-+ -j RETURN"
+      echo "-A DOCKER-USER -i $br -o docker0 -j RETURN"
+      echo "-A DOCKER-USER -i $br -j DROP"
+    done
     echo "# ATLAS-DOCKER-USER-END"
   } >"$tmp"
   awk -v blk="$tmp" 'BEGIN{done=0} /^COMMIT/ && !done { while ((getline l < blk) > 0) print l; done=1 } {print}' "$f" >"$f.atlas.tmp"
@@ -462,8 +542,8 @@ _ufw_rules() {
     warn "no NTP server address could be resolved; allowing NTP to the default gateway $gw only (UNVERIFIED that the router serves NTP)"
     ntp=("$gw")
   fi
-  # Persist the resolver list for the standalone DOCKER-USER script and re-runs (atlas.env key LAN_DNS_SERVERS; derived, not a secret).
-  ensure_kv "$ATLAS_ETC/atlas.env" LAN_DNS_SERVERS "\"${ATLAS_LAN_RESOLVERS[*]}\""
+  # Persist the resolver list for the standalone DOCKER-USER script and re-runs (network.env, never atlas.env; header).
+  phase1_network_env_save LAN_DNS_SERVERS "\"${ATLAS_LAN_RESOLVERS[*]}\""
 
   ufw --force reset >/dev/null
   ufw default deny incoming >/dev/null
@@ -485,15 +565,17 @@ _ufw_rules() {
   ufw allow in on docker0 to any port 3128 proto tcp comment 'squid from docker0' >/dev/null
   ufw allow in from 172.16.0.0/12 to any port 3128 proto tcp comment 'squid from compose bridges' >/dev/null
   # Outbound: NTP to the configured servers ONLY, DHCP, the LAN itself, the Docker bridges. DNS is NOT opened here:
-  # only the dnsmasq user may reach the resolvers' port 53 (owner match in before.rules, below), so no process on the
-  # host, resolved included, can ask the router about a name the allowlist does not carry (Section 12.5). HTTP(S)
-  # only for the squid user (before.rules). No outbound rule for UDP $WG_PORT: wg0 lives inside the wg-easy
-  # container, whose replies traverse FORWARD/DOCKER-USER under conntrack, never the host OUTPUT chain.
+  # only the dnsmasq user may reach the resolvers' port 53 (owner match in before.rules, below), and port 53 on the
+  # LAN interface is DROPPED for every other uid right behind that match, BEFORE the broad "LAN" allow below is ever
+  # reached (ufw-before-output runs ahead of the user rules), so no process on the host, resolved included, can ask
+  # the router (a LAN address) about a name the allowlist does not carry (Section 12.5; fix round 3). HTTP(S) only for
+  # the squid user (before.rules). No outbound rule for UDP $WG_PORT: wg0 lives inside the wg-easy container, whose
+  # replies traverse FORWARD/DOCKER-USER under conntrack, never the host OUTPUT chain.
   for r in "${ntp[@]}"; do
     ufw allow out on "$lan" to "$r" port 123 proto udp comment "NTP $r" >/dev/null
   done
   ufw allow out on "$lan" to any port 67 proto udp comment 'DHCP' >/dev/null
-  ufw allow out on "$lan" to "$net" comment 'LAN: router, Windows share, phone on LAN' >/dev/null
+  ufw allow out on "$lan" to "$net" comment 'LAN: router, Windows share, phone on LAN (port 53 dropped in before.rules)' >/dev/null
   ufw allow out to 172.16.0.0/12 comment 'Docker bridges (published services)' >/dev/null
   ufw allow out on "$wgbr" to "$wgnet" comment 'to the wg-easy container' >/dev/null
   # Pin timesyncd to the addresses the rules allow.
@@ -502,8 +584,9 @@ _ufw_rules() {
     "${ntp[*]}" "${ntp[*]}" >/etc/systemd/timesyncd.conf.d/90-atlas.conf
   systemctl try-restart systemd-timesyncd.service >/dev/null 2>&1 || true
   # Owner-matched egress (before.rules, chain ufw-before-output): only the 'proxy' user (squid) may open 80/443, only
-  # the 'dnsmasq' user may open 53 to the LAN resolvers. ICMP: echo-request and the error types to the LAN only (V1
-  # pings the gateway); never "any ICMP anywhere".
+  # the 'dnsmasq' user may open 53 to the LAN resolvers, and port 53 on the LAN interface is dropped for everyone else
+  # right after (the only way out on 53 is the owner match; _dns_fence_selftest proves it). ICMP: echo-request and
+  # the error types to the LAN only (V1 pings the gateway); never "any ICMP anywhere".
   local uid dns_uid; uid="$(id -u proxy)" || die "user 'proxy' (squid) does not exist"
   dns_uid="$(id -u dnsmasq)" || die "user 'dnsmasq' does not exist (the DNS forwarder must be installed before the firewall)"
   local f chain tmp
@@ -518,6 +601,8 @@ _ufw_rules() {
       echo "# ATLAS: only the squid proxy user may open outbound HTTP/HTTPS and only dnsmasq may reach the LAN resolvers (Section 12.5); ICMP to the LAN only (V1)"
       echo "-A $chain -p tcp -m multiport --dports 80,443 -m owner --uid-owner $uid -j ACCEPT"
       if [[ "$chain" == ufw6-before-output ]]; then
+        echo "-A $chain -o $lan -p udp --dport 53 -j DROP"
+        echo "-A $chain -o $lan -p tcp --dport 53 -j DROP"
         local t
         for t in 133 134 135 136 137; do echo "-A $chain -p ipv6-icmp --icmpv6-type $t -j ACCEPT"; done
         echo "-A $chain -p ipv6-icmp --icmpv6-type 128 -d fe80::/10 -j ACCEPT -m comment --comment ATLAS-END"
@@ -526,6 +611,8 @@ _ufw_rules() {
           echo "-A $chain -o $lan -d $r -p udp --dport 53 -m owner --uid-owner $dns_uid -j ACCEPT"
           echo "-A $chain -o $lan -d $r -p tcp --dport 53 -m owner --uid-owner $dns_uid -j ACCEPT"
         done
+        echo "-A $chain -o $lan -p udp --dport 53 -j DROP"
+        echo "-A $chain -o $lan -p tcp --dport 53 -j DROP"
         local t
         for t in destination-unreachable time-exceeded parameter-problem; do echo "-A $chain -p icmp --icmp-type $t -d $net -j ACCEPT"; done
         echo "-A $chain -p icmp --icmp-type echo-request -d $net -j ACCEPT -m comment --comment ATLAS-END"
@@ -536,10 +623,11 @@ _ufw_rules() {
   done
   _ufw_docker_user_base /etc/ufw/after.rules 0
   _ufw_docker_user_base /etc/ufw/after6.rules 1
-  # ufw.service drop-in: at boot and on `systemctl restart ufw`, rebuild the full DOCKER-USER set after the baseline
-  # (see _ufw_docker_user_base). `-` keeps a missing script (before step 6) or a failure from failing ufw itself.
+  # ufw.service drop-in: at boot and on `systemctl restart ufw`, rebuild the full DOCKER-USER set cleanly after the
+  # after.rules baseline was created or appended (see _ufw_docker_user_base). `-` keeps a missing script (before
+  # step 6) or a failure from failing ufw itself.
   install -d -m 755 /etc/systemd/system/ufw.service.d
-  printf '# ATLAS Phase 1 step 4: the ufw after.rules reset DOCKER-USER to the baseline; re-apply the full set (phase1/06-docker.sh).\n[Service]\nExecStartPost=-/usr/local/sbin/atlas-docker-egress\n' \
+  printf '# ATLAS Phase 1 step 4: ufw after.rules created (boot) or appended (reload) the DOCKER-USER baseline; rebuild the full set cleanly (phase1/06-docker.sh).\n[Service]\nExecStartPost=-/usr/local/sbin/atlas-docker-egress\n' \
     >/etc/systemd/system/ufw.service.d/atlas.conf
   systemctl daemon-reload
   ufw --force enable >/dev/null
@@ -714,9 +802,10 @@ step_04() {
   systemctl reload squid || systemctl restart squid
   _proxy_environment
   _dns_forwarder_install
-  # 2. Firewall (Section 3.6, 12.5).
+  # 2. Firewall (Section 3.6, 12.5), then prove the proxy path and the DNS fence.
   _ufw_rules
   _proxy_selftest
+  _dns_fence_selftest
   # 3. Full system update, through the proxy, unattended (needrestart would otherwise prompt on Server).
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
   retry 3 apt-get -q update || die "apt-get update failed through the proxy"

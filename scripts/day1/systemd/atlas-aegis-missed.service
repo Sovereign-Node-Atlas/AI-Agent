@@ -1,0 +1,17 @@
+# /etc/systemd/system/atlas-aegis-missed.service — pushed when the nightly AEGIS chain did not complete (Section 7.4
+# "fail loudly, never silently"; fix round 3). Started ONLY through OnFailure= of atlas-aegis-forget.service: a job
+# for that unit that ends in failure (its Requires= atlas-aegis.service could not start — StartLimit hit by manual
+# triggers earlier in the 6 h window, or a failed ExecStartPre — or the prune itself failed) runs no ExecStopPost of
+# either unit, so without this unit a skipped night would surface only when Sentinel's 36 h backup-age telemetry trips
+# the next day. The push goes through /usr/local/sbin/atlas-aegis notify (phase2/atlas-aegis.sh): root reads the token
+# from ${ATLAS_ETC}/secrets/ntfy.env and hands it to curl through a process substitution, never on argv; it never
+# fails the caller. Installed by phase2/07-restic.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+
+[Unit]
+Description=AEGIS nightly chain did not run or failed: push the fact (Section 9.5, 7.4)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-${ATLAS_ETC}/orchestrator.env
+Environment=ATLAS_ETC=${ATLAS_ETC} ATLAS_OPT=${ATLAS_OPT}
+ExecStart=/usr/local/sbin/atlas-aegis notify "AEGIS nightly chain on this node did NOT complete: atlas-aegis-forget.service failed (backup dependency, start-limit or prune). Check: journalctl -u atlas-aegis.service -u atlas-aegis-forget.service; if the start limit was hit: systemctl reset-failed atlas-aegis.service atlas-aegis-trigger.path && systemctl start atlas-aegis-trigger.path"

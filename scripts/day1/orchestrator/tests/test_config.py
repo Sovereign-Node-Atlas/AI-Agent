@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,8 @@ def test_settings_from_env_reads_atlas_env_and_process_env(config_dir: Path, mon
     assert s.extra == {"PRINCIPAL_USER": "tester", "TZ": "Australia/Sydney", "ORCH_PORT": "8800"}
     assert set(s.extra) <= set(SETTINGS_EXTRA_KEYS) and "LLAMA_PORT_BASE" not in s.extra
     assert not hasattr(s, "env") and "FAMILY_NAMES" not in str(dataclasses.asdict(s).get("extra"))
+    # The family names are Principal data (7.2 rule 1): a `%r` of the settings in a log line must not carry them.
+    assert "Testwood" not in repr(s) and "Ava" not in str(s) and "family_names" not in repr(s)
     monkeypatch.setenv("LLAMA_PORT_BASE", "9100")
     monkeypatch.setenv("ATLAS_DB_PATH", "/tmp/x.sqlite3")
     s2 = Settings.from_env()
@@ -149,7 +152,7 @@ def test_domain_card_headings(caplog: pytest.LogCaptureFixture) -> None:
             13, "Dean of Academia & Pedagogy", "Estate", "Arthur — tagged to 14", "C")
     assert caplog.text == ""
     # Non-conforming spellings (pipes, 8.2's inner comma): the lenient parse normalises and warns with the H1 the card
-    # should carry; strict=True (what load_domain_cards uses) raises the same message as ConfigError.
+    # should carry; strict=True (load_domain_cards(strict=True), `atlas-admin config check`) raises the same message.
     h7 = "# 07. Development Director, Property & Real Estate  (Corporate | Valerie, with Silas | Tier A)"
     h26 = "# 26. Cultural Asset & Fine Art Curator  (Estate, Alaric, with Silas, Tier C)"
     with caplog.at_level(logging.WARNING, logger="atlas.config"):
@@ -172,27 +175,73 @@ def _card_tree(tmp_path: Path) -> Path:
     return cards
 
 
-def test_load_domain_cards_fails_loudly_on_non_conforming_h1(tmp_path: Path) -> None:
-    # Rule §7.4 / CONVENTIONS.md §8: the H1 triple is a name that must agree across every file, so the Phase 2 gate
-    # sees the disagreement instead of a warning that scrolls by. One ConfigError names every offending card.
+def test_load_domain_cards_warns_by_default_and_refuses_when_strict(tmp_path: Path,
+                                                                     caplog: pytest.LogCaptureFixture) -> None:
+    # Fix round 3 (blocker): the service must START on the tree the node has, so the default load normalises a
+    # non-§8 H1 and warns with the H1 the card should carry; the §8 agreement is enforced by strict=True (the gate,
+    # `atlas-admin config check`), where ONE ConfigError names every offending card (rule §7.4).
     cards = _card_tree(tmp_path)
     (cards / "05-cfo.md").write_text("# 05. CFO  (Corporate, Silas, Tier A)\n\nbody\n")
     (cards / "07-dev.md").write_text("# 07. Dev  (Corporate | Valerie, with Silas | Tier A)\n\nbody\n")
     (cards / "26-art.md").write_text("# 26. Art  (Estate, Alaric, with Silas, Tier C)\n\nbody\n")
+    with caplog.at_level(logging.WARNING, logger="atlas.config"):
+        loaded = load_domain_cards(tmp_path)
+    assert [c.owner for c in loaded.values()] == ["Silas", "Valerie with Silas", "Alaric with Silas"]  # §8 spellings
+    assert caplog.text.count("not in the CONVENTIONS.md §8 form") == 2 and "05-cfo" not in caplog.text
+    assert "'(Corporate, Valerie with Silas, Tier A)'" in caplog.text
     with pytest.raises(ConfigError) as ei:
-        load_domain_cards(tmp_path)
+        load_domain_cards(tmp_path, strict=True)
     msg = str(ei.value)
     assert msg.startswith("2 domain card(s) do not carry the CONVENTIONS.md §8 H1 triple")
     assert str(cards / "07-dev.md") in msg and str(cards / "26-art.md") in msg and "05-cfo" not in msg
     assert "'(Corporate, Valerie with Silas, Tier A)'" in msg and "'(Estate, Alaric with Silas, Tier C)'" in msg
-    # Fixed cards load; the hemisphere comes back as the §8 key, never the H1 capitalisation.
+    # Fixed cards load in both modes; the hemisphere comes back as the §8 key, never the H1 capitalisation.
     (cards / "07-dev.md").write_text("# 07. Dev  (Corporate, Valerie with Silas, Tier A)\n\nbody\n")
     (cards / "26-art.md").write_text("# 26. Art  (Both, Alaric with Silas, Tier C)\n\nbody\n")
-    loaded = load_domain_cards(tmp_path)
-    assert [c.hemisphere for c in loaded.values()] == ["corporate", "corporate", "both"]
+    assert [c.hemisphere for c in load_domain_cards(tmp_path, strict=True).values()] == ["corporate", "corporate",
+                                                                                           "both"]
+    # Everything that is not the §8 triple drift stays a hard error in BOTH modes.
     (cards / "30-x.md").write_text("# 30. X  (Personal, Ren, Tier A)\n")
-    with pytest.raises(ConfigError, match=r"30-x\.md: hemisphere 'Personal' is not one of"):
-        load_domain_cards(tmp_path)
+    for strict in (False, True):
+        with pytest.raises(ConfigError, match=r"30-x\.md: hemisphere 'Personal' is not one of"):
+            load_domain_cards(tmp_path, strict=strict)
+
+
+def _real_config_tree() -> Path | None:
+    """scripts/day1/config when this checkout (or ATLAS_CONFIG_DIR on the node) has it; None otherwise."""
+    for candidate in (os.environ.get("ATLAS_CONFIG_DIR", ""), str(Path(__file__).resolve().parents[2] / "config")):
+        tree = Path(candidate) if candidate else None
+        if tree is not None and (tree / "engines.json").is_file() and (tree / "domains" / "cards").is_dir():
+            return tree
+    return None
+
+
+def test_real_config_tree_loads(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    # CONVENTIONS.md §8 asks for names that agree across every file; the fixtures alone cannot prove that, so this
+    # runs the loaders against the REAL tree (scripts/day1/config, or ATLAS_CONFIG_DIR on the node) when it is there.
+    # Two claims: (1) the service starts on it (load_config, lenient on the cards: the Phase 2 step 2 blocker);
+    # (2) every domain card carries the §8 H1 triple (strict). Until cards 07, 11, 26, 28, 32 and 35 read
+    # '(Corporate, Valerie with Silas, Tier A)', '(Corporate, Helena with Valerie, Tier C)', '(Estate, Alaric with
+    # Silas, Tier C)', '(Corporate, Helena with Minerva, Tier C)', '(Corporate, Valerie with Alaric, Tier B)' and
+    # '(Corporate, Valerie with Minerva, Tier C)', claim 2 FAILS here by design (fix round 3; the cards are another
+    # writer's files). ATLAS_ETC is a scratch dir so no real /etc/atlas/atlas.env (family names) is read.
+    tree = _real_config_tree()
+    if tree is None:
+        pytest.skip("the real config tree is not beside this checkout and ATLAS_CONFIG_DIR is unset")
+    settings = Settings.from_env({"ATLAS_CONFIG_DIR": str(tree), "ATLAS_ETC": str(tmp_path)})
+    with caplog.at_level(logging.WARNING, logger="atlas.config"):
+        cfg = load_config(settings)
+    assert set(cfg.personas) == {"ren", "arthur", "gideon", "silas", "valerie", "helena", "eleanor", "alaric",
+                                 "minerva", "victor"}
+    assert len(cfg.domain_cards) == 36 and len(cfg.task_forces) == 23 and len(cfg.engines) == 10  # §1 counts
+    assert list(cfg.engines) == list(ENGINE_KEYS) and len(cfg.phase4_engines) >= 16
+    drift = [ln for ln in caplog.text.splitlines() if "not in the CONVENTIONS.md §8 form" in ln]
+    try:
+        load_domain_cards(tree, strict=True)
+    except ConfigError as exc:
+        pytest.fail(f"the real tree loads (the service starts) but {len(drift)} domain card(s) drift from the "
+                    f"CONVENTIONS.md §8 H1 triple; fix the cards (another writer's files):\n{exc}")
+    assert drift == []
 
 
 def test_load_domain_cards(config_dir: Path) -> None:

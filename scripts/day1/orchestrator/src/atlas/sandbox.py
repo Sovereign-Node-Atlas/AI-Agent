@@ -28,10 +28,23 @@ The time bound is enforced INSIDE the container (the image's ENTRYPOINT wraps ev
 kill shows as exit 137 (128 + SIGKILL; proven by V17) and `docker inspect .State.OOMKilled` is the authoritative
 flag when the container still exists. GNU timeout returns 124 when the wall clock expires.
 
+Output bound (fix round 4): the caps above bound the sandboxed job's memory, pids, file size and time but not what it
+writes to its stdout/stderr, and `subprocess.run(capture_output=True)` would buffer all of it in the LAUNCHING process
+(the cpu Celery worker, a docker-group account) until the OOM killer took the worker: a denial of service from inside
+the sandbox that the run line cannot prevent. SubprocessDocker therefore drains both streams with a reader thread
+each and keeps at most SANDBOX_OUTPUT_MAX bytes per stream (`SandboxConfig.output_max`, default 1 MiB), discarding the
+rest as it arrives; SandboxResult.stdout_truncated / stderr_truncated say when that happened. Bounded in this process,
+not with `--log-opt max-size` (that bounds the daemon's log file, not the pipe the client relays).
+
 Network (16.4 "no network unless the task's tier grants it"): `run(network=True)` is REFUSED today, whatever the
-state of atlas-docker-egress.service (fix round 2). Reason: dropping `--network none` puts the job on the default
-bridge, and a bridge reaches the allowlist proxy NOT AT ALL (squid listens on loopback only, §8) while any DNS it could
-reach (phase1/docker-egress-rules.sh now drops bridge->53 too, but a pinned recursive resolver would be exactly this)
+state of atlas-docker-egress.service (fix round 2). RECORDED BASELINE DEVIATION (fix round 4): 16.4's network grant
+is a baseline capability and it is unavailable here until the `atlas-sandbox` bridge with squid bound on its gateway
+and bridge->53 dropped exists; the deviation belongs in scripts/day1/README.md "Baseline deviations" and
+phase2/README-contracts.md "Sandbox" still describes the older rule ("refuses a network grant when
+atlas-docker-egress.service is not active"), which that writer is asked to replace with this behaviour. Reason:
+dropping `--network none` puts the job on the default bridge, and a bridge reaches the allowlist proxy NOT AT ALL
+(squid listens on loopback only, §8) while any DNS it could reach (phase1/docker-egress-rules.sh now drops bridge->53
+too, but a pinned recursive resolver would be exactly this)
 is a tunnel: a recursive resolver forwards `<base32 chunk>.attacker.example` to the attacker's authoritative server,
 so everything staged in /work leaves the node while every HTTP byte is "denied and logged" (12.5). Pinning a resolver
 does not close that; only an `atlas-sandbox` bridge with squid bound on its gateway and bridge->53 dropped does, and
@@ -61,12 +74,13 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Any, Protocol
 
 log = logging.getLogger("atlas.sandbox")
 
@@ -78,6 +92,8 @@ DEFAULT_PIDS = 256
 DEFAULT_TMPFS = "512m"
 DEFAULT_TIMEOUT_S = 300
 DEFAULT_FSIZE = 1 << 30  # SANDBOX_FSIZE: 1 GiB per file (README-contracts.md "Sandbox")
+DEFAULT_OUTPUT_MAX = 1 << 20  # SANDBOX_OUTPUT_MAX: bytes of stdout / of stderr the launcher keeps (module docstring)
+_DRAIN_CHUNK = 64 * 1024
 HOST_TIMEOUT_SLACK_S = 10  # the host-side GNU timeout is a backstop after the in-container one
 EGRESS_UNIT = "atlas-docker-egress.service"
 EXIT_OOM_KILLED = 137
@@ -95,6 +111,7 @@ __all__ = [
     "StubDocker",
     "SubprocessDocker",
     "build_argv",
+    "drain_bounded",
     "egress_unit_active",
     "parse_memory_mb",
     "run",
@@ -113,6 +130,7 @@ class SandboxConfig:
     pids: int = DEFAULT_PIDS
     tmpfs_size: str = DEFAULT_TMPFS
     fsize: int = DEFAULT_FSIZE
+    output_max: int = DEFAULT_OUTPUT_MAX  # per stream, kept in the launcher (module docstring "Output bound")
     gid: int = -1  # the group the container runs with; -1 = this process's gid (atlas on the node)
     # The 16.4 caps the operator configured (SANDBOX_MEMORY, SANDBOX_CPUS, SANDBOX_TIMEOUT_S; fix round 2): run()
     # defaults its arguments to these, never to the code constants, once a config is given.
@@ -168,6 +186,7 @@ def sandbox_config_from_env(env: dict[str, str] | None = None) -> SandboxConfig:
         pids=_int("SANDBOX_PIDS", DEFAULT_PIDS),
         tmpfs_size=env.get("SANDBOX_TMPFS_SIZE") or DEFAULT_TMPFS,
         fsize=_int("SANDBOX_FSIZE", DEFAULT_FSIZE),
+        output_max=_int("SANDBOX_OUTPUT_MAX", DEFAULT_OUTPUT_MAX),
         memory_mb=parse_memory_mb(mem) if mem else DEFAULT_MEMORY_MB,
         cpus=cpus,
         timeout_s=_int("SANDBOX_TIMEOUT_S", DEFAULT_TIMEOUT_S),
@@ -186,6 +205,8 @@ class SandboxResult:
     argv: tuple[str, ...] = ()
     oom_killed: bool | None = None  # docker inspect .State.OOMKilled when it could be read
     work_dir: str = ""
+    stdout_truncated: bool = False  # the job wrote more than SANDBOX_OUTPUT_MAX; the tail was discarded
+    stderr_truncated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -202,24 +223,62 @@ class DockerRunner(Protocol):
     def image_exists(self, image: str) -> bool: ...
 
 
+def drain_bounded(stream: Any, limit: int) -> tuple[bytes, bool]:
+    """Read `stream` to EOF keeping at most `limit` bytes; the rest is read and discarded so the writer never blocks on
+    a full pipe. Returns (kept, truncated)."""
+    kept = bytearray()
+    truncated = False
+    while True:
+        chunk = stream.read(_DRAIN_CHUNK)
+        if not chunk:
+            break
+        room = limit - len(kept)
+        if room > 0:
+            kept += chunk[:room]
+        if len(chunk) > max(room, 0):
+            truncated = True
+    return bytes(kept), truncated
+
+
 class SubprocessDocker:
-    """The real runner: argv already starts with `timeout -k 5 N docker run ...`."""
+    """The real runner: argv already starts with `timeout -k 5 N docker run ...`. Output is drained with a bound
+    (module docstring "Output bound"); `last_truncated` tells run() whether either stream was cut."""
+
+    def __init__(self, output_max: int = DEFAULT_OUTPUT_MAX) -> None:
+        self.output_max = max(int(output_max), 0)
+        self.last_truncated: tuple[bool, bool] = (False, False)
 
     def run(self, argv: Sequence[str], *, timeout_s: float) -> tuple[int, str, str]:
         try:
-            proc = subprocess.run(
-                list(argv),
-                capture_output=True,
-                text=True,
-                timeout=timeout_s + 30,
-                check=False,
-                stdin=subprocess.DEVNULL,
+            proc = subprocess.Popen(
+                list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL
             )
         except FileNotFoundError as exc:
             raise SandboxError(f"{argv[0]} not found (coreutils timeout / docker CLI missing): {exc}") from exc
+        results: dict[str, tuple[bytes, bool]] = {}
+
+        def reader(name: str, stream: Any) -> None:
+            results[name] = drain_bounded(stream, self.output_max)
+
+        threads = [
+            threading.Thread(target=reader, args=("out", proc.stdout), daemon=True),
+            threading.Thread(target=reader, args=("err", proc.stderr), daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        try:
+            rc = proc.wait(timeout=timeout_s + 30)
         except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            proc.wait(timeout=30)
             raise SandboxError(f"sandbox run did not return {timeout_s + 30:.0f}s after start; docker hung?") from exc
-        return proc.returncode, proc.stdout, proc.stderr
+        finally:
+            for t in threads:
+                t.join(timeout=30)
+        out, out_cut = results.get("out", (b"", False))
+        err, err_cut = results.get("err", (b"", False))
+        self.last_truncated = (out_cut, err_cut)
+        return rc, out.decode("utf-8", errors="replace"), err.decode("utf-8", errors="replace")
 
     def inspect_oom(self, name: str) -> bool | None:
         try:
@@ -396,8 +455,8 @@ def run(
     failing program; only a broken sandbox contract (no docker, no image, no timeout binary, unwritable SANDBOX_DIR,
     a bad job id, a network grant) raises.
     """
-    runner = runner or SubprocessDocker()
     config = config or sandbox_config_from_env()
+    runner = runner or SubprocessDocker(output_max=config.output_max)
     memory_mb = config.memory_mb if memory_mb is None else memory_mb
     cpus = config.cpus if cpus is None else cpus
     timeout_s = config.timeout_s if timeout_s is None else timeout_s
@@ -466,6 +525,10 @@ def run(
         t0 = time.monotonic()
         rc, out, err = runner.run(argv, timeout_s=timeout_s + HOST_TIMEOUT_SLACK_S)
         elapsed = time.monotonic() - t0
+        out_cut, err_cut = tuple(getattr(runner, "last_truncated", (False, False)))
+        if out_cut or err_cut:
+            log.warning("sandbox job=%s output truncated at %d bytes per stream (stdout=%s stderr=%s)",
+                        job_id, config.output_max, out_cut, err_cut)
         name = f"sb-{job_id}"
         oom = runner.inspect_oom(name)
         runner.remove(name)  # the client may have been killed by timeout while the container lived on
@@ -488,6 +551,8 @@ def run(
             argv=tuple(argv),
             oom_killed=oom,
             work_dir=str(work_dir),
+            stdout_truncated=bool(out_cut),
+            stderr_truncated=bool(err_cut),
         )
     finally:
         if not keep_work_dir:

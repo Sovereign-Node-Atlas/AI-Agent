@@ -3,8 +3,10 @@
 # render_template (ATLAS_ETC, ATLAS_OPT substituted).
 # Step 1 runs verify/v13-restic.sh DIRECTLY (not through run_verify: verify.jsonl holds the Day 1 records, whose
 # latest-per-id semantics a quarterly row would overwrite — fix round); its one-line evidence goes to the journal, and a
-# failure is pushed to the Principal's phone through lib/common.sh's `notify` (ntfy, Section 9.3 alert row) before the
-# unit fails. Step 2 reads back a tenth of the repository data (restic check --read-data-subset, VERIFIED flag), pushed
+# failure is pushed to the Principal's phone through `/usr/local/sbin/atlas-aegis notify` (phase2/atlas-aegis.sh: the
+# ntfy token is read by root and handed to curl through a process substitution, never on argv where /proc/<pid>/cmdline
+# shows it to every local account — lib/common.sh's `notify` puts it on argv, so it is NOT used here; fix round 3)
+# before the unit fails. orchestrator.env is loaded for NTFY_URL/NTFY_TOPIC; the helper defaults them otherwise. Step 2 reads back a tenth of the repository data (restic check --read-data-subset, VERIFIED flag), pushed
 # and failed the same way. ATLAS_PHASE=quarterly makes v13 skip its own structural `restic check` (step 2 covers it)
 # and names its log file quarterly-<date>.log.
 
@@ -16,10 +18,12 @@ ConditionPathExists=${ATLAS_ETC}/restic.env
 [Service]
 Type=oneshot
 EnvironmentFile=${ATLAS_ETC}/restic.env
+EnvironmentFile=-${ATLAS_ETC}/orchestrator.env
+Environment=ATLAS_ETC=${ATLAS_ETC} ATLAS_OPT=${ATLAS_OPT}
 Environment=ATLAS_PHASE=quarterly
 Environment=ATLAS_LOG_TO_STDERR=1
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-ExecStart=/bin/bash -c 'source ${ATLAS_OPT}/day1/lib/common.sh; out="$$(${ATLAS_OPT}/day1/verify/v13-restic.sh)" || { echo "$$out" >&2; notify "AEGIS quarterly restore test FAILED: $$out"; exit 1; }; echo "$$out"; chk="$$(restic check --read-data-subset=1/10 2>&1)" || { echo "$$chk" >&2; notify "AEGIS quarterly restic check --read-data-subset=1/10 FAILED: $${chk:0:300}"; exit 1; }; echo "restic check --read-data-subset=1/10 ok"'
+ExecStart=/bin/bash -c 'out="$$(${ATLAS_OPT}/day1/verify/v13-restic.sh)" || { echo "$$out" >&2; /usr/local/sbin/atlas-aegis notify "AEGIS quarterly restore test FAILED: $$out"; exit 1; }; echo "$$out"; chk="$$(restic check --read-data-subset=1/10 2>&1)" || { echo "$$chk" >&2; /usr/local/sbin/atlas-aegis notify "AEGIS quarterly restic check --read-data-subset=1/10 FAILED: $${chk:0:300}"; exit 1; }; echo "restic check --read-data-subset=1/10 ok"'
 TimeoutStartSec=4h

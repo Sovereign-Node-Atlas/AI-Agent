@@ -4,18 +4,22 @@
 #   sudo ./atlas-day1.sh phase2 [--dry-run] [--force STEP] [--status]     (the entry point re-execs this file)
 #
 # Sources phase2/NN-*.sh in Section 17 order through run_phase_steps (CONVENTIONS.md §4); every step is idempotent.
-# Interactive pauses in this phase (CONVENTIONS.md §7.6 names the first two; the third is the vault writer's, recorded in
-# phase2/README-contracts.md §3 item 3 and here so the list stays complete): (1) the Hugging Face token prompt below when
-# $ATLAS_ETC/secrets/hf-token.env is absent; (2) the two Google OAuth links in step 6c (phase2/06c-google-oauth.sh);
-# (3) the vault passphrase display in step 9b (phase2/09b-vault.sh) when the vault is created. Everything else is
-# unattended.
+# Interactive pauses in this phase (CONVENTIONS.md §7.6): (1) the Hugging Face token prompt below when
+# $ATLAS_ETC/secrets/hf-token.env is absent; (2) the two Google OAuth links in step 6c (phase2/06c-google-oauth.sh).
+# Step 9b (phase2/09b-vault.sh) pauses ONLY when the Principal opts in with
+# `sudo env ATLAS_VAULT_INIT=1 ./atlas-day1.sh phase2 --force 09b` (phase2/README-contracts.md §1); a plain run leaves
+# the real vault uninitialised and continues. Everything else is unattended.
 #
 # Contracts relied on from other writers (CONVENTIONS.md §1): phase2/02-orchestrator.sh, 03-openwebui.sh, 05-voice.sh,
 # 06-tools.sh, 06b-cloudflare-token.sh, 06c-google-oauth.sh, 07-restic.sh, 08-sentinel.sh, 09-windows-share.sh,
 # 09b-vault.sh and 10-gate.sh live in phase2/ and each defines step_<id>; 10-gate.sh calls `gate phase2 ...` with the
-# CONVENTIONS.md §6 ids (V3b, V6, V12, V13, V14a, V15, V16, V17, V18, V20, V23 required -- V7, V10 recorded) and
-# records the Phase 2 half of V10 as `V10 info` through its own _gate_v10_half (verify/v10a-router-resident.sh; the id
-# V10a is not one §4 declares, so neither the gate nor step 04 records it).
+# CONVENTIONS.md §6 ids (V3b, V6, V12, V13, V14a, V15, V16, V17, V18, V20, V23 required -- V7, V10a recorded only).
+# V10's Phase 2 half (Section 21: the resident router "is verified separately at the Phase 2 gate") is recorded under
+# the id V10a, by step 04 (phase2/04-memory.sh, `run_verify V10a v10a-router-resident.sh`, fatal to the step on fail)
+# and again by 10-gate.sh (`run_verify V10a ...`, recorded only). No `V10` row is ever written from Phase 2: gate()
+# takes the latest record per id across phases and treats `info` as non-blocking, so a Phase 2 V10 row could stand in
+# for the Phase 3 load test. V10a is declared in CONVENTIONS §4 (ids), §5 (verify/v10a-router-resident.sh) and §6
+# (Phase 2 "recorded, not blocking": V7, V10a); tools/fill-workbook.py shows it as the Phase 2 evidence of the V10 row.
 
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
@@ -41,17 +45,18 @@ fi
 # Ownership (fix round 2, aligned with CONVENTIONS §2 instead of arguing with it): the FILE is atlas:atlas 600, because
 # phase2/02-orchestrator.sh points the orchestrator (User=atlas) at it through HF_TOKEN_FILE in orchestrator.env and
 # orchestrator/src/atlas/config.py knows the key; root readers (lib/common.sh hf_download, phase3-models.sh,
-# phase4/lib-engine.sh, verify/v06-pyannote.sh) read it regardless. The DIRECTORY is set to root:atlas 750 on every run
-# of this driver: atlas-side readers open their own 600 files inside it at run time (openwebui-admin.token for the D9
-# retention task, ntfy.env, google/), steps 02, 03, 07, 08 and 09 assert the same value, and the driver runs before
-# the steps on every re-run, so a step that tightened it to 700 (phase2/09b-vault.sh line 119, cross-writer; the
-# Phase 1 steps 02/03/07 create it 700) is corrected before anything atlas-side runs. 750 is a superset of 06c's 710
-# (traverse plus listing of file NAMES; every file stays 600 owned by its one reader) and satisfies 06c's proof.
-# CONVENTIONS §2 should read root:atlas 750 for the directory row (requested of every writer; 06c's header asks the
-# same with 710).
+# phase4/lib-engine.sh, verify/v06-pyannote.sh) read it regardless.
+# The DIRECTORY (fix round 3, ONE value): root:atlas 710, traverse-only for the atlas group. atlas-side readers
+# (orchestrator, Celery workers, 06c's proof, the D9 retention task) open their own 600 files inside it BY NAME and need
+# the x bit only; the r bit (750) would additionally let every atlas-group process list the secret file names, which
+# nothing needs. 710 is what phase1/02-luks.sh, 03-mounts.sh, 07-remote.sh and phase2/09b-vault.sh (the last step
+# before the gate, so the mode a finished Phase 2 ends with) already set; phase2/02, 03, 06c, 07, 08 and 09 still set
+# 750 and are asked to adopt 710 so the directory stops flipping between steps. CONVENTIONS §2's row (`root:root 700`,
+# which cannot hold beside its own atlas:atlas entries inside the directory) should read `root:atlas 710`
+# (phase2/README-contracts.md §3 item 10 asks the same). Every file inside stays 600, owned by its one reader.
 hf_token_prompt() {
   local secrets="$ATLAS_ETC/secrets" tokf="$ATLAS_ETC/secrets/hf-token.env"
-  ensure_dir "$secrets" root:atlas 750
+  ensure_dir "$secrets" root:atlas 710
   if [[ -s "$tokf" ]]; then
     # Idempotent alignment with §2 for a file written by an earlier revision (root:root).
     chown atlas:atlas "$tokf"
@@ -63,7 +68,9 @@ hf_token_prompt() {
     log "DRY-RUN would prompt for the Hugging Face token ($tokf absent)"
     return 0
   fi
-  [[ -t 0 ]] || die "$tokf is absent and stdin is not a terminal. Create it by hand: (umask 077; printf 'HF_TOKEN=hf_...\\n' > $tokf) && chown atlas:atlas $tokf && chmod 600 $tokf"
+  # Non-terminal remedy (fix round 3): a form that never puts the token on argv or in the shell history (printf and
+  # read are bash builtins, read -s hides the input; bash, not sh: dash has no read -s), so the only copy is the 600 file (§7.2).
+  [[ -t 0 ]] || die "$tokf is absent and stdin is not a terminal. Re-run from a terminal, or create it without the token ever appearing on a command line: sudo bash -c 'umask 077; printf \"HF token: \"; IFS= read -rs t; echo; printf \"HF_TOKEN=%s\\n\" \"\$t\" > $tokf; chown atlas:atlas $tokf; chmod 600 $tokf'"
   echo
   echo "Phase 2 needs a Hugging Face access token (read scope) for the gated models: PyAnnote 3.1 now, FLUX.1-dev and"
   echo "Stable Audio Open in Phase 4. Accept those licences on huggingface.co with the account that owns the token."
@@ -78,11 +85,17 @@ hf_token_prompt() {
   # Read-back test through the allowlist proxy: a rejected token must surface now, not in Phase 4. The bearer header is
   # read by curl from STDIN (-H @-, curl >= 7.55): never on argv where /proc/<pid>/cmdline shows it to every local user,
   # and never in a temp file that a SIGINT between mktemp and rm could leave behind (fix round 2, §7.2).
+  # The endpoint is PINNED (fix round 3): the token is only ever sent to huggingface.co. An inherited HF_ENDPOINT (a
+  # mirror from a shell profile or atlas.env, CONVENTIONS §3) must not receive it; the step stops rather than comply.
   proxy_env
+  local hf_base="https://huggingface.co"
+  if [[ -n "${HF_ENDPOINT:-}" && "${HF_ENDPOINT%/}" != "$hf_base" ]]; then
+    die "HF_ENDPOINT is set to '$HF_ENDPOINT'; the Hugging Face token is only ever sent to $hf_base (rule §7.2). Unset it (atlas.env or the environment) and re-run"
+  fi
   local code
   code="$(printf 'Authorization: Bearer %s\n' "$tok" \
           | curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H @- \
-            "${HF_ENDPOINT:-https://huggingface.co}/api/whoami-v2" || true)"
+            "$hf_base/api/whoami-v2" || true)"
   case "$code" in
     200) log "hf token: accepted by huggingface.co (whoami-v2 200); written to $tokf" ;;
     401|403) rm -f "$tokf"; die "huggingface.co rejected the token (HTTP $code); nothing kept, re-run to try again" ;;

@@ -21,11 +21,26 @@ One pulse (`atlas.tasks.sentinel_pulse`, cpu queue, enqueued hourly by atlas-sen
 
 No model is invoked on a quiet pulse. Nothing here calls anything but the allowlisted feeds and loopback services.
 
-Telemetry honesty (fix round, rule §7.4): a reader whose source cannot be read (journalctl without the
-systemd-journal group, squid's log unreadable, docker inspect erroring) raises OSError and the source is listed
-"telemetry unreadable: <id>", never a healthy zero. Container names are tried as `atlas-<name>` and then bare
-`<name>` (compose.voice.yml and sentinel-feeds.json disagreed on the prefix); a container without a healthcheck reads
-`none|running` and is healthy. Pulse and BLUF files under SENTINEL_LOG_DIR follow the history's 400-day window (10.4).
+Telemetry honesty (fix round, rule §7.4): a reader whose source cannot be read (docker inspect erroring, the firewall
+exporter file missing or stale) raises OSError and the source is listed "telemetry unreadable: <id>", never a healthy
+zero. The "firewall" item (fix round 4) is NOT read from journalctl or squid's access.log by this worker: the atlas
+account is in no journal or squid-log group (CONVENTIONS.md §2), so a root-side exporter, /usr/local/sbin/
+atlas-sentinel-telemetry (phase2/atlas-sentinel-telemetry.sh, run by atlas-sentinel.service's ExecStartPre=-+ before
+each enqueue),
+writes the last hour's counts to FIREWALL_TELEMETRY_FILE (/var/lib/atlas/telemetry/firewall.json, root 644; keys ts,
+window_s, ufw_block, docker_egress_denied, squid_denied, denied_per_hour, errors) and `_read_firewall` reads that file:
+missing, unparsable or `ts` older than FIREWALL_STALE_S (2 h) is unreadable; `denied_per_hour` null (a source the
+exporter could not count, named in `errors`) is unreadable too, never a zero. Container names are tried as
+`atlas-<name>` and then bare `<name>` (compose.voice.yml and sentinel-feeds.json disagreed on the prefix); a container
+without a healthcheck reads `none|running` and is healthy. Pulse and BLUF files under SENTINEL_LOG_DIR follow the
+history's window: SENTINEL_KEEP_DAYS = 366, "Sentinel logs 12 months" (D9 / 10.4; fix round 4: 400 was 35 days over).
+
+Sentinel memory (10.1 binding; fix round 4): every BLUF is written to the `sentinel` collection with
+hemisphere="estate", whatever hemisphere the feeds file tags a feed with (config/sentinel-feeds.json marks Silas's
+market feeds "corporate"). memory.COLLECTION_HEMISPHERES binds `sentinel` to estate alone (C12: Sentinel sits under
+Arthur, "not Ren"), the feed data is public (a price series, a public RSS feed), and Silas's ownership is a FIELD of the
+BLUF (`owners`, `hemispheres`, the Anomaly's `hemisphere` = the owner's division, Section 6.2), not a Ren-side read: a
+corporate dispatch never reads Sentinel output. `bluf_memory_write()` is that rule in one place and the test holds it.
 """
 
 from __future__ import annotations
@@ -57,12 +72,20 @@ FEED_TIMEOUT_S = 20.0  # sentinel-feeds.json _meta.poll
 USER_AGENT = "ATLAS-Sentinel/1.0 (+self-hosted node; RSS/JSON reader)"
 OWNER_UNDER = "arthur"  # 9.3 owners row; C12
 MARKET_TOPICS = ("crypto", "asx", "us-index", "index", "market", "price")
+SENTINEL_KEEP_DAYS = 366  # D9 / 10.4 "Sentinel logs 12 months": history rows, pulse files, BLUF files, the memory TTL
+SENTINEL_COLLECTION = "sentinel"
+SENTINEL_HEMISPHERE = "estate"  # memory.COLLECTION_HEMISPHERES["sentinel"]; C12 (module docstring)
+DEFAULT_FIREWALL_TELEMETRY_FILE = "/var/lib/atlas/telemetry/firewall.json"  # FIREWALL_TELEMETRY_FILE (phase2/08)
+FIREWALL_STALE_S = 7200.0  # the exporter's contract: ts older than 2 h = unreadable, never zero
 
 __all__ = [
+    "SENTINEL_HEMISPHERE",
+    "SENTINEL_KEEP_DAYS",
     "Anomaly",
     "FeedReading",
     "PulseResult",
     "SentinelHistory",
+    "bluf_memory_write",
     "container_is_bad",
     "container_names_to_try",
     "detect",
@@ -201,8 +224,8 @@ class SentinelHistory:
         self._conn.execute("INSERT OR REPLACE INTO telemetry VALUES (?, ?, ?)", (source_id, ts, json.dumps(value)))
         self._conn.commit()
 
-    def prune(self, keep_days: int = 400) -> None:
-        """Sentinel logs are kept 12 months (D9 / 10.4); the history table follows the same window."""
+    def prune(self, keep_days: int = SENTINEL_KEEP_DAYS) -> None:
+        """Sentinel logs are kept 12 months (D9 / 10.4, 366 days); the history table follows the same window."""
         cutoff = time.time() - keep_days * 86400
         self._conn.execute("DELETE FROM readings WHERE ts < ?", (cutoff,))
         self._conn.execute("DELETE FROM items WHERE seen_ts < ?", (cutoff,))
@@ -210,9 +233,9 @@ class SentinelHistory:
         self._conn.commit()
 
 
-def prune_log_files(log_dir: str | Path, keep_days: int = 400, *, now: float | None = None) -> int:
-    """Remove pulse-*.json and bluf-*.json older than `keep_days` (10.4 / D9: Sentinel logs 12 months, the same
-    window as SentinelHistory.prune) and drop the year/month directories they leave empty. Returns the count."""
+def prune_log_files(log_dir: str | Path, keep_days: int = SENTINEL_KEEP_DAYS, *, now: float | None = None) -> int:
+    """Remove pulse-*.json and bluf-*.json older than `keep_days` (10.4 / D9: Sentinel logs 12 months = 366 days, the
+    same window as SentinelHistory.prune) and drop the year/month directories they leave empty. Returns the count."""
     root = Path(log_dir)
     cutoff = (now or time.time()) - keep_days * 86400
     removed = 0
@@ -451,45 +474,47 @@ def container_is_bad(state: str) -> bool:
     return health == "unhealthy" or (status not in ("running", "") and status != "restarting")
 
 
-def _read_firewall() -> dict[str, float]:
-    if not shutil.which("journalctl"):
-        raise OSError("journalctl not available")
-    proc = subprocess.run(
-        ["journalctl", "-k", "--since", "-1h", "-o", "cat", "--no-pager"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    if proc.returncode != 0:
-        # "No journal files were opened due to insufficient permissions": atlas is not in systemd-journal (phase1
-        # writer). A zero here would be a silent pass on the one security metric; say unreadable instead.
-        raise OSError(f"journalctl -k exit {proc.returncode}: {proc.stderr.strip()[:200] or 'no output'}")
-    lines = proc.stdout.splitlines()
-    ufw = sum(1 for ln in lines if "[UFW BLOCK]" in ln)
-    dk = sum(1 for ln in lines if "ATLAS docker egress denied" in ln)
-    squid = 0.0
-    access = Path("/var/log/squid/access.log")
-    if access.exists():
-        cutoff = time.time() - 3600
-        try:
-            with access.open(encoding="utf-8", errors="replace") as fh:
-                for ln in fh:
-                    parts = ln.split()
-                    if parts and "TCP_DENIED" in ln:
-                        try:
-                            if float(parts[0]) >= cutoff:
-                                squid += 1
-                        except ValueError:
-                            continue
-        except OSError as exc:
-            raise OSError(f"{access} exists but cannot be read by this user: {exc}") from exc
-    return {
-        "denied_per_hour": float(ufw + dk + squid),
-        "ufw_block": float(ufw),
-        "docker_egress_denied": float(dk),
-        "squid_denied": squid,
-    }
+def _read_firewall(env: Mapping[str, str] | None = None, *, now: float | None = None) -> dict[str, float]:
+    """The D6 "firewall" item from the root exporter's file (module docstring; config/sentinel-feeds.json names the
+    file and the contract). This worker never runs journalctl or opens squid's log: as atlas both would fail, and a
+    zero here would be a silent pass on the one security metric, so every failure is OSError = "telemetry unreadable".
+    """
+    env = dict(os.environ if env is None else env)
+    path = Path(env.get("FIREWALL_TELEMETRY_FILE") or DEFAULT_FIREWALL_TELEMETRY_FILE)
+    if not path.is_file():
+        raise OSError(
+            f"{path} missing (atlas-sentinel.service's ExecStartPre=-+/usr/local/sbin/atlas-sentinel-telemetry writes "
+            "it as root before each enqueue; phase2/08-sentinel.sh installs it)"
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise OSError(f"{path} unreadable or not JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise OSError(f"{path} does not hold a JSON object")
+    try:
+        ts = float(data["ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise OSError(f"{path} carries no numeric ts: {exc}") from exc
+    age = (time.time() if now is None else now) - ts
+    if age > FIREWALL_STALE_S:
+        raise OSError(f"{path} is stale: ts {age / 3600:.1f} h old (limit {FIREWALL_STALE_S / 3600:.0f} h)")
+    errors = data.get("errors") or []
+    counts: dict[str, float] = {}
+    for key in ("ufw_block", "docker_egress_denied", "squid_denied"):
+        v = data.get(key)
+        if v is None:
+            # The exporter could not count this source ("a null count = could not count"): unreadable, never zero.
+            raise OSError(f"{path}: {key} is null, the exporter could not count it: {errors or 'no error given'}")
+        counts[key] = float(v)
+    total = data.get("denied_per_hour")
+    if total is None:
+        raise OSError(f"{path}: denied_per_hour is null ({errors or 'no error given'})")
+    try:
+        window = float(data.get("window_s") or 3600)
+    except (TypeError, ValueError):
+        window = 3600.0
+    return {"denied_per_hour": float(total), **counts, "window_s": window}
 
 
 def _read_backup() -> dict[str, float]:
@@ -680,7 +705,7 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                         )
                     )
             elif sid == "firewall":
-                v = _read_firewall()
+                v = _read_firewall(os.environ)
                 limit = float(th.get("denied_per_hour_max", 200))
                 if v["denied_per_hour"] > limit:
                     anomalies.append(
@@ -919,6 +944,31 @@ def compose_bluf(anomalies: Sequence[Mapping[str, Any]], pulse_ts: float, text: 
     }
 
 
+def bluf_memory_write(
+    store: Any, entry: Mapping[str, Any], anomalies: Sequence[Mapping[str, Any]], pulse_ts: float
+) -> Any:
+    """The one memory write of the Sentinel (module docstring "Sentinel memory"): the `sentinel` collection, hemisphere
+    estate, under Arthur, whatever hemisphere the anomalies carry. Returns the store's WriteResult."""
+    return store.write(
+        SENTINEL_COLLECTION,
+        [str(entry["text"])],
+        [
+            {
+                "kind": "sentinel-bluf",
+                "owners": ",".join(entry["owners"]),
+                "under": OWNER_UNDER,
+                "pulse_ts": pulse_ts,
+                "feeds": ",".join(sorted({str(a["feed_id"]) for a in anomalies})),
+                # Informational: the owners' divisions (Section 6.2), never a binding for the read side.
+                "owner_hemispheres": ",".join(entry.get("hemispheres") or []),
+            }
+        ],
+        hemisphere=SENTINEL_HEMISPHERE,
+        temporal=True,
+        ttl_hours=24 * SENTINEL_KEEP_DAYS,
+    )
+
+
 # --- Celery tasks -----------------------------------------------------------------------------------------------------
 
 
@@ -981,6 +1031,7 @@ def sentinel_bluf(
                 temperature=0.2,
                 task_id=self.request.id,
                 audience="principal",
+                hemisphere=SENTINEL_HEMISPHERE,  # the BLUF is Arthur's (module docstring); a failure's scar is estate
             )
         finally:
             client.close()
@@ -994,23 +1045,7 @@ def sentinel_bluf(
         written = False
         try:
             store = build_memory_store(with_graph=False)
-            wr = store.write(
-                "sentinel",
-                [entry["text"]],
-                [
-                    {
-                        "kind": "sentinel-bluf",
-                        "owners": ",".join(entry["owners"]),
-                        "under": OWNER_UNDER,
-                        "pulse_ts": pulse_ts,
-                        "feeds": ",".join(sorted({a["feed_id"] for a in anomalies})),
-                    }
-                ],
-                hemisphere="estate",
-                temporal=True,
-                ttl_hours=24 * 365,
-            )
-            written = wr.written
+            written = bluf_memory_write(store, entry, anomalies, pulse_ts).written
         except MemoryStoreError as exc:
             log.error("sentinel BLUF not written to memory: %s", exc)
         pushed = notify(

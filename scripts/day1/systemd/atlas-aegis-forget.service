@@ -6,11 +6,17 @@
 # first and prunes only when it succeeded (a failed dependency stops this unit from starting). The manual trigger
 # (atlas-aegis-trigger.path) starts atlas-aegis.service alone, so the orchestrator can add snapshots but can never
 # initiate the deletion of backups (fix round 2). ExecStopPost pushes a ntfy alert when the prune failed.
+# OnFailure=atlas-aegis-missed.service (fix round 3): when THIS unit's job fails because its Requires= dependency could
+# not start (atlas-aegis.service's StartLimit hit by manual triggers earlier that night, or a failed ExecStartPre), no
+# ExecStart or ExecStopPost of either unit runs and nothing would be pushed; systemd starts the OnFailure= unit for a
+# job that ends with result dependency/failed/timeout, and that unit pushes "nightly AEGIS did not run". A prune that
+# fails on its own is pushed twice (forget-result and missed): loud beats silent (Section 7.4).
 
 [Unit]
 Description=AEGIS retention: restic forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune (D9, nightly)
 Requires=atlas-aegis.service
 After=atlas-aegis.service
+OnFailure=atlas-aegis-missed.service
 RequiresMountsFor=/srv/backups
 Documentation=file:${ATLAS_ETC}/restic.env
 

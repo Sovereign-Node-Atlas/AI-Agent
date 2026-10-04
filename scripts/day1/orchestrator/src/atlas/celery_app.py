@@ -18,14 +18,62 @@ that must be split), task_routes, task_default_queue, crontab(), `-s` schedule f
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Mapping
+from pathlib import Path
 
 from celery import Celery
 from celery.schedules import crontab
 
+log = logging.getLogger("atlas.celery_app")
+
 BROKER_URL = os.environ.get("CELERY_BROKER_URL") or os.environ.get("REDIS_URL") or "redis://127.0.0.1:6379/0"
 RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND") or "redis://127.0.0.1:6379/1"
-TIMEZONE = os.environ.get("TZ") or "Australia/Sydney"
+ZONEINFO_DIR = "/usr/share/zoneinfo"
+
+
+def resolve_timezone(
+    env: Mapping[str, str] | None = None,
+    *,
+    etc_timezone: str | Path = "/etc/timezone",
+    localtime: str | Path = "/etc/localtime",
+) -> str:
+    """The zone the beat crontab runs in (fix round 4). The nightly chat-retention (04:15) is placed after the AEGIS
+    timer (02:30), and systemd timers fire in the NODE's local time, so beat must use that same zone: TZ when the units
+    carry it (phase2/02-orchestrator.sh mirrors TZ from atlas.env into orchestrator.env, which every Celery unit
+    loads), else the system's own setting (/etc/timezone, then the /etc/localtime symlink under /usr/share/zoneinfo),
+    else UTC with a warning in the log. Never a hard-coded city: a wrong zone could put the retention run before the
+    backup, and a hard-coded one was not "auto-detection" (CONVENTIONS.md §3)."""
+    env = dict(os.environ if env is None else env)
+    tz = (env.get("TZ") or "").strip()
+    if tz and not tz.startswith(":"):
+        return tz
+    try:
+        text = Path(etc_timezone).read_text(encoding="utf-8").strip()
+        if (text and "/" in text) or text == "UTC":
+            return text
+    except OSError:
+        pass
+    try:
+        target = Path(localtime).resolve(strict=True)
+        parts = target.parts
+        if "zoneinfo" in parts:
+            zone = "/".join(parts[parts.index("zoneinfo") + 1 :])
+            if zone:
+                return zone
+    except OSError:
+        pass
+    log.warning(
+        "no time zone found (TZ unset, %s and %s unusable); Celery beat runs in UTC: the 04:15 chat-retention may not "
+        "follow the node-local 02:30 AEGIS timer (set TZ in /etc/atlas/atlas.env)",
+        etc_timezone,
+        localtime,
+    )
+    return "UTC"
+
+
+TIMEZONE = resolve_timezone()
 
 QUEUE_CPU = "cpu"
 QUEUE_GPU = "gpu"
@@ -101,5 +149,7 @@ __all__ = [
     "TASK_RECORD_STRIKE",
     "TASK_SENTINEL_BLUF",
     "TASK_SENTINEL_PULSE",
+    "TIMEZONE",
     "app",
+    "resolve_timezone",
 ]

@@ -19,7 +19,10 @@
 #                  never through a paused queue; then the flag comes down (as atlas: it is atlas's file in atlas's
 #                  directory) and the package's aegis-thaw task is enqueued (now deliverable) for its ledger row and
 #                  spool replay. No reply from a worker: both workers are restarted and the unit is reported FAILED.
-#                  Then a ntfy push whenever systemd's $SERVICE_RESULT is not "success" or the thaw fell back.
+#                  Then a ntfy push whenever systemd's $SERVICE_RESULT is not "success" or the thaw fell back, AND
+#                  whenever restic exited 3 ("some source files could not be read"): the unit's SuccessExitStatus=3
+#                  makes that a systemd success so the forget chain still runs, which is why the helper, not the
+#                  result, reports the partial snapshot (fix round 3; never a silently partial night, §7.4).
 #   forget-result  ExecStopPost of atlas-aegis-forget.service: ntfy push when the retention prune did not succeed.
 #   notify MSG     push MSG (used by the two above; the bearer token is read by root from $ATLAS_ETC/secrets/ntfy.env and
 #                  handed to curl through a process substitution, never on argv where /proc/<pid>/cmdline shows it).
@@ -120,7 +123,10 @@ cmd_finish() {
   else
     say "finish: no freeze was requested by this run; nothing to thaw"
   fi
-  [[ "$status" == 3 ]] && say "restic exit 3: some source files could not be read (names above); the snapshot exists"
+  if [[ "$status" == 3 ]]; then
+    say "restic exit 3: some source files could not be read (names above); the snapshot exists"
+    notify_push "AEGIS backup on $(hostname): restic exit 3, some source files were NOT read (partial snapshot; the nightly prune still runs). Names: journalctl -u atlas-aegis.service | grep -i 'error\|cannot\|permission'"
+  fi
   if [[ "$result" != success || $rc -ne 0 ]]; then
     notify_push "AEGIS backup on $(hostname) FAILED: systemd result=$result exit=$status, thaw=$([[ $rc -eq 0 ]] && echo ok || echo fallback/failed). See: journalctl -u atlas-aegis.service"
     err "finish: result=$result exit=$status thaw_rc=$rc (ntfy pushed)"

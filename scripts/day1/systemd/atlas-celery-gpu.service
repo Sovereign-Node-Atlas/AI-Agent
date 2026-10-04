@@ -32,7 +32,7 @@ EnvironmentFile=-${ATLAS_ETC}/memory.env
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/var/lib/atlas/home
-ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env && { test ! -e ${ATLAS_ETC}/secrets/openwebui-admin.token || test -r ${ATLAS_ETC}/secrets/openwebui-admin.token; } || { echo "atlas-celery-gpu: ${ATLAS_ETC}/secrets is not traversable by atlas, or ntfy.env / openwebui-admin.token are unreadable (directory must be root:atlas 750, files atlas:atlas 600; phase2/02-orchestrator.sh header)" >&2; exit 1; }'
+ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env && { test ! -e ${ATLAS_ETC}/secrets/openwebui-admin.token || test -r ${ATLAS_ETC}/secrets/openwebui-admin.token; } || { echo "atlas-celery-gpu: ${ATLAS_ETC}/secrets is not traversable by atlas, or ntfy.env / openwebui-admin.token are unreadable (directory must be root:atlas 710, files atlas:atlas 600; phase2/02-orchestrator.sh header)" >&2; exit 1; }'
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-celery-gpu: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
 ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app worker -Q gpu -n gpu@%H --loglevel=INFO --concurrency=1 --prefetch-multiplier=1
 Restart=always

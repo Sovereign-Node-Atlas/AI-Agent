@@ -572,12 +572,24 @@ def test_deep_think_standard_goes_to_the_gpu_queue_and_the_interface_returns(har
 def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -> None:
     """4.2 rule 3 ("exactly one may generate at any moment ... including background work"): a router-qwen3.5-4b
     generation through /internal holds the slot, so a gpt-oss chat that arrives meanwhile QUEUES behind it (9.7 C15)
-    and starts only when the 4B stream has finished."""
+    and starts only when the 4B stream has finished. Fix round 4: the chat's ROUTING (the classifier verdict, itself a
+    generation) and its Arbiter LOAD both happen inside the slot, so while queued nothing of the chat has happened yet:
+    no routing row, no engine loaded, no stream; and a second weight-bearing request on an EXCLUSIVE engine queued at
+    the same time cannot evict the first one's engine before it generates: each stream is built with its engine
+    resident."""
     client: TestClient = harness["client"]
     deps: AppDeps = harness["deps"]
     gate = threading.Event()
     harness["llama"].gates["router-qwen3.5-4b"] = gate
     results: dict[str, Any] = {}
+    resident_at_stream: list[tuple[str, frozenset[str]]] = []
+    inner = deps.streamer_for
+
+    def recording_streamer(spec: Any) -> Any:
+        resident_at_stream.append((spec.key, frozenset(harness["arbiter"].resident)))
+        return inner(spec)
+
+    deps.streamer_for = recording_streamer
 
     def small() -> None:
         results["small"] = client.post(
@@ -587,6 +599,12 @@ def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -
 
     def big() -> None:
         results["big"] = _chat(client, "Draft the AEC bid summary.", atlas_session="queued-chat")
+
+    def apex() -> None:
+        results["apex"] = client.post(
+            "/internal/v1/chat/completions",
+            json={"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "deep plan"}]},
+        )
 
     t_small = threading.Thread(target=small)
     t_small.start()
@@ -598,20 +616,105 @@ def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -
     t_big = threading.Thread(target=big)
     t_big.start()
     deadline = time.monotonic() + 5
-    while not deps.slot.queue:
+    while len(deps.slot.queue) < 1:
         assert time.monotonic() < deadline, "the gpt-oss request never queued for the slot"
         time.sleep(0.02)
-    # gpt-oss is LOADED (residency is free, rule 3) but not generating: the 4B call holds the only slot.
-    assert "gpt-oss-120b" in harness["arbiter"].resident
-    assert not any(s.spec.key == "gpt-oss-120b" and s.started.is_set() for s in harness["llama"].made)
+    t_apex = threading.Thread(target=apex)
+    t_apex.start()
+    deadline = time.monotonic() + 5
+    while len(deps.slot.queue) < 2:
+        assert time.monotonic() < deadline, "the apex request never queued for the slot"
+        time.sleep(0.02)
+    # Queued = nothing happened yet: the classifier has not run (its verdict is a generation), no weight-bearing engine
+    # is loaded (the load happens inside the slot), nothing streamed; the Arbiter's own lock is free.
+    assert harness["arbiter"].resident == {}
+    assert not any(s.spec.key in ("gpt-oss-120b", "deepseek-v4-flash") for s in harness["llama"].made)
     assert harness["arbiter"].generating is None  # the Arbiter's own lock is taken only inside the slot
+    assert harness["ledger"].list_routing_decisions() == []
     gate.set()
     t_small.join(timeout=10)
     t_big.join(timeout=10)
-    assert results["small"].status_code == 200 and results["big"].status_code == 200
+    t_apex.join(timeout=10)
+    assert results["small"].status_code == 200 and results["big"].status_code == 200, results["big"].text
+    assert results["apex"].status_code == 200, results["apex"].text
     assert results["big"].json()["choices"][0]["message"]["content"] == "Stub answer from the engine."
+    # Every stream was built with its own engine resident: the exclusive apex load and the gpt-oss load each happened
+    # inside their own slot hold, so whichever went first had generated before the other's swap evicted it (the chat
+    # releases the slot between its classifier hold and its generation hold, so either order is a valid FIFO).
+    weight_bearing = [(k, r) for k, r in resident_at_stream if k != "router-qwen3.5-4b"]
+    assert sorted(k for k, _ in weight_bearing) == ["deepseek-v4-flash", "gpt-oss-120b"]
+    assert all(k in r for k, r in weight_bearing), resident_at_stream
+    first = weight_bearing[0][0]
+    assert ("stop", first) in harness["controller"].calls  # the second load swapped the first out, after its stream
     assert deps.slot.holder is None and deps.slot.queue == () and harness["arbiter"].generating is None
     assert client.get("/health").json()["generating"] is None
+
+
+def test_internal_failure_without_a_declared_hemisphere_writes_no_scar(harness: dict[str, Any]) -> None:
+    """Fix round 4 (7.3, 10.1): an /internal generation's prompt (a corporate document chunk here) must never become
+    an estate scar that Arthur's next dispatch carries across the membrane. Undeclared hemisphere: ledger row with the
+    prompt withheld, no scar. Declared: the scar is bound to THAT hemisphere. A bad declaration is 422."""
+    harness["llama"].fail = "llama-server HTTP 500: boom"
+    client: TestClient = harness["client"]
+    marker = "Zyxquorb Holdings acquisition memo"
+    r = client.post(
+        "/internal/v1/chat/completions",
+        json={"model": "router-qwen3.5-4b", "messages": [{"role": "user", "content": f"Extract entities: {marker}"}]},
+    )
+    assert r.status_code == 502
+    task_id = r.json()["error"]["task_id"]
+    strikes = harness["ledger"].list_strikes(task_id=task_id)
+    assert len(strikes) == 1 and strikes[0]["kind"] == "failed-generation" and strikes[0]["scar_id"] is None
+    assert "Zyxquorb" not in strikes[0]["description"] and "prompt withheld" in strikes[0]["description"]
+    assert "scars" not in harness["chroma"].collections or harness["chroma"].collections["scars"].count() == 0
+    # An estate dispatch sees no trace of it (the prompt's text is not in the system prompt).
+    harness["llama"].fail = None
+    r = _chat(client, "Zyxquorb Holdings and the family trust", model="arthur")
+    assert r.status_code == 200 and r.json()["atlas"]["hemisphere"] == "estate"
+    assert "Zyxquorb Holdings acquisition memo" not in harness["llama"].made[-1].requests[0]["messages"][0]["content"]
+    # Declared corporate: the scar is written, bound to corporate, so only a corporate dispatch can retrieve it.
+    harness["llama"].fail = "llama-server HTTP 500: boom"
+    r = client.post(
+        "/internal/v1/chat/completions",
+        json={
+            "model": "router-qwen3.5-4b",
+            "messages": [{"role": "user", "content": f"Summarise: {marker}"}],
+            "atlas_hemisphere": "corporate",
+        },
+    )
+    assert r.status_code == 502
+    strikes = harness["ledger"].list_strikes(task_id=r.json()["error"]["task_id"])
+    assert len(strikes) == 1 and strikes[0]["scar_id"] and "Zyxquorb" in strikes[0]["description"]
+    rows = harness["chroma"].collections["scars"].rows
+    assert len(rows) == 1 and next(iter(rows.values()))[1]["hemisphere"] == "corporate"
+    bad = client.post(
+        "/internal/v1/chat/completions",
+        json={"model": "router-qwen3.5-4b", "messages": [{"role": "user", "content": "x"}], "atlas_hemisphere": "ren"},
+    )
+    assert bad.status_code == 422 and "atlas_hemisphere" in bad.text
+    # Deep Think enqueues carry the chat's hemisphere for the task's own /internal generations.
+    harness["llama"].fail = None
+    r = _chat(client, "[DEEP THINK:STANDARD] the family trust exit", atlas_session="dt-h")
+    assert r.status_code == 200 and harness["enqueued"][-1][1]["hemisphere"] == "estate"
+
+
+def test_internal_token_guards_internal_routes_when_configured(harness: dict[str, Any]) -> None:
+    """/internal/* takes its own shared secret on top of loopback when ORCH_INTERNAL_TOKEN_FILE is configured (fix
+    round 4): X-Atlas-Internal-Token or Authorization: Bearer (what LightRAG's OpenAI client sends)."""
+    client: TestClient = harness["client"]
+    deps: AppDeps = harness["deps"]
+    deps.internal_token = "s3cret"
+    body = {"model": "router-qwen3.5-4b", "messages": [{"role": "user", "content": "x"}], "atlas_hemisphere": "estate"}
+    assert client.post("/internal/v1/chat/completions", json=body).status_code == 401
+    assert client.post("/internal/route", json={"message": "x"}).status_code == 401
+    url = "/internal/v1/chat/completions"
+    assert client.post(url, json=body, headers={"X-Atlas-Internal-Token": "nope"}).status_code == 403
+    assert client.post(url, json=body, headers={"X-Atlas-Internal-Token": "s3cret"}).status_code == 200
+    bearer = {"Authorization": "Bearer s3cret"}
+    assert client.post("/internal/route", json={"message": "x"}, headers=bearer).status_code == 200
+    assert _chat(client, "hello").status_code == 200  # the public route is untouched by the internal secret
+    deps.internal_token = None
+    assert client.post("/internal/route", json={"message": "x"}).status_code == 200
 
 
 def test_estate_scar_context_never_reaches_a_corporate_prompt(harness: dict[str, Any]) -> None:

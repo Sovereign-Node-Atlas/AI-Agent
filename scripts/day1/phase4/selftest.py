@@ -8,18 +8,23 @@ Steps (all must pass; each is timed and reported):
   1. rocminfo_gfx1151   rocminfo on PATH, else $(rocm-sdk path --root)/bin/rocminfo, MUST list gfx1151 (Section 21
                         V11: "rocminfo reports gfx1151"); no binary = fail (the Dockerfile guarantees one). torch's
                         gcnArchName is checked in addition, never as a substitute.
-  2. torch_device       torch.cuda.is_available(), device name/arch, HSA_OVERRIDE_GFX_VERSION unset (#6034),
-                        `pip show amd-torch-device-gfx1151` succeeds (TheRock #7839: without it every kernel launch
-                        fails with hipErrorInvalidImage).
+  2. torch_device       torch.cuda.is_available(), device name/arch, HSA_OVERRIDE_GFX_VERSION unset (#6034), and,
+                        ONLY when V11_EXPECT_DEVICE_WHEEL=1 (set by verify/v11-rocm-selftest.sh for the atlas base
+                        image), `pip show amd-torch-device-gfx1151` succeeds (TheRock #7839: without it every kernel
+                        launch fails with hipErrorInvalidImage). The driver's opt-in community-image diagnostic runs
+                        this same file without that variable, so a check specific to the atlas image cannot fail an
+                        image that never used AMD's device wheel (fix round 3).
   3. matmul_bf16        4096x4096 bf16 matmul on device vs the CPU result (rel. max error < 2e-2) + TFLOPS.
   4. alloc_4GB_gtt      a 4 GB device tensor filled and read back (GTT-backed device memory beyond the "15.5 GB only"
                         symptom, ROCm/ROCm #5444 UNVERIFIED-by-snippet).
   5. diffusion_2step    a randomly initialised UNet2DModel + DDPMScheduler for two steps in bf16 (no download, no
                         gated weights; conv, attention and GroupNorm kernels on gfx1151).
 
-Output: one JSON document to $V11_OUT (default /srv/atlas/engines/v11.json) and a one-line summary on stdout as the
-last line ("V11 ok ..." or "V11 FAIL ..."). Exit 0 only when every step passed. The caller runs it under `timeout`:
-a hang (the kernel-7.0 symptom of #6530/#6182) must count as a fail, not wait forever.
+Output: the step table as one JSON document, written to $V11_OUT when that is set to a path, else printed on stdout as
+the tagged line "V11JSON {json}" (the default: the container then writes nothing and the caller keeps the table
+root-held, fix round 3), followed by a one-line summary on stdout as the last line ("V11 ok ..." or "V11 FAIL ...").
+Exit 0 only when every step passed. The caller runs it under `timeout`: a hang (the kernel-7.0 symptom of #6530/#6182)
+must count as a fail, not wait forever.
 """
 
 from __future__ import annotations
@@ -86,9 +91,14 @@ def torch_gpu() -> dict[str, Any]:
     arch = getattr(p, "gcnArchName", "?")
     if not str(arch).startswith("gfx1151"):
         raise AssertionError(f"device arch is {arch}, not gfx1151")
-    subprocess.check_call([sys.executable, "-m", "pip", "show", "-q", "amd-torch-device-gfx1151"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.environ.get("V11_EXPECT_DEVICE_WHEEL") == "1":
+        subprocess.check_call([sys.executable, "-m", "pip", "show", "-q", "amd-torch-device-gfx1151"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        device_wheel = "amd-torch-device-gfx1151 installed"
+    else:
+        device_wheel = "not checked (V11_EXPECT_DEVICE_WHEEL unset: not the atlas base image)"
     return {
+        "device_wheel": device_wheel,
         "torch": torch.__version__,
         "hip": torch.version.hip,
         "name": p.name,
@@ -163,13 +173,17 @@ def main() -> int:
     step("alloc_4GB_gtt", big_alloc)
     step("diffusion_2step_bf16", diffusion_2_steps)
     ok = all(v["ok"] for v in results.values())
-    out = os.environ.get("V11_OUT", "/srv/atlas/engines/v11.json")
-    try:
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        with open(out, "w", encoding="utf-8") as fh:
-            json.dump({"ok": ok, "steps": results, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, fh, indent=2)
-    except OSError as exc:
-        print(f"[WARN] could not write {out}: {exc}", file=sys.stderr)
+    table = {"ok": ok, "steps": results, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    out = os.environ.get("V11_OUT", "")
+    if out:
+        try:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "w", encoding="utf-8") as fh:
+                json.dump(table, fh, indent=2)
+        except OSError as exc:
+            print(f"[WARN] could not write {out}: {exc}", file=sys.stderr)
+    else:
+        print("V11JSON " + json.dumps(table, separators=(",", ":")), flush=True)
     td = results["torch_device"]["detail"] if results["torch_device"]["ok"] else {}
     mm = results["matmul_bf16"]["detail"] if results["matmul_bf16"]["ok"] else {}
     df = results["diffusion_2step_bf16"]["detail"] if results["diffusion_2step_bf16"]["ok"] else {}

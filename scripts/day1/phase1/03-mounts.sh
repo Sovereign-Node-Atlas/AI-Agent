@@ -25,7 +25,9 @@ step_03() {
       elif [[ -s "$kf" ]]; then
         cryptsetup open --key-file "$kf" "$dev" "$mapping" || die "cannot open $dev with the TPM or the keyfile $kf"
       else
-        die "cannot open $dev: the TPM refused and there is no on-node recovery copy (accepted unencrypted OS). Open it with the USB recovery key: cryptsetup open $dev $mapping, then re-run: sudo $ATLAS_ENTRY phase1"
+        # Interactive `cryptsetup open` prompts for the key: never pass it on the command line (the shell history
+        # would keep it, rule §7.2).
+        die "cannot open $dev: the TPM refused and the on-node recovery copy $rf is missing (D3 writes it in step 2; --force 02 restores it). Open it with the USB recovery key at the interactive prompt, never on the command line:  cryptsetup open $dev $mapping   then re-run: sudo $ATLAS_ENTRY phase1"
       fi
     fi
   fi
@@ -91,7 +93,9 @@ step_03() {
   id -u "$PRINCIPAL_USER" >/dev/null 2>&1 || die "PRINCIPAL_USER=$PRINCIPAL_USER does not exist"
   # load_env installed atlas.env as root:root because the atlas group did not exist yet (§2 says root:atlas 640).
   chown root:atlas "$ATLAS_ETC/atlas.env"; chmod 640 "$ATLAS_ETC/atlas.env"
-  # root:atlas 710 (traverse-only for atlas; phase1/07-remote.sh header, phase2/06c): atlas-owned files live inside.
+  # root:atlas 750: the ONE value every writer asserts (phase2/02-orchestrator.sh header; phase2-services.sh, 02, 03,
+  # 06c, 07, 08, 09 and phase1/02, 07). Files inside stay 600 owned by their one reader; atlas-owned ones (ntfy.env,
+  # hf-token.env, google/) need the traversal. CONVENTIONS §2's row (root:root 700) needs the amendment (fix-round notes).
   ensure_dir "$ATLAS_ETC/secrets" root:atlas 710
   ensure_dir "$ATLAS_ETC/secrets/google" atlas:atlas 700
 

@@ -23,7 +23,10 @@ scripts/day1/
   phase1-platform.sh           Phase 1 driver; sources phase1/NN-*.sh in order; reboots after step 04 and resumes
   phase1/NN-<step>.sh          one file per Phase 1 step (01-preflight, 02-luks, 03-mounts, 04-system, 05-postboot, 05b-desktop, 06-docker, 07-remote, 08-gate)
   phase2-services.sh           Phase 2 driver; sources phase2/NN-*.sh in order
-  phase2/NN-<step>.sh          one file per Phase 2 step (01-llama, 02-orchestrator, 03-openwebui, ...)
+  phase2/NN-<step>.sh          one file per Phase 2 step (01-llama, 02-orchestrator, 03-openwebui, 04-memory, 05-voice, 06-tools,
+                               06b-cloudflare-token, 06c-google-oauth, 06d-sandbox, 07-restic, 08-sentinel, 09-windows-share,
+                               09b-vault, 10-gate). 06d (AEGIS sandbox image, Section 16.4; V17) and 09b (gocryptfs vault,
+                               Section 11; V18) are gap-fills: Section 17 names neither step, the gate needs both
   phase3-models.sh             Phase 3 driver (detached under systemd); phase3/loadtest.py does the measuring
   phase4-engines.sh            Phase 4 driver (detached); phase4/engines/<name>.sh builds and tests one engine
   verify/vNN-<name>.sh         standalone checks for Section 21; see §5
@@ -43,7 +46,7 @@ scripts/day1/
 | Path | Purpose | Owner:mode |
 |---|---|---|
 | `/etc/atlas/atlas.env` | non-secret settings (§3) | root:atlas 640 |
-| `/etc/atlas/secrets/` | every secret, one file each, never under `/srv/atlas`, never in restic's include set | root:root 700 |
+| `/etc/atlas/secrets/` | every secret, one file each, never under `/srv/atlas`, never in restic's include set | root:atlas 710 (traverse only; every file inside is 600, owned by its one reader) |
 | `/etc/atlas/secrets/cloudflare.env` | `CF_API_TOKEN=...` | atlas-ddns:atlas-ddns 600 |
 | `/etc/atlas/secrets/hf-token.env` | `HF_TOKEN=...` (gated models: PyAnnote, FLUX.1-dev, Stable Audio Open) | atlas:atlas 600 |
 | `/etc/atlas/secrets/ntfy.env` | `NTFY_TOKEN=...` | atlas:atlas 600 |
@@ -54,7 +57,7 @@ scripts/day1/
 | `/opt/atlas/day1/` | a copy of `scripts/day1/` taken by `atlas-day1.sh` on every run | root:root 755 |
 | `/opt/atlas/llama.cpp/` | llama.cpp source and build; binaries symlinked into `/usr/local/bin` | root |
 | `/opt/atlas/orchestrator/` + `/opt/atlas/venv/` | the `atlas` package and its venv | atlas |
-| `/srv/atlas/{models,engines,data,workspace,sandbox,vault,staging}` | 8 TB data volume (Section 3.5) | atlas:atlas |
+| `/srv/atlas/{models,engines,data,workspace,sandbox,vault,staging}` | 8 TB data volume (Section 3.5). `vault/cipher` is the gocryptfs container (backed up as ciphertext), `vault/open` the plaintext view (never backed up); `staging/vault-test-cipher` (atlas:atlas 700) is the gate's throw-away test vault, excluded with all of staging | atlas:atlas |
 | `/srv/atlas/staging/inbox/` | where the Principal drops files: `voice-references/alaric.wav`, `voice-references/gideon.wav`, `google-oauth-client.json` | principal:atlas 2770 |
 | `/srv/cold`, `/srv/backups` | 4 TB OS drive (Section 3.5) | atlas / root |
 
@@ -70,6 +73,8 @@ auto-detected as the largest unmounted NVMe), `CLOUDFLARE_TXT` (default `/home/$
 `GOOGLE_ACCOUNTS` (two emails, space-separated, each tagged `corporate` or `estate` as `email:tag`),
 `WINDOWS_SHARE` (`//host/share`), `NTFY_TOPIC=atlas`, `OPENWEBUI_PORT=3000`, `ORCH_PORT=8800`,
 `LLAMA_PORT_BASE=8100` (engine N listens on 8100+N), `HF_ENDPOINT` (unset), `DOWNLOAD_MBPS=100`.
+`ATLAS_ACCEPT_PCR7_NO_SB` (blank; `1` records the Principal's acknowledgement that, with Secure Boot disabled per D2, the PCR 7
+binding of the TPM2 enrolment does not tie the unlock to this OS image; pre-flight stops until it is set or Secure Boot is on).
 
 Secrets never go in this file.
 
@@ -92,7 +97,7 @@ Step files never define `main`; each defines `step_<id>()` and the driver calls 
 | `require_root` | exits unless EUID 0 |
 | `load_env` | installs `config/atlas.env.example` to `/etc/atlas/atlas.env` if missing (auto-detecting what it can), then sources it; dies if a required key is empty |
 | `run_step PHASE STEP FUNC` | idempotency: if `/var/lib/atlas/day1/done/PHASE.STEP` exists, logs "skip" and returns 0; else runs `FUNC`, and on success creates the marker. STEP is the two-digit-plus-letter id from Section 17 (`01`, `05b`, `06c`) |
-| `record_v ID RESULT MSG` | appends `{"ts","phase","id","result","msg"}` to `verify.jsonl`. RESULT ∈ `pass fail deferred info`. IDs are `V1`..`V23`, with halves `V3a`/`V3b` and `V14a`/`V14b` |
+| `record_v ID RESULT MSG` | appends `{"ts","phase","id","result","msg"}` to `verify.jsonl`. RESULT ∈ `pass fail deferred info`. IDs are `V1`..`V23`, with halves `V3a`/`V3b` and `V14a`/`V14b`, plus `V10a` (the Phase 2 resident-router half of V10; V10 itself is written only by the Phase 3 load test) |
 | `run_verify ID SCRIPT [ARGS]` | runs `verify/SCRIPT`, maps exit 0/1/2/3 → pass/fail/deferred/info, records its one-line stdout as MSG |
 | `gate PHASE REQUIRED_IDS... [-- OPTIONAL_IDS...]` | prints the phase table (latest result per id) and returns 1 if any REQUIRED id is `fail` or missing; `deferred` never blocks; OPTIONAL ids are printed only |
 | `apt_install PKG...` | non-interactive, idempotent, retries 3× |
@@ -112,10 +117,11 @@ Every phase script accepts `--dry-run` (print steps, run nothing), `--force STEP
 ## 5. Verification scripts (`verify/`)
 
 One per Section 21 item where the check is standalone: `v01-network.sh v02-tpm.sh v03a-gtt.sh v03b-llama-devices.sh
-v05-wireguard.sh v06-pyannote.sh v07-voice-listen.sh v11-rocm-selftest.sh v12-openwebui-offline.sh
-v13-restic.sh v17-sandbox.sh v18-vault.sh v19-xrdp.sh v20-google.sh v23-cloudflare-token.sh`.
-V4, V8, V9, V10, V14, V15, V16, V21, V22 are produced inside their phase (load tests, engine builds,
-orchestrator unit tests) and recorded with `record_v` directly.
+v05-wireguard.sh v06-pyannote.sh v07-voice-listen.sh v10a-router-resident.sh v11-rocm-selftest.sh v12-openwebui-offline.sh
+v13-restic.sh v14a-arbiter-stubs.sh v15-approval-gate.sh v16-router-hard-rule.sh v17-sandbox.sh v18-vault.sh v19-xrdp.sh
+v20-google.sh v23-cloudflare-token.sh`. V14a, V15 and V16 run the orchestrator's unit tests through those three scripts.
+V4, V8, V9, V10, V14b, V21, V22 are produced inside their phase (load tests, engine builds) and recorded with
+`record_v` directly (Phase 3 through loadtest.py's RECORD lines, Phase 4 by the driver).
 Contract: exit **0 pass, 1 fail, 2 deferred, 3 info**; print exactly one line of evidence on stdout;
 never prompt; never take longer than 10 minutes; safe to re-run.
 
@@ -124,7 +130,7 @@ never prompt; never take longer than 10 minutes; safe to re-run.
 | Phase | Required (red row blocks the next phase) | Recorded, not blocking |
 |---|---|---|
 | 1 | V2, V3a, V5, V19 | V1 (info) |
-| 2 | V3b, V6, V12, V13, V14a, V15, V16, V17, V18, V20, V23, and every service healthy | V7 (deferred if the reference recordings are absent) |
+| 2 | V3b, V6, V12, V13, V14a, V15, V16, V17, V18, V20, V23, and every service healthy | V7 (deferred if the reference recordings are absent), V10a (resident router; also fatal to step 4), V18 is `deferred` until the real vault is initialised (`ATLAS_VAULT_INIT=1`) |
 | 3 | V4 per engine, V10, V14b, V21 | V22 (a DeepSeek failure defers it, R19) |
 | 4 | V11 | V8, V9 (deferred on failure), per-engine pass/fail/deferred table |
 
@@ -134,6 +140,8 @@ never prompt; never take longer than 10 minutes; safe to re-run.
    request goes through the allowlist proxy; the allowlist is `config/allowlist.txt` and nothing else.
 2. **Secrets** live only under `/etc/atlas/secrets/`, mode 600, owned by the one service that reads them. Never
    echoed to logs, never in `atlas.env`, never in git, never inside `/srv/atlas`, never in restic's include set.
+   The one declared exception is the transient tmpfs passfile `/run/atlas-vault/pass` (root:root 600, written by the
+   root helper for one gocryptfs mount and shredded the moment the mount is up; the helper refuses a non-tmpfs `/run`).
    The Cloudflare relocation (Phase 2 step 6b) deletes `CLOUDFLARE.txt` with `shred -u` only after the new
    file is written and a read-back test of the API succeeds (V23).
 3. **Idempotent and resumable.** Every step is wrapped in `run_step`; re-running a phase skips completed steps.
@@ -182,6 +190,13 @@ ChromaDB 8000, Redis 6379 (loopback only), ntfy 8090, Cockpit 9090, xrdp 3389, W
 
 Control path: the orchestrator runs as `atlas` and starts/stops engines with `sudo systemctl {start,stop,restart}
 llama-server@<key>`; the sudoers fragment `/etc/sudoers.d/atlas-engines` allows exactly those commands and
-nothing else. Sentinel and the 72-hour prune are systemd timers whose only job is to enqueue the Celery task
+nothing else on the engine side. The vault button needs a second, equally narrow root path: `/etc/sudoers.d/atlas-vault`
+allows exactly `atlas-vault open|lock|status` (passphrase on stdin, never an argument). No other NOPASSWD grant exists;
+`phase2/07-restic.sh` proves that no fragment lets `atlas` touch `atlas-aegis.service`.
+
+Bind rule, as implemented: host daemons that cannot bind per address — sshd (22), cockpit-ws (9090), xrdp (3389) and
+Open WebUI on the host network (`$OPENWEBUI_PORT`) — listen on 0.0.0.0 behind ufw's default-deny with LAN/WireGuard
+allow rules; squid additionally listens on the docker0 gateway for the containers. Every other listener is loopback or
+pinned to the LAN address, and the Phase 2 gate marks any further wildcard listener NOT HEALTHY. Sentinel and the 72-hour prune are systemd timers whose only job is to enqueue the Celery task
 (Section 9.3 names a timer, Section 9.7 makes Celery the executor; this satisfies both). AEGIS nightly is the
 same pattern.

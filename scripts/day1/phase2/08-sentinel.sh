@@ -4,17 +4,20 @@
 # task (CONVENTIONS.md §8). Sourced by phase2-services.sh through run_phase_steps; defines step_08 only.
 #
 # Order (each part idempotent):
-#   1. config/sentinel-feeds.json (D6: CoinDesk RSS, ASX and US index feeds, RSS news, node telemetry) — the ON-NODE
+#   1. config/sentinel-feeds.json (D6, the closed list and nothing more: CoinDesk RSS, an ASX and a US index feed, RSS
+#      news, node telemetry; the former btc-usd Yahoo price series was a fifth source and is gone, fix round 3) — the ON-NODE
 #      copy $ATLAS_OPT/day1/config, the path the orchestrator reads and its units mount read-only (fix round 2; step 02
 #      dies when the copy is absent) — is validated as JSON, every feed host is proven to be in config/allowlist.txt
 #      (the file's own contract), every entry of the
 #      allowlist's Sentinel group that no feed references is reported (a wildcard nothing uses widens 12.5's surface;
-#      allowlist.txt is another writer's file, so this is a warning naming the line to remove), and each URL is probed
+#      allowlist.txt is another writer's file and still carries `.asx.com.au`, which no feed uses: a `die` here would
+#      stop the phase on that writer's file, so this stays a WARNING naming the line to remove until the two files are
+#      in sync, then it becomes a die (fix round 3; recorded in the notes for the allowlist writer)), and each URL is probed
 #      ONCE through the allowlist proxy: an unreachable feed is logged as "feed unreachable" (its URL is UNVERIFIED by
 #      the research and the task treats it the same way), never a failure.
 #   2. SENTINEL_FEEDS / SENTINEL_LOG_DIR / FIREWALL_TELEMETRY_FILE in $ATLAS_ETC/orchestrator.env (step 02 wrote the
 #      defaults; re-asserted), and the alert path proven for its reader: the cpu worker (user atlas) must be able to read
-#      NTFY_TOKEN_FILE ($ATLAS_ETC/secrets/ntfy.env, atlas:atlas 600 inside the root:atlas 750 secrets dir) — otherwise
+#      NTFY_TOKEN_FILE ($ATLAS_ETC/secrets/ntfy.env, atlas:atlas 600 inside the root:atlas 710 secrets dir) — otherwise
 #      every BLUF push fails silently at 03:00. The units now repeat that test as atlas at every start (fix round 2).
 #   2b. /usr/local/sbin/atlas-sentinel-telemetry from phase2/atlas-sentinel-telemetry.sh: the root-side exporter of the
 #      D6 "firewall" telemetry (kernel journal and squid log counts the atlas account cannot read) into the root-owned
@@ -30,8 +33,12 @@
 # Contract this step defines for the package (atlas.tasks.sentinel): the "firewall" telemetry reader reads
 # FIREWALL_TELEMETRY_FILE (JSON: ts, window_s, ufw_block, docker_egress_denied, squid_denied, denied_per_hour, errors;
 # a null count means "could not count") when the file exists and ts is < 2 h old, else "telemetry unreadable: firewall";
-# the "backup" reader uses `systemctl show atlas-aegis.service -p ExecMainStartTimestamp -p Result` (what it already
-# does; sentinel-feeds.json now says so). Until the package reads the file, its journalctl path still reports unreadable.
+# the "backup" reader uses `systemctl show atlas-aegis.service -p ExecMainStartTimestamp -p Result -p ExecMainStatus`
+# and reports ExecMainStatus=3 (restic "some source files could not be read"; Result is still success because the unit
+# carries SuccessExitStatus=3) as a WARNING reading, never as healthy (fix round 3; sentinel-feeds.json says so and
+# carries thresholds.exec_main_status_warn=[3]). Until the package reads the firewall file, its journalctl path still
+# reports unreadable; until it reads ExecMainStatus, a partial night shows as healthy in the telemetry (the unit's
+# helper pushes it to the phone regardless).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -153,11 +160,11 @@ _sentinel_env() {
   chown root:atlas "$ORCH_ENV"; chmod 640 "$ORCH_ENV"
   ensure_dir /srv/cold atlas:atlas 750
   # The alert path's reader is the cpu worker (atlas): prove the read now (fix round).
-  ensure_dir "$ATLAS_ETC/secrets" root:atlas 750
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas "${ORCH_SECRETS_MODE:-710}"
   [[ -s "$SENTINEL_NTFY_TOKEN" ]] || die "$SENTINEL_NTFY_TOKEN is missing: Phase 1 step 7 writes it (NTFY_TOKEN=tk_...); without it the Sentinel BLUF alert (Section 9.3) cannot reach the Principal's phone"
   grep -qE '^NTFY_TOKEN=tk_' "$SENTINEL_NTFY_TOKEN" || die "$SENTINEL_NTFY_TOKEN carries no NTFY_TOKEN=tk_... line (Phase 1 step 7's format)"
   svc_user_run cat "$SENTINEL_NTFY_TOKEN" >/dev/null 2>&1 \
-    || die "the atlas account cannot read $SENTINEL_NTFY_TOKEN ($(stat -c '%U:%G %a' "$SENTINEL_NTFY_TOKEN"); $ATLAS_ETC/secrets is $(stat -c '%U:%G %a' "$ATLAS_ETC/secrets"), must be root:atlas 750 and the file atlas:atlas 600 — 02's header names the writers that still set 700/710): the cpu worker's ntfy pushes would fail"
+    || die "the atlas account cannot read $SENTINEL_NTFY_TOKEN ($(stat -c '%U:%G %a' "$SENTINEL_NTFY_TOKEN"); $ATLAS_ETC/secrets is $(stat -c '%U:%G %a' "$ATLAS_ETC/secrets"), must be root:atlas 710 and the file atlas:atlas 600 — 02's header, the one value): the cpu worker's ntfy pushes would fail"
   log "alert path: $SENTINEL_NTFY_TOKEN readable by atlas (NTFY_TOKEN_FILE, KEY=VALUE format)"
 }
 

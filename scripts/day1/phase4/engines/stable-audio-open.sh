@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # phase4/engines/stable-audio-open.sh — Stable Audio Open 1.0, green (Section 15.2; step 2). Gated with a manual form:
-# HF_TOKEN from /etc/atlas/secrets/hf-token.env, read by root and staged as a copy the container uid can read (mode 400,
-# private root-only tmpfs) for this engine's pull run only (lib-engine.sh header "HF_TOKEN"); an absent token file
-# stops this engine before any container starts, naming the Phase 2 prompt and the licence URL; a 401/403 stops it
-# with the licence URL (adjudicated conflict 16).
+# HF_TOKEN from /etc/atlas/secrets/hf-token.env (atlas:atlas 600, CONVENTIONS §2), bind-mounted read-only into this
+# engine's pull container only (lib-engine.sh header "HF_TOKEN"; fix round 3: no copy anywhere); an absent token file
+# stops this engine before any container starts, naming the Phase 2 prompt and the licence URL; a wrong owner/mode
+# stops it naming the chown/chmod; a 401/403 stops it with the licence URL (adjudicated conflict 16).
 # Research: rocm-containers.md §3.8 (pip package VERIFIED; flash-attn unavailable on ROCm gfx1151 -> SDPA fallback
 # UNVERIFIED for every module; inference call UNVERIFIED-by-snippet). Test: stable-audio-open_test.py (10 s, 50 steps).
 # Install deviation (fix round, rule §7.9 — the README says so): stable-audio-tools 0.0.20 declares

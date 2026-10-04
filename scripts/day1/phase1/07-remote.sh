@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # phase1/07-remote.sh — Phase 1 step 7 (Sections 9.3, 12.2, 12.3, 17, 21 V5; R7, R11): WG-Easy from
-# docker/wg-easy/compose.yml (admin UI published on the LAN address only), the Cloudflare dynamic-DNS updater under
+# docker/wg-easy/compose.yml (admin UI published on 127.0.0.1 only; fix round 3), the Cloudflare dynamic-DNS updater under
 # atlas-ddns, ntfy with default-deny auth and a node token, the WireGuard bridge address added to the SSH/Cockpit/
 # xrdp bindings, and V5 (DNS matches the public IP; a handshake from mobile data within 10 minutes passes, else
 # V5 is recorded as FAIL with the exact re-run command: the step itself completes, the gate shows the red row and
 # Phase 2 waits for `--force 07`; CONVENTIONS §6 gives V5 no deferral provision).
 #
 # THE ONE POSSIBLE PROMPT IN THIS STEP (Section 22, S11): when the Cloudflare token cannot list zones
-# (Zone:DNS:Edit only, adjudicated conflict 3) and no zone id is found beside the token in CLOUDFLARE.txt or as
-# CF_ZONE_ID in atlas.env, the Principal is asked ONCE for the 32-hex zone id (Overview page of the zone), read from
-# /dev/tty with a 5-minute timeout. No terminal or no answer in time leaves CF_ZONE_ID blank with a warning (the
-# updater then fails visibly until it is set; V5 reports the DNS mismatch; Phase 2 step 6b stops with the manual fix).
-# Non-interactive path: CF_ZONE_ID=<id> in $ATLAS_ETC/atlas.env (non-secret) before this step runs.
+# (Zone:DNS:Edit only, adjudicated conflict 3) and no zone id is found beside the token in CLOUDFLARE.txt or in an
+# existing $ATLAS_ETC/secrets/cloudflare.env, the Principal is asked ONCE for the 32-hex zone id (Overview page of the
+# zone), read from /dev/tty with a 5-minute timeout. No terminal or no answer in time leaves CF_ZONE_ID blank with a
+# warning (the updater then fails visibly until it is set; V5 reports the DNS mismatch; Phase 2 step 6b stops with the
+# manual fix). Non-interactive paths: a "Zone ID: <32 hex>" line beside the token in CLOUDFLARE.txt, or
+# CF_ZONE_ID=<id> pre-seeded in $ATLAS_ETC/secrets/cloudflare.env. No atlas.env key (fix round 3): CONVENTIONS §3
+# fixes that file's key set and config/atlas.env.example does not list CF_ZONE_ID.
 #
 # CLOUDFLARE TOKEN HAND-OFF (Section 12.3, R7, V23): Phase 2 step 6b is the relocation step, but this step needs a
 # working updater NOW. So it READS the token from $CLOUDFLARE_TXT and writes $ATLAS_ETC/secrets/cloudflare.env
@@ -20,17 +22,23 @@
 # CLOUDFLARE.txt (V23).
 #
 # SECRETS ON DISK: WireGuard's server and peer private keys (/etc/wireguard in the container) live under
-# $ATLAS_ETC/secrets/wg-easy (root 700); ntfy's user.db (password hashes, the node token) lives under
-# /var/lib/atlas-ntfy (atlas 700). Neither is under /srv/atlas nor in restic's include set (CONVENTIONS §7.2);
-# client configs are regenerable from the admin UI and need no backup. $ATLAS_ETC/secrets itself is root:atlas 710
-# (traverse-only for the atlas group: no listing, every file 600 owned by its one reader) because atlas-owned files
-# live inside it (ntfy.env here, hf-token.env and secrets/google later) and their owner could not open them under
-# CONVENTIONS §2's root:root 700; phase2/06c-google-oauth.sh fixes the same mode for every writer, so no re-run of
-# this step (`--force 07` for V5) regresses it. Secrets never travel on a command line: curl reads the bearer header
-# from a file descriptor, docker exec takes NTFY_PASSWORD from --env-file, and every error message is redacted before
-# it reaches the log. Dependency noted for lib/common.sh's notify (called once below): it passes the ntfy token as
-# `-H "Authorization: Bearer ..."` on curl's argv (readable in /proc/<pid>/cmdline for the life of the process); the
-# fix belongs to common.sh (`-H @<(printf ...)`), this step's own curl calls already use the fd form.
+# $ATLAS_ETC/secrets/wg-easy (root 700); ntfy's user.db (password hashes, the node token: the same secret as
+# secrets/ntfy.env) lives under $ATLAS_ETC/secrets/ntfy (atlas 700; fix round 3, CONVENTIONS §7.2 "secrets live only
+# under /etc/atlas/secrets/"; an earlier revision's /var/lib/atlas-ntfy is migrated once). Neither is under /srv/atlas
+# nor in restic's include set; client configs are regenerable from the admin UI and need no backup. $ATLAS_ETC/secrets
+# itself is root:atlas 750, the ONE value every writer asserts (phase2/02-orchestrator.sh header; phase2-services.sh,
+# 02, 03, 06c, 07, 08, 09 and phase1/02, 03): atlas-owned files live inside it (ntfy.env here, hf-token.env and
+# secrets/google later) and their owner could not open them under CONVENTIONS §2's root:root 700, whose row needs the
+# amendment (fix-round notes). Secrets never travel on a command line or in a docker exec's recorded environment:
+# curl reads the bearer header from a file descriptor, ntfy passwords are fed on stdin (`docker exec -i`: an
+# `--env-file` exec would leave the password in that exec instance's config, visible via `docker inspect <exec-id>`
+# to every docker-group member until the container restarts), and every error message is redacted before it reaches
+# the log. ntfy roles (fix round 3): the node account "atlas" is a plain user with write-only access to $NTFY_TOPIC
+# and ${NTFY_TOPIC}-*, so the token lib/common.sh's notify carries around (and the orchestrator holds) can publish
+# and nothing else; no admin account exists, the CLI inside the container is the admin path. Dependency noted for
+# lib/common.sh's notify (called once below): it passes the ntfy token as `-H "Authorization: Bearer ..."` on curl's
+# argv (readable in /proc/<pid>/cmdline for the life of the process); the fix belongs to common.sh
+# (`-H @<(printf ...)`), this step's own curl calls already use the fd form.
 # Facts from the platform research items 8, 9, 10, 11 (VERIFIED unless marked). Defines step_07 only.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
@@ -77,7 +85,7 @@ _wg_kernel() {
 
 _wg_easy_up() {
   local envf="$ATLAS_ETC/secrets/wg-easy.env" datadir="$ATLAS_ETC/secrets/wg-easy"
-  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710          # header: traverse-only for atlas; every writer uses this mode
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710          # header: the one value every writer asserts
   ensure_dir "$datadir" root:root 700
   _migrate_dir "$ATLAS_SRV/data/wg-easy" "$datadir"
   if [[ ! -s "$envf" ]]; then
@@ -124,18 +132,18 @@ _wg_easy_up() {
     log "wg-easy recreated without INIT_PASSWORD in its environment (the admin credential stays only in $envf)"
   fi
   ss -lunH "sport = :$WG_PORT" | grep -q ":$WG_PORT" || die "UDP $WG_PORT is not bound on the host (docker port wg-easy)"
-  log "WG-Easy up: admin http://$LAN_IP:51821/ (LAN and WireGuard only), UDP $WG_PORT published"
+  log "WG-Easy up: admin http://127.0.0.1:51821/ (loopback only; RDP Firefox or ssh -L), UDP $WG_PORT published"
 }
 
 # _wg_easy_check — the admin UI answers and $WG_IFACE is up inside the container.
 _wg_easy_check() {
   local code=""
   for _ in $(seq 1 30); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 "http://$LAN_IP:51821/" || true)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 "http://127.0.0.1:51821/" || true)"
     [[ "$code" =~ ^(200|30[1-8])$ ]] && break
     sleep 2
   done
-  [[ "$code" =~ ^(200|30[1-8])$ ]] || die "WG-Easy admin UI at http://$LAN_IP:51821/ did not answer (HTTP '$code'): docker logs wg-easy"
+  [[ "$code" =~ ^(200|30[1-8])$ ]] || die "WG-Easy admin UI at http://127.0.0.1:51821/ did not answer (HTTP '$code'): docker logs wg-easy"
   local wgs
   wgs="$(docker exec wg-easy wg show "$WG_IFACE" 2>&1 | head -n 3 || true)"
   grep -q "interface: $WG_IFACE" <<<"$wgs" \
@@ -146,9 +154,11 @@ _wg_easy_check() {
 _cloudflare_env() {
   local envf="$ATLAS_ETC/secrets/cloudflare.env" token="" zone_id=""
   if [[ -s "$envf" ]]; then
-    # Existing file from an earlier run: keep its values (KEY=VALUE lines only, CONVENTIONS.md §2).
+    # Existing file from an earlier run, or pre-seeded by the Principal with CF_ZONE_ID only (the non-interactive
+    # path, header): keep its values (KEY=VALUE lines only, CONVENTIONS.md §2).
     token="$(awk -F= '$1=="CF_API_TOKEN" {print $2; exit}' "$envf")"
     zone_id="$(awk -F= '$1=="CF_ZONE_ID" {print $2; exit}' "$envf")"
+    [[ -n "$zone_id" ]] && log "zone id taken from the existing $envf"
   fi
   if [[ -z "$token" ]]; then
     [[ -s "$CLOUDFLARE_TXT" ]] || die "$CLOUDFLARE_TXT is missing or empty: the scoped Cloudflare token (Zone:DNS:Edit on $DOMAIN) must be there for the ddns updater (Section 12.3)"
@@ -171,17 +181,13 @@ _cloudflare_env() {
   fi
   if [[ -z "$zone_id" ]]; then
     # Adjudicated conflict 3 / Section 22 / S11: the API when the token allows, else the id written beside the token
-    # in CLOUDFLARE.txt, else a non-secret CF_ZONE_ID= key in atlas.env, else the ONE ask of the Principal (header).
+    # in CLOUDFLARE.txt, else the ONE ask of the Principal (header; a pre-seeded cloudflare.env was read above).
     zone_id="$(_cf_curl "$token" "$api/zones?name=$DOMAIN&status=active" 2>/dev/null | jq -r '.result[0].id // empty' || true)"
     if [[ -n "$zone_id" ]]; then
       log "zone id for $DOMAIN resolved with GET /zones (the token carries Zone:Zone:Read)"
     else
       zone_id="$(grep -oiE 'zone[ _-]?id[^0-9a-f]*[0-9a-f]{32}' "$CLOUDFLARE_TXT" 2>/dev/null | grep -oE '[0-9a-f]{32}' | head -n1 || true)"
       [[ -n "$zone_id" ]] && log "zone id found beside the token in $CLOUDFLARE_TXT"
-    fi
-    if [[ -z "$zone_id" && -n "${CF_ZONE_ID:-}" ]]; then
-      zone_id="$(tr -d '[:space:]' <<<"$CF_ZONE_ID")"
-      log "zone id taken from CF_ZONE_ID in $ATLAS_ETC/atlas.env"
     fi
     if [[ -n "$zone_id" && ! "$zone_id" =~ ^[0-9a-f]{32}$ ]]; then
       warn "'$zone_id' is not a 32-hex zone id; ignoring it"
@@ -198,7 +204,7 @@ _cloudflare_env() {
           echo "  The token in $CLOUDFLARE_TXT is Zone:DNS:Edit only, so it cannot look up the zone id of $DOMAIN."
           echo "  Cloudflare dashboard -> $DOMAIN -> Overview -> API -> Zone ID (32 hex characters). Asked once; 5 minutes."
           echo "  (Press Enter with nothing to skip: the ddns updater then fails until CF_ZONE_ID is set in"
-          echo "   $ATLAS_ETC/secrets/cloudflare.env or $ATLAS_ETC/atlas.env and this step is re-run with --force 07.)"
+          echo "   $ATLAS_ETC/secrets/cloudflare.env and this step is re-run with --force 07.)"
         } >/dev/tty
         while (( tries < 3 )); do
           answer=""
@@ -211,10 +217,10 @@ _cloudflare_env() {
         done
         [[ -n "$zone_id" ]] && log "zone id for $DOMAIN entered by the Principal (stored in cloudflare.env; never asked again)"
       else
-        warn "no terminal: cannot ask for the Cloudflare zone id (set CF_ZONE_ID in $ATLAS_ETC/atlas.env for the non-interactive path)"
+        warn "no terminal: cannot ask for the Cloudflare zone id (non-interactive path: a 'Zone ID: <32 hex>' line beside the token in $CLOUDFLARE_TXT, or CF_ZONE_ID=<32 hex> in $ATLAS_ETC/secrets/cloudflare.env)"
       fi
     fi
-    [[ -n "$zone_id" ]] || warn "CF_ZONE_ID left blank (the token cannot list zones and no id was found or entered): the ddns updater will fail until it is set; V5 will report the DNS mismatch; Phase 2 step 6b stops with the manual fix. To fix it now: CF_ZONE_ID=<32-hex id from the dashboard Overview page> in $ATLAS_ETC/atlas.env, then: sudo $ATLAS_ENTRY phase1 --force 07"
+    [[ -n "$zone_id" ]] || warn "CF_ZONE_ID left blank (the token cannot list zones and no id was found or entered): the ddns updater will fail until it is set; V5 will report the DNS mismatch; Phase 2 step 6b stops with the manual fix. To fix it now: CF_ZONE_ID=<32-hex id from the dashboard Overview page> in $ATLAS_ETC/secrets/cloudflare.env, then: sudo $ATLAS_ENTRY phase1 --force 07"
   fi
   {
     echo "# Cloudflare dynamic DNS (Section 12.3; V23). Written by Phase 1 step 7, verified and finalised by Phase 2 step 6b."
@@ -242,23 +248,27 @@ _ddns_install() {
   fi
 }
 
-# _ntfy_cli ENVFILE_CONTENT ARGS... — `ntfy` inside the container with NTFY_PASSWORD delivered via --env-file (a
-# process-substituted file, never `-e NTFY_PASSWORD=...` on a world-readable command line). Empty content = no env.
-_ntfy_cli() {
-  local envc="$1"; shift
-  if [[ -n "$envc" ]]; then
-    docker exec --env-file <(printf '%s\n' "$envc") atlas-ntfy ntfy "$@"
-  else
-    docker exec atlas-ntfy ntfy "$@"
-  fi
+# _ntfy_cli ARGS... — `ntfy` inside the container (no password involved).
+_ntfy_cli() { docker exec atlas-ntfy ntfy "$@"; }
+
+# _ntfy_cli_pw PASSWORD ARGS... — `ntfy user add|change-pass` with the password fed TWICE on stdin (prompt + confirm),
+# never on argv and never in the exec's environment (header). ntfy's readPasswordAndConfirm reads from the CLI reader;
+# util.ReadPassword falls back to a plain line read when stdin is not a terminal (VERIFIED in cmd/user.go for the
+# prompt/confirm pair; the non-tty fallback of util.ReadPassword is UNVERIFIED on v2.28.0 from this sandbox, so a
+# non-zero exit here stops the step with the output, redacted, rather than falling back to an environment variable).
+_ntfy_cli_pw() {
+  local pw="$1"; shift
+  printf '%s\n%s\n' "$pw" "$pw" | docker exec -i atlas-ntfy ntfy "$@"
 }
 
 _ntfy_up() {
-  local base="$ATLAS_SRV/data/ntfy" auth=/var/lib/atlas-ntfy d
+  local base="$ATLAS_SRV/data/ntfy" auth="$ATLAS_ETC/secrets/ntfy" d
   for d in etc cache; do ensure_dir "$base/$d" atlas:atlas 750; done
   ensure_dir "$base" atlas:atlas 750
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710          # header: the one value every writer asserts
   ensure_dir "$auth" atlas:atlas 700
-  _migrate_dir "$base/lib" "$auth"
+  _migrate_dir "$base/lib" "$auth"                        # first revision kept user.db under /srv/atlas
+  _migrate_dir /var/lib/atlas-ntfy "$auth"                # second revision kept it outside /etc/atlas/secrets
   # server.yml: auth on, default deny (VERIFIED keys: auth-file, auth-default-access, base-url, listen-http, cache-file).
   cat >"$base/etc/server.yml" <<YML
 base-url: "http://$LAN_IP:8090"
@@ -289,26 +299,30 @@ YML
   [[ "$hs" == healthy ]] || die "docker reports atlas-ntfy health '$hs' (expected healthy): the in-container healthcheck fails although the host sees /v1/health. Check: docker inspect -f '{{json .State.Health}}' atlas-ntfy (an http_proxy leaking into the container, or a changed /v1/health body)"
   log "ntfy: docker health=$hs"
 
-  # Users and the node token via the CLI inside the container (NTFY_PASSWORD makes `user add` non-interactive;
-  # UNVERIFIED output format of `token add`, so the token is parsed and the step dies if nothing token-shaped appears).
+  # Users and the node token via the CLI inside the container (passwords on stdin, _ntfy_cli_pw; UNVERIFIED output
+  # format of `token add`, so the token is parsed and the step dies if nothing token-shaped appears). The node
+  # account "atlas" is a plain user (header: least privilege for the token every phase carries); an earlier revision
+  # created it as admin, so the role is set explicitly on every run (`user change-role`, VERIFIED in cmd/user.go).
+  # "already exists" on a re-run is tolerated, any other failure stops the step (output redacted before it is logged).
   local tokf="$ATLAS_ETC/secrets/ntfy.env" prinf="$ATLAS_ETC/secrets/ntfy-principal.env" out
-  # UNVERIFIED: NTFY_PASSWORD is ntfy's documented non-interactive password source for `user add`; "already exists"
-  # on a re-run is tolerated, any other failure stops the step (output redacted before it is logged).
-  out="$(_ntfy_cli "NTFY_PASSWORD=$(_rand_pw 32)" user add --role=admin atlas 2>&1)" \
+  out="$(_ntfy_cli_pw "$(_rand_pw 32)" user add --role=user atlas 2>&1)" \
     || grep -qi 'exists' <<<"$out" || die "ntfy user add atlas failed: $(_redact "$out")"
+  out="$(_ntfy_cli user change-role atlas user 2>&1)" || die "ntfy user change-role atlas user failed: $(_redact "$out")"
+  _ntfy_cli access atlas "$NTFY_TOPIC" write-only >/dev/null || die "ntfy access atlas $NTFY_TOPIC write-only failed"
+  _ntfy_cli access atlas "${NTFY_TOPIC}-*" write-only >/dev/null || die "ntfy access atlas ${NTFY_TOPIC}-* write-only failed"
   if [[ ! -s "$prinf" ]]; then
     local ppw; ppw="$(_rand_pw 20)"
-    out="$(_ntfy_cli "NTFY_PASSWORD=$ppw" user add --role=user principal 2>&1)" \
-      || { grep -qi 'exists' <<<"$out" && _ntfy_cli "NTFY_PASSWORD=$ppw" user change-pass principal >/dev/null; } \
+    out="$(_ntfy_cli_pw "$ppw" user add --role=user principal 2>&1)" \
+      || { grep -qi 'exists' <<<"$out" && _ntfy_cli_pw "$ppw" user change-pass principal >/dev/null; } \
       || die "ntfy user add/change-pass principal failed: $(_redact "$out")"
     printf 'NTFY_PRINCIPAL_USER=principal\nNTFY_PRINCIPAL_PASS=%s\n' "$ppw" | phase1_write_file 600 root:root "$prinf"
     log "ntfy phone login for the Principal written to $prinf (root, 600)"
   fi
-  _ntfy_cli "" access principal "$NTFY_TOPIC" read-only >/dev/null || die "ntfy access principal $NTFY_TOPIC failed"
-  _ntfy_cli "" access principal "${NTFY_TOPIC}-*" read-only >/dev/null || true
+  _ntfy_cli access principal "$NTFY_TOPIC" read-only >/dev/null || die "ntfy access principal $NTFY_TOPIC failed"
+  _ntfy_cli access principal "${NTFY_TOPIC}-*" read-only >/dev/null || true
   if [[ ! -s "$tokf" ]] || ! grep -qE '^NTFY_TOKEN=tk_' "$tokf"; then
     local tok
-    out="$(_ntfy_cli "" token add --label node atlas 2>&1)" || die "ntfy token add failed: $(_redact "$out")"
+    out="$(_ntfy_cli token add --label node atlas 2>&1)" || die "ntfy token add failed: $(_redact "$out")"
     tok="$(grep -oE 'tk_[A-Za-z0-9]{29}' <<<"$out" | head -n1 || true)"
     [[ -n "$tok" ]] || die "could not parse a tk_ token from 'ntfy token add' (UNVERIFIED output format; ${#out} bytes): $(_redact "$out")"
     printf 'NTFY_TOKEN=%s\n' "$tok" | phase1_write_file 600 atlas:atlas "$tokf"
@@ -324,7 +338,10 @@ YML
   [[ "$code" == 200 ]] || die "publishing to ntfy with the node token returned HTTP $code (expected 200)"
   code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 10 -d "anonymous" "http://127.0.0.1:8090/$NTFY_TOPIC" || true)"
   [[ "$code" == 403 ]] || die "anonymous publish to ntfy returned HTTP $code, expected 403 (auth-default-access deny-all not in effect)"
-  log "ntfy: auth default-deny confirmed (token 200, anonymous 403)"
+  # The node token must NOT be able to read (write-only grant): a subscribe poll with it must be refused.
+  code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 10 -H @<(printf 'Authorization: Bearer %s\n' "$NTFY_TOKEN") "http://127.0.0.1:8090/$NTFY_TOPIC/json?poll=1" || true)"
+  [[ "$code" == 403 ]] || die "the node token could READ topic $NTFY_TOPIC (HTTP $code, expected 403): the write-only grant for user atlas is not in effect (docker exec atlas-ntfy ntfy access)"
+  log "ntfy: auth default-deny confirmed (node token: publish 200, subscribe 403; anonymous 403)"
 }
 
 # _ntfy_path_from_vpn — prove the path a VPN client takes to ntfy: from the wg-easy container (the phone's packets
@@ -367,14 +384,15 @@ step_07() {
   ==== V5: WireGuard from mobile data (up to 10 minutes; the Principal's phone) ====
   Node public IP (per the ddns updater): $home_ip     DNS record: $VPN_HOST
   If your router's WAN address is in 100.64.0.0/10 you are behind CGNAT and this cannot pass (R11).
-  1. Open the WG-Easy admin page FROM THE NODE (the UI is plain http, so the password must not cross the
-     Wi-Fi): in the RDP session's Firefox, http://127.0.0.1:51821/ ; or over SSH: ssh -L 51821:127.0.0.1:51821
+  1. Open the WG-Easy admin page FROM THE NODE (it is published on 127.0.0.1 only, because the UI is plain
+     http): in the RDP session's Firefox, http://127.0.0.1:51821/ ; or over SSH: ssh -L 51821:127.0.0.1:51821
      and then http://127.0.0.1:51821/ on the PC. Log in as "$admin_user" with the password in
      $ATLAS_ETC/secrets/wg-easy.env (sudo cat it). Create a client named "phone" and show its QR code.
   2. On the phone: install the WireGuard app, scan the QR code, then TURN WI-FI OFF (mobile data only)
      and switch the tunnel on.
-  3. In the phone's browser open http://$LAN_IP:8090/ (ntfy) and log in as "principal" with the
-     password in $ATLAS_ETC/secrets/ntfy-principal.env; subscribe to topic "$NTFY_TOPIC".
+  3. With the tunnel UP, in the phone's browser open http://$LAN_IP:8090/ (ntfy) and log in as "principal"
+     with the password in $ATLAS_ETC/secrets/ntfy-principal.env; subscribe to topic "$NTFY_TOPIC". (ntfy's login
+     is plain http on the LAN address too: make it over the tunnel or on the LAN only, never from outside.)
   V5 passes as soon as a handshake from a mobile-data address is seen. If none arrives in 10 minutes, V5 is
   recorded as FAIL (CONVENTIONS §6: required, no deferral), this step still completes, and the Phase 1 gate
   blocks Phase 2 until you re-run it (idempotent, waits again) with:

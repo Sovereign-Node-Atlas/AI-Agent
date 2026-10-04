@@ -6,12 +6,13 @@ import argparse
 import json
 import logging
 import os
+import sqlite3
 import stat
 import sys
 import time
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -184,7 +185,7 @@ def test_concurrent_writers_share_one_connection() -> None:
 # --- retention (10.4, D9) ---------------------------------------------------------------------------------------------
 
 
-def test_purge_applies_the_d9_windows_and_never_touches_the_permanent_tables() -> None:
+def test_purge_applies_the_d9_windows_and_never_touches_the_permanent_tables(caplog: pytest.LogCaptureFixture) -> None:
     ledger = Ledger(":memory:")
     ledger.init_db()
     now = time.time()
@@ -194,26 +195,72 @@ def test_purge_applies_the_d9_windows_and_never_touches_the_permanent_tables() -
     ledger.insert_sentinel_pulse(task_id="p1", status="done", feeds=[], anomalies=[], alerted=False, duration_s=1.0)
     done = ledger.insert_task("sentinel", status="done")
     open_task = ledger.insert_task("chat", status="running")
-    ledger.insert_approval(task_id="t1", tier="standard", kind="email", status="held")
+    held = ledger.insert_approval(task_id="t1", tier="standard", kind="email", status="held")
+    decided = ledger.insert_approval(task_id="t2", tier="routine", kind="email", status="auto-sent", draft="hi")
     ledger.insert_strike(task_id="t1", kind="tool-failure", description="x", source="ouroboros")
-    # The windows: 30 days for the operational logs, 365 for Sentinel; nothing is young enough to go at 29 days.
+    archived: dict[str, list[dict[str, Any]]] = {}
+
+    def archive(table: str, rows: list[dict[str, Any]]) -> None:
+        archived.setdefault(table, []).extend(rows)
+
+    # The windows: 30 days for the operational logs (approvals included, D9 names scars as the one permanent category),
+    # 365 for Sentinel; nothing is young enough to go at 29 days.
     assert RETENTION_S["arbiter_decisions"] == RETENTION_S["routing_decisions"] == 30 * DAY_S
-    assert RETENTION_S["sentinel_pulses"] == 365 * DAY_S and PERMANENT_TABLES == {"approvals", "strikes", "meta"}
-    assert ledger.purge("arbiter_decisions", 30 * DAY_S, now=now + 29 * DAY_S) == 0
-    assert ledger.purge_expired(now=now + 31 * DAY_S) == {"arbiter_decisions": 3, "routing_decisions": 3, "tasks": 1,
-                                                        "sentinel_pulses": 0}
+    assert RETENTION_S["approvals"] == 30 * DAY_S
+    assert RETENTION_S["sentinel_pulses"] == 365 * DAY_S and PERMANENT_TABLES == {"strikes", "meta"}
+    assert ledger.purge("arbiter_decisions", 30 * DAY_S, now=now + 29 * DAY_S, archive=archive) == 0
+    assert ledger.purge_expired(now=now + 31 * DAY_S, archive=archive) == {
+        "arbiter_decisions": 3, "routing_decisions": 3, "tasks": 1, "approvals": 1, "sentinel_pulses": 0}
     assert ledger.list_arbiter_decisions() == [] and ledger.get_task(done) is None
     assert ledger.get_task(open_task) is not None  # an open task is never purged whatever its age
-    assert ledger.purge_expired(now=now + 366 * DAY_S)["sentinel_pulses"] == 1 and ledger.list_sentinel_pulses() == []
-    # Scars are permanent (9.4), approvals are the 16.2 audit trail.
-    assert len(ledger.list_approvals()) == 1 and len(ledger.list_strikes(task_id="t1")) == 1
-    for table in ("approvals", "strikes", "meta"):
+    # A held approval is a question the Principal has not answered: never purged; the decided row went to the archive
+    # (draft included) before the delete.
+    assert ledger.get_approval(held) is not None and ledger.get_approval(decided) is None
+    assert [r["id"] for r in archived["approvals"]] == [decided] and archived["approvals"][0]["draft"] == "hi"
+    assert ledger.purge_expired(now=now + 366 * DAY_S, archive=archive)["sentinel_pulses"] == 1
+    assert ledger.list_sentinel_pulses() == [] and len(archived["sentinel_pulses"]) == 1
+    assert ledger.get_approval(held) is not None  # still held a year on
+    # Scars are permanent (9.4); the schema row too.
+    assert len(ledger.list_strikes(task_id="t1")) == 1
+    for table in ("strikes", "meta"):
         with pytest.raises(ValueError, match="permanent"):
-            ledger.purge(table, 1.0)
+            ledger.purge(table, 1.0, archive=archive)
     with pytest.raises(ValueError, match="not a ledger table"):
-        ledger.purge("sqlite_master", 1.0)
+        ledger.purge("sqlite_master", 1.0, archive=archive)
     with pytest.raises(ValueError, match="positive"):
-        ledger.purge("tasks", 0)
+        ledger.purge("tasks", 0, archive=archive)
+    # The time-based sweep cannot discard: archive is a required argument (D9 "then archived"), and a per-table purge
+    # without one says so in the log (rule §7.4, never silently).
+    with pytest.raises(TypeError):
+        ledger.purge_expired(now=now + 400 * DAY_S)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="archive callback"):
+        ledger.purge_expired(now=now + 400 * DAY_S, archive=None)  # type: ignore[arg-type]
+    ledger.insert_routing_decision(task_id="r9", route="ren", engine="e", reason="x")
+    with caplog.at_level(logging.WARNING, logger="atlas.ledger"):
+        assert ledger.purge("routing_decisions", 1.0, now=time.time() + 10.0) == 1
+    assert "routing_decisions: 1 row(s)" in caplog.text and "WITHOUT an archive" in caplog.text
+
+
+def test_transaction_reports_the_lock_not_a_failed_rollback(tmp_path: Path) -> None:
+    # Under write contention BEGIN IMMEDIATE itself fails after the busy timeout. The error the operator must see is
+    # "database is locked", not "cannot rollback - no transaction is active" from a ROLLBACK with nothing to roll back
+    # (which pointed atlas-admin's message at permissions instead of the lock; rule §7.4).
+    db = tmp_path / "atlas.sqlite3"
+    first = Ledger(db)
+    first.init_db()
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            Ledger(db, timeout_s=0.2).insert_task("chat")
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    # Released: the same ledger writes again (no connection state was left half-open by the failed BEGIN).
+    second = Ledger(db, timeout_s=0.2)
+    assert second.get_task(second.insert_task("chat")) is not None
+    second.close()
+    first.close()
 
 
 def test_purge_archives_before_it_deletes_and_keeps_rows_when_the_archive_fails() -> None:
@@ -252,6 +299,16 @@ def test_enqueue_redacts_broker_credentials_from_stderr_and_the_ledger(tmp_path:
         "Error 111 connecting to redis://:***@127.0.0.1:6379/0. Connection refused.")
     assert admin._redact("amqp://atlas:s3cr3t@broker:5672//") == "amqp://atlas:***@broker:5672//"
     assert admin._redact("https://ntfy.example/topic no credentials") == "https://ntfy.example/topic no credentials"
+    # An unencoded '/' or '+' inside the password (a base64 secret) and the ?password= query form are masked too.
+    assert admin._redact("redis://:abc/def+ghi==@127.0.0.1:6379/0 refused") == "redis://:***@127.0.0.1:6379/0 refused"
+    assert admin._redact("rediss://u:p%2Fw@h:1/0?ssl=1 and redis://h:6379/0?password=hunter2&db=0") == (
+        "rediss://u:***@h:1/0?ssl=1 and redis://h:6379/0?password=***&db=0")
+    assert admin._redact("redis://h/0 then TOKEN=x? no url") == "redis://h/0 then TOKEN=x? no url"
+    # A SUCCESS result is masked the same way before it is stored or printed (the task writer's contract is not relied
+    # on); a result the mask would make unparseable is stored as the masked text.
+    assert admin._redacted_result({"broker": "redis://:hunter2@h:6379/0", "n": 1}) == {
+        "broker": "redis://:***@h:6379/0", "n": 1}
+    assert admin._redacted_result(["ok", "amqp://a:b@c//"]) == ["ok", "amqp://a:***@c//"]
 
     class FakeApp:
         class conf:  # mirrors celery's lowercase attribute
@@ -276,3 +333,92 @@ def test_enqueue_redacts_broker_credentials_from_stderr_and_the_ledger(tmp_path:
     assert "hunter2" not in rows[0]["error"] and "redis://:***@127.0.0.1:6379/0" in rows[0]["error"]
     assert "hunter2" not in json.dumps(dict(rows[0]))
     ledger.close()
+
+
+def test_enqueue_wait_masks_a_success_result_before_the_ledger_and_stdout(tmp_path: Path,
+                                                                            monkeypatch: pytest.MonkeyPatch,
+                                                                            capsys: pytest.CaptureFixture[str]) -> None:
+    from atlas import admin
+
+    class FakeResult:
+        state = "SUCCESS"
+        result: ClassVar[dict[str, str]] = {"status": "pulse ok", "broker": "redis://:hunter2@127.0.0.1:6379/0"}
+
+        def get(self, timeout: float, propagate: bool) -> Any:
+            return self.result
+
+    class FakeApp:
+        class conf:
+            task_default_queue = "cpu"
+
+        amqp = types.SimpleNamespace(router=types.SimpleNamespace(route=lambda *_a: {"queue": "cpu"}))
+
+        def send_task(self, name: str, **kw: Any) -> Any:
+            return FakeResult()
+
+    monkeypatch.setitem(sys.modules, "atlas.celery_app", types.SimpleNamespace(app=FakeApp()))
+    db = tmp_path / "atlas.sqlite3"
+    monkeypatch.setenv("ATLAS_DB_PATH", str(db))
+    monkeypatch.setenv("ATLAS_ETC", str(tmp_path))
+    assert admin.cmd_enqueue(argparse.Namespace(task="sentinel", queue=None, wait=5.0)) == 0
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 1 and "hunter2" not in out[0]  # ONE JSON line, masked (contract in phase2/02-orchestrator.sh)
+    line = json.loads(out[0])
+    assert line["status"] == "done" and json.loads(line["result_json"])["broker"] == "redis://:***@127.0.0.1:6379/0"
+    ledger = Ledger(db)
+    row = ledger.list_tasks(status="done")[0]
+    assert "hunter2" not in json.dumps(dict(row)) and "redis://:***@127.0.0.1:6379/0" in row["result_json"]
+    ledger.close()
+
+
+def test_admin_refuses_root_on_a_ledger_owned_by_another_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    # The Principal running `sudo atlas-admin init-db|enqueue|arbiter status` by hand would leave root-owned -wal/-shm
+    # files next to the atlas-owned database and the service would fail on its next write (rule §7.4): refused with
+    # the runuser line, before anything is opened. The uid lookups are stubbed; the suite may itself run as root.
+    from atlas import admin
+
+    db = tmp_path / "atlas.sqlite3"
+    assert admin._root_owner_conflict(db, euid=0) is None  # nothing there yet: a fresh init-db as root is root's call
+    db.write_bytes(b"")
+    monkeypatch.setattr(admin, "_file_uid", lambda _p: 999)
+    assert admin._root_owner_conflict(db, euid=999) is None  # the owner itself
+    assert admin._root_owner_conflict(db, euid=1000) is None  # not root: the ledger's own permission errors apply
+    msg = admin._root_owner_conflict(db, euid=0)
+    assert msg is not None and "owned by uid 999" in msg and "runuser -u atlas -- atlas-admin" in msg
+    monkeypatch.setattr(admin.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("ATLAS_ETC", str(tmp_path))
+    assert admin.main(["init-db", "--db", str(db)]) == 2
+    assert "owned by uid 999" in capsys.readouterr().err and db.read_bytes() == b""  # untouched
+    monkeypatch.setenv("ATLAS_DB_PATH", str(db))
+    assert admin.main(["arbiter", "status", "--json", "--limit", "1"]) == 2
+    monkeypatch.setattr(admin, "_file_uid", lambda _p: 0)
+    assert admin.main(["init-db", "--db", str(db)]) == 0  # root's own file: fine
+    assert "ledger ready" in capsys.readouterr().out
+
+
+def test_admin_config_check_runs_the_strict_card_pass(config_dir: Path, tmp_path: Path,
+                                                      monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    # For the Phase 2 gate: exit 0 + one line when the tree loads and every card carries the §8 triple; exit 1 naming
+    # the drifting cards (the service itself still starts on that tree: load_config is lenient).
+    import shutil
+
+    from atlas import admin
+    from atlas.config import load_config
+
+    tree = tmp_path / "config"
+    shutil.copytree(config_dir, tree)
+    monkeypatch.setenv("ATLAS_CONFIG_DIR", str(tree))
+    monkeypatch.setenv("ATLAS_ETC", str(tree))
+    assert admin.main(["config", "check"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("config ok:") and "cards=6" in out and out.count("\n") == 1
+    card = tree / "domains" / "cards" / "07-development-director-property-real-estate.md"
+    card.write_text(card.read_text().replace("(Corporate, Valerie with Silas, Tier A)",
+                                             "(Corporate | Valerie, with Silas | Tier A)"))
+    assert load_config().domain_cards[7].owner == "Valerie with Silas"  # the service would start
+    assert admin.main(["config", "check"]) == 1
+    err = capsys.readouterr().err
+    assert "1 domain card(s) do not carry" in err and "07-development-director" in err
+    assert "'(Corporate, Valerie with Silas, Tier A)'" in err

@@ -9,6 +9,26 @@
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 }
 
+# phase1_secure_boot_state — "enabled", "disabled" or "unknown". Source of record: the SecureBoot EFI variable (efivarfs
+# files carry a 4-byte attribute header, byte 4 is the value); mokutil --sb-state when present; a legacy-BIOS boot has
+# no Secure Boot at all. verify/v02-tpm.sh carries the same reading (it is standalone and must not depend on this file).
+phase1_secure_boot_state() {
+  local f v
+  for f in /sys/firmware/efi/efivars/SecureBoot-*; do
+    [[ -r "$f" ]] || continue
+    v="$(od -An -tu1 -j4 -N1 "$f" 2>/dev/null | tr -d '[:space:]')"
+    case "$v" in 1) echo enabled; return 0 ;; 0) echo disabled; return 0 ;; esac
+  done
+  if command -v mokutil >/dev/null 2>&1; then
+    case "$(mokutil --sb-state 2>/dev/null || true)" in
+      *enabled*) echo enabled; return 0 ;;
+      *disabled*) echo disabled; return 0 ;;
+    esac
+  fi
+  [[ -d /sys/firmware/efi ]] || { echo disabled; return 0; }
+  echo unknown
+}
+
 step_01() {
   local problems=()
 
@@ -48,7 +68,13 @@ step_01() {
     warn "pre-flight: GPU device id $devid (0x1586 = Strix Halo 8050S/8060S in pci.ids; the 8065S id is unpublished, so this is informational)"
   fi
   local cdev; cdev="$(gpu_card_device_dir)" || die "pre-flight: no /sys/class/drm/card*/device with vendor 0x1002"
-  log "drm: $(dirname "$cdev") gtt_total=$(gpu_gtt_total_mb) MiB (pre-reboot: TTM's default is ~50 % of RAM; step 4 raises it), vram_total=$(( $(cat "$cdev/mem_info_vram_total") / 1048576 )) MiB"
+  # Assigned on their own lines (fix round 3): a `die` inside a command substitution that is an argument to `log` exits
+  # only the subshell and set -e ignores it, so an unreadable mem_info_* would print "gtt_total= MiB" and continue.
+  local gtt vram_bytes vram
+  gtt="$(gpu_gtt_total_mb)"
+  vram_bytes="$(cat "$cdev/mem_info_vram_total")" || die "pre-flight: cannot read $cdev/mem_info_vram_total (amdgpu bound to $slot but the sysfs layout differs)"
+  vram=$(( vram_bytes / 1048576 ))
+  log "drm: $(dirname "$cdev") gtt_total=$gtt MiB (pre-reboot: TTM's default is ~50 % of RAM; step 4 raises it), vram_total=$vram MiB"
   [[ -c /dev/kfd ]] || warn "pre-flight: /dev/kfd is absent (amdkfd not loaded?); Phase 4 containers need it, Phase 1 does not"
 
   # --- fTPM (V2 is recorded in step 2, after enrolment) ---------------------------------------------------------
@@ -58,6 +84,24 @@ step_01() {
   log "tpm2: $(grep '/dev/tpmrm0' <<<"$tpmlist" | head -n1)"
   [[ ! -e /etc/systemd/tpm2-pcr-public-key.pem ]] \
     || die "pre-flight: /etc/systemd/tpm2-pcr-public-key.pem exists; systemd-cryptenroll would also bind to a PCR 11 signature that GRUB boots cannot satisfy. Remove it (it belongs to UKI/systemd-boot setups) and re-run."
+  # --- Secure Boot vs the PCR 7 binding (fix round 3, major). D2 closes Secure Boot as DISABLED and S9 fixes the TPM2
+  # enrolment to PCR 7. With Secure Boot off, PCR 7 measures only the SecureBoot=0/PK/KEK/db/dbx variables and no
+  # image-authority event, so its value is the same for the installed GRUB and for any live USB booted on this
+  # hardware: the TPM would unseal both volumes' keys to anyone who boots their own OS on the node, and Section 3.5's
+  # encryption at rest protects against disk removal only, not theft of the whole node. Two closed decisions meet
+  # here with a consequence the baseline does not record; the Principal settles it, and the scripts never report
+  # V2 green over it unnoticed. The acknowledgement is ATLAS_ACCEPT_PCR7_NO_SB=1 in atlas.env (also enforced by
+  # verify/v02-tpm.sh, which puts the Secure Boot state in every V2 row). CONVENTIONS §3 / config/atlas.env.example
+  # list the key (blank by default); Section 20 still needs an R-item for the decision (README "Known limits").
+  local sb; sb="$(phase1_secure_boot_state)"
+  log "secure boot: $sb (D2 closes it as disabled; step 2 binds the TPM2 tokens to PCR 7, S9)"
+  if [[ "$sb" != enabled ]]; then
+    if [[ "${ATLAS_ACCEPT_PCR7_NO_SB:-0}" == "1" ]]; then
+      warn "pre-flight: Secure Boot is $sb, so the PCR 7 binding of step 2 does not tie the TPM unlock to this OS image (any OS booted on this hardware can unseal); ACKNOWLEDGED by ATLAS_ACCEPT_PCR7_NO_SB=1 in $ATLAS_ETC/atlas.env and recorded in every V2 row"
+    else
+      die "pre-flight: Secure Boot is $sb (D2) and step 2 binds the TPM2 enrolment to PCR 7 only (S9). With Secure Boot off, PCR 7 carries no image-authority measurement, so the TPM unseals both volumes' keys to ANY OS booted on this hardware (a rescue USB): the encryption at rest then protects against disk removal only, not theft of the whole node. Decide before anything is enrolled: (a) enable Secure Boot in the BIOS (reopens D2; PCR 7 then carries the image authority; the shim/GRUB path of Ubuntu boots signed) or (b) accept the weaker binding knowingly with ATLAS_ACCEPT_PCR7_NO_SB=1 in $ATLAS_ETC/atlas.env (every V2 row records it). Not offered here: --tpm2-pcrs=0+4+7, because PCR 4 changes on every GRUB/shim update and the headless node would stop at a console passphrase prompt after unattended-upgrades; it needs a Section 23 amendment of S9 first. Then re-run: sudo $ATLAS_ENTRY phase1"
+    fi
+  fi
 
   # --- NVMe: two drives; DATA_DISK is a blank whole disk, not the root disk ------------------------------------
   log "disks:"; lsblk -d -o NAME,SIZE,MODEL,SERIAL,TRAN,TYPE | sed 's/^/    /'
@@ -81,17 +125,14 @@ step_01() {
   else
     die "pre-flight: DATA_DISK $data_dev carries signature '${sig:-partitions}' that is not this script's atlas-data LUKS volume; refusing to touch it. Wipe it deliberately (wipefs -a) only if you are certain, then re-run."
   fi
-  # Section 3.5 requires LUKS2 on the OS volume too. An unencrypted OS volume is a recorded decision, never a
-  # footnote: it stops here unless ATLAS_ALLOW_UNENCRYPTED_OS=1 is set in atlas.env (documented in the
-  # phase1-platform.sh header; config/atlas.env.example should carry it blank). The same key waives D3's on-node
-  # recovery-key copy (step 2 keeps none on an unencrypted drive; the USB copy is the only copy) and V2 records the
-  # acknowledgement. Checked on "/" itself, not on any crypt mapping (an already-open atlas-data mapping must not count).
+  # Section 3.5 requires LUKS2 on the OS volume too ("nothing transient touches disk unencrypted") and Section 22's
+  # precondition is an install with the encrypted-LVM option. No step offers a waiver (fix round 3): only a Section 23
+  # amendment by the Principal could change 3.5 or D3, and the scripts follow the document. Checked on "/" itself,
+  # not on any crypt mapping (an already-open atlas-data mapping must not count).
   if lsblk -sno TYPE "$root_src" 2>/dev/null | grep -qx crypt; then
     log "OS volume: LUKS present (installer choice, Section 3.5)"
-  elif [[ "${ATLAS_ALLOW_UNENCRYPTED_OS:-0}" == "1" ]]; then
-    warn "OS volume: NOT encrypted; deviation from Section 3.5 ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 in $ATLAS_ETC/atlas.env (step 2 leaves nothing on the OS drive that opens the data volume: no on-node recovery copy, D3 waived by the same key)"
   else
-    die "pre-flight: the OS volume is NOT encrypted, but Section 3.5 requires LUKS2 on both volumes ('nothing transient touches disk unencrypted'). Either reinstall Ubuntu Server with the encrypted-LVM option, or, to accept the deviation knowingly, add ATLAS_ALLOW_UNENCRYPTED_OS=1 to $ATLAS_ETC/atlas.env (this also waives D3's on-node recovery-key copy: the USB copy becomes the only copy) and re-run: sudo $ATLAS_ENTRY phase1"
+    die "pre-flight: the OS volume is NOT encrypted, but Section 3.5 requires LUKS2 on both volumes ('nothing transient touches disk unencrypted'; Section 22 presumes the encrypted-LVM install). Reinstall Ubuntu Server with the encrypted-LVM option and re-run: sudo $ATLAS_ENTRY phase1. (No setting waives this: a change to 3.5/D3 is a Section 23 amendment, not a script option.)"
   fi
   # SSH, Cockpit and xrdp bind to LAN_IP itself (Section 3.6). A DHCP lease that later changes would leave them on
   # the stale address (console-only recovery), so a dynamic address is flagged for a router reservation.

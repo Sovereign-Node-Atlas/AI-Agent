@@ -28,8 +28,12 @@ measured at startup by `measure_resident_set()` (V3 makes this ~170 GB).
 Phase 4 engines (Section 15.2, CONVENTIONS.md §8 class `phase4`). build_arbiter() merges config/phase4-engines.json into
 the Arbiter's engine map so Phase 4 step 5 (POST /arbiter/register) records each container engine's measured footprint
 under a known key (rule 1); they run in their own containers, so request_load() on one is REFUSED with that reason.
-A registration for a key in neither file is accepted as a `phase4` spec built from the request (the driver measured
-something real) and logged as such; a key that is not a bare unit-style name is still UnknownEngine.
+A registration for a key in neither file is UnknownEngine (fix round 3: §8 makes phase4-engines.json the single list of
+Phase 4 engines, and a typo such as 'ui-tars-1.5-7b' for the real key 'ui-tars' must fail the registration, not split
+one engine's footprint across two ledger keys); `register_measured(..., allow_unknown=True)` is the one escape hatch,
+for a driver path that measured a real process the config does not list yet: bounded (MAX_REQUEST_SPECS), logged at
+WARNING and written to the ledger as such. The API route (POST /arbiter/register, another writer) does not pass it, so
+an unknown key is a 404 there.
 
 Failure paths (fix round). A controller start that raises — EngineControlError from systemctl, or the parent
 EngineError from the post-start /health check — releases the reservation and clears `_busy`; a catch-all does the same
@@ -79,6 +83,9 @@ log = logging.getLogger("atlas.arbiter")
 
 GIB = 1024**3
 MAX_RESIDENT = 2  # Section 4.2 rule 3
+# register_measured(allow_unknown=True) may create at most this many specs per process (16.3 item 6: configuration
+# changes are the Principal's; a measurement for a key the config does not list is tolerated, never unbounded).
+MAX_REQUEST_SPECS = 32
 APEX_KEY = "deepseek-v4-flash"  # CONVENTIONS.md §8 arbiter class `apex`
 
 # --- KV-cache size model (Section 4.3; bytes of K+V per token of the TOTAL pool, at f16) ------------------------------
@@ -362,6 +369,7 @@ class Arbiter:
         self._resident_set_bytes = resident_set_bytes
         self.resident: dict[str, Resident] = {}  # rule 1, insertion order = load order
         self.measured: dict[str, int] = {}  # measured total footprints by engine key (Phase 3 / Phase 4 step 5)
+        self._request_specs: set[str] = set()  # keys register_measured(allow_unknown=True) created (MAX_REQUEST_SPECS)
         self._cv = threading.Condition(threading.RLock())  # the state lock; never held across controller I/O
         self._busy: str | None = None  # "loading <key>" / "unloading <key>" while the I/O runs outside the lock
         self._gen_holder: str | None = None  # task id
@@ -470,33 +478,51 @@ class Arbiter:
         return (self._footprint(self.spec(key), profile.ctx, profile.parallel, profile.kv_type,
                                 coresident=profile.coresident), profile)
 
-    def register_measured(self, key: str, total_bytes: int, *, task_id: str | None = None) -> None:
+    def register_measured(self, key: str, total_bytes: int, *, task_id: str | None = None,
+                          allow_unknown: bool = False) -> None:
         """Phase 3 step 2 / Phase 4 step 5: replace the estimate with the measured footprint (rule 1).
 
-        A key in neither engines.json nor phase4-engines.json is accepted as a Phase 4 container engine (class
-        `phase4`, footprint = the measurement) when it is a bare unit-style name: the driver measured a real process
-        and the ledger must reflect it (4.2 rule 1), so the answer is a logged WARNING, not a 404. Anything else is
-        UnknownEngine.
+        `key` must be in engines.json or phase4-engines.json (CONVENTIONS.md §8: one list of names); anything else is
+        UnknownEngine, so a typo in a registration fails loudly and the key gets added to config/phase4-engines.json
+        (rule §7.4). allow_unknown=True accepts a bare unit-style key the config does not list as a class `phase4` spec
+        built from the request (footprint = the measurement), at most MAX_REQUEST_SPECS per process, logged at WARNING
+        and recorded in the ledger as "created from request"; a key that is not a bare unit-style name is UnknownEngine
+        either way.
         """
         if int(total_bytes) < 0:
             raise ArbiterError(f"cannot register {key!r}: total_bytes {total_bytes} is negative")
         with self._cv:
+            created = False
             if key not in self.engines:
                 if not UNIT_KEY_RE.fullmatch(key):
-                    raise UnknownEngine(f"cannot register {key!r}: not an engine key ([A-Za-z0-9._-]+; CONVENTIONS.md §8)")
+                    raise UnknownEngine(f"cannot register {key!r}: not an engine key ([A-Za-z0-9._-]+; "
+                                        "CONVENTIONS.md §8)")
+                if not allow_unknown:
+                    raise UnknownEngine(f"cannot register {key!r}: in neither engines.json nor phase4-engines.json "
+                                        "(CONVENTIONS.md §8: add it to config/phase4-engines.json; the Arbiter does "
+                                        "not invent engine keys)")
+                if len(self._request_specs) >= MAX_REQUEST_SPECS:
+                    raise UnknownEngine(f"cannot register {key!r}: {MAX_REQUEST_SPECS} request-created engine specs "
+                                        f"already exist ({sorted(self._request_specs)}); add the keys to "
+                                        "config/phase4-engines.json")
                 self.engines[key] = EngineSpec(key=key, mode=PHASE4_MODE, arbiter_class="phase4", kv_class="none",
                                                footprint_gb=int(total_bytes) / GIB, ctx_size=0, parallel=1,
-                                               notes="created from a POST /arbiter/register; not in "
-                                                     "config/phase4-engines.json")
-                log.warning("arbiter engine=%s registered as class phase4 from the request: it is in neither "
-                            "engines.json nor phase4-engines.json (add it there so the key is documented)", key)
+                                               notes="created from a register_measured(allow_unknown=True) call; not "
+                                                     "in config/phase4-engines.json")
+                self._request_specs.add(key)
+                created = True
+                log.warning("arbiter engine=%s registered as class phase4 from the request (allow_unknown): it is in "
+                            "neither engines.json nor phase4-engines.json; add it to config/phase4-engines.json "
+                            "(%d/%d request-created specs)", key, len(self._request_specs), MAX_REQUEST_SPECS)
             self.measured[key] = int(total_bytes)
             res = self.resident.get(key)
             if res is not None:
                 res.measured_bytes = int(total_bytes)
             self._log("measure", key, Decision.GRANTED, task_id, int(total_bytes),
                       reason=f"measured footprint {total_bytes / GIB:.2f} GiB recorded "
-                             f"(class {self.engines[key].arbiter_class})")
+                             f"(class {self.engines[key].arbiter_class})"
+                             + ("; WARNING: spec created from request, key not in config/phase4-engines.json"
+                                if created else ""))
 
     def confirm_loaded(self, key: str, *, task_id: str | None = None) -> int:
         """After a real load: measure the counter delta and record it as the engine's footprint."""

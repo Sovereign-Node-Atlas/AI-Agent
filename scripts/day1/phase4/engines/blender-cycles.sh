@@ -49,7 +49,8 @@ _bl_fetch() {
   [[ -n "$expected" ]] || die "$P4_KEY: $sha_name carries no sha256 for $tar"
   # Download inside the container as atlas (resumable; the image has curl and ca-certificates).
   log "$P4_KEY: downloading $BL_INDEX$tar through the proxy into $P4_HOST_DL (as atlas, in the container)"
-  p4_docker_run --net -- curl -fsSL -C - --retry 5 --retry-delay 10 --max-time 3600 -o "$P4_DL/$tar" "$BL_INDEX$tar" \
+  # -q FIRST: no ~/.curlrc is read (HOME is a throw-away tmpfs anyway, lib-engine.sh header "HOME"); no .netrc exists.
+  p4_docker_run --net -- curl -q -fsSL -C - --retry 5 --retry-delay 10 --max-time 3600 -o "$P4_DL/$tar" "$BL_INDEX$tar" \
     || die "$P4_KEY: download of $tar failed; re-run to resume"
   # Verify on the host, read-only: a regular file whose real path is under the download dir (never through a planted
   # symlink).

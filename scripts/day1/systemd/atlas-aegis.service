@@ -12,9 +12,12 @@
 #     /run/atlas/aegis-request as atlas; PID 1 starts this unit, whose first ExecStartPre removes the request (rm -f
 #     unlinks, it never follows a symlink, so a planted link in the atlas-owned /run/atlas is harmless). NO sudo, NO
 #     second sudoers fragment: /etc/sudoers.d/atlas-engines stays the only NOPASSWD grant (CONVENTIONS.md §8).
-#   StartLimit: two starts per 6 h (the nightly plus one manual), so repeated requests cannot keep the queues frozen
-#   and the disk busy; after a third request the path unit fails with unit-start-limit-hit and is re-armed with
-#   `systemctl reset-failed atlas-aegis.service atlas-aegis-trigger.path && systemctl start atlas-aegis-trigger.path`.
+#   StartLimit: three starts per 6 h (the nightly plus two manual; fix round 3), so repeated requests cannot keep the
+#   queues frozen and the disk busy; after a fourth request the path unit fails with unit-start-limit-hit and is
+#   re-armed with `systemctl reset-failed atlas-aegis.service atlas-aegis-trigger.path && systemctl start
+#   atlas-aegis-trigger.path`. phase2/07-restic.sh runs reset-failed after the Day 1 first backup so that run does not
+#   count. When the nightly chain cannot start because the limit is hit anyway, atlas-aegis-forget.service's
+#   OnFailure=atlas-aegis-missed.service pushes the fact to the phone (never a silently skipped night, §7.4).
 #
 # Sequence (Section 9.5 "Freeze" row; CONVENTIONS.md §8 / S23 say "the same pattern" as Sentinel, i.e. a timer that
 # only enqueues — this unit DEVIATES, deliberately and recorded for the baseline: restic.pass and /srv/backups are
@@ -39,7 +42,11 @@
 #                 a task queue is cancelled; the flag comes down, then the package's `aegis-thaw` task is enqueued for
 #                 its ledger row and spool replay. If a worker does not answer, both workers are restarted and the unit
 #                 is reported FAILED (loud, never silent). `finish` pushes a ntfy alert whenever $SERVICE_RESULT is not
-#                 success or the thaw needed the fallback (token read by root from secrets/ntfy.env, never on argv).
+#                 success or the thaw needed the fallback (token read by root from secrets/ntfy.env, never on argv),
+#                 AND whenever $EXIT_STATUS is 3: SuccessExitStatus=3 below makes a partial snapshot ("some source files
+#                 could not be read") Result=success for systemd so the forget chain still runs, so the helper, not
+#                 systemd's result, is what reports it (fix round 3; the Sentinel "backup" telemetry reads
+#                 ExecMainStatus as well and shows exit 3 as a warning, config/sentinel-feeds.json).
 # Contract with the `atlas` package: `atlas-admin enqueue aegis-freeze --wait N` / `enqueue aegis-thaw --wait N`
 # (exit 0 when the task completed within N seconds), the freeze flag at /run/atlas/aegis-freeze (AEGIS_FREEZE_FLAG),
 # `atlas.celery_app` answering `celery control add_consumer`, and the manual trigger = create /run/atlas/aegis-request
@@ -52,7 +59,7 @@ After=atlas-orchestrator.service atlas-celery-cpu.service
 RequiresMountsFor=${ATLAS_SRV} /srv/backups /srv/cold
 Documentation=file:${ATLAS_ETC}/restic.env
 StartLimitIntervalSec=6h
-StartLimitBurst=2
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -65,8 +72,9 @@ Environment=ATLAS_ETC=${ATLAS_ETC} ATLAS_OPT=${ATLAS_OPT} ATLAS_SRV=${ATLAS_SRV}
 RuntimeDirectory=atlas-aegis
 RuntimeDirectoryMode=0755
 # restic exit 3 = "some source files could not be read" (a path in the include set missing until a later step, or a
-# file changed mid-read): the snapshot exists, restic printed the names; a warning, not a failed backup. The helper
-# never exits 3.
+# file changed mid-read): the snapshot exists, restic printed the names; a warning, not a failed backup, so the forget
+# chain still runs — and `finish` PUSHES it (EXIT_STATUS=3 is what the helper sees even though the result is success).
+# The helper never exits 3.
 SuccessExitStatus=3
 Nice=10
 IOSchedulingClass=best-effort

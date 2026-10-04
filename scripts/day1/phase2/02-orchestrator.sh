@@ -5,7 +5,8 @@
 #
 # What it does, in order (each part idempotent):
 #   1. apt: python3-venv/pip, build tools, rsync.
-#   1b. $ATLAS_OPT/venv-uv (uv from PyPI, shared with phase2/05-voice.sh) and a uv-managed CPython 3.12 under
+#   1b. $ATLAS_OPT/venv-uv (uv==ORCH_UV_PIN from PyPI, the SAME pin as phase2/05-voice.sh's UV_PIN, which shares the
+#      venv; the two are cross-checked at run time so one bump cannot leave them apart, fix round 3) and a uv-managed CPython 3.12 under
 #      $ATLAS_OPT/python. The host python3 on Ubuntu 26.04 is 3.14 (research services-tools.md) and the pinned tree does
 #      NOT import there (chromadb-client 1.5.9 -> overrides 7.7.0 uses typing.ByteString, removed in 3.14; fastapi and the
 #      package's own annotations fail under PEP 749), although `pip install` succeeds (fix round, blocker): the venv is
@@ -74,17 +75,23 @@
 # Contract this file defines for others: $ATLAS_ETC/core.env and the `core_compose` helper
 # (`core_compose up -d <service>`), used by step 03; step 04 uses the bare `docker compose -f` form and step 05 merges
 # docker/core/compose.voice.yml into the same project (compose.yml carries `name: atlas-core` and the `atlas` network).
-# $ATLAS_ETC/secrets (root:atlas 750): the directory must be traversable by the atlas account, whose workers read the
-# atlas-owned token files inside it (ntfy.env, openwebui-admin.token, redis.env); every file stays 600 owned by its one
-# reader. CONVENTIONS.md §2 says 700 for the directory and "owned by the one service that reads them" for the files,
-# which cannot both hold; ONE value, root:atlas 750, is what phase2-services.sh (every phase-2 start), 02, 03, 07, 08
-# and 09 now assert. ADJUDICATION ITEM (fix round 2, blocker): phase2/09b-vault.sh:119 (root:root 700, runs AFTER 09 so
-# a complete Phase 2 leaves the directory 700), phase2/06c-google-oauth.sh:115 (710) and phase1/02-luks.sh:82,
-# 03-mounts.sh:80, 07-remote.sh:66 (700) must change to the same `ensure_dir "$ATLAS_ETC/secrets" root:atlas 750` line,
-# and CONVENTIONS.md §2's directory row to root:atlas 750. Until they do, the failure is LOUD, not nightly-silent: the
+# $ATLAS_ETC/secrets (root:atlas 710, fix round 3, ONE value): the directory must be TRAVERSABLE by the atlas account,
+# whose workers open the atlas-owned token files inside it BY NAME (ntfy.env, openwebui-admin.token, redis.env,
+# hf-token.env; every file stays 600 owned by its one reader). 710 gives the x bit only: 750 would additionally let every
+# atlas-group process list the secret file names, which nothing needs (reviewer finding; the "minimum" variant. The
+# LoadCredential alternative keeps §2's 700 only for the three worker files and not for atlas-ddns, rclone's google/
+# dir or 06c, so it does not remove the traversal need). CONVENTIONS.md §2's row (root:root 700) cannot hold beside its
+# own atlas:atlas and atlas-ddns rows and must read root:atlas 710 (recorded for the Principal; phase2/README-contracts.md
+# §3 asks the same). 710 is what phase2-services.sh (every phase-2 start) and 09b (the last step before the gate) set;
+# 02, 03, 07, 08 and 09 now set the same, so the mode no longer flips during one Phase 2 run. Still at 750 in other
+# writers' files: phase1/02-luks.sh, 03-mounts.sh, 07-remote.sh and phase2/06c-google-oauth.sh (they should adopt 710;
+# harmless meanwhile: 750 is looser, and the driver tightens it at the next phase-2 start). The failure stays LOUD: the
 # atlas-celery-cpu/-gpu and atlas-sentinel units carry an ExecStartPre (run as atlas) that fails the unit when the
 # directory cannot be traversed or ntfy.env cannot be read, and this step's own root-side helpers (orch_admin, the
 # celery ping) source redis.env as root before dropping to atlas, so they never depend on the traversal.
+# smb.cred (fix round 3): step 9 needs $ATLAS_ETC/secrets/smb.cred and §7.6 sanctions no prompt there; this step is the
+# first of Phase 2 that this writer owns, so it DIES here when the file is absent (naming the creation command) instead
+# of letting the unattended phase run ~40 more minutes to a predictable stop at step 9.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -102,6 +109,8 @@ ORCH_PYTHON="3.12"                 # pyproject.toml requires-python >=3.12; 3.14
 ORCH_UV_VENV="$ATLAS_OPT/venv-uv"  # shared with phase2/05-voice.sh (_voice_uv): same path, same bootstrap
 ORCH_UV_BIN=""
 ORCH_CACHE_DIR="/var/cache/atlas"  # transient caches; never $ATLAS_STATE (restic's include set, CONVENTIONS.md §2)
+ORCH_UV_PIN="0.12.23"              # rule §7.9: MUST equal phase2/05-voice.sh's UV_PIN (same venv); _orch_uv cross-checks it
+ORCH_SECRETS_MODE=710              # header: the one value for $ATLAS_ETC/secrets (root:atlas, traverse-only for atlas)
 
 # orch_write_file MODE OWNER DST — write stdin to DST atomically (mktemp 0600 -> install). OWNER is "user:group" or "".
 # Shared by steps 02, 03, 07 and 08 (header: rust-coreutils install rejects a pipe source when DST exists).
@@ -168,13 +177,18 @@ _orch_apt() {
   apt_install python3 python3-venv python3-pip python3-dev build-essential rsync git jq curl
 }
 
-# --- pre-flight courtesy for step 9 (fix round: no prompt mid-phase; the credential file must be pre-staged) ----------
-_orch_preflight_notes() {
+# --- fail fast for step 9 (fix round 3: no prompt mid-phase, §7.6; the credential file must be pre-staged) -----------
+# Section 22 / README.md (other writers' files) must carry the checklist line: "before Phase 2, create
+# /etc/atlas/secrets/smb.cred with the Windows account that can read and write WINDOWS_SHARE" plus this command.
+_orch_preflight_smb_cred() {
   local cred="$ATLAS_ETC/secrets/smb.cred"
   if [[ ! -s "$cred" ]]; then
-    warn "step 9 (Windows PC share) will stop unless $cred exists: create it now in another terminal, before step 9 runs (the password is read from the terminal, never typed on a command line where shell history and /proc/<pid>/cmdline would keep it, §7.2):"
-    warn "  sudo bash -c 'umask 077; read -rp \"Windows user: \" u; read -rsp \"Windows password: \" p; echo; printf \"username=%s\\npassword=%s\\ndomain=WORKGROUP\\n\" \"\$u\" \"\$p\" > $cred; chown root:root $cred; chmod 600 $cred'"
+    die "$cred is missing: step 9 (the Windows PC share, Section 12.4) needs it and §7.6 sanctions no prompt there, so Phase 2 stops NOW rather than ~40 min later. Create it (the password is read from the terminal, never typed on a command line where shell history and /proc/<pid>/cmdline would keep it, §7.2), then re-run the phase: sudo bash -c 'umask 077; read -rp \"Windows user: \" u; read -rsp \"Windows password: \" p; echo; printf \"username=%s\\npassword=%s\\ndomain=WORKGROUP\\n\" \"\$u\" \"\$p\" > $cred; chown root:root $cred; chmod 600 $cred' && sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2"
   fi
+  if ! grep -q '^username=.\+' "$cred" || ! grep -q '^password=.\+' "$cred"; then
+    die "$cred lacks a username= or password= line (mount.cifs credentials format: username=, password=, domain=); fix it before step 9"
+  fi
+  log "step 9 pre-flight: $cred present"
 }
 
 # --- core.env: one interpolation file for docker/core/compose.yml -------------------------------------------------------
@@ -217,7 +231,7 @@ _core_env_write() {
 
 # --- Redis secret ----------------------------------------------------------------------------------------------------------
 _orch_redis_secret() {
-  ensure_dir "$ATLAS_ETC/secrets" root:atlas 750
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas "$ORCH_SECRETS_MODE"
   if [[ -s "$REDIS_ENV" ]] && grep -qE '^REDIS_PASSWORD=[A-Za-z0-9]{32,}$' "$REDIS_ENV" \
      && grep -qE '^CELERY_BROKER_URL=redis://:' "$REDIS_ENV"; then
     log "redis secret $REDIS_ENV present"
@@ -293,14 +307,25 @@ _orch_sync_source() {
 }
 
 # _orch_uv — uv in its own venv (the host pip is fine for THAT: uv is a static binary) plus a managed CPython. Same
-# bootstrap and paths as phase2/05-voice.sh _voice_uv so the two steps share one uv and one python store.
+# bootstrap, paths and PIN as phase2/05-voice.sh _voice_uv so the two steps share one uv and one python store (fix
+# round 3: 02 used to install uv unpinned and 05 re-installed its pin into the same venv on every fresh node).
 _orch_uv() {
+  # The two pins must agree (rule §7.9, one venv): read 05's UV_PIN line when the file is present and die on a mismatch.
+  local voice="$ATLAS_DAY1_DIR/phase2/05-voice.sh" other
+  if [[ -f "$voice" ]]; then
+    other="$(sed -nE 's/^UV_PIN="([^"]+)"$/\1/p' "$voice" | head -n1)"
+    [[ -n "$other" ]] || die "$voice carries no UV_PIN=\"x.y.z\" line; cannot prove it shares $ORCH_UV_VENV's uv pin $ORCH_UV_PIN"
+    [[ "$other" == "$ORCH_UV_PIN" ]] || die "uv pin mismatch: phase2/02-orchestrator.sh ORCH_UV_PIN=$ORCH_UV_PIN, phase2/05-voice.sh UV_PIN=$other (same venv $ORCH_UV_VENV); make them equal"
+  fi
   if [[ ! -x "$ORCH_UV_VENV/bin/uv" ]]; then
     mkdir -p "$ATLAS_OPT"
     python3 -m venv "$ORCH_UV_VENV" || die "python3 -m venv $ORCH_UV_VENV failed"
+  fi
+  if [[ "$("$ORCH_UV_VENV/bin/uv" --version 2>/dev/null | awk '{print $2}')" != "$ORCH_UV_PIN" ]]; then
     proxy_env
-    # UNVERIFIED: uv version — the research gives no pin for uv itself; installed unpinned from PyPI (README notes it).
-    retry 3 "$ORCH_UV_VENV/bin/python" -m pip install --quiet --disable-pip-version-check uv || die "pip install uv into $ORCH_UV_VENV failed (pypi.org / files.pythonhosted.org through the proxy?)"
+    log "venv-uv: installing uv==$ORCH_UV_PIN into $ORCH_UV_VENV (was: $("$ORCH_UV_VENV/bin/uv" --version 2>/dev/null || echo none))"
+    retry 3 "$ORCH_UV_VENV/bin/python" -m pip install --quiet --disable-pip-version-check "uv==$ORCH_UV_PIN" || die "pip install uv==$ORCH_UV_PIN into $ORCH_UV_VENV failed (pypi.org / files.pythonhosted.org through the proxy?)"
+    [[ "$("$ORCH_UV_VENV/bin/uv" --version 2>/dev/null | awk '{print $2}')" == "$ORCH_UV_PIN" ]] || die "uv in $ORCH_UV_VENV is not $ORCH_UV_PIN after the install: $("$ORCH_UV_VENV/bin/uv" --version 2>&1)"
   fi
   ORCH_UV_BIN="$ORCH_UV_VENV/bin/uv"
   export UV_PYTHON_INSTALL_DIR="$ATLAS_OPT/python" UV_CACHE_DIR="$ORCH_CACHE_DIR/uv" UV_HTTP_TIMEOUT=600
@@ -313,7 +338,7 @@ _orch_uv() {
     retry 3 "$ORCH_UV_BIN" python install "$ORCH_PYTHON" || die "uv python install $ORCH_PYTHON failed (github.com release assets through the proxy?)"
   fi
   chmod -R a+rX "$UV_PYTHON_INSTALL_DIR"   # the atlas account runs the venv built on this interpreter
-  log "uv: $("$ORCH_UV_BIN" --version 2>&1) with CPython $ORCH_PYTHON"
+  log "uv: $("$ORCH_UV_BIN" --version 2>&1) (pinned $ORCH_UV_PIN, proven) with CPython $ORCH_PYTHON"
 }
 
 # _orch_python_ok — 0 when $ORCH_VENV/bin/python exists and is the pinned minor version.
@@ -526,7 +551,7 @@ _orch_units() {
   # The secrets-dir contract made loud at unit start (header): the workers test the traversal as atlas before running.
   for u in atlas-celery-cpu atlas-celery-gpu; do
     grep -qF "ExecStartPre=/bin/sh -c 'test -x $ATLAS_ETC/secrets" "/etc/systemd/system/$u.service" \
-      || die "$u.service lost its secrets-readability ExecStartPre (the loud guard for the root:atlas 750 directory contract)"
+      || die "$u.service lost its secrets-readability ExecStartPre (the loud guard for the root:atlas $ORCH_SECRETS_MODE directory contract)"
   done
   systemctl daemon-reload
   for u in "${ORCH_UNITS[@]}"; do
@@ -573,7 +598,7 @@ PY
 step_02() {
   [[ -n "${ORCH_PORT:-}" && -n "${OPENWEBUI_PORT:-}" ]] || die "ORCH_PORT/OPENWEBUI_PORT are empty (load_env)"
   id -u atlas >/dev/null 2>&1 || die "service account 'atlas' does not exist (Phase 1 step 6)"
-  _orch_preflight_notes
+  _orch_preflight_smb_cred
   _orch_apt
   _core_env_write
   _orch_redis_secret

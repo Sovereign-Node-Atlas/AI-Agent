@@ -6,16 +6,16 @@
 # DROPs at `ufw enable`, before dockerd exists; (2) a docker.service drop-in (phase1/06-docker.sh) runs the same
 # script as ExecStartPre, so the full set is in place before any restart:unless-stopped container starts; (3) this
 # unit re-applies it after dockerd is up and whenever docker restarts (PartOf=). If it ever fails, the after.rules
-# baseline still drops everything leaving a bridge for the LAN interface.
+# baseline still drops everything leaving a bridge for any non-bridge interface.
 #
-# REVERSE INTERACTION (contract for Phases 2-4): `ufw reload`, `ufw enable` and `ufw --force reset` run
-# iptables-restore over after.rules, which flushes the live DOCKER-USER chain back to that baseline: the
-# `--ctstate DNAT -j ACCEPT` rules and the logging are gone until this script runs again, so VPN clients lose ntfy and
-# Open WebUI with no log line pointing at the cause (availability only; the fallback is stricter). Therefore every
-# `ufw reload|enable|reset` MUST be followed by `systemctl restart atlas-docker-egress.service`. Made automatic where
-# a unit is involved: /etc/systemd/system/ufw.service.d/atlas.conf (phase1/04-system.sh) runs the script as
-# ExecStartPost of ufw.service (boot, `systemctl restart ufw`), and step 4's _ufw_rules calls it after `ufw enable`.
-# A bare `ufw reload` from a shell is not covered by any unit: restart this service by hand afterwards.
+# INTERACTION WITH ufw (contract for Phases 2-4; fix round 3, corrected): ufw restores after.rules with
+# `iptables-restore -n` (VERIFIED in ufw 0.36.2, usr/lib/ufw/ufw-init-functions). On a cold boot this creates
+# DOCKER-USER with the baseline before dockerd exists; on a later `ufw reload|enable|reset` the existing chain is
+# neither flushed nor recreated, so the baseline is appended after the live set's final `-j RETURN` (harmless,
+# unreachable duplicates) and the full set stays in force. Restart this service afterwards anyway so the chain is
+# rebuilt cleanly. Made automatic where a unit is involved: /etc/systemd/system/ufw.service.d/atlas.conf
+# (phase1/04-system.sh) runs the script as ExecStartPost of ufw.service (boot, `systemctl restart ufw`), and step 4's
+# _ufw_rules calls it after `ufw enable`. A bare `ufw reload` from a shell: restart this service by hand afterwards.
 # Installed by phase1/06-docker.sh; the rules script is phase1/docker-egress-rules.sh -> /usr/local/sbin/atlas-docker-egress.
 [Unit]
 Description=ATLAS container egress rules (DOCKER-USER chain)

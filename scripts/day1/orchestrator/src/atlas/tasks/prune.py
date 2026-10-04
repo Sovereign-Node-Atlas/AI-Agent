@@ -19,6 +19,12 @@ Archive: `/srv/cold/prune/prune-<UTC stamp>.tar.zst` holding one JSON file per c
 written with Python's `compression.zstd` (3.14+) when present, else the `zstd` binary, else (fix round) stdlib
 `tarfile` in xz mode as `.tar.xz` (no Day 1 step installs zstd; Section 9.6 fixes the place, not the format). Every
 path reads the archive back and compares before anything is deleted; nothing is deleted before the archive verifies.
+The archive holds memory CONTENT in plaintext, so (fix round 4) /srv/cold/prune is created 0750 and every archive is
+CREATED 0640 through os.open(O_CREAT|O_EXCL) or a 0600 temporary file renamed into place: no process-umask window.
+
+Counts are what the store reports (fix round 4): MemoryStore.delete returns 0 and SPOOLS the delete when the AEGIS
+freeze flag has been up longer than freeze_wait_s, so a sweep that overlaps a long backup records those documents
+under `spooled` ("still active until the thaw replays them"), never under `purged`/`moved`.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ class PruneResult:
     moved: dict[str, int] = field(default_factory=dict)
     graph_moved: int = 0
     purged: dict[str, int] = field(default_factory=dict)  # expired chat turns deleted WITHOUT archive (D9)
+    spooled: dict[str, int] = field(default_factory=dict)  # deletions spooled behind the AEGIS freeze, replayed at thaw
     invariant_breaches: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -76,6 +83,7 @@ class PruneResult:
             "moved": self.moved,
             "graph_moved": self.graph_moved,
             "purged": self.purged,
+            "spooled": self.spooled,
             "total": self.total,
             "invariant_breaches": self.invariant_breaches,
             "errors": self.errors,
@@ -154,10 +162,31 @@ def _zstd_available() -> bool:
     return True
 
 
+ARCHIVE_DIR_MODE = 0o750
+ARCHIVE_FILE_MODE = 0o640
+
+
+def _private_archive_dir(path: Path) -> None:
+    """The archive directory, created with its final mode (the umask may only tighten it) and re-chmodded when it
+    already existed wider: the archives hold memory content (CONVENTIONS.md §2)."""
+    path.mkdir(mode=ARCHIVE_DIR_MODE, parents=True, exist_ok=True)
+    os.chmod(path, ARCHIVE_DIR_MODE)
+
+
+def _open_new_private(path: Path) -> int:
+    """O_CREAT|O_EXCL 0640: the archive is never world-readable for even an instant, and an existing file (a second
+    sweep in the same second) is a loud error, never overwritten."""
+    try:
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, ARCHIVE_FILE_MODE)
+    except FileExistsError as exc:
+        raise RuntimeError(f"archive {path} already exists; refusing to overwrite it") from exc
+
+
 def write_archive(path: Path, members: dict[str, Any]) -> Path:
     """members: {name.json: json-serialisable}. Returns the path written (`.tar.xz` when no zstd path exists).
-    Verified by reading the archive back byte for byte and comparing the tar listing."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    Verified by reading the archive back byte for byte and comparing the tar listing. Created 0640 in a 0750 directory
+    (module docstring)."""
+    _private_archive_dir(path.parent)
     if not _zstd_available():
         return _write_archive_xz(path.with_name(path.name.removesuffix(".zst") + ".xz"), members)
     buf = io.BytesIO()
@@ -172,22 +201,36 @@ def write_archive(path: Path, members: dict[str, Any]) -> Path:
     try:
         from compression import zstd  # type: ignore[import-not-found]  # Python 3.14+
 
-        path.write_bytes(zstd.compress(raw))
+        with os.fdopen(_open_new_private(path), "wb") as out:
+            out.write(zstd.compress(raw))
         with zstd.open(path, "rb") as fh:
             back = fh.read()
     except ImportError:
         with tempfile.TemporaryDirectory() as td:
             plain = Path(td) / "archive.tar"
             plain.write_bytes(raw)
-            proc = subprocess.run(
-                ["zstd", "-q", "-f", "-o", str(path), str(plain)],
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False,
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(f"zstd failed: {proc.stderr.strip()[:300]}") from None
+            # zstd writes its output with the process umask: write to a 0600 temporary file IN the archive directory
+            # and rename it into place (same filesystem; the final name never exists in a wider mode).
+            fd, tmp_name = tempfile.mkstemp(prefix=".prune-", suffix=".tmp", dir=str(path.parent))
+            os.close(fd)
+            tmp = Path(tmp_name)
+            try:
+                proc = subprocess.run(
+                    ["zstd", "-q", "-f", "-o", str(tmp), str(plain)],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"zstd failed: {proc.stderr.strip()[:300]}") from None
+                os.chmod(tmp, ARCHIVE_FILE_MODE)
+                if path.exists():
+                    raise RuntimeError(f"archive {path} already exists; refusing to overwrite it")
+                os.replace(tmp, path)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
             back = subprocess.run(
                 ["zstd", "-d", "-q", "-c", str(path)], capture_output=True, timeout=600, check=False
             ).stdout
@@ -197,13 +240,15 @@ def write_archive(path: Path, members: dict[str, Any]) -> Path:
         names = set(tar.getnames())
     if names != set(members):
         raise RuntimeError(f"archive {path} lists {sorted(names)}, expected {sorted(members)}")
-    os.chmod(path, 0o640)
+    os.chmod(path, ARCHIVE_FILE_MODE)
     return path
 
 
 def _write_archive_xz(path: Path, members: dict[str, Any]) -> Path:
-    """The stdlib fallback: tar + xz through `tarfile`, then a full read-back of every member."""
-    with tarfile.open(path, mode="w:xz") as tar:
+    """The stdlib fallback: tar + xz through `tarfile` on a descriptor opened 0640 (O_EXCL), then a full read-back of
+    every member."""
+    _private_archive_dir(path.parent)
+    with os.fdopen(_open_new_private(path), "wb") as out, tarfile.open(fileobj=out, mode="w:xz") as tar:
         for name, obj in members.items():
             data = json.dumps(obj, ensure_ascii=False, indent=1, default=str).encode("utf-8")
             info = tarfile.TarInfo(name=name)
@@ -219,8 +264,28 @@ def _write_archive_xz(path: Path, members: dict[str, Any]) -> Path:
                 raise RuntimeError(f"archive {path}: member {name} does not read back identically; nothing was deleted")
     if names != set(members):
         raise RuntimeError(f"archive {path} lists {sorted(names)}, expected {sorted(members)}")
-    os.chmod(path, 0o640)
+    os.chmod(path, ARCHIVE_FILE_MODE)
     return path
+
+
+def _delete_counted(
+    store: MemoryStore, col: str, hits: Sequence[Hit], result: PruneResult, counter: dict[str, int], what: str
+) -> int:
+    """store.delete's RETURN VALUE is the truth (fix round 4): 0 with hits present means the delete was spooled behind
+    the AEGIS freeze and the documents are still active until the thaw replays it; said in the log and in
+    `result.spooled`, never counted as done."""
+    n = store.delete(col, [h.id for h in hits], hemisphere=_hemisphere_for(col))
+    if n == 0 and hits:
+        result.spooled[col] = result.spooled.get(col, 0) + len(hits)
+        log.warning(
+            "prune: %d %s deletion(s) in %s spooled behind the AEGIS freeze, replayed at thaw (active until then)",
+            len(hits),
+            what,
+            col,
+        )
+        return 0
+    counter[col] = counter.get(col, 0) + n
+    return n
 
 
 def run_sweep(
@@ -254,9 +319,9 @@ def run_sweep(
         if not hits:
             continue
         try:
-            store.delete(col, [h.id for h in hits], hemisphere=_hemisphere_for(col))
-            result.purged[col] = len(hits)
-            log.info("prune: %d expired chat turn(s) purged from %s without archive (D9, 10.4)", len(hits), col)
+            n = _delete_counted(store, col, hits, result, result.purged, "chat-turn")
+            if n:
+                log.info("prune: %d expired chat turn(s) purged from %s without archive (D9, 10.4)", n, col)
         except MemoryStoreError as exc:
             result.errors.append(f"purge {col}: {exc}")
             log.error("prune: %s", result.errors[-1])
@@ -327,8 +392,7 @@ def run_sweep(
         if not hits:
             continue
         try:
-            store.delete(col, [h.id for h in hits], hemisphere=_hemisphere_for(col))
-            result.moved[col] = len(hits)
+            _delete_counted(store, col, hits, result, result.moved, "archived")
         except MemoryStoreError as exc:
             result.errors.append(f"delete {col}: {exc} (archived at {path}, still active)")
             log.error("prune: %s", result.errors[-1])
@@ -336,15 +400,19 @@ def run_sweep(
         try:
             if graph.delete_document(r.doc_id):  # type: ignore[union-attr]  # False = spooled for the AEGIS thaw
                 result.graph_moved += 1
+            else:
+                result.spooled["graph"] = result.spooled.get("graph", 0) + 1
         except Exception as exc:
             result.errors.append(f"graph delete {r.doc_id}: {exc}")
             log.error("prune: %s", result.errors[-1])
     log.info(
-        "prune: moved %d vector docs and %d graph docs older than %.0f h to %s",
+        "prune: moved %d vector docs and %d graph docs older than %.0f h to %s (%d deletion(s) spooled behind the "
+        "AEGIS freeze)",
         sum(result.moved.values()),
         result.graph_moved,
         window_hours,
         path,
+        sum(result.spooled.values()),
     )
     return result
 

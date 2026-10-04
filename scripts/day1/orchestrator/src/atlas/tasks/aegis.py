@@ -15,14 +15,20 @@ Division of labour (atlas-aegis.service header, CONVENTIONS.md §8 "AEGIS nightl
     contract ("Contract with the `atlas` package"), and this task's thaw() re-adds both consumers again, harmlessly.
   * ExecStart runs restic itself (as root); ExecStopPost enqueues `aegis-thaw` -> `atlas.tasks.aegis_thaw`: flag
     down, consumers back, and the memory spool (writes deferred during the freeze) replayed.
-  * The manual `[EXECUTE AEGIS BACKUP]` trigger (9.5) is `atlas.tasks.aegis_manual_backup`, which runs
-    `sudo -n systemctl start --no-block atlas-aegis.service` under /etc/sudoers.d/atlas-aegis (plain sudo, conflict
-    7; the fragment permits `start` and `start --no-block`): the same unit, the same freeze/thaw, the same include
-    set. `--no-block` because `systemctl start` of a Type=oneshot blocks until ExecStart finishes (restic runs minutes
-    to hours; TimeoutStartSec=6h): the task returns once `systemctl is-active` reports activating/active, and reports
-    failure only when the unit is neither (fix round: a blocking start that timed out was a false failure).
-  * `restic_backup_command()` types the backup line for a caller that IS root (the include file path is checked, the
-    D9 retention is `forget --keep-daily 30 --keep-monthly 12 --prune`). The task text names
+  * The manual `[EXECUTE AEGIS BACKUP]` trigger (9.5) is `atlas.tasks.aegis_manual_backup`, which creates the EMPTY
+    file /run/atlas/aegis-request (AEGIS_REQUEST_FILE) as atlas and nothing else: systemd/atlas-aegis-trigger.path
+    (PathExists=) starts atlas-aegis.service, whose first ExecStartPre removes the request, and the task confirms with
+    `systemctl is-active atlas-aegis.service` (activating|active within START_CONFIRM_S). NO sudo (fix round 4): the
+    earlier `sudo -n systemctl start --no-block` route and its sudoers fragment are gone; /etc/sudoers.d/atlas-engines
+    is the only NOPASSWD grant of the atlas account (CONVENTIONS.md §8), phase2/07-restic.sh removes a stale fragment,
+    proves sudo refuses the unit, and asserts statically that this module names the request file and builds no sudo
+    command. The same unit, the same freeze/thaw, the same include set; it never prunes (atlas-aegis-forget.service is
+    the nightly timer's alone, 16.3 item 5). StartLimitBurst=3 per 6 h on the unit: when it is hit the path unit fails
+    with unit-start-limit-hit and the error text names the re-arm command.
+  * `restic_backup_command()` types the backup line for a caller that IS root (the include file path is checked);
+    `restic_forget_command()` types the D9 retention line EXACTLY as systemd/atlas-aegis-forget.service runs it
+    (`forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune`; that unit is the authoritative copy and the
+    only place a backup is ever deleted, 16.3 item 5). The task text names
     /etc/atlas/restic.include; phase2/07-restic.sh writes /etc/atlas/restic-include.txt: both are looked for, in that
     order, and a missing include file stops the run (never an empty backup). The exclude file is required too, and
     the vault's plaintext mount (VAULT_MOUNT_DIR, vault.env) is excluded explicitly on top of it: an open vault's
@@ -41,7 +47,7 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -50,10 +56,14 @@ from celery import shared_task
 log = logging.getLogger("atlas.aegis")
 
 DEFAULT_FREEZE_FLAG = "/run/atlas/aegis-freeze"
+# The manual trigger (AEGIS_REQUEST_FILE): systemd/atlas-aegis-trigger.path watches exactly this path; /run/atlas is
+# atlas-orchestrator.service's RuntimeDirectory (atlas:atlas), so the Celery worker (user atlas) may create the file.
+DEFAULT_REQUEST_FILE = "/run/atlas/aegis-request"
 INCLUDE_CANDIDATES: tuple[str, ...] = ("/etc/atlas/restic.include", "/etc/atlas/restic-include.txt")
 EXCLUDE_FILE = "/etc/atlas/restic-exclude.txt"
 DEFAULT_VAULT_MOUNT_DIR = "/srv/atlas/vault/open"  # atlas.vault.DEFAULT_MOUNT_DIR; vault.env VAULT_MOUNT_DIR
 KEEP_DAILY, KEEP_MONTHLY = 30, 12  # D9
+KEEP_WITHIN = "1d"  # atlas-aegis-forget.service's floor: a second snapshot on one day never deletes the earlier one
 # Both queues pause (9.5). The thaw travels on `cpu` (admin.py ENQUEUE_TASKS + celery_app task_default_queue) and is
 # deliverable because atlas-aegis.service re-adds the consumers over the broadcast channel before enqueueing it.
 FREEZE_QUEUES: tuple[str, ...] = ("cpu", "gpu")
@@ -62,15 +72,21 @@ THAW_QUEUE = "cpu"  # where atlas.tasks.aegis_thaw is delivered (the unit's broa
 QUEUES = FREEZE_QUEUES  # kept name: what freeze() pauses
 AEGIS_UNIT = "atlas-aegis.service"
 START_CONFIRM_S = 30.0  # how long trigger_unit waits for systemd to report the unit activating/active
+REARM_COMMAND = (
+    "systemctl reset-failed atlas-aegis.service atlas-aegis-trigger.path && systemctl start atlas-aegis-trigger.path"
+)
 
 __all__ = [
+    "DEFAULT_REQUEST_FILE",
     "FREEZE_QUEUES",
+    "REARM_COMMAND",
     "THAW_QUEUE",
     "THAW_QUEUES",
     "aegis_freeze",
     "aegis_manual_backup",
     "aegis_thaw",
     "freeze",
+    "request_file",
     "restic_backup_command",
     "restic_forget_command",
     "thaw",
@@ -81,6 +97,12 @@ __all__ = [
 def _flag_path(env: dict[str, str] | None = None) -> Path:
     env = dict(os.environ if env is None else env)
     return Path(env.get("AEGIS_FREEZE_FLAG") or DEFAULT_FREEZE_FLAG)
+
+
+def request_file(env: Mapping[str, str] | None = None) -> Path:
+    """The path atlas-aegis-trigger.path watches (AEGIS_REQUEST_FILE in orchestrator.env, else the unit's literal)."""
+    env = dict(os.environ if env is None else env)
+    return Path(env.get("AEGIS_REQUEST_FILE") or DEFAULT_REQUEST_FILE)
 
 
 def include_file(env: dict[str, str] | None = None) -> Path:
@@ -129,7 +151,20 @@ def restic_backup_command(env: dict[str, str] | None = None) -> list[str]:
 
 
 def restic_forget_command() -> list[str]:
-    return ["restic", "forget", "--keep-daily", str(KEEP_DAILY), "--keep-monthly", str(KEEP_MONTHLY), "--prune"]
+    """The D9 retention line, typed exactly as systemd/atlas-aegis-forget.service's ExecStart runs it (the authoritative
+    copy; only the nightly timer runs it, 16.3 item 5). Nothing in this package executes it: it is here so the two typed
+    versions of the retention line agree (CONVENTIONS.md §8) and a test can hold them together."""
+    return [
+        "restic",
+        "forget",
+        "--keep-within",
+        KEEP_WITHIN,
+        "--keep-daily",
+        str(KEEP_DAILY),
+        "--keep-monthly",
+        str(KEEP_MONTHLY),
+        "--prune",
+    ]
 
 
 def freeze(
@@ -223,45 +258,61 @@ def unit_state(unit: str, *, runner: Any = subprocess.run) -> str:
     return (proc.stdout or "").strip() or "unknown"
 
 
+def _create_request(path: Path) -> None:
+    """Create the empty request file as this process's user (atlas). O_NOFOLLOW: /run/atlas is atlas-writable, and a
+    planted symlink there must never be followed (the unit's own `rm -f` never follows one either). The file is 0640:
+    PID 1 only needs it to exist."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot create {path.parent} for the AEGIS request ({exc}); /run/atlas is atlas-orchestrator.service's "
+            "RuntimeDirectory (atlas:atlas): is the orchestrator running?"
+        ) from exc
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o640)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot create the AEGIS request file {path} ({exc}); it must be creatable by the atlas account "
+            "(phase2/07-restic.sh proves this once on Day 1)"
+        ) from exc
+    os.close(fd)
+
+
 def trigger_unit(
     unit: str = AEGIS_UNIT,
     *,
     runner: Any = subprocess.run,
     sleep: Any = time.sleep,
     confirm_s: float = START_CONFIRM_S,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """The manual trigger: `sudo -n systemctl start --no-block atlas-aegis.service` (/etc/sudoers.d/atlas-aegis),
-    then `systemctl is-active` until the unit reports activating/active. A blocking start that times out is treated
-    as "started, still running" and confirmed the same way; failure is reported only when the unit is not
-    active/activating afterwards (rule §7.4: never a false failure)."""
-    cmd = ["sudo", "-n", "systemctl", "start", "--no-block", unit]
-    timed_out = False
-    try:
-        proc = runner(cmd, capture_output=True, text=True, timeout=120, check=False, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        timed_out = True  # a Type=oneshot start that blocked: the unit is running; confirm below
-        proc = None
-    except OSError as exc:
-        raise RuntimeError(f"{' '.join(cmd)} could not run: {exc}") from exc
-    if proc is not None and proc.returncode != 0:
-        state = unit_state(unit, runner=runner)
-        if state not in ("active", "activating"):
-            raise RuntimeError(
-                f"{' '.join(cmd)} exited {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]} "
-                f"(unit is {state}; is /etc/sudoers.d/atlas-aegis installed by phase2/07-restic.sh, with the "
-                "`start --no-block` line?)"
-            )
+    """The manual trigger (Section 9.5) WITHOUT sudo (fix round 4; CONVENTIONS.md §8): create the empty request file
+    that systemd/atlas-aegis-trigger.path watches (PathExists=/run/atlas/aegis-request), then `systemctl is-active`
+    until the unit reports activating/active. PID 1 starts the unit within a second or two and its first ExecStartPre
+    removes the request; a very small include set can even finish inside the confirmation window, which shows as the
+    request gone and the unit inactive again: that is a completed run, not a failure (rule §7.4: never a false failure,
+    never a false success). Failure is reported only when the unit is neither activating nor active while the request
+    still sits there (StartLimitBurst=3 per 6 h reached, the path unit not running, or the unit failed at once)."""
+    req = request_file(env)
+    _create_request(req)
     deadline = time.monotonic() + confirm_s
     state = unit_state(unit, runner=runner)
     while state not in ("active", "activating") and time.monotonic() < deadline:
+        if not req.exists() and state == "inactive":
+            # The unit ran and finished already (the ExecStartPre removed the request, restic was quick).
+            return {"unit": unit, "started": True, "state": "finished", "request_file": str(req), "sudo": False}
         sleep(1.0)
         state = unit_state(unit, runner=runner)
     if state not in ("active", "activating"):
+        if not req.exists() and state == "inactive":
+            return {"unit": unit, "started": True, "state": "finished", "request_file": str(req), "sudo": False}
         raise RuntimeError(
-            f"{unit} is {state} after `{' '.join(cmd)}` (StartLimitBurst=2 per 6 h reached, or the unit failed at "
-            "once: journalctl -u atlas-aegis.service)"
+            f"{unit} is {state} {confirm_s:.0f}s after {req} was created: atlas-aegis-trigger.path did not start it "
+            f"(StartLimitBurst=3 per 6 h reached, the path unit inactive, or the unit failed at once: journalctl -u "
+            f"atlas-aegis-trigger.path -u {unit}). Re-arm with: {REARM_COMMAND}"
         )
-    return {"unit": unit, "started": True, "state": state, "command": " ".join(cmd), "start_timed_out": timed_out}
+    return {"unit": unit, "started": True, "state": state, "request_file": str(req), "sudo": False}
 
 
 # --- Celery tasks -----------------------------------------------------------------------------------------------------
@@ -281,6 +332,23 @@ def aegis_freeze(self: Any) -> dict[str, Any]:
     return rec.done(out)
 
 
+def thaw_memory_store(builder: Any | None = None) -> Any | None:
+    """The store the thaw replays the spool into: WITH the graph layer (fix round 4). The spool holds graph-insert /
+    graph-delete lines beside the vector ones whenever LightRAGStore spooled during the freeze, and
+    MemoryStore._commit raises for a graph line when the store has no graph, so a thaw built `with_graph=False` moved
+    every graph write into `<file>.failed.jsonl` for ever. build_memory_store() builds the LightRAGStore lazily (only
+    when LIGHTRAG_WORKING_DIR is set; lightrag is imported on the first graph line actually replayed), so this costs
+    nothing on a node without the graph. None when no store can be built yet (before Phase 2 step 4): nothing was
+    spooled, nothing to replay; said in the log."""
+    try:
+        if builder is None:
+            from atlas.memory import build_memory_store as builder
+        return builder()
+    except Exception as exc:
+        log.warning("aegis thaw: memory store not available (%s); no spool replay", exc)
+        return None
+
+
 @shared_task(name="atlas.tasks.aegis_thaw", bind=True)
 def aegis_thaw(self: Any) -> dict[str, Any]:
     from atlas.celery_app import app
@@ -288,14 +356,7 @@ def aegis_thaw(self: Any) -> dict[str, Any]:
 
     rec = TaskRecord(self.request.id, "aegis-thaw")
     try:
-        memory = None
-        try:
-            from atlas.memory import build_memory_store
-
-            memory = build_memory_store(with_graph=False)
-        except Exception as exc:  # no memory store yet (before Phase 2 step 4): nothing spooled, nothing to replay
-            log.warning("aegis thaw: memory store not available (%s); no spool replay", exc)
-        out = thaw(control=app.control, memory=memory)
+        out = thaw(control=app.control, memory=thaw_memory_store())
     except Exception as exc:
         rec.failed(f"{type(exc).__name__}: {exc}")
         raise
@@ -314,7 +375,8 @@ def aegis_manual_backup(self: Any, requested_by: str = "principal") -> dict[str,
         notify(f"AEGIS manual backup could not start: {exc}", title="ATLAS AEGIS", priority="high", tags=["warning"])
         raise
     notify(
-        f"AEGIS backup started (manual trigger; unit {out['state']}); the unit reports on completion in the journal.",
+        f"AEGIS backup started (manual trigger through {out['request_file']}; unit {out['state']}); the unit reports "
+        "on completion in the journal.",
         title="ATLAS AEGIS",
     )
     return rec.done(out)

@@ -13,11 +13,15 @@
 #       (verify/v11-rocm-selftest.sh -> phase4/selftest.py: rocminfo gfx1151, torch sees the device, matmul, 4 GB
 #       alloc, two-step diffusion). V11 also records which container flags the GPU needs
 #       ($ATLAS_STATE/phase4/v11-runflags.txt, root-held: the default seccomp profile first, seccomp=unconfined/ipc=host
-#       only when the default demonstrably fails). V11 fail STOPS the phase (Section 17 step 1: the first and only
-#       place ROCm runs): the same self-test runs once in the community image kyuz0/amd-strix-halo-comfyui as a
-#       diagnostic (research §1.1; digest-pinned in the json; hardened flags first, the relaxed pair only on a
-#       non-timeout failure, like V11), the diagnostic is folded into the V11 fail record (never a second record with
-#       another status), conflict 19's kernel note is logged, the gate table is printed, then the driver stops.
+#       only when the default demonstrably fails, each flag probed separately). V11 fail STOPS the phase (Section 17
+#       step 1: the first and only place ROCm runs): conflict 19's kernel note is logged (ROCm/pytorch #6530, #6182:
+#       the host kernel may be the cause; no Day 1 action), the gate table is printed, then the driver stops. The
+#       community-image diagnostic (research §1.1: the same self-test once in kyuz0/amd-strix-halo-comfyui,
+#       digest-pinned in the json, hardened flags first, the relaxed flags one at a time on a non-timeout failure) is
+#       OPT-IN (fix round 3): P4_V11_DIAG=1 in /etc/atlas/atlas.env or the environment. The default does not pull a
+#       5.4 GB third-party image and run a second ROCm userspace on the GPU, because Section 17 step 1 makes the base
+#       container the only place ROCm runs and S15 says the kernel-7.0 hang risk is flagged, not acted on. When run,
+#       the diagnostic is folded into the V11 fail record (never a second record with another status).
 #   02  green engines in Section 17's order, each by phase4/engines/<key>.sh under its json timeout; per-engine JSON at
 #       $ATLAS_STATE/phase4/<key>.json (built, loaded, sample_output_path, footprint_mb from the GTT delta, seconds);
 #       a failure is recorded fail and the phase CONTINUES (per-engine pass/fail, never block). Before the first engine
@@ -37,11 +41,11 @@
 #   * /etc/atlas/docker.env (phase1/06-docker.sh): ATLAS_UID ATLAS_GID RENDER_GID VIDEO_GID CONTAINER_HTTP_PROXY
 #     CONTAINER_HTTPS_PROXY CONTAINER_NO_PROXY (containers reach squid at the docker0 gateway; DOCKER-USER blocks the rest).
 #   * /etc/atlas/secrets/hf-token.env (phase2-services.sh): HF_TOKEN=... for the gated repos (FLUX.1-dev, Stable Audio
-#     Open; conflict 16). Root reads it; its owner and mode are the Phase 2 writer's business (currently atlas:atlas 600
-#     per CONVENTIONS §2; an earlier revision wrote root:root 600) because lib-engine.sh never mounts the file itself:
-#     for a gated pull it stages a copy owned by the container uid (mode 400) in a private root-only tmpfs directory,
-#     bind-mounts THAT read-only at /run/secrets/hf-token.env, and removes it after the run. Absent -> those two
-#     engines fail before any container starts, naming the token prompt and the licence URL; the phase continues.
+#     Open; conflict 16), atlas:atlas 600 per CONVENTIONS §2 (phase2-services.sh hf_token_prompt chowns it so). For a
+#     gated pull lib-engine.sh bind-mounts the file itself read-only at /run/secrets/hf-token.env (the bind mount keeps
+#     the inode's owner and mode, so the container's atlas uid reads it; no copy anywhere, fix round 3) and dies when
+#     the owner is not the atlas uid or the mode is not 600. Absent -> those two engines fail before any container
+#     starts, naming the token prompt and the licence URL; the phase continues.
 #   * /etc/atlas/orchestrator.env (phase2/02-orchestrator.sh): ORCH_URL, and ORCH_ADMIN_TOKEN_FILE when the admin
 #     routes carry a token (atlas/api.py: without it the admin routes accept loopback clients, which this driver is).
 #     The token header is handed to curl on STDIN (-H @-), never on argv (/proc/<pid>/cmdline is world-readable;
@@ -55,13 +59,16 @@
 # $ATLAS_STATE/phase4/summary.json and $ATLAS_SRV/engines/phase4-results.json (the Section 17 step 6 table as JSON),
 # $ATLAS_STATE/phase4/registry.json ([{key, footprint_mb, total_bytes, class, registered, http}]),
 # $ATLAS_STATE/phase4/diag-image.txt (the digest of the diagnostic image once pulled, when the json pins none),
-# $ATLAS_STATE/phase4/hf-manifests/ and git-pins.json (lib-engine.sh: pull listings, revision pins, clone pins).
+# $ATLAS_STATE/phase4/hf-manifests/ and git-pins.json (lib-engine.sh: pull listings, revision pins, clone pins), each
+# engine's $ATLAS_STATE/phase4/manifests/<key>.json published as atlas to $ATLAS_SRV/engines/<key>/MANIFEST.json (the
+# file phase2/atlas-aegis.sh collects into the restic set; Appendix C "manifest only").
 # Per-engine logs: $ATLAS_STATE/logs/phase4-<key>.log. To redo one engine: delete $ATLAS_STATE/phase4/<key>.json and
 # re-run with --force 02 (or 03/04); completed builds, venvs and pulls are skipped by the engine scripts themselves.
 # Root never opens a path under $ATLAS_SRV for writing (fix round 2): the tree is atlas-owned and bind-mounted RW into
-# every Phase 4 container, so a symlink planted there could redirect a root write. Everything root records lives
-# under $ATLAS_STATE/phase4 (root:root); copies meant for the data volume are written by a container running as atlas
-# (_p4_publish), which cannot gain anything from its own symlinks.
+# Phase 4 containers, so a symlink planted there could redirect a root write. Everything root records lives under
+# $ATLAS_STATE/phase4 (root:root); copies meant for the data volume are written by a container running as atlas
+# (_p4_publish), which cannot gain anything from its own symlinks. Directories under $ATLAS_SRV are created ONCE
+# (_p4_dir_once: no chmod/chown of an existing path, never through a symlink; fix round 3).
 #
 # Privilege note for the Principal (fix round): `atlas` is in group `docker` (Phase 1 step 6) = root-equivalent on the
 # host through the rootful docker socket. The sudoers fragment (CONVENTIONS §8) and the approval gate bound the
@@ -139,6 +146,16 @@ _p4_result() {
 }
 # _p4_denv KEY — one value of /etc/atlas/docker.env.
 _p4_denv() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$P4_DOCKER_ENV"; }
+# _p4_dir_once PATH OWNER MODE — create a directory on the atlas-writable tree ONCE (header). Never chmod/chown an
+# existing path (both follow a symlink container code could plant) and never create through a symlink. The same
+# helper lives in phase4/lib-engine.sh (that file is sourced by engine scripts, not by this driver).
+_p4_dir_once() {
+  local d="$1" owner="$2" mode="$3"
+  [[ ! -L "$d" ]] || die "$d is a symlink on the atlas-writable tree (planted by container code?); refusing to use it"
+  if [[ ! -d "$d" ]]; then
+    install -d -m "$mode" -o "${owner%%:*}" -g "${owner##*:}" -- "$d" || die "could not create $d"
+  fi
+}
 
 # Every non-deferred engine must have its script and test (rule §7.4: fail before spending hours, not after).
 P4_ALL_KEYS=()
@@ -187,7 +204,10 @@ _p4_orch_curl() {
   local data=()
   [[ -n "$body" ]] && data=(-H 'Content-Type: application/json' -d "$body")
   local out code
-  out="$( { [[ -n "$tok" ]] && printf 'X-Atlas-Token: %s\n' "$tok"; } \
+  # The stdin producer must never fail: with no token `[[ -n ]] && printf` exits 1 and, under common.sh's pipefail,
+  # a successful curl would still be reported as 000 (fix round 3 blocker: every call answered 000 on a node without
+  # ORCH_ADMIN_TOKEN_FILE, which is the default; step 05 then counted 0 registrations and stopped on every run).
+  out="$( { [[ -z "$tok" ]] || printf 'X-Atlas-Token: %s\n' "$tok"; } \
           | curl -sS --noproxy '*' --max-time 20 -w $'\n%{http_code}' "${hdr[@]}" "${data[@]}" -X "$method" "$url$path" 2>/dev/null)" \
     || out=$'\n000'
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
@@ -246,15 +266,18 @@ _p4_v11_last_msg() {
   _atlas_verify_rows V11 | tail -n1 | cut -f4
 }
 
-# _p4_diag_run — the V11 self-test once in the community image (research §1.1), as a diagnostic only. Hardened run:
-# atlas uid, no capabilities, no new privileges, pids/memory caps, read-only root with a tmpfs /tmp; devices and gids
-# as any GPU run; --entrypoint so the self-test is what runs whatever ENTRYPOINT the image declares (fix round 2).
-# Flag sets mirror V11: the hardened profile first, and only a NON-timeout failure is repeated once with
-# --security-opt seccomp=unconfined --ipc=host (the community image's documented run line, research §6.2; a hang is a
-# kernel symptom, never a seccomp one). Pinned by digest: config diagnostic_fallback_digest (VERIFIED from the Docker
-# Hub registry API on 2026-10-04 for :latest), else the digest recorded in $P4_STATE/diag-image.txt after the first
-# pull (rule §7.9). Prints one line on STDOUT (the caller folds it into the V11 record); logs go to stderr so they
-# never land in that record (fix round 2). Never fails the caller.
+# _p4_diag_run — the V11 self-test once in the community image (research §1.1), as a diagnostic only, and only when
+# the Principal opted in (P4_V11_DIAG=1; header). Hardened run: atlas uid, no capabilities, no new privileges,
+# pids/memory caps, read-only root with a tmpfs /tmp; devices and gids as any GPU run; --entrypoint so the self-test is
+# what runs whatever ENTRYPOINT the image declares (fix round 2). Flag ladder mirrors V11 (fix round 3): the hardened
+# profile first; a NON-timeout failure is repeated with --security-opt seccomp=unconfined alone, then with --ipc=host
+# added, then with --ipc=host alone (the community image's documented run line carries both, research §6.2; a hang is
+# a kernel symptom, never a seccomp one, so a timeout ends the ladder). The image does not use AMD's device wheel, so
+# selftest.py runs WITHOUT V11_EXPECT_DEVICE_WHEEL and skips that one check (the same tensor/matmul/alloc/diffusion
+# steps run). Pinned by digest: config diagnostic_fallback_digest (VERIFIED from the Docker Hub registry API on
+# 2026-10-04 for :latest), else the digest recorded in $P4_STATE/diag-image.txt after the first pull (rule §7.9).
+# Prints one line on STDOUT (the caller folds it into the V11 record); logs go to stderr so they never land in that
+# record (fix round 2). Never fails the caller.
 _p4_diag_run() {
   local ref="$P4_DIAG_IMAGE" digest="$P4_DIAG_DIGEST" pinned="config"
   if [[ -z "$digest" && -s "$P4_DIAG_DIGEST_FILE" ]]; then digest="$(head -n1 "$P4_DIAG_DIGEST_FILE")"; pinned="recorded"; fi
@@ -289,12 +312,17 @@ _p4_diag_run() {
     docker rm -f "v11-diag-$$" >/dev/null 2>&1 || true
   }
   _diag_once
-  if (( rc != 0 && rc != 124 && rc != 137 )); then
-    local first="$out"
-    _diag_once --security-opt seccomp=unconfined --ipc=host
-    used="hardened failed (exit; $(tr '\n' ' ' <<<"$first" | cut -c1-160)), then relaxed seccomp=unconfined ipc=host"
-  elif (( rc == 124 || rc == 137 )); then
+  if (( rc == 124 || rc == 137 )); then
     used="hardened run hung and was killed (not retried: a hang is a kernel symptom, #6530 #6182)"
+  elif (( rc != 0 )); then
+    local first="$out" rung
+    used="hardened failed (exit; $(tr '\n' ' ' <<<"$first" | cut -c1-160))"
+    for rung in "--security-opt seccomp=unconfined" "--security-opt seccomp=unconfined --ipc=host" "--ipc=host"; do
+      # shellcheck disable=SC2086  # the rung is a short list of docker flags, split on purpose
+      _diag_once $rung
+      used="$used; then [$rung] exit $rc"
+      (( rc == 0 || rc == 124 || rc == 137 )) && break
+    done
   fi
   echo "$ref ($pinned; $used) exit $rc: $(tr '\n' ' ' <<<"$out" | cut -c1-600)"
 }
@@ -315,12 +343,13 @@ step_01() {
   [[ -n "$hp" ]] || hp="$sp"
   [[ -n "$np" ]] || np="localhost,127.0.0.1"
 
-  ensure_dir "$P4_ENGINES_DIR/manifests" "$uid:$gid" 755
-  # The container HOME and the MIOpen cache hold whatever tools drop there: not world-readable (CONVENTIONS §2).
-  ensure_dir "$P4_ENGINES_DIR/home" "$uid:$gid" 700
-  ensure_dir "$P4_ENGINES_DIR/miopen" "$uid:$gid" 700
-  ensure_dir "$P4_ENGINES_DIR/hf" "$uid:$gid" 755
-  ensure_dir "$ATLAS_SRV/workspace/phase4-samples" "$uid:$gid" 755
+  # Created ONCE as atlas-owned (header: never chmod/chown an existing path on the atlas-writable tree, never through
+  # a symlink). The persisted cache base and the MIOpen cache hold whatever tools drop there: not world-readable.
+  _p4_dir_once "$P4_ENGINES_DIR/manifests" "$uid:$gid" 755
+  _p4_dir_once "$P4_ENGINES_DIR/home" "$uid:$gid" 700
+  _p4_dir_once "$P4_ENGINES_DIR/miopen" "$uid:$gid" 700
+  _p4_dir_once "$P4_ENGINES_DIR/hf" "$uid:$gid" 755
+  _p4_dir_once "$ATLAS_SRV/workspace/phase4-samples" "$uid:$gid" 755
   mkdir -p "$P4_STATE"
 
   if [[ "$(docker image inspect -f "{{index .Config.Labels \"$P4_LABEL\"}}" "$P4_IMAGE" 2>/dev/null)" == "$P4_IMAGE_VER" ]]; then
@@ -334,7 +363,7 @@ step_01() {
       --build-arg "ATLAS_UID=$uid" --build-arg "ATLAS_GID=$gid" \
       --build-arg "ROCM_INDEX=$(_p4_cfg rocm_index)" --build-arg "ROCM_VER=$(_p4_cfg rocm_version)" \
       "$P4_DOCKERFILE_DIR" </dev/null \
-      || die "docker build of $P4_IMAGE failed. If pip could not resolve torch==$(_p4_cfg torch) for cp312 (UNVERIFIED cp-tag list, research §1.1), drop the == pins in the Dockerfile and let the [device-gfx1151] extras resolve; if the build stopped at 'rocminfo not found', the rocm[...] wheel layout changed (research §1.2); otherwise check /var/log/squid/access.log for TCP_DENIED"
+      || die "docker build of $P4_IMAGE failed. If pip could not resolve torch==$(_p4_cfg torch) for cp312 (UNVERIFIED cp-tag list, research §1.1), drop the == pins in the Dockerfile and let the [device-gfx1151] extras resolve; if pip reports 'no matching distribution' for a third-party dependency of torch (sympy, filelock, jinja2, networkx, fsspec, typing-extensions, setuptools: the stable AMD index is used ALONE, research-VERIFIED pattern, and whether it mirrors them is UNVERIFIED), add '--extra-index-url https://pypi.org/simple' to the ROCm pip line of the Dockerfile (pypi.org is allowlisted) and pin torchaudio to the +rocm$(_p4_cfg rocm_version) build it then resolves so PyPI cannot substitute a CUDA torchaudio; if the build stopped at 'rocminfo not found', the rocm[...] wheel layout changed (research §1.2); otherwise check /var/log/squid/access.log for TCP_DENIED"
   fi
   # The resolved wheel set is the manifest of this image (rule §7.9; Appendix C: engines/ is backed up as manifests).
   # Root keeps its copy under $P4_STATE; the data-volume copies are written by the image itself as atlas (header).
@@ -359,16 +388,23 @@ step_01() {
     log "V11 pass; the base image is proven on gfx1151; GPU run flags ($P4_RUNFLAGS_FILE): $(grep -v '^#' "$P4_RUNFLAGS_FILE" 2>/dev/null | paste -sd ' ' - || echo '?')"
     return 0
   fi
-  # Diagnostic only (research §1.1): the same self-test in the community image separates "our image is wrong" from
-  # "this kernel/BIOS combination is broken". Folded into the V11 fail record: gate, --status, report and
-  # tools/fill-workbook.py read the LATEST record per id, so a second record with another status would mask the fail.
-  local v11_msg diag
-  v11_msg="$(_p4_v11_last_msg)"
-  warn "V11 FAILED in $P4_IMAGE. Running the same self-test once in $P4_DIAG_IMAGE as a diagnostic (~5.4 GB pull, best effort)"
-  diag="$(_p4_diag_run)"
-  warn "diagnostic ($P4_DIAG_IMAGE --entrypoint /opt/venv/bin/python, VERIFIED venv path): $diag"
-  record_v V11 fail "${v11_msg:-V11 fail (no message recorded)}; diagnostic in $P4_DIAG_IMAGE: $diag"
-  warn "If the community image also fails (hang, 'Memory critical error', or no device): kernel 7.0 + gfx1151 has open hang reports (ROCm/legacy-rocm-build #6530, ROCm/ROCm #6182); the host kernel, not the container, may be the cause. Adjudicated conflict 19: no Day 1 action, flagged for the Principal in the README."
+  # Adjudicated conflict 19 (S15): a V11 failure may be the host kernel; log the possibility with the issue numbers,
+  # act on nothing. The community-image diagnostic (research §1.1: separates "our image is wrong" from "this
+  # kernel/BIOS combination is broken") runs only on P4_V11_DIAG=1 (header) and is then folded into the V11 fail
+  # record: gate, --status, report and tools/fill-workbook.py read the LATEST record per id, so a second record with
+  # another status would mask the fail.
+  warn "V11 FAILED in $P4_IMAGE. Kernel 7.0 + gfx1151 has open PyTorch hang reports (ROCm/pytorch #6530, #6182; ROCm/legacy-rocm-build #6530, ROCm/ROCm #6182): the host kernel, not the container, may be the cause. Adjudicated conflict 19: no Day 1 action, flagged for the Principal in the README."
+  if [[ "${P4_V11_DIAG:-0}" == "1" ]]; then
+    local v11_msg diag
+    v11_msg="$(_p4_v11_last_msg)"
+    warn "P4_V11_DIAG=1: running the same self-test once in $P4_DIAG_IMAGE as a diagnostic (~5.4 GB pull, a second ROCm userspace on the GPU, best effort)"
+    diag="$(_p4_diag_run)"
+    warn "diagnostic ($P4_DIAG_IMAGE --entrypoint /opt/venv/bin/python, VERIFIED venv path): $diag"
+    record_v V11 fail "${v11_msg:-V11 fail (no message recorded)}; diagnostic in $P4_DIAG_IMAGE: $diag"
+    warn "If the community image also fails (hang, 'Memory critical error', or no device), the kernel question above is the likelier cause."
+  else
+    log "community-image diagnostic not run (set P4_V11_DIAG=1 in $ATLAS_ETC/atlas.env or the environment to run the same self-test once in $P4_DIAG_IMAGE on a re-run)"
+  fi
   notify "Phase 4 STOPPED: V11 failed in $P4_IMAGE (see journalctl -u atlas-day1-phase4)"
   # Rule §7.10: the gate table and the exact next command even when the phase stops here.
   gate phase4 V11 -- V8 V9 || true
@@ -379,17 +415,15 @@ step_01() {
 # --- Step 02: green engines ------------------------------------------------------------------------------------------
 # _p4_arbiter_clear — Section 4.2 rules 3 and 5: nothing weight-bearing from Phase 3 may still be resident when the
 # first Phase 4 engine loads. GET /arbiter/status; unload every core/apex/vision/crosscheck engine through the
-# Arbiter; refuse if one stays. Unreachable orchestrator: the GTT counter decides (a quiet GPU is under 16 GiB used).
+# Arbiter; refuse if one stays. An unreachable orchestrator STOPS the step (fix round 3, rule §7.4 fail-early: Section
+# 4.2 rule 1 makes the Arbiter the one service every load passes through, a healthy orchestrator is a Phase 2 gate
+# requirement, and step 05 would stop on the same outage after hours of engine loads; no GTT heuristic stands in).
 _p4_arbiter_clear() {
   local line code body
   line="$(_p4_orch_curl GET /arbiter/status)"
   code="${line%% *}"; body="${line#* }"
   if [[ "$code" != 200 ]]; then
-    local used
-    used="$(gpu_gtt_used_mb 2>/dev/null || echo 0)"
-    warn "GET $(_p4_orch_url)/arbiter/status answered $code: cannot ask the Arbiter what is resident; GTT used ${used} MiB"
-    (( used < 16384 )) || die "GTT used ${used} MiB with the Arbiter unreachable: something is still resident (Section 4.2 rule 5); stop it (systemctl stop 'llama-server@*') or start the orchestrator, then re-run"
-    return 0
+    die "GET $(_p4_orch_url)/arbiter/status answered HTTP $code: the Arbiter cannot say what is resident (Section 4.2 rules 1 and 5), so no Phase 4 engine loads. Start the orchestrator (Phase 2 step 2: sudo systemctl start atlas-orchestrator; journalctl -u atlas-orchestrator), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (GTT used now: $(gpu_gtt_used_mb 2>/dev/null || echo '?') MiB)"
   fi
   local resident=()
   mapfile -t resident < <(python3 -c '
@@ -506,10 +540,13 @@ json.dump(out, open(path, "w", encoding="utf-8"), indent=2)
 print(f"{path}: {len(out['engines'])} passing engines, {sum(1 for e in out['engines'] if e['registered'])} registered")
 PY
   if (( registered != ${#passing[@]} || ${#unmeasured[@]} > 0 )); then
-    # Rule §7.10: the per-engine table AND the gate table still print before the stop; the gate marker is not written
-    # (step 06 does that) while step 05 is undone.
+    # Rule §7.10: the per-engine table AND the verify table still print before the stop. verify_table, not gate: gate
+    # would write $ATLAS_DONE_DIR/phase4.gate and print "PASS / Next: report" (V11 passed, or step 05 would never have
+    # run) while step 05 is undone; the gate is step 06's, after registration (Section 17; fix round 3). The die below
+    # is the only next command.
     echo; _p4_table; echo
-    gate phase4 V11 -- V8 V9 || true
+    echo "Verify records so far (the Phase 4 gate itself is step 06, after registration):"
+    verify_table V11 V8 V9
     (( ${#unmeasured[@]} == 0 )) || warn "step 05: passing engine(s) without a measured footprint: ${unmeasured[*]} (delete $P4_STATE/<key>.json and re-run the engine with --force 02/03/04 so the GTT delta is measured)"
     die "step 05: $registered of ${#passing[@]} measured passing engines registered with the Arbiter at $url${unmeasured:+; ${#unmeasured[@]} passing engine(s) unmeasured} (404 = the running orchestrator rejects class-phase4 keys: restart it on the current atlas package, or fix atlas/arbiter.py; 000 = orchestrator down), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (the step is not marked done)"
   fi
@@ -573,7 +610,7 @@ step_06() {
   echo
   echo "Phase 4 engines (Section 17 step 6 table: built, loaded, sample output, footprint, pass/fail/deferred; RESULT shows deferred(fail) when a non-blocking attempt failed):"
   _p4_table
-  echo "Per-engine detail: $P4_STATE/<key>.json; logs: $ATLAS_LOG_DIR/phase4-<key>.log; samples: $ATLAS_SRV/workspace/phase4-samples/<key>/; venv freezes: $P4_ENGINES_DIR/manifests/<key>-freeze.txt; pull records and pins: $P4_STATE/hf-manifests/, $P4_STATE/git-pins.json"
+  echo "Per-engine detail: $P4_STATE/<key>.json; logs: $ATLAS_LOG_DIR/phase4-<key>.log; samples: $ATLAS_SRV/workspace/phase4-samples/<key>/; venv freezes: $P4_ENGINES_DIR/manifests/<key>/freeze.txt; pull records and pins: $P4_STATE/hf-manifests/, $P4_STATE/git-pins.json (published per engine as $P4_ENGINES_DIR/<key>/MANIFEST.json for the AEGIS backup)"
   echo
   # CONVENTIONS.md §6: V11 required; V8, V9 recorded, deferred never blocks.
   if gate phase4 V11 -- V8 V9; then

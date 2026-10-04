@@ -181,14 +181,24 @@ _cf_read_back() {
 }
 
 _cf_write_env() {
-  local record="$VPN_HOST"
+  local record="$VPN_HOST" tmp
+  # Through a 0600 temp file, never `... | install /dev/stdin DEST` (fix round 3, blocker): Ubuntu 26.04's /usr/bin/install
+  # is rust-coreutils 0.8.0, which canonicalises the SOURCE whenever DEST already exists (phase1/04-system.sh,
+  # phase1_write_file: VERIFIED packages.ubuntu.com/resolute), and $CF_ENVF always exists here (Phase 1 step 7 wrote it),
+  # so the pipe form died with ENOENT on every run before the second read-back, the shred and V23. mktemp creates the
+  # file 0600, so the token never sits readable by anyone else, and install(1) copies a regular file with both GNU and
+  # uutils coreutils.
+  tmp="$(mktemp)" || die "_cf_write_env: mktemp failed"
   {
     echo "# Cloudflare dynamic DNS (Section 12.3; V23). Written by Phase 1 step 7, verified and finalised by Phase 2 step 6b."
     echo "CF_API_TOKEN=$CF_TOKEN"
     echo "CF_ZONE_NAME=$CF_ZONE_NAME"
     echo "CF_ZONE_ID=$CF_ZONE_ID"
     echo "CF_RECORD_NAME=$record"
-  } | install -m 600 -o atlas-ddns -g atlas-ddns /dev/stdin "$CF_ENVF"
+  } >"$tmp" || { rm -f "$tmp"; die "_cf_write_env: could not write the temp copy of $CF_ENVF"; }
+  install -m 600 -o atlas-ddns -g atlas-ddns "$tmp" "$CF_ENVF" || { rm -f "$tmp"; die "_cf_write_env: install $CF_ENVF failed"; }
+  rm -f "$tmp"
+  [[ "$(stat -c '%a %U:%G' "$CF_ENVF")" == "600 atlas-ddns:atlas-ddns" ]] || die "$CF_ENVF is $(stat -c '%a %U:%G' "$CF_ENVF") after the write, not 600 atlas-ddns:atlas-ddns"
   log "finalised $CF_ENVF (600 atlas-ddns:atlas-ddns, zone id set)"
   # The updater must work from the finalised file: one forced run through its own unit (its failure is not fatal
   # here, V5/Phase 1 already judged the DNS side; the journal says why).

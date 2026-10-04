@@ -261,7 +261,7 @@
       "expected_decode_tok_s": null,
       "port": 8108,
       "kv_proof_lines": 1,
-      "notes": "Pulled in Phase 2 step 4 and verified at the Phase 2 gate (verify/v10a-router-resident.sh, recorded as `V10 info` by step 4 and by the gate: the Section 21 V10 half that Section 17 places at the Phase 2 gate; V10a is not an id CONVENTIONS §4 declares, the Phase 3 gate records V10 proper). Thinking off for immediate classification answers (gguf-models.md §9.1). Never counted against the engine budget (Section 4.1 resident set)."
+      "notes": "Pulled in Phase 2 step 4 and verified at the Phase 2 gate (verify/v10a-router-resident.sh, recorded under the id V10a by step 4 (fatal to the step on fail) and by phase2/10-gate.sh (recorded only): the Section 21 V10 half that Section 17 places at the Phase 2 gate. No V10 row is written before the Phase 3 load test; V10a is requested of CONVENTIONS §4/§6). Thinking off for immediate classification answers (gguf-models.md §9.1). Never counted against the engine budget (Section 4.1 resident set)."
     },
     {
       "key": "embed-bge-m3",

@@ -30,20 +30,28 @@
 #      forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune; Requires/After the backup), atlas-aegis.timer
 #      (nightly 02:30 -> the forget unit, so only the nightly timer prunes), atlas-aegis-trigger.path (the manual
 #      [EXECUTE AEGIS BACKUP] trigger: /run/atlas/aegis-request, created by the orchestrator as atlas, starts the backup
-#      unit; NO sudo), atlas-restic-check.service/.timer (quarterly restore test). A stale /etc/sudoers.d/atlas-aegis from
-#      an earlier revision is removed and a negative sudo test proves the control path is atlas-engines alone (§8).
+#      unit; NO sudo), atlas-aegis-missed.service (OnFailure= of the forget unit: a nightly chain that did not run is
+#      pushed to the phone, never silent), atlas-restic-check.service/.timer (quarterly restore test). A stale
+#      /etc/sudoers.d/atlas-aegis from an earlier revision is removed and a negative sudo test proves the control path is
+#      atlas-engines alone (§8). Content greps match DIRECTIVES (^Exec...=), never the units' own header comments (fix
+#      round 3, blocker: `grep 'restic forget'` matched atlas-aegis.service's comment and died on every run).
+#   6b. The package side of the trigger is ASSERTED, not assumed (fix round 3, major): $ORCH_DIR/src/atlas/tasks/aegis.py
+#      must name /run/atlas/aegis-request and must not build a `["sudo", ...]` command; otherwise the step dies with the
+#      contract, because a [EXECUTE AEGIS BACKUP] press would otherwise fail with "a password is required" on first use.
 #   7. First backup now, through the manual trigger's path (atlas creates the request file; the path unit starts the
 #      service; the step waits for Result=success and no raised freeze flag), then run_verify V13 v13-restic.sh (restore
 #      the canary to a scratch dir, sha256 compare, restic check). A V13 fail is recorded, not fatal here: the gate
-#      blocks on it.
+#      blocks on it. After the run `systemctl reset-failed` zeroes the start-rate counter, so the Day 1 run does not
+#      count against the 6 h StartLimit window (nightly + two manual = StartLimitBurst=3).
 #
 # Contracts: `atlas-admin enqueue aegis-freeze|aegis-thaw --wait N` and `celery -A atlas.celery_app control
 # add_consumer <queue>` (phase2/02-orchestrator.sh header; the package's freeze cancels the gpu consumer and raises
-# /run/atlas/aegis-freeze). orch_write_file/orch_admin/ORCH_ENV/REDIS_ENV come from step 02. $ATLAS_ETC/secrets is
-# root:atlas 750 (02's header; adjudication item there). The package's manual trigger (atlas.tasks.aegis_manual_backup)
-# MUST create /run/atlas/aegis-request and confirm with `systemctl is-active atlas-aegis.service`, never call sudo (the
-# previous `sudo systemctl start [--no-block] atlas-aegis.service` route and its sudoers fragment are gone, fix round 2;
-# until the package follows, its sudo call fails loudly with "a password is required" and the task's notify says so).
+# /run/atlas/aegis-freeze). orch_write_file/orch_admin/ORCH_ENV/ORCH_DIR/REDIS_ENV come from step 02. $ATLAS_ETC/secrets
+# is root:atlas 710 (02's header; the one value with phase2-services.sh and 09b). The package's manual trigger
+# (atlas.tasks.aegis_manual_backup) MUST create /run/atlas/aegis-request and confirm with `systemctl is-active
+# atlas-aegis.service`, never call sudo (the previous `sudo systemctl start [--no-block] atlas-aegis.service` route and
+# its sudoers fragment are gone, fix round 2); _restic_trigger_contract dies when the installed package still builds a
+# sudo command, so a trigger that would fail on first use is never declared proven (fix round 3).
 # File writes use orch_write_file (rust-coreutils install rejects a pipe source on re-runs; 02's header).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
@@ -66,11 +74,11 @@ AEGIS_HELPER=/usr/local/sbin/atlas-aegis
 AEGIS_HELPER_SRC="$ATLAS_DAY1_DIR/phase2/atlas-aegis.sh"
 AEGIS_REQUEST=/run/atlas/aegis-request
 AEGIS_STALE_SUDOERS=/etc/sudoers.d/atlas-aegis   # earlier revision; removed here
-AEGIS_UNITS=(atlas-aegis.service atlas-aegis-forget.service atlas-restic-check.service)
+AEGIS_UNITS=(atlas-aegis.service atlas-aegis-forget.service atlas-aegis-missed.service atlas-restic-check.service)
 AEGIS_VERBATIM=(atlas-aegis.timer atlas-aegis-trigger.path atlas-restic-check.timer)
 
 _restic_passphrase() {
-  ensure_dir "$ATLAS_ETC/secrets" root:atlas 750
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710   # the one value (02's header; phase2-services.sh; 09b)
   if [[ ! -s "$RESTIC_PASS_FILE" ]]; then
     (umask 077; head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40 >"$RESTIC_PASS_FILE"; echo >>"$RESTIC_PASS_FILE")
     chown root:root "$RESTIC_PASS_FILE"; chmod 600 "$RESTIC_PASS_FILE"
@@ -240,6 +248,21 @@ _restic_no_sudoers() {
   log "control path: no sudo grant for atlas-aegis.service (start and stop refused as atlas); the trigger is $AEGIS_REQUEST"
 }
 
+# --- the package side of the manual trigger (fix round 3, major) -----------------------------------------------------------
+# Static assertion against the INSTALLED package ($ORCH_DIR, synced by step 02): the task module must create the request
+# file and must not shell out to sudo. A dynamic exercise (`atlas-admin enqueue aegis-manual`) is not in step 02's
+# contract, so the file is read; the first backup below then exercises the path unit itself.
+_restic_trigger_contract() {
+  local mod="$ORCH_DIR/src/atlas/tasks/aegis.py"
+  [[ -f "$mod" ]] || die "contract: $mod is missing (atlas.tasks.aegis, the orchestrator writer's module; step 02 synced $ORCH_DIR)"
+  grep -q 'aegis-request' "$mod" \
+    || die "contract: atlas.tasks.aegis_manual_backup must create $AEGIS_REQUEST (no sudo) and confirm with 'systemctl is-active atlas-aegis.service'; $mod never names aegis-request (see this file's header; atlas-aegis-trigger.path is the trigger)"
+  if grep -qE '\[[[:space:]]*"sudo"' "$mod"; then
+    die "contract: $mod still builds a sudo command for the manual AEGIS trigger; the sudoers fragment /etc/sudoers.d/atlas-aegis is gone (CONVENTIONS.md §8: atlas-engines is the only grant) so every [EXECUTE AEGIS BACKUP] press would fail with 'a password is required'. The task must create $AEGIS_REQUEST and poll 'systemctl is-active atlas-aegis.service' instead (this file's header)"
+  fi
+  log "trigger contract: $mod names $AEGIS_REQUEST and builds no sudo command"
+}
+
 _restic_units() {
   local u
   export ATLAS_ETC ATLAS_OPT ATLAS_SRV
@@ -251,25 +274,36 @@ _restic_units() {
   done
   render_template -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-aegis.service" /etc/systemd/system/atlas-aegis.service ATLAS_ETC ATLAS_OPT ATLAS_SRV
   render_template -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-aegis-forget.service" /etc/systemd/system/atlas-aegis-forget.service ATLAS_ETC ATLAS_OPT
+  render_template -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-aegis-missed.service" /etc/systemd/system/atlas-aegis-missed.service ATLAS_ETC ATLAS_OPT
   render_template -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-restic-check.service" /etc/systemd/system/atlas-restic-check.service ATLAS_ETC ATLAS_OPT
   for u in "${AEGIS_VERBATIM[@]}"; do
     install -m 644 "$ATLAS_DAY1_DIR/systemd/$u" "/etc/systemd/system/$u"
   done
-  # Content checks, not mere presence (the lines the Section 9.5 contract hangs on).
+  # Content checks, not mere presence (the lines the Section 9.5 contract hangs on). Every grep is anchored to a DIRECTIVE
+  # (`^Key=`): render_template keeps the units' header comments, and an unanchored 'restic forget' matched
+  # atlas-aegis.service's own comment on every run (fix round 3, blocker).
   grep -q -- '^ExecStart=/usr/bin/restic forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune' /etc/systemd/system/atlas-aegis-forget.service || die "atlas-aegis-forget.service lost its retention line"
   grep -q '^Requires=atlas-aegis.service' /etc/systemd/system/atlas-aegis-forget.service || die "atlas-aegis-forget.service must Require atlas-aegis.service (prune only after a successful backup)"
+  grep -q '^OnFailure=atlas-aegis-missed.service' /etc/systemd/system/atlas-aegis-forget.service || die "atlas-aegis-forget.service lost OnFailure=atlas-aegis-missed.service (a nightly chain that did not run must be pushed, §7.4)"
+  grep -q '^ExecStart=/usr/local/sbin/atlas-aegis notify ' /etc/systemd/system/atlas-aegis-missed.service || die "atlas-aegis-missed.service does not run '$AEGIS_HELPER notify'"
   grep -q '^Unit=atlas-aegis-forget.service' /etc/systemd/system/atlas-aegis.timer || die "atlas-aegis.timer must start atlas-aegis-forget.service (backup, then the nightly-only prune)"
-  grep -q 'restic forget' /etc/systemd/system/atlas-aegis.service && die "atlas-aegis.service must not prune (the manual trigger starts it; Section 16.3 item 5)"
+  grep -qE '^Exec(Start|StartPre|StartPost|Stop|StopPost|Condition)=.*restic forget' /etc/systemd/system/atlas-aegis.service && die "atlas-aegis.service must not prune (the manual trigger starts it; Section 16.3 item 5)"
   grep -q '^SuccessExitStatus=3' /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service lost SuccessExitStatus=3 (restic's partial-read exit code)"
+  grep -q '^StartLimitBurst=3' /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service lost StartLimitBurst=3 (nightly plus two manual starts per 6 h)"
   grep -q "^ExecStartPre=/bin/rm -f $AEGIS_REQUEST" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not remove $AEGIS_REQUEST first (the path unit would re-trigger for ever)"
   grep -q "^ExecStartPre=$AEGIS_HELPER freeze" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not run '$AEGIS_HELPER freeze'"
-  grep -q "^ExecStopPost=$AEGIS_HELPER finish" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not run '$AEGIS_HELPER finish' (the thaw)"
+  grep -q "^ExecStopPost=$AEGIS_HELPER finish" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not run '$AEGIS_HELPER finish' (the thaw, and the exit-3 'files not read' push)"
   grep -q '^RuntimeDirectory=atlas-aegis' /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service lost RuntimeDirectory=atlas-aegis (the helper's root-owned intent marker)"
-  grep -qF "EnvironmentFile=$ATLAS_ETC/secrets/redis.env" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not load secrets/redis.env (the broker URL for freeze/thaw)"
+  grep -qxF "EnvironmentFile=$ATLAS_ETC/secrets/redis.env" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not load secrets/redis.env (the broker URL for freeze/thaw)"
+  grep -qE '^Exec[A-Za-z]*=.*\bnotify\b' /etc/systemd/system/atlas-restic-check.service && ! grep -qE "^ExecStart=.*$AEGIS_HELPER notify" /etc/systemd/system/atlas-restic-check.service \
+    && die "atlas-restic-check.service pushes through lib/common.sh's notify (token on curl's argv); it must use '$AEGIS_HELPER notify'"
   grep -q "^PathExists=$AEGIS_REQUEST" /etc/systemd/system/atlas-aegis-trigger.path || die "atlas-aegis-trigger.path does not watch $AEGIS_REQUEST"
   grep -q '^Unit=atlas-aegis.service' /etc/systemd/system/atlas-aegis-trigger.path || die "atlas-aegis-trigger.path does not start atlas-aegis.service"
+  # The helper itself carries the exit-3 push (restic "some source files could not be read" is Result=success for
+  # systemd, so `finish` must speak, fix round 3): assert the installed helper has it.
+  grep -q 'status" == 3' "$AEGIS_HELPER" || die "$AEGIS_HELPER lost its restic-exit-3 handling (a partial snapshot must be pushed, §7.4)"
   systemctl daemon-reload
-  systemctl reset-failed atlas-aegis.service atlas-aegis-forget.service atlas-aegis-trigger.path 2>/dev/null || true
+  systemctl reset-failed atlas-aegis.service atlas-aegis-forget.service atlas-aegis-missed.service atlas-aegis-trigger.path 2>/dev/null || true
   systemctl enable --now atlas-aegis.timer >/dev/null
   systemctl enable --now atlas-restic-check.timer >/dev/null
   systemctl enable --now atlas-aegis-trigger.path >/dev/null || die "systemctl enable --now atlas-aegis-trigger.path failed: $(systemctl status atlas-aegis-trigger.path --no-pager 2>&1 | tail -n 5)"
@@ -319,7 +353,11 @@ _restic_first_backup() {
   local n
   n="$(restic snapshots --json 2>/dev/null | python3 -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
   (( n >= 1 )) || die "no snapshot in $RESTIC_REPO after the first backup"
-  log "first backup done through the trigger path: $n snapshot(s) in $RESTIC_REPO ($(du -sh "$RESTIC_REPO" 2>/dev/null | cut -f1)); freeze/thaw completed through the orchestrator"
+  # reset-failed also zeroes the start-rate counter (fix round 3): the Day 1 run must not count against the 6 h window
+  # that the nightly and the Principal's first [EXECUTE AEGIS BACKUP] presses share (StartLimitBurst=3).
+  systemctl reset-failed atlas-aegis.service atlas-aegis-trigger.path 2>/dev/null || true
+  systemctl is-active --quiet atlas-aegis-trigger.path || die "atlas-aegis-trigger.path is no longer active after the first backup (journalctl -u atlas-aegis-trigger.path)"
+  log "first backup done through the trigger path: $n snapshot(s) in $RESTIC_REPO ($(du -sh "$RESTIC_REPO" 2>/dev/null | cut -f1)); freeze/thaw completed through the orchestrator; start-rate counter reset, path unit active"
 }
 
 step_07() {
@@ -330,6 +368,7 @@ step_07() {
   _restic_helper
   _restic_units
   _restic_no_sudoers
+  _restic_trigger_contract
   _restic_first_backup
   run_verify V13 v13-restic.sh "$RESTIC_CANARY" \
     || warn "V13 recorded as fail: the restore test did not verify by checksum; the Phase 2 gate will block until it passes"
@@ -342,8 +381,9 @@ step_07() {
                     drive with the LUKS recovery key (D3, R16) — printed once above when a terminal was present.
   Nightly:          atlas-aegis.timer 02:30 -> atlas-aegis-forget.service (backup: freeze -> restic -> thaw; then
                     forget --keep-within 1d / 30 daily / 12 monthly --prune; only the nightly run prunes)
-  Manual trigger:   [EXECUTE AEGIS BACKUP] -> the orchestrator creates $AEGIS_REQUEST (no sudo);
-                    atlas-aegis-trigger.path starts the backup (two starts per 6 h)
+  Manual trigger:   [EXECUTE AEGIS BACKUP] -> the orchestrator creates $AEGIS_REQUEST (no sudo; the installed
+                    package was checked for exactly that); atlas-aegis-trigger.path starts the backup.
+                    Start limit: 3 starts per 6 h (nightly + two manual); a missed nightly is pushed to the phone.
   Restore test:     atlas-restic-check.timer quarterly; V13 recorded now.
   ======================
 MSG

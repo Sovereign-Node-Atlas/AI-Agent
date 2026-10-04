@@ -420,10 +420,14 @@ def cmd_render(args: argparse.Namespace) -> int:
 
 
 def _write_summary(args: argparse.Namespace, summary: dict[str, Any]) -> None:
+    """Write --json-out atomically (temp file + rename): a partial write can never leave a half summary that
+    verify/v07-voice-listen.sh or phase2/05-voice.sh would read as the verdict (fix round 3)."""
     if args.json_out:
         jp = Path(args.json_out)
         jp.parent.mkdir(parents=True, exist_ok=True)
-        jp.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        tmp = jp.with_name(jp.name + ".part")
+        tmp.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(jp)
     print(json.dumps(summary), flush=True)
 
 

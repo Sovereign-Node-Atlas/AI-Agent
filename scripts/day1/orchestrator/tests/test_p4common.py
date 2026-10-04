@@ -1,7 +1,9 @@
-"""Unit tests for phase4/engines/p4common.py that need no GPU, no network and no container (CONVENTIONS §7.8: tests
-run with pytest and no live services). They prove the offline-cache contract the fix round introduced:
-huggingface_hub (2.0.0 VERIFIED) writes no refs/main for a commit-hash download, every GPU test resolves "main" with
-HF_HUB_OFFLINE=1, so the pull must write refs/main itself and prove_offline must catch a cache that does not resolve."""
+"""Unit tests for scripts/day1/phase4/engines/p4common.py that need no GPU, no network and no container. They live
+here because CONVENTIONS §7.8 places every Python test under orchestrator/tests (fix round 3; the module itself stays
+beside the engine tests it serves and is loaded by path). They prove the offline-cache contract the fix round
+introduced: huggingface_hub (2.0.0 VERIFIED) writes no refs/main for a commit-hash download, every GPU test resolves
+"main" with HF_HUB_OFFLINE=1, so the pull must write refs/main itself and prove_offline must catch a cache that does not
+resolve. huggingface_hub is not an orchestrator dependency: the cache tests skip when it is absent."""
 
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ from pathlib import Path
 import pytest
 
 HERE = Path(__file__).resolve().parent
-ENGINES = HERE.parent / "engines"
+ENGINES = HERE.parents[1] / "phase4" / "engines"
 
 
 def _load_p4common() -> object:

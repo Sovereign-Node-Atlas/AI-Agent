@@ -1,9 +1,9 @@
 # docker/sandbox/Dockerfile — the AEGIS sandbox image (Section 16.4): "a container with a hard memory limit, CPU
-# quota, no network unless the task's tier grants it, and a timeout". Built by phase2/10-gate.sh as
-# atlas-sandbox:py3.12; proven by verify/v17-sandbox.sh (a memory bomb dies with exit 137 under --memory=512m and the
-# host does not notice; a SIGTERM-ignoring script is still gone when the in-container timeout expires). The
-# orchestrator's run line (SANDBOX_* keys in /etc/atlas/orchestrator.env, README-contracts.md "Sandbox"; the gate owns
-# the build only because no Section 17 step does, recorded in README-contracts.md §3):
+# quota, no network unless the task's tier grants it, and a timeout". Built by phase2/06d-sandbox.sh (fix round 4: a
+# step of its own before step 7, so the gate only judges; it also writes the SANDBOX_* keys) as atlas-sandbox:py3.12;
+# proven by verify/v17-sandbox.sh at the gate (a memory bomb dies with exit 137 under --memory=512m and the host does not
+# notice; a SIGTERM-ignoring script is still gone when the in-container timeout expires). The orchestrator's run line
+# (SANDBOX_* keys in /etc/atlas/orchestrator.env, README-contracts.md "Sandbox"):
 #
 #   timeout -k 5 $((SANDBOX_TIMEOUT_S + 10)) docker run --rm --init --pull never --name sb-<job> \
 #     --network none --memory $SANDBOX_MEMORY --memory-swap $SANDBOX_MEMORY --cpus $SANDBOX_CPUS \
@@ -49,25 +49,38 @@
 # VERIFIED flags) and the in-container timeout, not by anything else in this image. Arthur's code review is a second
 # layer over this, not the guard. A tier that grants network replaces `--network none`; the container is then still
 # confined to the allowlist proxy by the DOCKER-USER rules of atlas-docker-egress.service (README-contracts.md).
+# Rule §7.1 inside the container too (fix round 4): the ENV block switches off every telemetry beacon a library the
+# staged code brings could attempt once a tier grants network (huggingface_hub, chromadb/posthog, pip), because
+# huggingface.co is on the allowlist and the egress rules would let such a beacon through; zero cost with no network.
 #
-# Base image pin (rule §7.9; fix round 2). UNVERIFIED: the research names no python image tag or digest, so the digest
-# below is the multi-arch index that Docker Hub served for python:3.12-slim on 2026-10-04, resolved by this file's
-# writer (GET registry-1.docker.io/v2/library/python/manifests/3.12-slim, Accept: OCI index), not a research pin. A
-# digest pin is strictly safer than the floating tag (the image the caps were proven on is the image that runs), and a
-# build from a digest Docker Hub no longer serves fails loudly in phase2/10-gate.sh (V17 fail), never silently floats.
-# To re-pin: `docker pull python:3.12-slim && docker image inspect python:3.12-slim --format '{{index .RepoDigests 0}}'`
-# on the node, paste the digest here, bump org.atlas.sandbox.version (the gate and v17-sandbox.sh check it) and the
-# "Unpinned" section of README-contracts.md. The gate skips the build once the labelled image exists (rule §7.3).
+# Base image pin (rule §7.9; fix round 2). The research names no python image tag or digest, so the pin is this file's
+# writer's, not a research pin: the multi-arch index Docker Hub served for python:3.12-slim on 2026-10-04 (GET
+# registry-1.docker.io/v2/library/python/manifests/3.12-slim, Accept: OCI index). VERIFIED 2026-10-04 (fix round 4,
+# by this writer and independently by the reviewer): HEAD registry-1.docker.io/v2/library/python/manifests/<digest>
+# answers 200 and the `3.12-slim` tag's Docker-Content-Digest is exactly this digest. A digest pin is strictly safer than
+# the floating tag (the image the caps were proven on is the image that runs), and a build from a digest Docker Hub no
+# longer serves fails loudly in phase2/06d-sandbox.sh (the step dies), never silently floats. To re-pin: `docker pull
+# python:3.12-slim && docker image inspect python:3.12-slim --format '{{index .RepoDigests 0}}'` on the node, paste the
+# digest here AND in the org.atlas.sandbox.base label, bump org.atlas.sandbox.version (06d, the gate and v17-sandbox.sh
+# check it) and the "Unpinned" section of README-contracts.md. 06d skips the build once the labelled image exists
+# (rule §7.3). Label version 4 = digest-pinned base + in-container timeout entrypoint + the telemetry opt-outs.
 FROM python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
 
-LABEL org.atlas.sandbox.version="3" \
+LABEL org.atlas.sandbox.version="4" \
       org.atlas.sandbox.section="16.4" \
       org.atlas.sandbox.base="python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONHASHSEED=random \
+    PYTHONNOUSERSITE=1 \
     PIP_NO_INDEX=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_OFFLINE=1 \
+    DO_NOT_TRACK=1 \
+    ANONYMIZED_TELEMETRY=False \
+    CHROMA_TELEMETRY_ENABLED=false \
     HOME=/tmp \
     SANDBOX_TIMEOUT_S=300
 

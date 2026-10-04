@@ -11,8 +11,15 @@ Subcommands and who calls them:
                        send a Celery task on the queue atlas.celery_app routes it to (--queue overrides); --wait
                        SECONDS blocks and prints the ledger record as ONE JSON line (contract in
                        phase2/02-orchestrator.sh; the task module atlas.tasks is another writer's)
+  config check         load the whole config tree the way the service does, then the strict CONVENTIONS.md §8 pass over
+                       the domain cards (load_domain_cards(strict=True)); exit 0 and one line, or exit 1 with every
+                       card that drifts from §8 and the H1 it should carry. For the Phase 2 gate / a verify script
+                       (NOT a CONVENTIONS.md contract; offered to the gate writer, fix round 3).
 
-Every failure exits non-zero with a one-line reason on stderr (rule §7.4); nothing here prompts.
+Every failure exits non-zero with a one-line reason on stderr (rule §7.4); nothing here prompts. Root is refused for
+the subcommands that open the ledger (init-db, arbiter status, enqueue) when the database belongs to another user:
+Ledger() sets WAL mode and would leave root-owned -wal/-shm files that atlas-orchestrator.service cannot write; run
+them as that user (`runuser -u atlas -- atlas-admin ...`, what phase2/02-orchestrator.sh's orch_admin does).
 """
 
 from __future__ import annotations
@@ -21,14 +28,16 @@ import argparse
 import importlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from atlas.arbiter import GIB, MAX_RESIDENT, ArbiterError, SysfsMemoryProbe
-from atlas.config import ConfigError, EngineSpec, Settings, load_engines
+from atlas.config import ConfigError, EngineSpec, Settings, load_config, load_domain_cards, load_engines
 from atlas.engines import EngineControlError, SystemdEngineController
 from atlas.ledger import Ledger, new_task_id
 
@@ -50,18 +59,44 @@ ENQUEUE_TASKS: dict[str, str] = {
     "aegis-thaw": "atlas.tasks.aegis_thaw",
     "chat-retention": "atlas.tasks.chat_retention",
 }
-# `redis://:hunter2@127.0.0.1:6379/0` -> `redis://:***@127.0.0.1:6379/0` (the user part, if any, is kept).
-_URL_CREDENTIALS = re.compile(r"://([^/@:\s]*):([^@/\s]*)@")
+# `redis://:hunter2@127.0.0.1:6379/0` -> `redis://:***@127.0.0.1:6379/0` (the user part, if any, is kept). The password
+# runs to the LAST '@' before whitespace, so an unencoded '/' or '+' inside it (a base64 secret) is masked too; the
+# `?password=` / `&token=` query forms are masked by the second pattern.
+_URL_CREDENTIALS = re.compile(r"://([^/@:\s]*):([^@\s]*)@")
+_QUERY_CREDENTIALS = re.compile(r"(?i)([?&](?:password|passwd|pass|pwd|token|auth|secret|api_key|apikey)=)[^&\s]+")
 
 
 def _redact(text: str) -> str:
-    """Mask the password of any `scheme://user:pass@host` in an error message before it reaches a log or the ledger."""
-    return _URL_CREDENTIALS.sub(r"://\1:***@", text)
+    """Mask the password of any `scheme://user:pass@host` (and `?password=`/`&token=` query values) in a message
+    before it reaches a log or the ledger."""
+    return _QUERY_CREDENTIALS.sub(r"\1***", _URL_CREDENTIALS.sub(r"://\1:***@", text))
 
 
 def _fail(msg: str, code: int = 1) -> int:
     print(f"atlas-admin: {msg}", file=sys.stderr)
     return code
+
+
+def _file_uid(path: Path) -> int:
+    return path.stat().st_uid
+
+
+def _root_owner_conflict(db: Path, *, euid: int | None = None) -> str | None:
+    """Why a root run must not open `db`, or None.
+
+    Every ledger-opening subcommand run as root while atlas-orchestrator is stopped would create root-owned
+    atlas.sqlite3-wal/-shm (Ledger() sets journal_mode=WAL) or, on a fresh --db path, a root-owned database; the atlas
+    service then fails with 'attempt to write a readonly database' on its next write. The Ledger only warns when it
+    cannot chmod a file it does not own; the owner check belongs here, before anything is opened (rule §7.4).
+    """
+    euid = os.geteuid() if euid is None else euid
+    if euid != 0 or not db.exists():
+        return None
+    owner = _file_uid(db)
+    if owner == 0:
+        return None
+    return (f"{db} is owned by uid {owner}; run as that user (runuser -u atlas -- atlas-admin ...) so the -wal/-shm "
+            "files stay writable by the service (rule §7.4)")
 
 
 # --- init-db ----------------------------------------------------------------------------------------------------------
@@ -183,6 +218,15 @@ def _routed_queue(app: Any, name: str) -> str:
         return str(app.conf.task_default_queue or "cpu")
 
 
+def _redacted_result(value: Any) -> Any:
+    """A task's return value with every embedded credential masked; the masked JSON text when it no longer parses."""
+    masked = _redact(json.dumps(value, ensure_ascii=False, default=str))
+    try:
+        return json.loads(masked)
+    except ValueError:
+        return masked
+
+
 def cmd_enqueue(args: argparse.Namespace) -> int:
     name = ENQUEUE_TASKS.get(args.task)
     if name is None:
@@ -226,13 +270,34 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     state = str(result.state)
     row = ledger.get_task(task_id)
     if row is not None and row.get("status") in ("queued", "running"):
-        # The task writer updates the row; when it did not, record Celery's own outcome so the line is honest.
-        ledger.update_task(task_id, status="done" if state == "SUCCESS" else "failed",
-                           result=result.result if state == "SUCCESS" else None,
+        # The task writer updates the row; when it did not, record Celery's own outcome so the line is honest. The
+        # SUCCESS result passes through the same mask as the failures: a task that returns a dict naming the broker
+        # URL would otherwise reach the journal and result_json verbatim (the contract above asks the task writer not
+        # to; this side does not rely on it).
+        res = _redacted_result(result.result) if state == "SUCCESS" else None
+        ledger.update_task(task_id, status="done" if state == "SUCCESS" else "failed", result=res,
                            error=None if state == "SUCCESS" else _redact(str(result.result)))
-    print(ledger.record_json("tasks", task_id))
+    # Every byte this command writes to stdout has passed the mask, whoever wrote the row.
+    print(_redact(ledger.record_json("tasks", task_id)))
     ledger.close()
     return 0 if state == "SUCCESS" else 1
+
+
+# --- config check (CONVENTIONS.md §8 agreement; for the Phase 2 gate) -------------------------------------------------
+
+
+def cmd_config_check(args: argparse.Namespace) -> int:
+    """Exit 0 when the tree loads as the service loads it AND every domain card carries the §8 H1 triple; else 1."""
+    settings = Settings.from_env()
+    cfg = load_config(settings)  # lenient on the cards, like atlas-orchestrator; ConfigError -> main() -> exit 1
+    try:
+        load_domain_cards(settings.config_dir, strict=True)
+    except ConfigError as exc:
+        return _fail(f"config check: {exc}")
+    print(f"config ok: {settings.config_dir} engines={len(cfg.engines)} phase4={len(cfg.phase4_engines)} "
+          f"personas={len(cfg.personas)} task_forces={len(cfg.task_forces)} cards={len(cfg.domain_cards)} "
+          "(every card in the CONVENTIONS.md §8 H1 form)")
+    return 0
 
 
 # --- parser -----------------------------------------------------------------------------------------------------------
@@ -246,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("init-db", help="create the SQLite ledger at ATLAS_DB_PATH (idempotent)")
     s.add_argument("--db", help="override ATLAS_DB_PATH")
-    s.set_defaults(fn=cmd_init_db)
+    s.set_defaults(fn=cmd_init_db, opens_ledger=True)
 
     e = sub.add_parser("engines", help="engine table")
     esub = e.add_subparsers(dest="engines_cmd", required=True)
@@ -260,7 +325,13 @@ def build_parser() -> argparse.ArgumentParser:
     st = asub.add_parser("status", help="GTT counters, unit states, last ledger decisions")
     st.add_argument("--json", action="store_true")
     st.add_argument("--limit", type=int, default=20)
-    st.set_defaults(fn=cmd_arbiter_status)
+    st.set_defaults(fn=cmd_arbiter_status, opens_ledger=True)
+
+    c = sub.add_parser("config", help="the config tree")
+    csub = c.add_subparsers(dest="config_cmd", required=True)
+    cc = csub.add_parser("check", help="load the tree as the service does, then the strict §8 pass over the domain "
+                                       "cards; exit 1 naming every card that drifts (for the Phase 2 gate)")
+    cc.set_defaults(fn=cmd_config_check)
 
     v = sub.add_parser("vault-session-test", help="V18: open by button, lock on idle, no vault content in memory")
     v.add_argument("--idle-seconds", type=int, default=5)
@@ -273,7 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--wait", type=float, default=None, metavar="SECONDS")
     q.add_argument("--queue", default=None, help="override the task's configured route (default: what "
                                                   "atlas.celery_app.task_routes says, else the cpu queue)")
-    q.set_defaults(fn=cmd_enqueue)
+    q.set_defaults(fn=cmd_enqueue, opens_ledger=True)
     return p
 
 
@@ -282,6 +353,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     try:
+        if getattr(args, "opens_ledger", False):
+            db = Path(args.db) if getattr(args, "db", None) else Settings.from_env().db_path
+            conflict = _root_owner_conflict(db)
+            if conflict:
+                return _fail(conflict, 2)
         return int(args.fn(args))
     except ConfigError as exc:
         return _fail(f"config: {exc}")

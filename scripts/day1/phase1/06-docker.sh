@@ -17,18 +17,30 @@
 # (`docker run -v /:/host --privileged`), so the sudoers fragment that "allows exactly those systemctl commands" (§8)
 # and Section 16.3 item 6 (never modify its own code, configuration or the allowlist) are NOT enforceable against the
 # account that runs the orchestrator: a prompt-injected task that reaches a shell as atlas has host root. Neither
-# Section 16.3 nor D1-D14 records the Principal accepting this; it belongs in Section 20 as a new R-item for the
-# Principal to decide. Proposed mitigations (either is a Phase 2 contract change, not made here): a restricted socket
-# (tecnativa/docker-socket-proxy with CONTAINERS=1 POST=1 IMAGES=1 NETWORKS=1 VOLUMES=0 EXEC=0 PRIVILEGED=0 and
-# DOCKER_HOST pointed at it) or root-owned systemd units for every compose lifecycle that atlas may only
-# `systemctl start` through the sudoers fragment.
+# Section 16.3 nor D1-D14 records the Principal accepting this; it belongs in Section 20 as a new R-item (proposed
+# R22, wording below in _docker_group_warning; the docs file and CONVENTIONS §2's service-account line are other
+# writers' files, so this step also WARNS the same sentence at run time, into the Phase 1 log and gate output, until
+# the Principal has read it there). Proposed mitigations (either is a Phase 2 contract change, not made here): a
+# restricted socket (tecnativa/docker-socket-proxy with CONTAINERS=1 POST=1 IMAGES=1 NETWORKS=1 VOLUMES=0 EXEC=0
+# PRIVILEGED=0 and DOCKER_HOST pointed at it) or root-owned systemd units for every compose lifecycle that atlas may
+# only `systemctl start` through the sudoers fragment.
 #
 # SANDBOX CAPS (Section 16.4): daemon.json sets "no-new-privileges": true for every container the daemon starts (a
 # contract other writers' compose files inherit; recorded in /etc/atlas/docker.env as DOCKER_NO_NEW_PRIVILEGES). The
-# AEGIS sandbox image (docker/sandbox) must in addition run with --network none, --memory, --cpus, --pids-limit and a
-# `timeout`, exactly as the three test containers below do. No daemon-wide nproc ulimit: RLIMIT_NPROC counts every
-# process of a uid host-wide (container root = host root without userns), so a global cap could starve the host;
-# --pids-limit per container is the right tool and is applied per container.
+# AEGIS sandbox image (docker/sandbox) must in addition run with --network none, --memory, --cpus, --pids-limit,
+# --cap-drop ALL and a `timeout`, exactly as the three test containers below do (fix round 3: all three now carry
+# --cpus and --cap-drop ALL; apt inside them runs with APT::Sandbox::User=root because apt's own privilege drop needs
+# CAP_SETUID/SETGID). The full line is published once as SANDBOX_RUN_FLAGS in docker.env for docker/sandbox and the
+# orchestrator to consume; 16.4 names no numbers, so the memory/cpu/pids figures there are this step's defaults
+# (UNVERIFIED by the baseline) and the Phase 2 writer may tighten them. No daemon-wide nproc ulimit: RLIMIT_NPROC
+# counts every process of a uid host-wide (container root = host root without userns), so a global cap could starve
+# the host; --pids-limit per container is the right tool and is applied per container.
+#
+# CONTAINER TELEMETRY (fix round 3): the telemetry-off keys step 4 installs for the host do not reach containers
+# (/root/.docker/config.json injects the proxy variables only), and Open WebUI, docling-serve, speaches, kokoro and the
+# Phase 4 ROCm images all import huggingface_hub, which posts to huggingface.co/api/telemetry (an allowlisted host, so
+# squid lets it through). docker.env therefore carries CONTAINER_HF_HUB_DISABLE_TELEMETRY and friends, and EVERY compose
+# service MUST interpolate them into its `environment:` (contract; the second test container proves the mechanism).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -43,12 +55,23 @@ _docker_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt_install ca-certificates curl
   install -m 0755 -d /etc/apt/keyrings
-  local ok=1
-  if [[ ! -s /etc/apt/keyrings/docker.asc ]]; then
-    curl -fsSL --max-time 60 https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc || ok=0
-    [[ -s /etc/apt/keyrings/docker.asc ]] && chmod a+r /etc/apt/keyrings/docker.asc
+  local ok=1 keyf=/etc/apt/keyrings/docker.asc
+  if [[ ! -s "$keyf" ]]; then
+    if curl -fsSL --max-time 60 https://download.docker.com/linux/ubuntu/gpg -o "$keyf.tmp"; then
+      mv "$keyf.tmp" "$keyf"; chmod a+r "$keyf"
+    else
+      rm -f "$keyf.tmp"; ok=0
+    fi
   fi
   if (( ok )); then
+    # Fingerprint pinned (fix round 3): 9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88 as published on
+    # docs.docker.com/engine/install/ubuntu; VERIFIED live during the fix round against the key file served by
+    # download.docker.com. A mismatch is a stop (tampered download or a rotated key), never a fallback to the archive.
+    command -v gpg >/dev/null || apt_install gnupg
+    local docker_fpr=9DC858229FC7DD38854AE2D88D81803C0EBFCD88 got
+    got="$(gpg --show-keys --with-fingerprint --with-colons "$keyf" 2>/dev/null | awk -F: '$1=="fpr" {print $10}' | tr '\n' ' ')"
+    grep -qw "$docker_fpr" <<<"$got" \
+      || die "Docker's apt signing key does not carry the published fingerprint $docker_fpr (got: ${got:-none}); refusing to add the repository (rm $keyf and re-run after checking https://docs.docker.com/engine/install/ubuntu/)"
     local codename; codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
     cat >/etc/apt/sources.list.d/docker.sources <<SRC
 Types: deb
@@ -72,6 +95,12 @@ SRC
     _ATLAS_APT_UPDATED=0
     apt_install docker.io docker-compose-v2
   fi
+}
+
+# _docker_group_warning — the Section 20 R-item this step proposes (R22), warned at run time so it reaches the Phase 1
+# log and the gate output until docs/ATLAS_FRAMEWORK_REVIEW.md and CONVENTIONS §2 carry it (other writers' files).
+_docker_group_warning() {
+  warn "R22 (proposed, Section 20): the atlas service account is in the docker group (CONVENTIONS §2), which is root-equivalent on the host (docker run -v /:/host --privileged); the sudoers fragment /etc/sudoers.d/atlas-engines and Section 16.3 item 6 are therefore NOT enforceable against the orchestrator account. Mitigations for the Principal to choose in Phase 2: a restricted socket (tecnativa/docker-socket-proxy, EXEC=0 PRIVILEGED=0 VOLUMES=0, DOCKER_HOST pointed at it) or root-owned systemd units for every compose lifecycle reached through the sudoers fragment."
 }
 
 step_06() {
@@ -116,8 +145,9 @@ JSON
   log "DOCKER-USER egress rules active: $(iptables -w -S DOCKER-USER | wc -l) rules"
 
   # Service account groups (Section 3.6, CONVENTIONS §2): docker for compose, render+video for the GPU device nodes.
-  # See the header: docker-group membership makes this account root-equivalent on the host (open risk).
+  # See the header: docker-group membership makes this account root-equivalent on the host (open risk, proposed R22).
   usermod -aG docker,render,video atlas
+  _docker_group_warning
   local render_gid video_gid atlas_uid atlas_gid atlas_home
   render_gid="$(getent group render | cut -d: -f3)"; video_gid="$(getent group video | cut -d: -f3)"
   atlas_uid="$(id -u atlas)"; atlas_gid="$(id -g atlas)"
@@ -130,8 +160,10 @@ JSON
 
   # Compose-friendly env (CONTRACT for Phase 2+ compose files: `docker compose --env-file /etc/atlas/docker.env`).
   # NTFY_DATA_DIR holds ntfy's config and message cache (backed up); NTFY_AUTH_DIR holds user.db (password hashes and
-  # the node token) on the OS volume, outside /srv/atlas and outside restic's include set; WG_DATA_DIR holds the
-  # WireGuard server and peer private keys under /etc/atlas/secrets (CONVENTIONS §7.2). Written BEFORE the squid
+  # the node token, the same secret as secrets/ntfy.env) under /etc/atlas/secrets/ntfy (atlas:atlas 700; fix round 3,
+  # CONVENTIONS §7.2 "secrets live only under /etc/atlas/secrets/"); WG_DATA_DIR holds the WireGuard server and peer
+  # private keys under /etc/atlas/secrets/wg-easy. Neither is under /srv/atlas or in restic's include set. The
+  # CONTAINER_* telemetry keys and SANDBOX_RUN_FLAGS are contracts described in the header. Written BEFORE the squid
   # re-render because _squid_render reads DOCKER_GW from this file.
   {
     echo "# Written by ATLAS Phase 1 step 6; sourceable and usable as a compose --env-file. Not a secret (no tokens)."
@@ -154,8 +186,20 @@ JSON
     echo "WG_BRIDGE_NET=$ATLAS_WG_BRIDGE_NET"
     echo "WG_BRIDGE_GW=$ATLAS_WG_BRIDGE_GW"
     echo "NTFY_DATA_DIR=$ATLAS_SRV/data/ntfy"
-    echo "NTFY_AUTH_DIR=/var/lib/atlas-ntfy"
+    echo "NTFY_AUTH_DIR=$ATLAS_ETC/secrets/ntfy"
     echo "WG_DATA_DIR=$ATLAS_ETC/secrets/wg-easy"
+    echo "# Telemetry off INSIDE containers (rule §7.1; huggingface_hub posts to huggingface.co/api/telemetry otherwise)."
+    echo "# CONTRACT: every compose service interpolates these into its environment:, e.g."
+    echo "#   - HF_HUB_DISABLE_TELEMETRY=\${CONTAINER_HF_HUB_DISABLE_TELEMETRY}   (one line per key below)"
+    echo "CONTAINER_HF_HUB_DISABLE_TELEMETRY=1"
+    echo "CONTAINER_HF_HUB_DISABLE_IMPLICIT_TOKEN=1"
+    echo "CONTAINER_HF_HUB_ENABLE_HF_TRANSFER=0"
+    echo "CONTAINER_DO_NOT_TRACK=1"
+    echo "CONTAINER_PIP_DISABLE_PIP_VERSION_CHECK=1"
+    echo "# AEGIS sandbox run line (Section 16.4: hard memory limit, CPU quota, no network, a timeout; 16.4 names no"
+    echo "# numbers, so these are Phase 1 defaults the sandbox writer may tighten). Consumed by docker/sandbox and the"
+    echo "# orchestrator; the caller adds the \`timeout\` and, when the task's tier grants network, replaces --network none."
+    echo "SANDBOX_RUN_FLAGS='--network none --memory 4g --cpus 2 --pids-limit 256 --security-opt no-new-privileges --cap-drop ALL --read-only'"
   } | phase1_write_file 644 '' "$ATLAS_ETC/docker.env"
   log "wrote $ATLAS_ETC/docker.env (LAN_IP, uids/gids, container proxy at $gw:3128)"
 
@@ -187,9 +231,9 @@ JSON
   # privileges, a timeout). Phase 4 containers must keep the default seccomp profile and run with --cap-drop ALL,
   # adding only what a measured failure proves necessary. ubuntu:26.04 tag VERIFIED (services research 4.8).
   log "pulling ubuntu:26.04 through the proxy for the passthrough test"
-  retry 3 docker pull -q ubuntu:26.04 >/dev/null || die "docker pull ubuntu:26.04 failed (registry-1.docker.io / auth.docker.io / the blob CDN must be allowlisted; see /var/log/squid/access.log)"
+  retry 3 docker pull -q ubuntu:26.04 >/dev/null || die "docker pull ubuntu:26.04 failed (registry-1.docker.io, auth.docker.io and the blob CDN production.cloudfront.docker.com must be allowlisted; see /var/log/squid/access.log for the TCP_DENIED host)"
   local out
-  out="$(timeout -s KILL 60 docker run --rm --network none --memory 256m --pids-limit 64 --security-opt no-new-privileges \
+  out="$(timeout -s KILL 60 docker run --rm --network none --memory 256m --cpus 2 --pids-limit 64 --security-opt no-new-privileges \
            --device /dev/kfd --device /dev/dri --cap-drop ALL \
            --user "$atlas_uid:$atlas_gid" --group-add "$render_gid" --group-add "$video_gid" \
            ubuntu:26.04 sh -c 'ls /dev/kfd /dev/dri/renderD* && id -G' 2>&1)" \
@@ -201,19 +245,26 @@ JSON
   log "GPU passthrough test as atlas: $(tr '\n' ' ' <<<"$out")"
   # Containers must reach the proxy and nothing else: prove both from inside a container with apt (ubuntu:26.04
   # ships no curl; apt honours http_proxy/https_proxy, sends the hostname to squid, needs no DNS, and
-  # .archive.ubuntu.com is allowlisted).
-  if timeout -s KILL 120 docker run --rm --memory 512m --pids-limit 128 --security-opt no-new-privileges \
-       -e "http_proxy=http://$gw:3128" -e "https_proxy=http://$gw:3128" ubuntu:26.04 \
-       apt-get -qq -o Acquire::http::Timeout=20 -o Acquire::Retries=1 update >/dev/null 2>&1; then
-    log "container -> proxy ($gw:3128) -> archive.ubuntu.com: ok"
+  # .archive.ubuntu.com is allowlisted). Same cap set as the sandbox (--cpus, --cap-drop ALL): apt's own privilege drop
+  # to _apt needs CAP_SETUID/SETGID, so APT::Sandbox::User=root keeps it from failing for a reason unrelated to egress.
+  # The same run proves the docker.env telemetry contract: an -e key must be visible to the process (exit 42 if not).
+  local rc=0
+  timeout -s KILL 120 docker run --rm --memory 512m --cpus 2 --pids-limit 128 --security-opt no-new-privileges --cap-drop ALL \
+       -e "http_proxy=http://$gw:3128" -e "https_proxy=http://$gw:3128" -e HF_HUB_DISABLE_TELEMETRY=1 ubuntu:26.04 \
+       sh -c 'env | grep -qx HF_HUB_DISABLE_TELEMETRY=1 || exit 42; exec apt-get -qq -o APT::Sandbox::User=root -o Acquire::http::Timeout=20 -o Acquire::Retries=1 update' >/dev/null 2>&1 || rc=$?
+  if (( rc == 0 )); then
+    log "container -> proxy ($gw:3128) -> archive.ubuntu.com: ok (with --cpus 2 --cap-drop ALL; -e HF_HUB_DISABLE_TELEMETRY=1 visible inside)"
+  elif (( rc == 42 )); then
+    die "an environment key passed with -e was not visible inside the container; the docker.env CONTAINER_* telemetry contract cannot work on this daemon"
   else
-    die "a container could not reach archive.ubuntu.com through the proxy at $gw:3128. Check 'ss -ltn sport = :3128' (squid must listen on $gw), 'ufw status' for the docker0/172.16.0.0/12 port 3128 rules, /var/log/squid/access.log, and 'iptables -S DOCKER-USER'. (Containers have no DNS by design: that is not the fault here, apt sends the name to squid.)"
+    die "a container could not reach archive.ubuntu.com through the proxy at $gw:3128 (rc $rc). Check 'ss -ltn sport = :3128' (squid must listen on $gw), 'ufw status' for the docker0/172.16.0.0/12 port 3128 rules, /var/log/squid/access.log, and 'iptables -S DOCKER-USER'. (Containers have no DNS by design: that is not the fault here, apt sends the name to squid.)"
   fi
-  # /root/.docker/config.json injects the proxy into every container root starts, so the negative test blanks it.
+  # /root/.docker/config.json injects the proxy into every container root starts, so the negative test blanks it. The
+  # flags are identical to the positive test above, so a failure here can only be the egress block.
   docker rm -f atlas-egress-test >/dev/null 2>&1 || true
-  if timeout -s KILL 90 docker run --rm --name atlas-egress-test --memory 512m --pids-limit 128 --security-opt no-new-privileges \
+  if timeout -s KILL 90 docker run --rm --name atlas-egress-test --memory 512m --cpus 2 --pids-limit 128 --security-opt no-new-privileges --cap-drop ALL \
        -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= ubuntu:26.04 \
-       apt-get -qq -o Acquire::http::Timeout=8 -o Acquire::Retries=0 update >/dev/null 2>&1; then
+       apt-get -qq -o APT::Sandbox::User=root -o Acquire::http::Timeout=8 -o Acquire::Retries=0 update >/dev/null 2>&1; then
     docker rm -f atlas-egress-test >/dev/null 2>&1 || true
     die "a container reached the internet WITHOUT the proxy: the DOCKER-USER egress rules are not enforcing (iptables -S DOCKER-USER)"
   fi

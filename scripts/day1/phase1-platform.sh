@@ -25,16 +25,21 @@
 #   * step 2: the recovery key is printed once and the step waits for "WRITTEN DOWN"; in the SAME pause, when the
 #     installer encrypted the OS volume and it has no TPM2 token yet, the OS LUKS passphrase is asked ONCE so the TPM
 #     can unlock the OS at boot (Section 3.5; used for the enrolment only, never stored);
-#   * step 7: when the Cloudflare token cannot list zones and no zone id is found (CLOUDFLARE.txt, CF_ZONE_ID in
-#     atlas.env), the zone id is asked ONCE from the terminal with a 5-minute timeout (Section 22, S11); no terminal
-#     or no answer leaves it blank with a warning. Non-interactive path: CF_ZONE_ID=<32 hex> in /etc/atlas/atlas.env.
+#   * step 7: when the Cloudflare token cannot list zones and no zone id is found (beside the token in CLOUDFLARE.txt,
+#     or in an existing secrets/cloudflare.env), the zone id is asked ONCE from the terminal with a 5-minute timeout
+#     (Section 22, S11); no terminal or no answer leaves it blank with a warning.
+#   * step 7's non-interactive path for the zone id: a "Zone ID: <32 hex>" line beside the token in CLOUDFLARE.txt, or
+#     CF_ZONE_ID= pre-seeded in /etc/atlas/secrets/cloudflare.env (no atlas.env key: CONVENTIONS §3 does not list one).
 # Waits that are not prompts: steps 5b and 7 WAIT up to 10 minutes each for the Principal's RDP session and phone
 # handshake. A timeout records V19/V5 as FAIL (CONVENTIONS §6 lists both as required with no deferral), the step
 # still completes, and the Phase 1 gate blocks Phase 2 until `--force 05b` / `--force 07` re-runs the wait.
-# Recorded setting with a Section 3.5 consequence: ATLAS_ALLOW_UNENCRYPTED_OS=1 in /etc/atlas/atlas.env accepts an
-# unencrypted OS volume (step 1 otherwise stops); it also waives D3's on-node recovery-key copy (a plain-text key on
-# an unencrypted drive would defeat the data volume's encryption), so the USB copy is then the only copy. The key is
-# documented here and in steps 1/2; config/atlas.env.example should list it blank with the same text.
+# No waiver of Section 3.5 exists (fix round 3): an unencrypted OS volume stops step 1; the on-node recovery copy of
+# D3 is always written. One recorded acknowledgement exists, ATLAS_ACCEPT_PCR7_NO_SB=1 in /etc/atlas/atlas.env: D2
+# (Secure Boot disabled) makes the S9 PCR 7 binding unseal to any OS booted on the hardware, and step 1 / V2 stop
+# until the Principal either enables Secure Boot or records that acknowledgement (see phase1/01-preflight.sh). The
+# key is listed in CONVENTIONS §3 and config/atlas.env.example (blank by default).
+# Phase-1-owned settings file: /etc/atlas/network.env (LAN_DNS_SERVERS, written by step 4, read by step 7,
+# docker-egress-rules.sh and --reload-allowlist); nothing Phase 1 derives is written into atlas.env (§3 key set).
 
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
@@ -114,7 +119,9 @@ done
 require_root
 if (( reload_allowlist )); then
   (( ${#args[@]} == 0 )) || die "--reload-allowlist takes an optional FILE and no other option"
-  # No load_env: the render needs only the allowlist, sentinel-feeds.json and the squid template (no atlas.env key).
+  # No load_env: the render needs only the allowlist, sentinel-feeds.json and the squid template; the dnsmasq
+  # re-render reads DOMAIN/WINDOWS_SHARE/LAN_IFACE from atlas.env and LAN_DNS_SERVERS from network.env inside
+  # phase1_reload_allowlist.
   # shellcheck source=phase1/04-system.sh
   source "$ATLAS_DAY1_DIR/phase1/04-system.sh"
   phase1_reload_allowlist "$reload_file"

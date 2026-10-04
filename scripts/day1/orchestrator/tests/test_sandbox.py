@@ -1,10 +1,13 @@
 """Section 16.4 / V17 with a StubDocker: the run line is the Dockerfile's (plus --pull never and the atlas gid), exit
 137 reads as killed_by_cap, a missing image is refused, every network grant is refused (the bridge is a DNS tunnel at
-best), staged paths and job ids stay inside SANDBOX_DIR, the operator's caps come from the environment."""
+best), staged paths and job ids stay inside SANDBOX_DIR, the operator's caps come from the environment, and the
+launcher keeps a bounded amount of the job's output (fix round 4)."""
 
 from __future__ import annotations
 
+import io
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +16,9 @@ from atlas.sandbox import (
     SandboxConfig,
     SandboxError,
     StubDocker,
+    SubprocessDocker,
     build_argv,
+    drain_bounded,
     parse_memory_mb,
     run,
     sandbox_config_from_env,
@@ -213,6 +218,7 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SANDBOX_MEMORY", "2g")
     monkeypatch.setenv("SANDBOX_CPUS", "2")
     monkeypatch.setenv("SANDBOX_TIMEOUT_S", "300")
+    monkeypatch.setenv("SANDBOX_OUTPUT_MAX", "4096")
     c = sandbox_config_from_env()
     assert (c.image, c.base_dir, c.pids, c.tmpfs_size, c.fsize) == (
         "atlas-sandbox:py3.12",
@@ -221,7 +227,9 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "512m",
         1073741824,
     )
-    assert (c.memory_mb, c.cpus, c.timeout_s) == (2048, 2.0, 300)
+    assert (c.memory_mb, c.cpus, c.timeout_s, c.output_max) == (2048, 2.0, 300, 4096)
+    monkeypatch.delenv("SANDBOX_OUTPUT_MAX")
+    assert sandbox_config_from_env().output_max == 1 << 20
     assert c.run_gid >= 0
     assert parse_memory_mb("512m") == 512 and parse_memory_mb("2048") == 2048 and parse_memory_mb("1G") == 1024
     for bad in ("2 cows", "5m", ""):
@@ -237,3 +245,28 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         with pytest.raises(SandboxError, match=key):
             sandbox_config_from_env()
         monkeypatch.delenv(key)
+
+
+def test_launcher_keeps_a_bounded_amount_of_the_jobs_output(tmp_path: Path) -> None:
+    """A job that prints without end must not grow the cpu worker until the OOM killer takes it (module docstring
+    "Output bound"): the real runner drains both pipes keeping at most output_max bytes each and flags the cut. Proven
+    with a plain python3 child (no docker): the bound is the launcher's, whatever argv it runs."""
+    kept, cut = drain_bounded(io.BytesIO(b"x" * 100), 10)
+    assert kept == b"x" * 10 and cut
+    kept, cut = drain_bounded(io.BytesIO(b"short"), 10)
+    assert kept == b"short" and not cut
+    runner = SubprocessDocker(output_max=1000)
+    code = "import sys; sys.stdout.write('o' * 50000); sys.stderr.write('e' * 10); sys.exit(3)"
+    rc, out, err = runner.run([sys.executable, "-c", code], timeout_s=30)
+    assert rc == 3 and out == "o" * 1000 and err == "e" * 10 and runner.last_truncated == (True, False)
+    # Through run(): the flags land on the result and the stub path (no last_truncated) reads as not truncated.
+    res = run("print(1)", runner=StubDocker(stdout="1\n"), config=cfg(tmp_path), job_id="bounded")
+    assert not res.stdout_truncated and not res.stderr_truncated
+
+    class Loud(StubDocker):
+        last_truncated = (True, True)
+
+    res = run("print(1)", runner=Loud(stdout="1\n"), config=cfg(tmp_path), job_id="bounded2")
+    assert res.stdout_truncated and res.stderr_truncated
+    # The default runner is built with the configured bound.
+    assert SubprocessDocker().output_max == 1 << 20 and SandboxConfig(output_max=7).output_max == 7

@@ -3,7 +3,8 @@
 
 Section 21 of the framework review lists V1..V23. The Day 1 scripts record results with
 `record_v` (lib/common.sh) as JSON lines: {"ts","phase","id","result","msg"} where result is
-one of pass|fail|deferred|info and id is V1..V23 or a half: V3a/V3b, V14a/V14b.
+one of pass|fail|deferred|info and id is V1..V23 or a half: V3a/V3b, V14a/V14b, or V10a (the Phase 2
+resident-router half of V10; CONVENTIONS.md §4).
 
 Rules for turning records into one row per V-item:
   * latest record per exact id wins, except V4 (per engine) where every latest-per-message
@@ -11,7 +12,9 @@ Rules for turning records into one row per V-item:
   * halves combine: both pass -> Pass; either fail -> Fail; otherwise Deferred (one half not
     yet run means the item is not proven, and the sheet has no "partial" value);
   * info records never set Pass; they are written into the evidence column with the row left
-    as "Not yet run" unless another record exists (V1 is informational only, Section 21).
+    as "Not yet run" unless another record exists (V1 is informational only, Section 21);
+  * V10's verdict is the Phase 3 load test's V10 record alone; the Phase 2 V10a record (resident
+    router) is prepended to its evidence and, while no V10 exists yet, shown as "Not yet run".
 
 Usage:
   fill-workbook.py [--verify /var/lib/atlas/day1/verify.jsonl] [--workbook docs/ATLAS_BUILD_BASELINE.xlsx]
@@ -22,11 +25,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from pathlib import Path
 
 RESULT_WORD = {"pass": "Pass", "fail": "Fail", "deferred": "Deferred"}
 HALVES = {"V3": ("V3a", "V3b"), "V14": ("V14a", "V14b")}
+EVIDENCE_ONLY = {"V10": "V10a"}  # Phase 2 half shown as evidence; the verdict is the Phase 3 record
 PER_ENGINE = {"V4"}
 
 
@@ -90,11 +94,13 @@ def combine(vid: str, records: list[dict], latest: dict[str, dict]) -> tuple[str
             return "Pass", evidence
         return "Deferred", evidence
     rec = latest.get(vid)
+    extra = latest.get(EVIDENCE_ONLY[vid]) if vid in EVIDENCE_ONLY else None
+    prefix = f"{EVIDENCE_ONLY[vid]} {extra['result']}: {extra['msg']} | " if extra else ""
     if rec is None:
-        return "Not yet run", ""
+        return "Not yet run", prefix.rstrip(" |")
     if rec["result"] == "info":
-        return "Not yet run", f"info: {rec['msg']}"
-    return RESULT_WORD.get(rec["result"], "Not yet run"), rec["msg"]
+        return "Not yet run", f"{prefix}info: {rec['msg']}"
+    return RESULT_WORD.get(rec["result"], "Not yet run"), f"{prefix}{rec['msg']}"
 
 
 def main() -> int:

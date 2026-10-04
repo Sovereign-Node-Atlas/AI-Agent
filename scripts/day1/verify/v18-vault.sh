@@ -3,12 +3,20 @@
 # collections afterwards" (Sections 10.5, 11, 21; D13; Phase 2 step 9b and the Phase 2 gate). Contract (CONVENTIONS.md
 # §5): exit 0 pass / 1 fail; exactly one stdout line; never prompts; under 10 minutes (idle window 20 s); safe to
 # re-run. Must run as root (unit control, the override file, the test passphrase file, runuser).
-# Usage: [printf '%s\n' "$passphrase" |] v18-vault.sh [CIPHER_DIR]
-#   * passphrase on STDIN (a pipe, never an argument): used for CIPHER_DIR (default: the real vault when a passphrase
-#     arrives). phase2/09b-vault.sh runs it this way with the Principal's passphrase on the real cipher dir.
-#   * nothing on stdin: CIPHER_DIR defaults to VAULT_TEST_CIPHER_DIR (the test vault step 9b initialised) and the
-#     passphrase is read from $ATLAS_ETC/secrets/vault-test.pass — the unattended gate run. The Principal's passphrase
-#     is never stored, so the gate proves the mechanics on a cipher dir whose passphrase is not the Principal's.
+# Usage: v18-vault.sh [CIPHER_DIR]                                   (test mode: the gate's unattended run)
+#        printf '%s\n' "$passphrase" | V18_REAL_VAULT=1 v18-vault.sh [CIPHER_DIR]   (real mode: phase2/09b-vault.sh)
+#   * REAL mode is EXPLICIT (fix round 4): only with V18_REAL_VAULT=1 in the environment is one line read from stdin
+#     (a pipe, never an argument) and used as the passphrase for CIPHER_DIR (default: the real vault). Without the flag
+#     stdin is ignored entirely, so a driver run as `yes | ...` or from a here-doc can never feed an arbitrary string to
+#     the real vault as a passphrase (which would count as a refusal in the orchestrator and alarm ntfy).
+#   * TEST mode (no flag): CIPHER_DIR defaults to VAULT_TEST_CIPHER_DIR (the test vault step 9b initialised) and the
+#     passphrase is read from $ATLAS_ETC/secrets/vault-test.pass. The Principal's passphrase is never stored, so the gate
+#     proves the mechanics on a cipher dir whose passphrase is not the Principal's. The real vault is refused in this
+#     mode. RESULT IN TEST MODE: while the real vault is uninitialised ($ATLAS_STATE/vault-init-pending exists, the state
+#     after a default unattended step 9b) every check still runs, but a clean run exits 2 (`deferred`, never `pass`):
+#     Section 21 V18 is a proof about THE vault, and a pass recorded for a substitute cipher dir while the real one does
+#     not exist would be the silent pass §7.4 forbids. Once the real vault exists, a clean test-mode run is a pass (the
+#     mechanics are the same unit, helper, button and memory rule; only the cipher dir differs).
 #
 # Steps (every one fails loudly, nothing is skipped):
 #   1. The vault must be locked; the helper, unit, memory.env (CHROMA_URL, CHROMA_COLLECTIONS), the orchestrator's
@@ -60,20 +68,22 @@ SELFTEST_SUBDIR=".atlas-selftest"   # must equal VAULT_SELFTEST_SUBDIR in phase2
 
 # --- passphrase source and cipher dir -------------------------------------------------------------------------------------
 pass=""
-if [[ ! -t 0 ]]; then
-  IFS= read -r -t 5 pass || true
-fi
-if [[ -n "$pass" ]]; then
-  cipher="${1:-$VAULT_CIPHER_DIR}"
+pending_flag="$ATLAS_STATE/vault-init-pending"
+if [[ "${V18_REAL_VAULT:-0}" == 1 ]]; then
   mode="real"
+  cipher="${1:-$VAULT_CIPHER_DIR}"
+  [[ ! -t 0 ]] || { echo "V18 fail: V18_REAL_VAULT=1 but stdin is a terminal; pipe the passphrase (never an argument)"; exit 1; }
+  IFS= read -r -t 30 pass || true
+  [[ -n "$pass" ]] || { echo "V18 fail: V18_REAL_VAULT=1 but no passphrase line arrived on stdin within 30 s"; exit 1; }
 else
-  cipher="${1:-$VAULT_TEST_CIPHER_DIR}"
   mode="test"
+  cipher="${1:-$VAULT_TEST_CIPHER_DIR}"
+  # stdin is deliberately NOT read in this mode (header): whatever a driver pipes in is not a passphrase.
   tpf="$ATLAS_ETC/secrets/vault-test.pass"
-  [[ -r "$tpf" ]] || { echo "V18 fail: nothing on stdin and $tpf is missing (step 9b writes it); pipe a passphrase or re-run step 9b"; exit 1; }
+  [[ "$cipher" != "$VAULT_CIPHER_DIR" ]] || { echo "V18 fail: the real vault is only exercised with V18_REAL_VAULT=1 and the Principal's passphrase on stdin (phase2/09b-vault.sh does this); test mode refuses it"; exit 1; }
+  [[ -r "$tpf" ]] || { echo "V18 fail: $tpf is missing (step 9b writes it); re-run step 9b"; exit 1; }
   IFS= read -r pass <"$tpf" || true
   [[ -n "$pass" ]] || { echo "V18 fail: $tpf is empty"; exit 1; }
-  [[ "$cipher" == "$VAULT_CIPHER_DIR" ]] && { echo "V18 fail: the real vault needs the Principal's passphrase on stdin; nothing arrived"; exit 1; }
 fi
 [[ -f "$cipher/gocryptfs.conf" ]] || { echo "V18 fail: $cipher/gocryptfs.conf missing: not an initialised vault (step 9b)"; exit 1; }
 
@@ -148,19 +158,41 @@ orch_port="$(awk -F= '$1=="ORCH_PORT" {print $2; exit}' "$orch_env" 2>/dev/null 
 [[ "$orch_port" =~ ^[0-9]+$ ]] || orch_port=8800
 orch_base="http://127.0.0.1:$orch_port"
 
-# Admin routes (api.py): with ORCH_ADMIN_TOKEN_FILE configured, /vault/* need X-Atlas-Token; the header goes through a
-# curl config file (600, shredded by cleanup), never argv. Without a token file the routes accept loopback callers.
+# The EXIT trap is installed BEFORE anything secret is written anywhere (fix round 4: the earlier order left the admin
+# token's curl config in /tmp on every early exit, e.g. a gate run against a not-yet-healthy stack).
+mfile=""
+mdir="$VAULT_MOUNT_DIR/$SELFTEST_SUBDIR"
 curl_cfg=""
+# shellcheck disable=SC2329  # invoked through the EXIT trap below
+cleanup() {
+  # Never leave the marker, the vault open, an override, a passfile or the token config behind, whatever happened above.
+  if [[ -n "$mfile" ]] && is_mounted; then runuser -u atlas -- rm -f "$mfile" 2>/dev/null || true; fi
+  if is_mounted; then runuser -u atlas -- rmdir "$mdir" 2>/dev/null || true; fi
+  if is_mounted || systemctl is-active --quiet "$VAULT_UNIT"; then "$VAULT_HELPER" lock >/dev/null 2>&1 || true; fi
+  rm -f "$VAULT_OVERRIDE_FILE" 2>/dev/null || true
+  if [[ -e "$VAULT_PASS_FILE" && ! -L "$VAULT_PASS_FILE" ]]; then shred -u "$VAULT_PASS_FILE" 2>/dev/null || rm -f "$VAULT_PASS_FILE"; fi
+  if [[ -n "$curl_cfg" && -f "$curl_cfg" ]]; then shred -u "$curl_cfg" 2>/dev/null || rm -f "$curl_cfg"; fi
+  pass=""
+  return 0
+}
+trap cleanup EXIT
+
+# Admin routes (api.py): with ORCH_ADMIN_TOKEN_FILE configured, /vault/* need X-Atlas-Token; the header goes through a
+# curl config file, never argv. The config lives on tmpfs in the root-only vault run dir (root 600, shredded by cleanup):
+# the token never touches disk (CONVENTIONS §7.2). Without a token file the routes accept loopback callers.
 token_file="$(awk -F= '$1=="ORCH_ADMIN_TOKEN_FILE" {print $2; exit}' "$orch_env" 2>/dev/null || true)"
 token_file="${token_file%\"}"; token_file="${token_file#\"}"
 auth_note="loopback (no ORCH_ADMIN_TOKEN_FILE)"
 if [[ -n "$token_file" ]]; then
   [[ -r "$token_file" ]] || { echo "V18 fail: ORCH_ADMIN_TOKEN_FILE=$token_file is set in $orch_env but is not readable; the button (POST /vault/open) needs X-Atlas-Token"; exit 1; }
+  [[ ! -L "$VAULT_RUN_DIR" ]] || { echo "V18 fail: $VAULT_RUN_DIR is a symlink; refusing"; exit 1; }
+  install -d -m 755 -o root -g root "$VAULT_RUN_DIR"
+  [[ "$(findmnt -n -o FSTYPE --target "$VAULT_RUN_DIR" 2>/dev/null || true)" == tmpfs ]] || { echo "V18 fail: $VAULT_RUN_DIR is not on tmpfs; the admin token must not touch disk"; exit 1; }
   tok="$(sed -nE 's/^ORCH_ADMIN_TOKEN=//p' "$token_file" | head -n1)"
   [[ -n "$tok" ]] || tok="$(head -n1 "$token_file")"
   tok="${tok%\"}"; tok="${tok#\"}"
   [[ -n "$tok" ]] || { echo "V18 fail: $token_file holds no token (ORCH_ADMIN_TOKEN=... or the bare token)"; exit 1; }
-  curl_cfg="$(mktemp)"
+  curl_cfg="$(umask 077; mktemp -p "$VAULT_RUN_DIR" .v18curl.XXXXXX)"
   chmod 600 "$curl_cfg"
   printf 'header = "X-Atlas-Token: %s"\n' "$tok" >"$curl_cfg"
   tok=""
@@ -190,22 +222,6 @@ print(d.get("state") or d.get("status") or "missing-state")' <<<"$body" 2>/dev/n
     *) echo "http-$code" ;;
   esac
 }
-
-mfile=""
-mdir="$VAULT_MOUNT_DIR/$SELFTEST_SUBDIR"
-# shellcheck disable=SC2329  # invoked through the EXIT trap below
-cleanup() {
-  # Never leave the marker, the vault open, an override, a passfile or the token config behind, whatever happened above.
-  if [[ -n "$mfile" ]] && is_mounted; then runuser -u atlas -- rm -f "$mfile" 2>/dev/null || true; fi
-  if is_mounted; then runuser -u atlas -- rmdir "$mdir" 2>/dev/null || true; fi
-  if is_mounted || systemctl is-active --quiet "$VAULT_UNIT"; then "$VAULT_HELPER" lock >/dev/null 2>&1 || true; fi
-  rm -f "$VAULT_OVERRIDE_FILE" 2>/dev/null || true
-  if [[ -e "$VAULT_PASS_FILE" && ! -L "$VAULT_PASS_FILE" ]]; then shred -u "$VAULT_PASS_FILE" 2>/dev/null || rm -f "$VAULT_PASS_FILE"; fi
-  if [[ -n "$curl_cfg" && -f "$curl_cfg" ]]; then shred -u "$curl_cfg" 2>/dev/null || rm -f "$curl_cfg"; fi
-  pass=""
-  return 0
-}
-trap cleanup EXIT
 
 # --- 2. open by the button ---------------------------------------------------------------------------------------------
 # The one-shot override (root-only directory; the helper refuses an idle longer than VAULT_IDLE or a cipher dir that is
@@ -383,5 +399,12 @@ if [[ -n "$LIGHTRAG_WORKING_DIR" && -d "$LIGHTRAG_WORKING_DIR" ]]; then
   fi
   graph_note="absent from the graph store ($LIGHTRAG_WORKING_DIR)"
 fi
-echo "vault ($mode cipher dir) opened by the button (POST /vault/open, auth $auth_note -> sudo -n atlas-vault -> $VAULT_UNIT; override honoured; sudo status and GET /vault/status open), marker under $SELFTEST_SUBDIR/ read by vault-session-test via $admin_via and removed, auto-locked after ${locked_after}s with -idle $IDLE (/vault/status locked); marker $detail; $graph_note"
+evidence="vault ($mode cipher dir) opened by the button (POST /vault/open, auth $auth_note -> sudo -n atlas-vault -> $VAULT_UNIT; override honoured; sudo status and GET /vault/status open), marker under $SELFTEST_SUBDIR/ read by vault-session-test via $admin_via and removed, auto-locked after ${locked_after}s with -idle $IDLE (/vault/status locked); marker $detail; $graph_note"
+if [[ "$mode" == test && -f "$pending_flag" ]]; then
+  # Every check passed on the test cipher dir, but the vault Section 21 speaks of does not exist yet: deferred (exit 2),
+  # never pass (header). The gate prints the opt-in command; this line carries it too.
+  echo "deferred: real vault not initialised (flag $pending_flag; from a console: sudo env ATLAS_VAULT_INIT=1 ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 09b); mechanics proven on the test cipher dir: $evidence"
+  exit 2
+fi
+echo "$evidence"
 exit 0

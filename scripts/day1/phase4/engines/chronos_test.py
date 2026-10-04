@@ -44,4 +44,4 @@ def main(t: Test) -> None:
 
 
 if __name__ == "__main__":
-    Test("timesfm-chronos").run(main)
+    Test("chronos").run(main)

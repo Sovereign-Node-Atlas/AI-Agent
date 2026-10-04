@@ -27,13 +27,13 @@
 #     on the host network, the orchestrator) are host processes; an unauthenticated document-conversion API gets no LAN
 #     listener for no consumer (Section 12.5). Should a LAN consumer appear, "docling-serve 5001" must first be added to
 #     the §8 port table.
-#   * DOCLING STEP OWNERSHIP (Section 17 places the "Docling ingestion service" in step 4; phase2/04-memory.sh installs
-#     the library and prefetches its models): the docling service below needs NO voice.env and NO LAN_IP, so step 4 can
-#     start it first with
-#         docker compose -f docker/core/compose.yml -f docker/core/compose.voice.yml --env-file /etc/atlas/core.env up -d docling
-#     and phase2/05-voice.sh's `up -d` is then a no-op for it. Until the 04 writer adds that line, the container is
-#     started by step 5 and Open WebUI reaches it from step 5 on (deviation stated in 05-voice.sh; a step-4 item for
-#     phase2/README-contracts.md).
+#   * DOCLING STEP OWNERSHIP (resolved, fix round 3): Section 17 places the "Docling ingestion service" in step 4, and
+#     phase2/04-memory.sh now STARTS the docling container from this overlay (its _mem_preflight requires this file and
+#     it runs `docker compose -f compose.yml -f compose.voice.yml --env-file /etc/atlas/core.env up -d docling`), so Open
+#     WebUI (step 3) has its document service from step 4 on. The service therefore needs NO voice.env and NO LAN_IP
+#     (loopback publish only, defaults for everything else). phase2/05-voice.sh's `up -d kokoro speaches docling` is a
+#     no-op for it and re-proves /docs so a `--force 05` re-run still checks the whole overlay. The §1 layout row still
+#     needs this overlay added beside compose.yml (CONTRACT above).
 #   * Nothing outbound and nothing cloud (rule §7.1): HF_HUB_OFFLINE=1 everywhere after the first speaches start,
 #     HF_HUB_DISABLE_TELEMETRY=1, DO_NOT_TRACK=1, Kokoro's web player and voice-pack saving off, docling's remote
 #     (cloud VLM / picture-description) services and external plugins pinned OFF, not left to the image default.

@@ -123,7 +123,10 @@ class Settings:
     db_path: Path
     engines_env_dir: Path
     llama_port_base: int
-    family_names: tuple[str, ...]
+    # The Principal's real family names (7.2 rule 1, 10.5 sensitivity): never in repr()/str(), so a `%r` of the settings
+    # or an exception that formats them cannot put the names into the journal. asdict() still carries them; nothing
+    # may JSON-dump a Settings object (the API's /config answers from AtlasConfig fields, never from this dataclass).
+    family_names: tuple[str, ...] = field(repr=False)
     # An allowlisted subset of the merged environment, copied by name. Never the whole environment: the units inherit
     # proxy.env, memory.env and every later *.env, and asdict()/vars() of this object must not dump them.
     extra: dict[str, str] = field(default_factory=dict, repr=False)
@@ -362,7 +365,7 @@ class TaskForce(BaseModel):
     @field_validator("default_tier")
     @classmethod
     def _tier_known(cls, v: str) -> str:
-        # CONVENTIONS.md §8 tiers are lowercase keys; 8.3's "Sensitive" must be caught here, not at dispatch (rule §7.4).
+        # §8 tiers are lowercase keys; 8.3's "Sensitive" must fail here, not at dispatch (rule §7.4).
         if v not in TIERS:
             raise ValueError(f"default_tier {v!r} is not one of {TIERS} (CONVENTIONS.md §8)")
         return v
@@ -468,14 +471,18 @@ def load_personas(cfg_dir: Path | None = None, engines: dict[str, EngineSpec] | 
 # --- domains/cards/NN-slug.md -----------------------------------------------------------------------------------------
 
 # "# NN. Name  (Hemisphere, Owner, Tier X)" — CONVENTIONS.md §8 "Domain cards": the triple is comma-separated and the
-# owner drops 8.2's inner comma ("Eleanor with Silas", "Arthur — tagged to 14"). parse_card_heading() still READS a
-# card that carries the 8.2 inner comma ("Alaric, with Silas") or a pipe-separated triple ("(Corporate | Valerie, with
-# Silas | Tier A)"), normalising the owner to the §8 spelling, so a tool can report what the card should say; but
-# load_domain_cards() (and so load_config and the Phase 2 gate) REFUSES a tree with such a card, listing every file
-# with the H1 it expects (rule §7.4: a §8 name that disagrees across files is a config error, not a warning). Fix
-# round: the real tree had six of them (07, 11, 26, 28, 32, 35), raised with the cards writer. The name may carry its
-# own parenthetical ("(incl. ...)") and the triple may nest one ("phrasing softened (Section 18 C9)"), so the split
-# point is the LAST run of two or more spaces before an opening parenthesis, not a regex over parentheses.
+# owner drops 8.2's inner comma ("Eleanor with Silas", "Arthur — tagged to 14"). parse_card_heading() READS a card that
+# carries the 8.2 inner comma ("Alaric, with Silas") or a pipe-separated triple ("(Corporate | Valerie, with Silas |
+# Tier A)") and normalises the owner to the §8 spelling, logging the H1 the card should carry. load_domain_cards() is
+# lenient by default (one WARNING per such card) so the orchestrator STARTS on a tree whose cards drift from §8 — the
+# node mirrors scripts/day1/config as it is, and a crash loop at Phase 2 step 2 helps nobody (fix round 3, blocker:
+# the real tree carries six such cards, 07, 11, 26, 28, 32, 35; the parse already yields the §8 owner). The §8
+# agreement is still enforced, where rule §7.4 wants it seen: load_domain_cards(..., strict=True) raises one
+# ConfigError naming every offending card and the H1 it expects; `atlas-admin config check` (exit 1) and
+# tests/test_config.py::test_real_config_tree_loads run that strict pass so the Phase 2 gate turns red with a precise
+# message instead of a dead service. The name may carry its own parenthetical ("(incl. ...)") and the triple may nest
+# one ("phrasing softened (Section 18 C9)"), so the split point is the LAST run of two or more spaces before an opening
+# parenthesis, not a regex over parentheses.
 _CARD_H1 = re.compile(r"^#\s+(\d{2})\.\s+(.*\S)\s*$")
 _CARD_SEP = re.compile(r"\s{2,}\(")
 _OWNER_INNER_COMMA = re.compile(r"^([A-Z][a-z]+), (with |and |tagged )")
@@ -502,7 +509,7 @@ def parse_card_heading(line: str, *, source: str = "", strict: bool = False) -> 
     """(number, name, hemisphere, owner, tier) from a card H1; the owner is returned in the §8 spelling.
 
     A non-§8 triple (pipes, or an owner with 8.2's inner comma) is normalised and logged with the H1 the card should
-    carry; with strict=True it raises ConfigError with that message instead (what load_domain_cards does).
+    carry; with strict=True it raises ConfigError with that message instead (load_domain_cards(strict=True) does).
     """
     m = _CARD_H1.match(line.strip())
     seps = list(_CARD_SEP.finditer(m.group(2))) if m else []
@@ -531,7 +538,15 @@ def parse_card_heading(line: str, *, source: str = "", strict: bool = False) -> 
     return number, name, hemisphere, owner, tm.group(1)
 
 
-def load_domain_cards(cfg_dir: Path | None = None) -> dict[int, DomainCard]:
+def load_domain_cards(cfg_dir: Path | None = None, *, strict: bool = False) -> dict[int, DomainCard]:
+    """config/domains/cards/*.md -> {number: DomainCard}.
+
+    strict=False (load_config, the running service): a card whose H1 triple is not in the §8 form is normalised and
+    logged as a WARNING naming the H1 it should carry. strict=True (`atlas-admin config check`, the gate, the real-tree
+    test): the same cards raise ONE ConfigError listing every offender (rule §7.4), after the whole tree has been read
+    so the message is complete. Everything else (a missing dir, a bad number, a duplicate, an unknown hemisphere) is a
+    ConfigError in both modes.
+    """
     cfg_dir = cfg_dir or config_dir()
     cdir = cfg_dir / "domains" / "cards"
     if not cdir.is_dir():
@@ -542,9 +557,9 @@ def load_domain_cards(cfg_dir: Path | None = None) -> dict[int, DomainCard]:
         text = path.read_text(encoding="utf-8")
         first = next((ln for ln in text.splitlines() if ln.strip()), "")
         try:
-            number, name, hemisphere, owner, tier = parse_card_heading(first, source=str(path), strict=True)
+            number, name, hemisphere, owner, tier = parse_card_heading(first, source=str(path), strict=strict)
         except ConfigError as exc:
-            if "not in the CONVENTIONS.md §8 form" not in str(exc):
+            if not strict or "not in the CONVENTIONS.md §8 form" not in str(exc):
                 raise
             non_conforming.append(str(exc))  # keep going: one message names every offending card
             number, name, hemisphere, owner, tier = parse_card_heading(first, source=str(path))
@@ -650,6 +665,8 @@ def load_config(settings: Settings | None = None) -> AtlasConfig:
         raise ConfigError(f"router-rules.json: classifier_engine {rules.classifier_engine!r} is not in engines.json")
     task_forces = load_task_forces(cfg, rules.max_domain_cards)
     personas = load_personas(cfg, engines)
+    # Lenient on purpose (see the comment above load_domain_cards): the service must start on the tree the node has;
+    # the strict §8 pass is `atlas-admin config check` / the gate, where a red row says which card to fix.
     cards = load_domain_cards(cfg)
     phase4 = load_phase4_engines(cfg)
     clash = sorted(set(phase4) & set(engines))

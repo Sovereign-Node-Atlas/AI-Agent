@@ -10,7 +10,10 @@ queue need on top of the raw records:
     `engine_for(persona, override)` refusing an engine the persona is not bound to (6.1 C6: overrides are explicit,
     never a default);
   * `external_tier(persona)`: the approval tier at which the persona speaks externally (6.2 "Speaks externally"
-    column, 16.2), the floor the approval queue applies to that persona's outbound items.
+    column, 16.2), the floor the approval queue applies to that persona's outbound items. A director file that
+    disagrees with the closed 6.2 table is a ConfigError (CONVENTIONS.md preamble: the document wins; §7.4: loudly,
+    not by a warning and a silent substitution), checked once when the registry is built so the orchestrator refuses
+    to start on a bad file rather than failing at the first outbound item.
 
 Nothing here reads a live service; loading is one pass over the config tree.
 """
@@ -98,6 +101,7 @@ class PersonaRegistry(Mapping[str, Persona]):
                 for ek in (p.default_engine, *p.override_engines):
                     if ek not in self._engines:
                         raise ConfigError(f"persona {key}: engine {ek!r} is not a key of engines.json")
+            external_tier(p)  # 6.2 agreement and the lead minimums, at load (ConfigError), not at the first item
 
     # --- Mapping -----------------------------------------------------------------------------------------------------
 
@@ -193,22 +197,20 @@ _LEAD_MINIMUM_SECTION: dict[str, str] = {"ren": "16.1 rule 2", "arthur": "16.5"}
 def external_tier(persona: Persona) -> str:
     """The tier at which a persona speaks externally (6.2 column; the file's value must agree with 6.2).
 
-    Directors: the 6.2 value, with a warning when the file disagrees. Leads (ren, arthur): the file's declared tier
-    (an inference the Principal confirms, config/README.md), refused loudly when it is below the lead's minimum in
-    LEAD_MINIMUM_EXTERNAL_TIER (Ren: `standard`, 16.1 rule 2, so a lead's outbound item can never auto-send; Arthur:
-    `sensitive`, 16.5, every external disclosure of family and health data is sensitive-tier).
+    Directors: the 6.2 value; a file that disagrees is a ConfigError (the document wins, CONVENTIONS.md preamble, and
+    §7.4 wants the disagreement loud: a warning in the journal plus a silent substitution is the silent path). Leads
+    (ren, arthur): the file's declared tier (an inference the Principal confirms, config/README.md), refused loudly
+    when it is below the lead's minimum in LEAD_MINIMUM_EXTERNAL_TIER (Ren: `standard`, 16.1 rule 2, so a lead's
+    outbound item can never auto-send; Arthur: `sensitive`, 16.5, every external disclosure of family and health data
+    is sensitive-tier).
     """
     expected = SECTION_6_2_EXTERNAL_TIER.get(persona.key)
     declared = persona.speaks_externally_tier
     if expected is not None and declared != expected:
-        # The document wins over the file (CONVENTIONS.md preamble); say so rather than silently pick one.
-        log.warning(
-            "persona %s declares speaks_externally_tier=%s but Section 6.2 says %s; using 6.2",
-            persona.key,
-            declared,
-            expected,
+        raise ConfigError(
+            f"persona {persona.key}: speaks_externally_tier {declared!r} disagrees with Section 6.2 ({expected}); "
+            f"fix config/personas/{persona.key}.md (the document wins; 16.3 rule 6: a file edit never widens a tier)"
         )
-        return expected
     if declared not in TIERS:
         raise ConfigError(f"persona {persona.key}: speaks_externally_tier {declared!r} is not one of {TIERS}")
     minimum = LEAD_MINIMUM_EXTERNAL_TIER.get(persona.key)

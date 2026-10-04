@@ -21,7 +21,12 @@ invalidates the cached prefix").
 Layer 4 is hemisphere-isolated (7.3: "enforced by separate memory collections, separate context windows"): the
 builder is the last component that knows whose context window this is, so a memory mapping that carries the other
 hemisphere's collection (`estate` / `documents_estate` into a corporate prompt, or the reverse) is a ValueError,
-never silently merged and never silently dropped. The hemisphere is the layer-1 persona's own (the persona whose
+never silently merged and never silently dropped. The check can only run on text that names its collection, so
+UNTYPED memory (a flat list, or the generic keys "memory" / "documents") is admitted but never silently: every
+non-empty untyped bucket is a WARNING naming the persona and the count, so the by-pass is visible in the journal.
+Callers should pass the 10.1 collection names (api.py `_retrieve`: `{info.hemisphere: [...], "scars": [...]}` and
+`documents_<hemisphere>` for document hits; contract for the API writer).
+The hemisphere is the layer-1 persona's own (the persona whose
 context window the prompt is): for a task-force dispatch that is the owning director, which the router keeps in the
 lead's hemisphere (8.1 preset tag) except on a hard hit or a typed override; when the decision's lead is in the other
 hemisphere the builder logs the 7.3 tension and still keys on the dispatch persona. The `sentinel` collection is
@@ -140,7 +145,9 @@ def governance_hash() -> str:
 
 
 # Keys a memory mapping may carry (10.1 collections plus the pipeline's generic "memory"/"documents" buckets). The
-# hemisphere-specific ones are admitted only for the speaking hemisphere; `sentinel` only for its 9.3 owners.
+# hemisphere-specific ones are admitted only for the speaking hemisphere; `sentinel` only for its 9.3 owners. The
+# generic buckets carry no collection name, so they pass no 7.3 check: they are admitted with a WARNING (module
+# docstring), not refused, because the chat pipeline hands its hemisphere-queried hits over under "memory" today.
 _SHARED_MEMORY_KEYS: tuple[str, ...] = ("memory", "documents")
 SENTINEL_KEY = "sentinel"
 # 9.3 "Owners: Alaric for threats, Silas for markets, under Arthur. RESOLVED (C12): not Ren."
@@ -155,14 +162,31 @@ def _split_memory(
     `sentinel`, to a persona in SENTINEL_READERS (9.3 / C12).
 
     The other hemisphere's collections present and non-empty, an unknown key, or `sentinel` for a persona who does
-    not own it raise ValueError (7.3 isolation; CONVENTIONS.md §7.4 never silent)."""
+    not own it raise ValueError (7.3 isolation; CONVENTIONS.md §7.4 never silent). Untyped memory (a flat list or a
+    generic key) is admitted with a WARNING per non-empty bucket: it carries no collection name to check."""
     if memory is None:
         return [], []
     if hemisphere not in HEMISPHERES:
         raise ValueError(f"unknown hemisphere {hemisphere!r} (CONVENTIONS.md §8: {HEMISPHERES})")
+    who = persona_key or hemisphere
     if not isinstance(memory, Mapping):
-        return [str(m) for m in memory if str(m).strip()], []
+        flat = [str(m) for m in memory if str(m).strip()]
+        if flat:
+            log.warning(
+                "prompt for %s (%s): untyped memory list (%d snippets) admitted without a collection check (7.3); "
+                "pass a mapping keyed by 10.1 collection",
+                who, hemisphere, len(flat),
+            )
+        return flat, []
     allowed = (*_SHARED_MEMORY_KEYS, hemisphere, f"documents_{hemisphere}")
+    for generic in _SHARED_MEMORY_KEYS:
+        count = sum(1 for m in (memory.get(generic) or ()) if str(m).strip())
+        if count:
+            log.warning(
+                "prompt for %s (%s): generic memory key %r (%d snippets) admitted without a collection check "
+                "(7.3); pass %r / %r instead",
+                who, hemisphere, generic, count, hemisphere, f"documents_{hemisphere}",
+            )
     if persona_key in SENTINEL_READERS:
         allowed = (*allowed, SENTINEL_KEY)
     for key, value in memory.items():

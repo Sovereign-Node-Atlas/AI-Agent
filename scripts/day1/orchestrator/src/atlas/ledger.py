@@ -16,8 +16,12 @@ WAL mode so the API and the Celery workers can read while one writes.
 
 Retention (Section 10.4, D9 closed): operational logs 30 days hot then archived, Sentinel logs 12 months, scars
 permanent. RETENTION_S states the window per table and `purge()` / `purge_expired()` apply it, handing the expired rows
-to an archive callback first; approvals and strikes are never purged (the scar record of 9.4 is permanent, the approval
-trail is the audit of 16.2). The 72-hour prune task (atlas.tasks.prune, another writer) is the intended caller.
+to an archive callback BEFORE the delete. D9 names exactly one permanent category, scars, so `strikes` (and the schema
+row in `meta`) are never purged; `approvals` (16.2) are operational — routine-tier "logged for review" rows and full
+outbound drafts, Principal data — and go to the archive after 30 days once decided (a `held` row is never purged,
+whatever its age: it is still a question for the Principal). The 72-hour prune task (atlas.tasks.prune, another
+writer) is the intended caller; purge_expired() takes the archive callback as a REQUIRED argument so the sweep can never
+discard a row that D9 says to archive, and purge() warns when it deletes without one (rule §7.4, never silently).
 """
 
 from __future__ import annotations
@@ -159,10 +163,13 @@ RETENTION_S: dict[str, float] = {
     "arbiter_decisions": 30 * DAY_S,  # 4.2 rule 9: every decision of every request
     "routing_decisions": 30 * DAY_S,  # 7.2 rule 5
     "tasks": 30 * DAY_S,  # the per-task rows of 9.7 are an operational log once the task is over
+    "approvals": 30 * DAY_S,  # 16.2 queue: decided rows are an operational log (D9), held rows never go
     "sentinel_pulses": 365 * DAY_S,  # 10.4: Sentinel logs 12 months
 }
-PERMANENT_TABLES: frozenset[str] = frozenset({"approvals", "strikes", "meta"})
+# D9: scars are the one permanent category (9.4 "scars permanent under curation"); meta is the schema row.
+PERMANENT_TABLES: frozenset[str] = frozenset({"strikes", "meta"})
 _TASK_OPEN_STATUSES: tuple[str, ...] = ("queued", "running")
+_APPROVAL_OPEN_STATUSES: tuple[str, ...] = ("held",)
 
 
 def new_task_id() -> str:
@@ -239,7 +246,12 @@ class Ledger:
                 yield cur
                 cur.execute("COMMIT")
             except BaseException:
-                cur.execute("ROLLBACK")
+                # BEGIN IMMEDIATE itself fails under write contention ("database is locked" after the busy timeout:
+                # the API, two Celery workers and atlas-admin share one WAL file). Then no transaction is open and a
+                # bare ROLLBACK would raise "cannot rollback - no transaction is active" IN PLACE of the real error,
+                # sending the operator to permissions instead of the lock (rule §7.4). Roll back only what was begun.
+                if self._conn.in_transaction:
+                    cur.execute("ROLLBACK")
                 raise
             finally:
                 cur.close()
@@ -451,23 +463,27 @@ class Ledger:
     ) -> int:
         """Delete the rows of `table` older than `older_than_s` seconds and return how many went.
 
-        D9 says "30 days hot, then archived": when `archive` is given it receives (table, rows) BEFORE the delete,
-        inside the same transaction, so a failing archive keeps the rows (the caller, atlas.tasks.prune, writes them
-        under /srv/cold). approvals, strikes and meta are permanent and refused with ValueError. Open tasks (queued or
-        running) are never purged whatever their age: a row that vanished mid-flight would be a lie in the ledger.
+        D9 says "30 days hot, then archived": `archive` receives (table, rows) BEFORE the delete, inside the same
+        transaction, so a failing archive keeps the rows (the caller, atlas.tasks.prune, writes them under /srv/cold).
+        Without an archive the delete still happens — a one-off operator sweep may want that — but a WARNING names the
+        table and the count, so a discard is never silent (rule §7.4); purge_expired() does not allow it at all.
+        strikes and meta are permanent and refused with ValueError. Open rows are never purged whatever their age: a
+        task that is queued or running, an approval still `held` — a row that vanished mid-flight would be a lie in the
+        ledger and a question the Principal never got to answer.
         """
         table = self._table(table)
         if table in PERMANENT_TABLES:
-            raise ValueError(f"table {table!r} is permanent (approvals: 16.2 audit; strikes: 9.4 scars); never purged")
+            raise ValueError(f"table {table!r} is permanent (strikes: 9.4 scars; meta: the schema row); never purged")
         if older_than_s <= 0:
             raise ValueError(f"older_than_s must be positive, got {older_than_s!r}")
         ts_col = "created_at" if table == "tasks" else "ts"
         cutoff = (time.time() if now is None else now) - older_than_s
         where = f"{ts_col} < ?"
         params: list[Any] = [cutoff]
-        if table == "tasks":
-            where += " AND status NOT IN ({})".format(", ".join("?" for _ in _TASK_OPEN_STATUSES))
-            params.extend(_TASK_OPEN_STATUSES)
+        open_statuses = {"tasks": _TASK_OPEN_STATUSES, "approvals": _APPROVAL_OPEN_STATUSES}.get(table)
+        if open_statuses:
+            where += " AND status NOT IN ({})".format(", ".join("?" for _ in open_statuses))
+            params.extend(open_statuses)
         with self.transaction() as cur:
             if archive is not None:
                 cur.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY {ts_col}", params)
@@ -477,15 +493,26 @@ class Ledger:
                 archive(table, rows)
             cur.execute(f"DELETE FROM {table} WHERE {where}", params)
             deleted = int(cur.rowcount or 0)
+        if archive is None and deleted:
+            log.warning("%s: %d row(s) older than %.0f days deleted WITHOUT an archive (D9, Section 10.4: operational "
+                        "logs are 30 days hot, then archived; pass archive= to keep them)", table, deleted,
+                        older_than_s / DAY_S)
         if vacuum and deleted:
             with self._lock:
                 self._conn.execute("VACUUM")
         return deleted
 
-    def purge_expired(self, *, now: float | None = None,
-                      archive: Callable[[str, list[dict[str, Any]]], None] | None = None,
+    def purge_expired(self, *, archive: Callable[[str, list[dict[str, Any]]], None], now: float | None = None,
                       vacuum: bool = False) -> dict[str, int]:
-        """Apply RETENTION_S to every table that has a window; {table: rows deleted}. The 72-hour prune calls this."""
+        """Apply RETENTION_S to every table that has a window; {table: rows deleted}. The 72-hour prune calls this.
+
+        `archive` is required, not defaulted: the time-based sweep is exactly the step D9 describes as "then
+        archived", so there is no legitimate call that throws the rows away (rule §7.4). A caller that truly wants a
+        discard calls purge() per table and gets the WARNING.
+        """
+        if not callable(archive):
+            raise TypeError("purge_expired() needs an archive callback (table, rows) -> None (D9: archived, not "
+                            "discarded)")
         out: dict[str, int] = {}
         for table, window in RETENTION_S.items():
             out[table] = self.purge(table, window, now=now, archive=archive)

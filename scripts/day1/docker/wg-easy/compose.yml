@@ -14,11 +14,12 @@
 #
 # Network design (adjudicated conflict 4): wg0 lives INSIDE this container. VPN clients reach the host masqueraded
 # as the container address 10.42.42.42 on the bridge br-atlas-wg, so "bound to LAN and WireGuard" for host services
-# means ufw rules on ${LAN_IFACE} and on br-atlas-wg (10.42.42.0/24). The admin UI (51821) is published on the LAN
-# address only, because Docker's published ports bypass ufw; UDP 51820 is published on every address by design.
-# INSECURE=true means the admin password crosses the LAN Wi-Fi in clear on a login from the Windows PC: step 7's V5
-# instructions therefore have the first login made from the node itself (the RDP session, http://127.0.0.1:51821) or
-# over the VPN.
+# means ufw rules on ${LAN_IFACE} and on br-atlas-wg (10.42.42.0/24). The admin UI (51821) is published on
+# 127.0.0.1 ONLY (fix round 3): INSECURE=true is plain HTTP, so a LAN publish would let the admin password cross the
+# home Wi-Fi in clear whenever a login is made from the Windows PC, and nothing on the LAN needs the page (the phone
+# QR is produced at the node, VPN clients never need admin). The Principal reaches it from the RDP session's Firefox
+# (http://127.0.0.1:51821) or over `ssh -L 51821:127.0.0.1:51821`; step 7's V5 text says so. UDP 51820 is published
+# on every address by design.
 #
 # Proxy: the host's /root/.docker/config.json (step 6) injects http_proxy/https_proxy into every container compose
 # starts as root. wg-easy needs no egress (DISABLE_VERSION_CHECK=true) and its busybox wget (used by step 7 to probe
@@ -35,7 +36,7 @@ services:
     image: ghcr.io/wg-easy/wg-easy:15.4.0
     container_name: wg-easy
     environment:
-      - INSECURE=true                # http only; the UI is reachable from LAN/VPN only (published on ${LAN_IP})
+      - INSECURE=true                # http only; the UI is published on 127.0.0.1 only (header)
       - DISABLE_VERSION_CHECK=true   # no phone-home (§7.1)
       - DISABLE_IPV6=true
       - INIT_ENABLED=${WG_INIT_ENABLED:-true}
@@ -62,7 +63,6 @@ services:
       - ${WG_DATA_DIR}:/etc/wireguard
     ports:
       - "${WG_PORT}:${WG_PORT}/udp"
-      - "${LAN_IP}:51821:51821/tcp"
       - "127.0.0.1:51821:51821/tcp"
     restart: unless-stopped
     cap_drop:

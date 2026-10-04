@@ -12,20 +12,28 @@ No live service: Ledger(':memory:'), StubSender, StubNotifier, and a stub cross-
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
+import httpx
 import pytest
 
 from atlas.approval import (
     HUMAN_ACTORS,
     PRINCIPAL_RECIPIENTS,
     ROUTINE_KINDS,
+    ROUTINE_MAX_CHARS,
     SENSITIVE_KINDS,
+    STANDARD_MINIMUM_KINDS,
     ApprovalError,
     ApprovalItem,
     ApprovalQueue,
     CrossCheckRecord,
     CrossCheckRequired,
+    HumanActor,
+    LlamaCrossChecker,
     NotPending,
     NullNotifier,
     SendError,
@@ -33,6 +41,7 @@ from atlas.approval import (
     StubSender,
 )
 from atlas.config import ConfigError
+from atlas.engines import LlamaClient
 from atlas.governance import DECISION_PREFIX, Register
 from atlas.ledger import Ledger
 from atlas.personas import LEAD_MINIMUM_EXTERNAL_TIER, PersonaRegistry, external_tier, load_persona_registry
@@ -226,6 +235,115 @@ def test_hand_attached_cross_check_needs_provenance(gate: Gate, ledger: Ledger) 
     assert queue.approve(item.id, decided_by="principal").status == "sent"
 
 
+def test_verdict_less_cross_check_row_is_not_a_record(gate: Gate, ledger: Ledger) -> None:
+    # A done "cross-check" tasks row under the approval's task that names the approval but carries no verdict (the
+    # checker's own inference row, or a row written through the Ledger API) must not read back as "agree": only a row
+    # the gate wrote (source "gate"/"attached") with a verdict in CROSS_CHECK_VERDICTS satisfies approve()'s backstop.
+    queue, sender, _ = gate
+    item = queue.submit(_email("sensitive", "gideon", "Our position is...", recipient="counsel@example.com"))
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+                       parent_task_id=item.task_id, payload={"approval_id": item.id})
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+                       parent_task_id=item.task_id, payload={"approval_id": item.id, "source": "inference"})
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+                       parent_task_id=item.task_id,
+                       payload={"approval_id": item.id, "source": "gate", "verdict": "maybe"})
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+                       parent_task_id=item.task_id, payload={"approval_id": item.id, "verdict": "agree"})
+    assert queue.get(item.id).cross_check is None
+    with pytest.raises(CrossCheckRequired):
+        queue.approve(item.id, decided_by="principal")
+    assert sender.sent == [] and [i.id for i in queue.needs_cross_check()] == [item.id]
+    real = queue.attach_cross_check(item.id, _record(ledger, "arthur", "nemotron-3-super"))
+    assert real.cross_check is not None and queue.get(item.id).cross_check.verdict == "agree"
+    assert queue.approve(item.id, decided_by="principal").status == "sent"
+
+
+def _fake_llama(handler: Callable[[httpx.Request], httpx.Response]) -> LlamaClient:
+    return LlamaClient("http://127.0.0.1:8102", transport=httpx.MockTransport(handler))
+
+
+def test_llama_cross_checker_runs_the_other_lead_on_another_engine(ledger: Ledger, personas: PersonaRegistry) -> None:
+    # 9.2 strong version, the shipped implementation: the other hemisphere lead judges the draft on an engine the
+    # draft did not use; the inference is its own done "cross-check" tasks row (provenance) that the gate verifies.
+    seen: list[tuple[str, dict]] = []
+    leased: list[tuple[str, str]] = []
+
+    def reply(engine: str) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((engine, json.loads(request.content)))
+            text = '{"verdict": "amended", "notes": "Clause 12 caps nothing; say so."}'
+            return httpx.Response(200, json={"choices": [{"message": {"content": text}, "finish_reason": "stop"}]})
+        return handler
+
+    @contextmanager
+    def lease(engine: str, task_id: str) -> Iterator[None]:
+        leased.append((engine, task_id))
+        yield
+
+    checker = LlamaCrossChecker(personas, lambda e: _fake_llama(reply(e)), ledger=ledger, lease=lease,
+                                engines={"gpt-oss-120b", "nemotron-3-super", "qwen3.5-122b", "meditron-70b",
+                                         "gpt-oss-120b-abliterated", "deepseek-v4-flash"})
+    sender, notifier = StubSender(), StubNotifier()
+    queue = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=checker)
+    item = queue.submit(_email("sensitive", "gideon", "Our client's position on the indemnity clause is...",
+                               recipient="opposing.counsel@example.com", reason="Clause 12 is uncapped."))
+    assert item.cross_check is not None and item.cross_check.persona == "arthur"
+    assert item.cross_check.engine == "nemotron-3-super" and item.cross_check.verdict == "amended"
+    assert "cross-check: arthur@nemotron-3-super says amended: Clause 12 caps nothing; say so." in item.note
+    engine, body = seen[0]
+    assert engine == "nemotron-3-super" and body["response_format"] == {"type": "json_object"}
+    assert body["temperature"] == 0.2 and "Clause 12 is uncapped." in body["messages"][1]["content"]
+    assert "Our client's position" in body["messages"][1]["content"] and "Arthur" in body["messages"][0]["content"]
+    assert leased and leased[0][0] == "nemotron-3-super"
+    # Provenance: the checker's inference row (running -> done, no verdict) is the parent of nothing and the record
+    # points at it; the gate's own record row (source "gate") is what reads back.
+    inference = ledger.get_task(leased[0][1])
+    assert inference["kind"] == "cross-check" and inference["status"] == "done"
+    assert inference["parent_task_id"] == item.task_id and '"source": "inference"' in inference["payload_json"]
+    gate_row = ledger.get_task(item.cross_check.task_id)
+    assert '"source": "gate"' in gate_row["payload_json"]
+    assert f'"inference_task_id": "{leased[0][1]}"' in gate_row["payload_json"]
+    assert queue.approve(item.id, decided_by="principal").status == "sent"
+    # An estate draft gets Ren on gpt-oss-120b; Minerva gets her own lead on Meditron (6.2); a Ren draft whose own
+    # engine is gpt-oss-120b sends Arthur to nemotron; the Apex and abliterated engines are never chosen.
+    assert checker.choose(_email("sensitive", "alaric", "x")) == ("ren", "gpt-oss-120b")
+    assert checker.choose(_email("sensitive", "minerva", "x", engine="gpt-oss-120b")) == ("arthur", "meditron-70b")
+    assert checker.choose(_email("sensitive", "ren", "x", engine="gpt-oss-120b")) == ("arthur", "nemotron-3-super")
+    assert checker.choose(_email("sensitive", "arthur", "x", engine="nemotron-3-super")) == ("ren", "gpt-oss-120b")
+    # A draft already on the other lead's only engines leaves no swap: refused loudly, the gate holds without a record.
+    narrow = LlamaCrossChecker(personas, lambda e: _fake_llama(reply(e)), ledger=ledger, engines={"gpt-oss-120b"})
+    with pytest.raises(ApprovalError, match="no engine swap"):
+        narrow.choose(_email("sensitive", "alaric", "x", engine="gpt-oss-120b"))
+    held = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=narrow).submit(
+        _email("sensitive", "alaric", "Perimeter review...", engine="gpt-oss-120b"))
+    assert held.cross_check is None and "cross-check failed: ApprovalError: no engine swap" in held.note
+
+
+def test_llama_cross_checker_never_defaults_a_verdict(ledger: Ledger, personas: PersonaRegistry) -> None:
+    def prose(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Looks fine to me."}}]})
+
+    def odd(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"verdict": "fine"}'}}]})
+
+    def down(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"code": 503, "message": "Loading model"}})
+
+    sender, notifier = StubSender(), StubNotifier()
+    for handler, fragment in ((prose, "no JSON object"), (odd, "not one of"), (down, "HTTP 503")):
+        checker = LlamaCrossChecker(personas, lambda e, h=handler: _fake_llama(h), ledger=ledger)
+        queue = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=checker)
+        item = queue.submit(_email("sensitive", "gideon", "Our position is...", recipient="counsel@example.com"))
+        assert item.cross_check is None and "cross-check failed:" in item.note and fragment in item.note
+        with pytest.raises(CrossCheckRequired):
+            queue.approve(item.id, decided_by="principal")
+        failed = [t for t in ledger.list_tasks() if t["kind"] == "cross-check" and t["parent_task_id"] == item.task_id]
+        assert len(failed) == 1 and failed[0]["status"] == "failed"  # the inference row says what happened
+        assert queue.get(item.id).cross_check is None  # and never reads back as a record
+    assert sender.sent == []
+
+
 def test_failed_automatic_cross_check_holds_without_a_record(ledger: Ledger, personas: PersonaRegistry) -> None:
     def broken(item: ApprovalItem) -> CrossCheckRecord:
         raise RuntimeError("meditron slot busy")
@@ -292,6 +410,31 @@ def test_decisions_are_human_only(gate: Gate) -> None:
     assert sender.sent == [] and queue.get(item.id).status == "held"
 
 
+def test_authenticated_actor_is_the_decision_form(gate: Gate, ledger: Ledger, caplog: pytest.LogCaptureFixture) -> None:
+    # 16.3 rule 3: the API builds the actor from the identity that passed its admin check (ApprovalQueue.principal),
+    # never from the request body; the bare label still works for the transition but is marked as a label in the
+    # ledger note and warned about, so the two forms are distinguishable after the fact.
+    queue, sender, _ = gate
+    item = queue.submit(_email("standard", "silas", "Attached is the revised forecast."))
+    actor = queue.principal(authenticated_via="admin-token")
+    assert isinstance(actor, HumanActor) and actor.name == "principal"
+    with caplog.at_level("WARNING", logger="atlas.approval"):
+        sent = queue.approve(item.id, decided_by=actor)
+    assert sent.status == "sent" and "approved by principal (authenticated via admin-token)" in sent.note
+    assert ledger.get_approval(item.id)["decided_by"] == "principal"
+    assert not any("by label" in r.getMessage() for r in caplog.records)
+    labelled = queue.submit(_email("standard", "silas", "Attached is the revised forecast."))
+    with caplog.at_level("WARNING", logger="atlas.approval"):
+        by_label = queue.reject(labelled.id, decided_by="principal")
+    assert "rejected by principal (label, unauthenticated actor)" in by_label.note
+    assert any("by label 'principal'" in r.getMessage() for r in caplog.records)
+    with pytest.raises(ApprovalError, match="not a human actor"):
+        HumanActor("celery-worker", "admin-token")
+    with pytest.raises(ApprovalError, match="authenticated_via"):
+        HumanActor("principal", " ")
+    assert [s.id for s in sender.sent] == [item.id]
+
+
 def test_approve_claims_the_row_atomically(gate: Gate, monkeypatch: pytest.MonkeyPatch) -> None:
     # Two processes over the same SQLite file may both read "held"; only the conditional UPDATE decides who sends.
     queue, sender, _ = gate
@@ -333,6 +476,30 @@ def test_routine_is_a_pre_approved_category_not_a_label(gate: Gate, ledger: Ledg
     assert ledger.get_approval(item.id)["tier"] == "standard"
     ok = queue.submit(_email("routine", "victor", "Tuesday 10:00 works; booked.", kind="scheduling"))
     assert ok.status == "auto-sent" and [s.id for s in sender.sent] == [ok.id]
+
+
+def test_routine_auto_send_reads_the_body_not_only_the_label(gate: Gate, ledger: Ledger) -> None:
+    # 16.3 rule 3: the routine path is the one place ATLAS sends with no human tap, so a pre-approved kind whose body
+    # names a payment, an account or a one-time code (atlas.router.SENSITIVE_KEYWORDS) is substance and is held at
+    # standard; so is a "confirmation" that runs past ROUTINE_MAX_CHARS. A real confirmation still goes out.
+    queue, sender, notifier = gate
+    money = queue.submit(_email("routine", "victor", "Confirming the $40,000 transfer to BSB 062-000 account 1234 "
+                                                      "today.", kind="confirmation"))
+    assert money.status == "held" and money.tier == "standard" and sender.sent == []
+    assert "body carries" in money.note and "'transfer'" in money.note and "16.3 rule 3" in money.note
+    assert ledger.get_approval(money.id)["tier"] == "standard" and notifier.notices[-1][1].id == money.id
+    code = queue.submit(_email("routine", "victor", "Your one-time code is 482913.", kind="acknowledgement"))
+    assert code.status == "held" and "'one-time code'" in code.note
+    assert ROUTINE_MAX_CHARS == 600
+    essay = queue.submit(_email("routine", "victor", "Noted. " + "The itinerary is as follows. " * 80,
+                                kind="acknowledgement"))
+    assert essay.status == "held" and essay.tier == "standard" and "exceeds the routine length" in essay.note
+    ok = queue.submit(_email("routine", "victor", "Car confirmed for 06:30.", kind="confirmation"))
+    assert ok.status == "auto-sent" and [s.id for s in sender.sent] == [ok.id]
+    # The same rule for the Principal's register: a "confirmation" naming a wire is held, not auto-sent.
+    wire = queue.submit(ApprovalItem(tier="routine", persona="ren", recipient="principal", audience="principal",
+                                     kind="confirmation", body="Confirming the wire to the vendor went out."))
+    assert wire.status == "held" and wire.tier == "standard"
 
 
 def test_register_is_set_on_submit_and_internal_relays_are_not_gated(gate: Gate, ledger: Ledger) -> None:
@@ -451,6 +618,7 @@ def test_routine_send_failure_is_recorded_and_raised(ledger: Ledger, personas: P
     queue = ApprovalQueue(ledger, sender, notifier, personas=personas)
     with pytest.raises(SendError, match="smtp down") as info:
         queue.submit(_email("routine", "victor", "Car confirmed.", kind="confirmation"))
+    assert "example.com" not in str(info.value) and "approval #" in str(info.value)  # the id, never the recipient
     rows = ledger.list_approvals("held")
     assert len(rows) == 1 and "routine send failed: RuntimeError: smtp down" in rows[0]["note"]
     # The Sender's text is redacted and truncated to its first line before it reaches the ledger or an HTTP body.
@@ -491,8 +659,9 @@ def test_approved_but_undelivered_items_are_stalled_and_resendable(ledger: Ledge
     sender, notifier = StubSender(fail=RuntimeError("smtp down")), StubNotifier()
     queue = ApprovalQueue(ledger, sender, notifier, personas=personas)
     item = queue.submit(_email("standard", "helena", "Dear Ms Frost, ..."))
-    with pytest.raises(SendError, match="after approval"):
+    with pytest.raises(SendError, match="after approval") as info:
         queue.approve(item.id, decided_by="principal")
+    assert "example.com" not in str(info.value)  # the recipient stays in the ledger row (HTTP 5xx bodies are logged)
     row = ledger.get_approval(item.id)
     assert row["status"] == "approved" and "send failed" in row["note"] and "delivery" not in row["note"]
     assert queue.pending() == [] and [i.id for i in queue.stalled()] == [item.id]
@@ -506,8 +675,9 @@ def test_approved_but_undelivered_items_are_stalled_and_resendable(ledger: Ledge
 def test_sensitive_kinds_are_floored_by_the_gate(ledger: Ledger, personas: PersonaRegistry) -> None:
     # 16.2 "Sensitive: Legal, financial, medical, estate, security, any payment"; 16.3 rule 1. The caller's tier on
     # such a kind is a label: the gate raises it and the strong cross-check runs.
-    assert SENSITIVE_KINDS == frozenset({"payment", "transfer", "invoice", "contract", "signature", "dns", "legal",
+    assert SENSITIVE_KINDS == frozenset({"payment", "transfer", "invoice", "contract", "signature", "legal",
                                          "medical", "estate", "security", "vault"})
+    assert STANDARD_MINIMUM_KINDS == frozenset({"dns"})
     sender, notifier = StubSender(), StubNotifier()
     queue = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=_swap_check)
     item = queue.submit(_email("standard", "silas", "Release the $40,000 transfer to the vendor today.",
@@ -517,9 +687,14 @@ def test_sensitive_kinds_are_floored_by_the_gate(ledger: Ledger, personas: Perso
     assert item.cross_check is not None and item.cross_check.persona == "arthur"
     assert ledger.get_approval(item.id)["tier"] == "sensitive" and sender.sent == []
     assert notifier.notices[0][0].startswith(f"[sensitive] approval #{item.id} waiting: silas (payment)")
-    # Even a "routine" label on a DNS change is sensitive, and so is a Principal-facing estate item.
+    # A "routine" label on a DNS change is raised to STANDARD and held (16.2 lists DNS changes under Standard; 16.3
+    # rule 4; Section 13: sovereign-node.link's own DNS is sensitive, which is the caller's tier to say), and no
+    # cross-check is forced on it. A Principal-facing estate item is sensitive.
     dns = queue.submit(_email("routine", "valerie", "Point the MX record at the new relay.", kind="dns"))
-    assert dns.tier == "sensitive" and dns.status == "held"
+    assert dns.tier == "standard" and dns.status == "held" and dns.cross_check is None
+    assert "16.2 standard category" in dns.note and "16.3 rule 4" in dns.note and sender.sent == []
+    own = queue.submit(_email("sensitive", "valerie", "Point sovereign-node.link at the new relay.", kind="dns"))
+    assert own.tier == "sensitive" and own.cross_check is not None  # the caller's tier stands
     est = queue.submit(ApprovalItem(tier="standard", persona="arthur", recipient="principal", audience="principal",
                                     kind="estate", body="The trust's position after the sale is..."))
     assert est.tier == "sensitive" and est.cross_check is not None
@@ -656,6 +831,16 @@ def test_arthur_speaks_externally_at_sensitive_tier_at_least(personas: PersonaRe
     with pytest.raises(ConfigError, match=r"ren.*16\.1 rule 2.*minimum standard"):
         external_tier(personas["ren"].model_copy(update={"speaks_externally_tier": "routine"}))
     assert external_tier(personas["ren"].model_copy(update={"speaks_externally_tier": "standard"})) == "standard"
+    # A director file that disagrees with the closed 6.2 table is a ConfigError (the document wins; §7.4 loud), not a
+    # warning with a silent substitution; the registry runs the check at load so the service refuses to start.
+    with pytest.raises(ConfigError, match=r"gideon.*disagrees with Section 6\.2 \(sensitive\)"):
+        external_tier(personas["gideon"].model_copy(update={"speaks_externally_tier": "routine"}))
+    with pytest.raises(ConfigError, match=r"victor.*Section 6\.2 \(routine\)"):
+        external_tier(personas["victor"].model_copy(update={"speaks_externally_tier": "sensitive"}))
+    bad = dict(personas)
+    bad["gideon"] = personas["gideon"].model_copy(update={"speaks_externally_tier": "standard"})
+    with pytest.raises(ConfigError, match="gideon"):
+        PersonaRegistry(bad)
 
 
 def test_bad_inputs_fail_loudly(gate: Gate) -> None:

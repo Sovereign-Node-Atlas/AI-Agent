@@ -31,8 +31,7 @@ step_05() {
   fi
   local osdev="" os_note; declare -F _luks_os_device >/dev/null && osdev="$(_luks_os_device)"
   if [[ -n "$osdev" ]]; then os_note="auto-unlocked at boot"
-  elif [[ "${ATLAS_ALLOW_UNENCRYPTED_OS:-0}" == "1" ]]; then os_note="OS volume UNENCRYPTED, ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 (Section 3.5 deviation, see step 2)"
-  else os_note="OS volume UNENCRYPTED and not acknowledged (Section 3.5)"; fi   # v02 records this as a fail
+  else os_note="OS volume UNENCRYPTED (Section 3.5)"; fi   # v02 records "-" as a fail unconditionally (no waiver exists)
   run_verify V2 v02-tpm.sh "$dev" "$mapping" "${osdev:--}" "$os_note" \
     || die "V2 failed post-reboot"
 

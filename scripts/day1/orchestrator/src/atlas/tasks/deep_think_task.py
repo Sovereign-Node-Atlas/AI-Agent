@@ -10,6 +10,11 @@ PRINCIPAL register before it is stored when `audience` is "principal" (the chat 
 the stored answer, so nothing task-shaped may be in it. Intermediate calls (generator, adversary, refine) are not
 rewritten: they are the engines talking to each other. When done, ntfy tells the Principal where the answer is.
 
+`hemisphere` (fix round 4) is the chat's hemisphere, filled by atlas.api._enqueue_deep_think from the router's decision
+and REQUIRED (one of HEMISPHERES, else the task fails before any generation): every /internal generation this task
+makes declares it, so a failed call's scar is bound to that hemisphere and never carries the Principal's problem into
+the other hemisphere's prompts (7.3, 10.1).
+
 Vault rule (10.5, fix round): a `session_id` that atlas.vault.SessionTags marks vault is REFUSED unless
 `remember=True` (the Principal's explicit "remember this"), because the answer would otherwise persist outside the
 vault (the chat path runs such a session inline instead). The Celery RESULT (Redis db 1, kept `result_expires` days)
@@ -24,6 +29,7 @@ from typing import Any
 from celery import shared_task
 
 from atlas import deep_think
+from atlas.config import HEMISPHERES
 from atlas.governance import never_delegate_rewrite
 from atlas.vault import SessionTags
 
@@ -41,6 +47,7 @@ def deep_think_task(
     session_id: str | None = None,
     remember: bool = False,
     audience: str = "principal",
+    hemisphere: str | None = None,
 ) -> dict[str, Any]:
     from atlas.tasks import OrchestratorClient, TaskRecord, notify
 
@@ -49,8 +56,21 @@ def deep_think_task(
         "deep-think",
         queue="gpu",
         parent_task_id=parent_task_id,
-        payload={"tier": tier, "chars": len(problem), "session_id": session_id, "audience": audience},
+        payload={
+            "tier": tier,
+            "chars": len(problem),
+            "session_id": session_id,
+            "audience": audience,
+            "hemisphere": hemisphere,
+        },
     )
+    if hemisphere not in HEMISPHERES:
+        msg = (
+            f"hemisphere={hemisphere!r} is not one of {sorted(HEMISPHERES)}: a Deep Think must declare the chat's "
+            "hemisphere for every generation it makes (module docstring; atlas.api._enqueue_deep_think fills it)"
+        )
+        rec.failed(msg)
+        raise RuntimeError(msg)
     sessions = SessionTags.from_env()
     if sessions.is_vault(session_id) and not remember:
         msg = (
@@ -71,7 +91,12 @@ def deep_think_task(
             engine: str, persona: str, messages: Sequence[Mapping[str, str]], *, temperature: float, max_tokens: int
         ) -> str:
             return client.generate(
-                engine, list(messages), max_tokens=max_tokens, temperature=temperature, task_id=self.request.id
+                engine,
+                list(messages),
+                hemisphere=hemisphere,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                task_id=self.request.id,
             )
 
         res = deep_think.run(

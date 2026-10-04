@@ -7,6 +7,7 @@ the Section 4.3 model in atlas.arbiter.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -16,12 +17,14 @@ import pytest
 from atlas.arbiter import (
     APEX_KEY,
     GIB,
+    MAX_REQUEST_SPECS,
     MAX_RESIDENT,
     Arbiter,
     ArbiterError,
     Decision,
     ReleaseTimeout,
     StubProbe,
+    UnknownEngine,
     build_arbiter,
     kv_estimate_bytes,
     read_unit_profile,
@@ -570,11 +573,13 @@ def test_confirm_loaded_records_the_measured_footprint(engines: dict[str, Engine
     assert status["resident"][0]["measured_bytes"] == measured and status["budget_bytes"] == 170 * GIB
 
 
-def test_register_measured_accepts_phase4_engines(engines: dict[str, EngineSpec], config_dir: Path) -> None:
+def test_register_measured_accepts_phase4_engines(engines: dict[str, EngineSpec], config_dir: Path,
+                                                  caplog: pytest.LogCaptureFixture) -> None:
     # Section 4.2: every weight-bearing process, the Phase 4 container engines included, passes through the Arbiter;
     # Phase 4 step 5 registers each passing engine with its measured footprint (POST /arbiter/register). Those keys come
-    # from config/phase4-engines.json (class phase4), and a key in neither file is still accepted as class phase4 with
-    # a logged warning, never a 404 (fix round).
+    # from config/phase4-engines.json (class phase4). A key in NEITHER file is UnknownEngine (fix round 3: §8 makes
+    # that file the single list, and 'ui-tars-1.5-7b' for the real key 'ui-tars' must not split one engine's footprint
+    # across two ledger keys); allow_unknown=True is the bounded, logged escape hatch.
     phase4 = load_phase4_engines(config_dir)
     assert "flux1-dev" in phase4 and phase4["flux1-dev"].is_phase4 and phase4["flux1-dev"].arbiter_class == "phase4"
     assert not phase4["flux1-dev"].is_apex and phase4["flux1-dev"].kv_class == "none"
@@ -586,15 +591,34 @@ def test_register_measured_accepts_phase4_engines(engines: dict[str, EngineSpec]
     assert measured["flux1-dev"] == {"engine": "flux1-dev", "class": "phase4", "measured_bytes": 24 * GIB}
     rows = ledger.list_arbiter_decisions(task_id="p4-05")
     assert rows[0]["action"] == "measure" and rows[0]["decision"] == "granted" and "class phase4" in rows[0]["reason"]
+    assert "created from request" not in rows[0]["reason"]
     # A Phase 4 engine is never loaded as a llama-server unit: the answer is a reason, not a systemctl call.
     refused = arb.request_load("flux1-dev", task_id="p4-x")
     assert refused.decision is Decision.REFUSED and "Section 15.2" in refused.reason
-    # Not in either file: accepted as class phase4 from the request, and the spec it creates carries the measurement.
-    arb.register_measured("ui-tars-1.5-7b", 16 * GIB, task_id="p4-06")
+    # A typo for a real key fails loudly; the real key (here trellis, in the fixture AND the real file) registers.
+    with pytest.raises(UnknownEngine, match=r"ui-tars-1\.5-7b.*neither engines\.json nor phase4-engines\.json"):
+        arb.register_measured("ui-tars-1.5-7b", 16 * GIB, task_id="p4-06")
+    assert "ui-tars-1.5-7b" not in arb.engines and "ui-tars-1.5-7b" not in arb.measured
+    arb.register_measured("trellis", 16 * GIB, task_id="p4-06")
+    assert arb.measured["trellis"] == 16 * GIB and arb.engines["trellis"].is_phase4
+    # allow_unknown=True: a bare unit-style key becomes a class-phase4 spec carrying the measurement, with a WARNING in
+    # the log AND in the ledger row, bounded by MAX_REQUEST_SPECS; a malformed key is UnknownEngine either way.
+    with caplog.at_level(logging.WARNING, logger="atlas.arbiter"):
+        arb.register_measured("ui-tars-1.5-7b", 16 * GIB, task_id="p4-07", allow_unknown=True)
+    assert "allow_unknown" in caplog.text and f"1/{MAX_REQUEST_SPECS} request-created" in caplog.text
     assert arb.engines["ui-tars-1.5-7b"].is_phase4 and arb.engines["ui-tars-1.5-7b"].footprint_bytes == 16 * GIB
     assert {m["engine"]: m["class"] for m in arb.status()["measured"]}["ui-tars-1.5-7b"] == "phase4"
+    row = ledger.list_arbiter_decisions(task_id="p4-07")[0]
+    assert "WARNING: spec created from request" in row["reason"]
+    for i in range(MAX_REQUEST_SPECS - 1):
+        arb.register_measured(f"made-up-{i}", 1, allow_unknown=True)
+    with pytest.raises(UnknownEngine, match=f"{MAX_REQUEST_SPECS} request-created engine specs already exist"):
+        arb.register_measured("one-too-many", 1, allow_unknown=True)
+    arb.register_measured("made-up-0", 2, allow_unknown=True)  # re-measuring an existing one is not a new spec
     with pytest.raises(ArbiterError, match="not an engine key"):
         arb.register_measured("x y;z", 1)
+    with pytest.raises(ArbiterError, match="not an engine key"):
+        arb.register_measured("x y;z", 1, allow_unknown=True)
     with pytest.raises(ArbiterError, match="negative"):
         arb.register_measured("flux1-dev", -1)
 

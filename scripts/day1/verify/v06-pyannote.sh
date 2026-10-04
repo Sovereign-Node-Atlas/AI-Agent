@@ -56,7 +56,9 @@ head_code() {
   hdr="$(mktemp)"
   code="$(curl -sS -I -L --max-time 60 -o /dev/null -D "$hdr" -w '%{http_code}' -H "@$hdrf" "$url" 2>/dev/null)" || code="${code:-000}"
   [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
-  err="$(grep -i '^x-error-code:' "$hdr" | tail -n1 | tr -d '\r' | awk '{print $2}')"
+  # `|| true`: a normal 200 answer carries no X-Error-Code header, grep exits 1 and, under set -E, the ERR trap would
+  # otherwise log a spurious "command failed" line twice per passing V6 (fix round 3; the function itself continued).
+  err="$(grep -i '^x-error-code:' "$hdr" | tail -n1 | tr -d '\r' | awk '{print $2}' || true)"
   rm -f "$hdr"
   printf '%s%s\n' "$code" "${err:+/$err}"
 }

@@ -15,9 +15,13 @@ before its own generation even starts, so the client's read timeout is that valu
 (DEFAULT_TIMEOUT_SLACK_S); the two are sized together, never equal (fix round 2: an equal timeout fired the moment
 the orchestrator began generating, orphaning the child row).
 Only 127.0.0.1 is ever dialled; trust_env=False keeps the allowlist proxy out of loopback traffic. When the
-orchestrator's admin routes carry a token (ORCH_ADMIN_TOKEN_FILE, atlas.api), the client sends it as X-Atlas-Token.
+orchestrator's admin routes carry a token (ORCH_ADMIN_TOKEN_FILE, atlas.api), the client sends it as X-Atlas-Token;
+when /internal/* carries its own secret (ORCH_INTERNAL_TOKEN_FILE, fix round 4) it goes as X-Atlas-Internal-Token.
 `generate(..., audience="principal")` asks the orchestrator to run the never-delegate rewrite (16.1 rule 5) on the
-answer, for text that reaches the Principal (a Sentinel BLUF pushed to the phone).
+answer, for text that reaches the Principal (a Sentinel BLUF pushed to the phone). `generate(..., hemisphere=)` is
+REQUIRED (fix round 4): it declares the hemisphere of the text (atlas_hemisphere), so a failed generation's scar is
+bound to it and never lands in another hemisphere's prompts (7.3, 10.1; the Sentinel BLUF is estate, a retention
+summary carries the routed hemisphere, a Deep Think the chat's).
 
 Ledger rule: `atlas-admin enqueue` inserts the task row with the Celery task id BEFORE sending (admin.py); the worker
 finds that row and updates it. Beat-scheduled and chained tasks have no row yet, so `TaskRecord.start()` inserts one.
@@ -37,7 +41,7 @@ from typing import Any
 
 import httpx
 
-from atlas.config import Settings
+from atlas.config import HEMISPHERES, Settings
 from atlas.ledger import Ledger
 
 log = logging.getLogger("atlas.tasks")
@@ -48,6 +52,7 @@ __all__ = [
     "TaskRecord",
     "admin_token",
     "generation_timeout_s",
+    "internal_token",
     "notify",
     "open_task_ledger",
     "read_secret_line",
@@ -110,6 +115,22 @@ def admin_token(env: Mapping[str, str] | None = None) -> str | None:
         raise RuntimeError(f"ORCH_ADMIN_TOKEN_FILE={path} is set but unreadable ({exc}; {_owner_mode(path)})") from exc
 
 
+def internal_token(env: Mapping[str, str] | None = None) -> str | None:
+    """The /internal/* shared secret (ORCH_INTERNAL_TOKEN_FILE, atlas.api `require_loopback`; fix round 4), or None
+    when the node runs on loopback trust alone (the Day 1 state: no step writes the file yet). A configured but
+    unreadable file is an error, never a silent None."""
+    env = dict(os.environ if env is None else env)
+    path = env.get("ORCH_INTERNAL_TOKEN_FILE")
+    if not path:
+        return None
+    try:
+        return read_secret_line(path, "ORCH_INTERNAL_TOKEN")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"ORCH_INTERNAL_TOKEN_FILE={path} is set but unreadable ({exc}; {_owner_mode(path)})"
+        ) from exc
+
+
 def notify(
     message: str,
     *,
@@ -135,10 +156,10 @@ def notify(
     token_file = env.get("NTFY_TOKEN_FILE")
     if token_file:
         # No silent `is_file()` gate (fix round): a token file this worker cannot traverse to is an ERROR in the
-        # journal (CONVENTIONS.md §2 keeps /etc/atlas/secrets root:root 700, so an atlas-read secret belongs in an
-        # atlas-owned subdirectory, /etc/atlas/secrets/atlas/ 700 with files 600, and NTFY_TOKEN_FILE points there;
-        # phase2/02-orchestrator.sh currently widens the directory to root:atlas 750 instead, a cross-writer item),
-        # and the push still goes out so the server's refusal is visible too; ntfy's default-deny auth would drop an
+        # journal. The implemented layout (phase2/02-orchestrator.sh header, 06c, 09b; README-contracts.md §3 item
+        # 10): /etc/atlas/secrets root:atlas 710 (traversable by atlas; 750 also traverses) and ntfy.env atlas:atlas
+        # 600; atlas-sentinel.service's and atlas-celery-gpu.service's ExecStartPre assert exactly that. The push
+        # still goes out so the server's refusal is visible too; ntfy's default-deny auth would drop an
         # unauthenticated push.
         try:
             headers["Authorization"] = f"Bearer {read_secret_line(token_file, 'NTFY_TOKEN')}"
@@ -194,6 +215,9 @@ class OrchestratorClient:
         token = admin_token()
         if token:
             headers["X-Atlas-Token"] = token
+        itoken = internal_token()
+        if itoken:
+            headers["X-Atlas-Internal-Token"] = itoken
         read_s = generation_timeout_s() if timeout_s is None else timeout_s
         self.timeout_s = read_s
         self._http = httpx.Client(
@@ -219,19 +243,25 @@ class OrchestratorClient:
         engine: str,
         messages: Sequence[Mapping[str, Any]],
         *,
+        hemisphere: str,
         max_tokens: int = 1024,
         temperature: float = 0.3,
         task_id: str | None = None,
         audience: str | None = None,
     ) -> str:
         """POST /internal/v1/chat/completions {model: <engine key>} -> the assistant text (generation-slot held).
-        `audience="principal"`: the orchestrator runs the never-delegate rewrite on the answer (16.1 rule 5)."""
+        `hemisphere` (required, module docstring): the hemisphere of the text, sent as atlas_hemisphere so a
+        failure's scar is bound to it. `audience="principal"`: the orchestrator runs the never-delegate rewrite on
+        the answer (16.1 rule 5)."""
+        if hemisphere not in HEMISPHERES:
+            raise ValueError(f"hemisphere must be one of {sorted(HEMISPHERES)} (got {hemisphere!r}); Section 7.3")
         body: dict[str, Any] = {
             "model": engine,
             "messages": list(messages),
             "stream": False,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "atlas_hemisphere": hemisphere,
         }
         if task_id:
             body["atlas_task_id"] = task_id

@@ -4,10 +4,12 @@
 # never prompts (phase2/google_oauth.py verify refreshes a stored token but never opens the browser flow).
 # Pass only when every account in GOOGLE_ACCOUNTS answered all three APIs with its own address, AND the proof ran as
 # the account that consumes the tokens at run time: when this script runs as root the helper is executed as atlas
-# (runuser), so a token atlas cannot open (a root-only /etc/atlas/secrets, CONVENTIONS §2 vs the atlas-owned google/
-# subdirectory; the agreed mode is root:atlas 750, see phase2/06c-google-oauth.sh "SECRETS DIRECTORY") fails here, at
-# the gate, not in Phase 3; the failure text names the directory's mode, owner and last change time so the step that
-# flipped it can be found. The coreutils `timeout` sits INSIDE the runuser/env chain (fix round 2: `timeout` execs its
+# (runuser), so a token atlas cannot open (a root-only /etc/atlas/secrets: CONVENTIONS §2's root:root 700 cannot hold
+# beside the atlas-owned google/ subdirectory; the directory must be root:atlas with the x bit for the group, 710 as
+# phase2-services.sh, phase1/02,03,07 and phase2/06c,09b write it, or 750 as phase2/02,03,07,08,09 still write it; both
+# traverse) fails here, at the gate, not in Phase 3; the failure text prints the directory's measured mode, owner and
+# last change time so the step that flipped it can be found (fix round 3: no hard-coded culprit; the earlier text
+# blamed a 700 that 09b no longer writes). The coreutils `timeout` sits INSIDE the runuser/env chain (fix round 2: `timeout` execs its
 # argument and cannot run a shell function; placed outside it printed "failed to run command 'as_consumer'" into
 # /dev/null and every account was recorded as "no answer").
 # The inbox copy of the OAuth client JSON must be gone (step 6c shreds it after V20 first passes; §7.2: no secret
@@ -49,21 +51,31 @@ for acct in $accounts; do
   [[ "$perm" == "600 atlas" ]] || failed+=("$tag $email: token is $perm, want 600 atlas")
   if ! as_consumer test -r "$tokf"; then
     secrets_dir="$(dirname "$(dirname "$tokf")")"
-    failed+=("$tag $email: $who cannot read $tokf ($(stat -c '%A %U:%G, changed %y' "$secrets_dir") on $secrets_dir blocks traversal; every writer must set it root:atlas 750 (phase2/09b-vault.sh:119 still writes 700), see phase2/06c-google-oauth.sh)")
+    failed+=("$tag $email: $who cannot read $tokf ($(stat -c '%A %U:%G, changed %y' "$secrets_dir") on $secrets_dir blocks traversal; a step reset the directory: every writer's ensure_dir of it must be root:atlas 710 (750 also traverses), see phase2/06c-google-oauth.sh SECRETS DIRECTORY)")
     continue
   fi
   # runuser -> env -> timeout -> python: every link execs an external program (a shell function cannot follow timeout).
   out="$(as_consumer timeout 240 "$venv/bin/python" "$helper" verify --token "$tokf" --email "$email" --owner atlas 2>/dev/null || true)"
-  json="$(printf '%s\n' "$out" | grep -E '^\{' | tail -n1)"
+  # `|| true` (fix round 3, major): with no JSON line (helper crashed before emit(), ImportError, the 240 s timeout,
+  # an empty $out) grep exits 1 and pipefail would otherwise abort the whole script here with nothing on stdout; the
+  # parser below maps an empty $json to the FAIL line and the remaining accounts are still evaluated.
+  json="$(printf '%s\n' "$out" | grep -E '^\{' | tail -n1 || true)"
+  # Plain double quotes inside the single-quoted program (fix round 3, blocker): the earlier `\"key\"` inside f-string
+  # replacement fields reached python as literal backslashes and was a SyntaxError on every CPython, so every account
+  # fell into the "could not parse" branch and V20 could never pass. str.format needs no quotes inside the fields.
   line="$(python3 -c '
 import json, sys
 tag, email = sys.argv[1:3]
 raw = sys.stdin.read().strip()
-d = json.loads(raw) if raw else {}
+try:
+    d = json.loads(raw) if raw else {}
+except json.JSONDecodeError:
+    d = {}
 if d.get("ok"):
-    print(f"OK {tag} {email}: gmail {d[\"gmail_labels\"]} labels, {d[\"calendars\"]} calendar(s), drive {d[\"drive_user\"]}")
+    print("OK {} {}: gmail {} labels, {} calendar(s), drive {}".format(
+        tag, email, d.get("gmail_labels", "?"), d.get("calendars", "?"), d.get("drive_user", "?")))
 else:
-    print(f"FAIL {tag} {email}: {d.get(\"error\", \"no answer from google_oauth.py verify\")}")' "$tag" "$email" <<<"$json" 2>/dev/null)" \
+    print("FAIL {} {}: {}".format(tag, email, d.get("error", "no answer from google_oauth.py verify")))' "$tag" "$email" <<<"$json" 2>/dev/null)" \
     || line="FAIL $tag $email: could not parse the helper's answer"
   case "$line" in
     OK\ *) parts+=("${line#OK }") ;;

@@ -157,19 +157,27 @@ def test_v10_line_pass_carries_footprint_and_control() -> None:
     assert result == "pass" and "footprint 70.0 GB" in msg and "control orchestrator" in msg
 
 
-def test_v10_line_crash_at_8k_fails_unless_s6_tolerates_it() -> None:
+def test_v10_line_crash_at_8k_is_a_fail_with_the_s6_issue_number() -> None:
     res = _good("qwen3.5-122b")
     res.crashed_at_8k = True
     res.load_error = "8k prefill crashed the server (died during the prefill)"
     assert lt.v10_line(res, SPEC)[0] == "fail"
-    # Section 23 S6: nemotron's death at 8k is a warning with the issue number, recorded, never a phase-blocking fail.
+    # Section 23 S6 / engines.json known_issue: the alive check ran, the server was dead -> V10 fail carrying #20732.
     res = _good("nemotron-3-super")
     res.crashed_at_8k = True
     res.released = True
-    res.known_issue_note = f"8k prefill crashed the server: {lt.NEMOTRON_ISSUE}; Section 23 S6 records a warning"
+    res.known_issue_note = f"8k prefill crashed the server: {lt.NEMOTRON_ISSUE}; Section 23 S6: alive check: dead"
     res.warn(res.known_issue_note)
     result, msg = lt.v10_line(res, SPEC)
-    assert result == "pass" and "#20732" in msg and "warn:" in msg
+    assert result == "fail" and "#20732" in msg and "warn:" in msg
+    # Alive after a failed 8k request is a fail too (V10 wants generation at 8k), and alive + measured is a pass.
+    res = _good("nemotron-3-super")
+    res.load_error = "8k prefill request failed: HTTP 500"
+    assert lt.v10_line(res, SPEC)[0] == "fail"
+    res = _good("nemotron-3-super")
+    res.prefill_8k_note = f"{lt.NEMOTRON_ISSUE_ID} checked, server alive"
+    result, msg = lt.v10_line(res, SPEC)
+    assert result == "pass" and "#20732 checked, server alive" in msg
 
 
 def test_run_timeout_is_a_recorded_failure_not_a_traceback() -> None:
@@ -193,15 +201,19 @@ def test_v10_line_external_stop_is_a_fail_not_a_crash() -> None:
 
 
 def test_check_band_verdicts() -> None:
+    # Section 21 V10 "within the expected bands": anything under the lower bound is a fail, no tolerance factor.
     res = _good()
-    res.decode_tps_512 = 20.0  # < 0.7 x 30
+    res.decode_tps_512 = 20.0
     lt.check_band(res, SPEC)
     assert res.band_fail and lt.v10_line(res, SPEC)[0] == "fail"
     res = _good()
-    res.decode_tps_512 = 25.0  # between 21 and 30
+    res.decode_tps_512 = 29.9
     lt.check_band(res, SPEC)
-    assert not res.band_fail and "under the expected band" in res.band_note and res.warnings
-    assert lt.v10_line(res, SPEC)[0] == "pass"
+    assert res.band_fail and "below the expected band 30-55" in res.band_fail and lt.v10_line(res, SPEC)[0] == "fail"
+    res = _good()
+    res.decode_tps_512 = 30.0
+    lt.check_band(res, SPEC)
+    assert not res.band_fail and "within" in res.band_note and lt.v10_line(res, SPEC)[0] == "pass"
     res = _good()
     res.decode_tps_512 = 60.0
     lt.check_band(res, SPEC)
@@ -379,6 +391,7 @@ def _ladder_harness(ctx: Any, ctl: FakeControl, monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(lt, "release_or_poll", lambda *_a: (True, 5.0, "GTT back"))
     monkeypatch.setattr(lt, "gtt_used_bytes", lambda: 160 * lt.GB)
     monkeypatch.setattr(lt, "run_measurements", measure)
+    monkeypatch.setattr(lt, "require_generation_idle", lambda *_a: None)
     return rendered, current
 
 
@@ -408,9 +421,29 @@ def test_ladder_engine_descends_and_keeps_the_rung_above_a_failure(tmp_path: Pat
     assert not lt.pending_path(ctx).exists()  # the journal of the temporary rung overrides is closed
 
 
-def test_ladder_engine_stops_on_a_measurement_failure_with_v22_deferred(tmp_path: Path,
-                                                                        monkeypatch: pytest.MonkeyPatch,
-                                                                        capsys: pytest.CaptureFixture[str]) -> None:
+def test_ladder_engine_tries_every_rung_so_q4_wins_below_a_failed_q8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    # Section 4.3: "a coherence prompt at each rung ... keeps the lowest coherent setting": a q8_0 that fails to load
+    # (its KV at 32768 is about the f16 rung's bytes at the 16384 cap) must not hide a q4_0 that fits.
+    ctx = _ctx(tmp_path, ENGINES)
+    ctl = FakeControl(fail_loads={"q8_0"})
+
+    def fake_measure(_ctx: Any, res: Any, *_a: Any) -> None:
+        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
+
+    _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
+    lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
+    assert ctl.loads == ["f16", "q8_0", "q4_0"]
+    assert res.kv_applied == "q4_0" and res.ok and res.v22_result == "pass" and not res.baseline_deviation
+    assert res.ladder[1]["note"].startswith("load failed") and res.ladder[2]["coherent"]
+    recs = _records(capsys)
+    assert recs[-1][1] == "pass" and "Section 4.3 target reached" in recs[-1][2]
+    assert "rungs above the winner failed (q8_0=load failed)" in recs[-1][2]
+
+
+def test_ladder_engine_measurement_failure_does_not_stop_the_descent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                     capsys: pytest.CaptureFixture[str]) -> None:
     ctx = _ctx(tmp_path, ENGINES)
     ctl = FakeControl(fail_loads=set())
 
@@ -422,7 +455,26 @@ def test_ladder_engine_stops_on_a_measurement_failure_with_v22_deferred(tmp_path
     _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
     res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
     lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
-    assert ctl.loads == ["f16", "q8_0"]  # q8_0 coherent but its measurement failed: the ladder stops, q8_0 stands
+    assert ctl.loads == ["f16", "q8_0", "q4_0"]  # q8_0's measurement failed; q4_0 was still tried and wins
+    assert res.kv_applied == "q4_0" and res.v22_result == "pass" and res.ok
+    assert ctl.registered == [150 * lt.GB, 150 * lt.GB]  # f16 and q4_0 registered, the dead q8_0 server never (rule 1)
+    assert _records(capsys)[-1][1] == "pass"
+
+
+def test_ladder_engine_winner_with_failed_measurement_defers_v22(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _ctx(tmp_path, ENGINES)
+    ctl = FakeControl(fail_loads={"q4_0"})
+
+    def fake_measure(_ctx: Any, res: Any, _key: str, *_a: Any) -> None:
+        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
+        if res.ladder[-1]["kv"] == "q8_0":
+            res.crashed_at_8k, res.load_error = True, "8k prefill crashed the server (died during the prefill)"
+
+    _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
+    lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
+    assert ctl.loads == ["f16", "q8_0", "q4_0"]
     assert res.kv_applied == "q8_0" and res.v22_result == "deferred" and not res.ok
     assert "measurement failed at q8_0" in res.v22_msg and ctl.registered == [150 * lt.GB]  # only f16 was registered
     assert _records(capsys)[-1][1] == "pass"
@@ -545,3 +597,127 @@ def test_read_admin_token(tmp_path: Path) -> None:
 def test_record_line_protocol(capsys: pytest.CaptureFixture[str]) -> None:
     lt.record("V21", "pass", "two\tlines\nof text")
     assert capsys.readouterr().out == "RECORD\tV21\tpass\ttwo lines of text\n"
+
+
+# --- fix round: residency window, cumulative release, rule-3 belt, queued retry --------------------------------------
+
+
+def test_residency_bounds_are_capped_at_the_budget() -> None:
+    weights = 142 * lt.GB
+    low, high = lt.residency_bounds(weights, 170 * lt.GB)
+    assert low == int(0.85 * weights) and high == 170 * lt.GB  # 142 + 28 + 10 = 180 would exceed the budget
+    _, high2 = lt.residency_bounds(weights, 200 * lt.GB)
+    assert high2 == weights + 28 * lt.GB + 10 * lt.GB
+    _, high3 = lt.residency_bounds(weights, 0)
+    assert high3 == 0  # a zero budget means nothing can pass; the caller falls back to DEFAULT_BUDGET_BYTES before
+
+
+class _UnloadControl:
+    def __init__(self, refuse: set[str] = frozenset()) -> None:
+        self.unloaded: list[str] = []
+        self.refuse = refuse
+
+    def unload(self, key: str) -> str:
+        if key in self.refuse:
+            raise RuntimeError(f"Arbiter did not unload {key}: refused: generating")
+        self.unloaded.append(key)
+        return f"{key} released"
+
+
+def _fast_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lt.time, "sleep", lambda _s: None)
+
+
+def test_clear_residents_polls_once_after_the_last_unload(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fast_clock(monkeypatch)
+    ctl = _UnloadControl()
+    counter = {"v": 160 * lt.GB}
+    monkeypatch.setattr(lt, "gtt_used_bytes", lambda: counter["v"])
+
+    def unload(key: str) -> str:
+        r = _UnloadControl.unload(ctl, key)
+        counter["v"] -= 70 * lt.GB  # each unload returns its share; only after the LAST is the baseline reached
+        return r
+
+    monkeypatch.setattr(ctl, "unload", unload)
+    ok, _, note, settled = lt.clear_residents(ctl, ["gpt-oss-120b", "qwen2.5-vl-72b"], 20 * lt.GB, "prepare")
+    assert ok and ctl.unloaded == ["gpt-oss-120b", "qwen2.5-vl-72b"] and settled == 20 * lt.GB
+    assert "gpt-oss-120b+qwen2.5-vl-72b" in note and "Arbiter: gpt-oss-120b: gpt-oss-120b released" in note
+
+
+def test_clear_residents_stale_baseline_is_not_a_leak_when_the_arbiter_granted(monkeypatch: pytest.MonkeyPatch,
+                                                                             ) -> None:
+    _fast_clock(monkeypatch)
+    ctl = _UnloadControl()
+    monkeypatch.setattr(lt, "gtt_used_bytes", lambda: 25 * lt.GB)  # 5 GB above the earlier run's baseline
+    monkeypatch.setattr(lt, "RELEASE_TIMEOUT_S", 0.0)
+    ok, _, note, settled = lt.clear_residents(ctl, ["gpt-oss-120b"], 20 * lt.GB, "coresident")
+    assert not ok and settled == 25 * lt.GB and "stale baseline 20.0 GB vs settled 25.0 GB" in note
+    assert "Arbiter release check passed" in note
+
+
+def test_clear_residents_refusal_is_infra_and_empty_set_just_settles(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fast_clock(monkeypatch)
+    monkeypatch.setattr(lt, "gtt_used_bytes", lambda: 17 * lt.GB)
+    with pytest.raises(lt.Infra, match="cannot clear the resident engines"):
+        lt.clear_residents(_UnloadControl(refuse={"meditron-70b"}), ["meditron-70b"], 17 * lt.GB, "prepare")
+    ok, secs, note, settled = lt.clear_residents(_UnloadControl(), [], None, "prepare")
+    assert ok and secs == 0.0 and note == "nothing was resident" and settled == 17 * lt.GB
+    ok, _, note, _ = lt.clear_residents(_UnloadControl(), ["meditron-70b"], None, "prepare")
+    assert ok and "no earlier baseline" in note
+
+
+def test_require_generation_idle_waits_then_passes_or_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fast_clock(monkeypatch)
+    answers = iter([{"generating": ["gpt-oss-120b", "t1"], "generation_queue": []},
+                    {"generating": None, "generation_queue": ["t2"]},
+                    {"generating": None, "generation_queue": []}])
+    monkeypatch.setattr(lt, "http", lambda *_a, **_k: (200, next(answers)))
+    lt.require_generation_idle("http://127.0.0.1:8800/", "x")  # third answer is idle: returns
+    monkeypatch.setattr(lt, "GENERATION_IDLE_WAIT_S", 0.0)
+    monkeypatch.setattr(lt, "http", lambda *_a, **_k: (200, {"generating": ["qwen3.5-122b", "t9"],
+                                                             "generation_queue": []}))
+    with pytest.raises(lt.Infra, match="still generating"):
+        lt.require_generation_idle("http://127.0.0.1:8800", "x")
+    monkeypatch.setattr(lt, "http", lambda *_a, **_k: (503, {"status": "starting"}))
+    with pytest.raises(lt.Infra, match="answered 503"):
+        lt.require_generation_idle("http://127.0.0.1:8800", "x")
+
+
+def test_control_load_queued_retries_the_arbiter_not_the_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(lt.time, "sleep", lambda s: slept.append(s))
+    ctl = lt.Control.__new__(lt.Control)
+    ctl.orch_url, ctl.headers, ctl.last_decision = "http://127.0.0.1:8800", {}, {}
+    answers = iter([(200, {"decision": "queued", "reason": "arbiter busy: loading meditron-70b"}),
+                    (200, {"decision": "queued", "reason": "generation in progress on gpt-oss-120b (task t)"}),
+                    (200, {"decision": "granted", "reason": "fits", "projected_bytes": 70 * lt.GB})])
+    monkeypatch.setattr(ctl, "post", lambda *_a, **_k: next(answers))
+    monkeypatch.setattr(ctl, "_wait_resident", lambda *_a: pytest.fail("the ledger is not watched for a busy queue"))
+    monkeypatch.setattr(lt, "health_code", lambda _p: 200)
+    assert ctl.load("qwen3.5-122b", 262144, 8, 8104) >= 0
+    assert slept == [lt.QUEUED_RETRY_S, lt.QUEUED_RETRY_S]
+    # "already in progress" (another caller loading this engine) IS a ledger wait.
+    answers = iter([(200, {"decision": "queued", "reason": "load of qwen3.5-122b already in progress"})])
+    monkeypatch.setattr(ctl, "post", lambda *_a, **_k: next(answers))
+    monkeypatch.setattr(ctl, "_wait_resident", lambda *_a: True)
+    assert ctl.load("qwen3.5-122b", 262144, 8, 8104) >= 0
+
+
+def test_test_engine_releases_the_previous_engine_before_the_model_check(tmp_path: Path,
+                                                                        monkeypatch: pytest.MonkeyPatch,
+                                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _ctx(tmp_path, ENGINES)
+    ctx.results_dir.mkdir(parents=True)
+    (ctx.results_dir / "baseline.json").write_text(json.dumps({"gtt_used_bytes": 10 * lt.GB}))
+    swapped: list[str | None] = []
+    monkeypatch.setattr(lt, "Control", lambda *_a, **_k: FakeControl(set()))
+    monkeypatch.setattr(ctx, "render", lambda *_a, **_k: {"ATLAS_MODEL_PRESENT": "0", "ATLAS_MODEL_FILE": "x.gguf",
+                                                           "ATLAS_KV_TYPE": "q4_0"})
+    monkeypatch.setattr(lt, "swap_out", lambda _c, _l, prev, _b: (swapped.append(prev), (0.0, "released"))[1])
+    lt.test_engine(ctx, "gpt-oss-120b", "qwen2.5-vl-72b")
+    assert swapped == ["qwen2.5-vl-72b"]  # the previous engine was released although this one never loaded
+    saved = json.loads(ctx.result_path("gpt-oss-120b").read_text())
+    assert saved["resident_after"] is False and not saved["load_ok"]
+    assert _records(capsys) == [("V4", "fail", "gpt-oss-120b: not loaded (ATLAS_MODEL_PRESENT=0 in gpt-oss-120b.env: "
+                                 "model file x.gguf not found (step 01))")]

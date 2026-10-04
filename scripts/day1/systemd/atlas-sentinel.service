@@ -11,7 +11,7 @@
 #
 # Two ExecStartPre lines (fix round 2):
 #   1. as atlas: the secrets directory must be traversable and ntfy.env readable, otherwise the hourly pulse's BLUF
-#      push would fail silently at 03:00 — the unit fails instead and the journal says why (root:atlas 750 contract,
+#      push would fail silently at 03:00 — the unit fails instead and the journal says why (root:atlas 710 contract,
 #      phase2/02-orchestrator.sh header).
 #   2. as ROOT (`+`, failure tolerated with `-`): /usr/local/sbin/atlas-sentinel-telemetry (phase2/atlas-sentinel-
 #      telemetry.sh) writes /var/lib/atlas/telemetry/firewall.json — the counts of `[UFW BLOCK]` and `[ATLAS docker
@@ -36,7 +36,7 @@ EnvironmentFile=${ATLAS_ETC}/orchestrator.env
 EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 Environment=HOME=/var/lib/atlas/home
-ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env || { echo "atlas-sentinel: ${ATLAS_ETC}/secrets is not traversable by atlas or ntfy.env is unreadable (directory root:atlas 750, file atlas:atlas 600; phase2/02-orchestrator.sh header): the BLUF alert path is broken" >&2; exit 1; }'
+ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env || { echo "atlas-sentinel: ${ATLAS_ETC}/secrets is not traversable by atlas or ntfy.env is unreadable (directory root:atlas 710, file atlas:atlas 600; phase2/02-orchestrator.sh header): the BLUF alert path is broken" >&2; exit 1; }'
 ExecStartPre=-+/usr/local/sbin/atlas-sentinel-telemetry
 ExecStart=${ATLAS_OPT}/venv/bin/atlas-admin enqueue sentinel
 TimeoutStartSec=120

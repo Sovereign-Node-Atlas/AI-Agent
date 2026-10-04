@@ -15,8 +15,20 @@ Every outbound item passes through `ApprovalQueue.submit()`; it is a code path, 
                 cross-checked too (9.2 "and to anything the Principal marks important").
 
 The gate floors the tier itself for the categories 16.2 names sensitive (SENSITIVE_KINDS: payment, transfer, invoice,
-contract, signature, dns, legal, medical, estate, security, vault): a caller's "standard" on a payment is raised to
-sensitive (16.3 rule 1: money never moves without the Principal; the gate is the control, not the label).
+contract, signature, legal, medical, estate, security, vault): a caller's "standard" on a payment is raised to
+sensitive (16.3 rule 1: money never moves without the Principal; the gate is the control, not the label). A DNS change
+(kind "dns") is floored at STANDARD (STANDARD_MINIMUM_KINDS): 16.2 places "DNS changes" under Standard and Section 13
+says "All changes: standard tier, DNS for sovereign-node.link itself: sensitive", so a routine label on a DNS change is
+held for the Principal (16.3 rule 4) and the sovereign-node.link case is the caller's tier to raise. The routine
+auto-send path also reads the BODY (16.3 rule 3 is the one place ATLAS sends with no human tap): a pre-approved kind
+whose text carries a sensitive-lexicon word (atlas.router.SENSITIVE_KEYWORDS: payment, account and two-factor words)
+or runs past ROUTINE_MAX_CHARS is not a confirmation, it is substance, and is held at standard.
+
+The 9.2 strong cross-check has a concrete implementation here, `LlamaCrossChecker`: the other hemisphere lead (for
+Minerva, her own lead Arthur on Meditron-70B, 6.2) judges the draft on an engine the draft did not use, through a
+`client_for(engine)` the pipeline supplies (and an optional Arbiter `lease`), writing the done "cross-check" tasks row
+that is the record's provenance. api.py wires it as `cross_checker=LlamaCrossChecker(...)` (contract for the API
+writer); until it is wired, every sensitive item is held with "cross-check: pending" and cannot be approved.
 
 Register (6.4) decides what the gate does with a draft:
   * EXTERNAL (audience external/recipient): the full gate: the persona's Section 6.2 "speaks externally" tier is a
@@ -33,7 +45,12 @@ Register (6.4) decides what the gate does with a draft:
     recorded as their own `tasks` row (kind "relay", parent = the item's task) and returned with status "relayed";
     nothing is sent, nothing is announced, nothing is held.
 
-Decisions are human-only: `approve()`/`reject()` take `decided_by` from HUMAN_ACTORS (16.3 rule 3) and claim the row
+Decisions are human-only: `approve()`/`reject()`/`resend()` take the actor as a `HumanActor` the gate itself
+constructs from the AUTHENTICATED admin identity (`ApprovalQueue.principal(authenticated_via=...)`), never from a
+request body; the plain label "principal" (HUMAN_ACTORS) is still accepted for the transition and is logged as a label
+decision, because the string alone proves only that the caller typed the word (16.3 rule 3 / 16.2 "nothing external
+executes until the Principal taps approve": the API must derive the actor from `require_admin`, not from
+`body.decided_by`; contract for the API writer). Decisions claim the row
 atomically (UPDATE ... WHERE status = 'held'), so two processes over the same SQLite file cannot both send. A row
 approved but not delivered (a crash between the claim and the send) stays "approved" without a "delivery" note and
 is listed by `stalled()` for `resend()`. A rejected draft is a 9.4 automatic strike input: `reject()` writes the
@@ -47,6 +64,9 @@ and the flags; the caller's own task id, when given, is its parent_task_id, so a
 a `tasks` row of kind "cross-check" (parent = the approval's task id) for each cross-check record. A record attached
 by hand must name, in `task_id`, the done "cross-check" tasks row of the inference that produced it, with the same
 persona and engine (provenance: a fabricated "agree" is refused); the automatic path records the inference itself.
+Reading a record back is as strict: only a row the gate wrote (`source` "gate" or "attached") with a verdict in
+CROSS_CHECK_VERDICTS counts; an inference row, a row written through the Ledger API, or a row with no verdict is not a
+record and never defaults to "agree".
 Only the Ledger's public API is used (`transaction()` for the conditional claims and note updates). Sending and
 notifying go through the Sender and Notifier protocols; tests use the stubs (StubSender, StubNotifier) so nothing
 leaves the node. The push notification is a minimal announcement (tier, id, persona, kind, cross-check verdict), and
@@ -61,11 +81,13 @@ import json
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from atlas.config import TIERS, ConfigError
+from atlas.engines import LlamaClient
 from atlas.governance import (
     DisclosureResult,
     Register,
@@ -76,20 +98,26 @@ from atlas.governance import (
 )
 from atlas.ledger import Ledger, new_task_id
 from atlas.personas import PersonaRegistry
+from atlas.router import SENSITIVE_KEYWORDS, find_sensitive_keywords
 
 log = logging.getLogger("atlas.approval")
 
 __all__ = [
+    "CROSS_CHECK_SYSTEM_PROMPT",
     "HUMAN_ACTORS",
     "PRINCIPAL_RECIPIENTS",
     "ROUTINE_KINDS",
+    "ROUTINE_MAX_CHARS",
     "SENSITIVE_KINDS",
+    "STANDARD_MINIMUM_KINDS",
     "ApprovalError",
     "ApprovalItem",
     "ApprovalQueue",
     "CrossCheckRecord",
     "CrossCheckRequired",
     "CrossChecker",
+    "HumanActor",
+    "LlamaCrossChecker",
     "NotPending",
     "Notifier",
     "NullNotifier",
@@ -109,8 +137,8 @@ STATUS_SENT = "sent"
 STATUS_RELAYED = "relayed"  # ApprovalItem status for an internal relay: a tasks row, never an approvals row
 # 16.2 routine: "Meeting scheduling, confirmations, acknowledgements. Pre-approved categories". Nothing else auto-sends.
 ROUTINE_KINDS: frozenset[str] = frozenset({"acknowledgement", "scheduling", "confirmation"})
-# 16.2 sensitive: "Legal, financial, medical, estate, security, any payment"; 16.3 rules 1, 2, 4, 5 (money, contracts,
-# DNS, the vault). An item of one of these kinds is sensitive whatever tier the caller typed.
+# 16.2 sensitive: "Legal, financial, medical, estate, security, any payment"; 16.3 rules 1, 2, 5 (money, contracts,
+# the vault). An item of one of these kinds is sensitive whatever tier the caller typed.
 SENSITIVE_KINDS: frozenset[str] = frozenset(
     {
         "payment",
@@ -118,7 +146,6 @@ SENSITIVE_KINDS: frozenset[str] = frozenset(
         "invoice",
         "contract",
         "signature",
-        "dns",
         "legal",
         "medical",
         "estate",
@@ -126,6 +153,13 @@ SENSITIVE_KINDS: frozenset[str] = frozenset(
         "vault",
     }
 )
+# 16.2 standard: "DNS changes"; Section 13 Cloudflare "All changes: standard tier, DNS for sovereign-node.link itself:
+# sensitive"; 16.3 rule 4 (held until the Principal approves). A routine label on a DNS change is raised to standard;
+# the sovereign-node.link case is the caller's tier (the gate cannot see the zone).
+STANDARD_MINIMUM_KINDS: frozenset[str] = frozenset({"dns"})
+# A routine item is a pre-approved category, not substance (16.2): a confirmation or acknowledgement longer than this
+# is a reply with substance and is held at standard, whatever the kind label says (16.3 rule 3).
+ROUTINE_MAX_CHARS = 600
 # 16.3 rule 3 / 16.2 "nothing external executes until the Principal taps approve": the only actor that decides.
 HUMAN_ACTORS: frozenset[str] = frozenset({"principal"})
 # The Principal's own channel: the only recipient a PRINCIPAL-register item may name (module docstring). The pipeline
@@ -221,6 +255,23 @@ class CrossCheckRecord:
             raise ValueError(f"cross-check verdict {self.verdict!r} not in {sorted(CROSS_CHECK_VERDICTS)}")
 
 
+@dataclass(frozen=True)
+class HumanActor:
+    """The authenticated human behind a decision (16.3 rule 3). Construct it through `ApprovalQueue.principal()`,
+    from the API's authenticated admin identity, never from a request body: `authenticated_via` names the credential
+    or channel that proved it (e.g. "admin-token", "wireguard-lan") and is written into the decision note."""
+
+    name: str
+    authenticated_via: str
+
+    def __post_init__(self) -> None:
+        if self.name not in HUMAN_ACTORS:
+            raise ApprovalError(f"actor {self.name!r} is not a human actor {sorted(HUMAN_ACTORS)} (16.3 rule 3)")
+        if not self.authenticated_via.strip():
+            raise ApprovalError("a HumanActor must say what authenticated it (authenticated_via); the label alone "
+                                "authorises nothing (16.3 rule 3)")
+
+
 class Sender(Protocol):
     """Delivers an approved (or routine) item; returns a delivery reference (message id, path, ...)."""
 
@@ -238,9 +289,10 @@ class Notifier(Protocol):
 
 
 # The strong cross-check (9.2): given the held item, run a second persona on a different engine and return the
-# record. The pipeline wires it (a Celery task on the `gpu` queue, 9.7: e.g. arthur@nemotron-3-super for a corporate
-# draft, ren@gpt-oss-120b for an estate one, meditron-70b for Minerva per 6.2). It may raise; the gate then holds the
-# item without a record and approve() refuses until attach_cross_check() is called.
+# record. `LlamaCrossChecker` below is the shipped implementation (arthur@nemotron-3-super for a corporate draft,
+# ren@gpt-oss-120b for an estate one, arthur@meditron-70b for Minerva per 6.2); the pipeline wires it with its
+# `client_for` and Arbiter lease. It may raise; the gate then holds the item without a record and approve() refuses
+# until attach_cross_check() is called.
 CrossChecker = Callable[[ApprovalItem], CrossCheckRecord]
 
 
@@ -275,6 +327,137 @@ class NullNotifier:
 
     def notify(self, message: str, item: ApprovalItem) -> None:
         log.warning("approval notice (no notifier configured, nobody was pushed): %s", message)
+
+
+# --- the shipped cross-checker (9.2 strong version) -------------------------------------------------------------------
+
+# Fixed text (a critic prompt, 9.2 "second persona on a different engine"). The reviewer judges, never rewrites.
+CROSS_CHECK_SYSTEM_PROMPT = """You are {name}, acting as the second reviewer inside ATLAS (Section 9.2 cross-check). \
+A colleague, {drafter}, drafted the text below; it is {tier} tier and must not leave until a second persona on a \
+different engine has judged it. Check every number, date, name, legal claim and commitment against the drafter's \
+reasoning and against what the draft actually says. Do not rewrite the draft. Answer with ONE JSON object and \
+nothing else: {{"verdict": "agree" | "amended" | "disagree", "notes": "<one to three sentences: what is wrong or \
+what must change; empty when you agree>"}}. "amended" means the draft is sound once the stated change is made; \
+"disagree" means it must not be sent as it stands."""
+_JSON_DECODER = json.JSONDecoder()
+# CONVENTIONS.md §8 Arbiter classes: `apex` (deepseek-v4-flash) is exclusive and never a cross-check engine; the
+# abliterated engine is a manual escalation, never a default (6.1 C6 / R13). Filtered by key when the registry carries
+# no EngineSpec to read `arbiter_class` from.
+_NEVER_CROSS_CHECK_ENGINES: frozenset[str] = frozenset({"deepseek-v4-flash"})
+# 6.2 Minerva "Meditron-70B cross-check": her medical drafts are judged on the medical engine, by her own lead so the
+# health data stays in the estate hemisphere (7.3). Every other persona is judged by the other hemisphere lead
+# (8.3 TF_OMEGA dual sign-off needs exactly that record; 9.1 already pairs Ren and Arthur across hemispheres).
+DEFAULT_CROSS_CHECK_PLAN: Mapping[str, tuple[str, str]] = {"minerva": ("arthur", "meditron-70b")}
+
+
+class LlamaCrossChecker:
+    """9.2 strong cross-check on llama-server: a second persona on a different engine judges a held draft.
+
+    `client_for(engine_key)` returns a LlamaClient for that engine (api.py: LlamaClient.for_engine(config.engines[k]));
+    `lease(engine_key, task_id)` is an optional context manager that makes the engine resident and holds the single
+    generation slot for the call (the Arbiter: request_load + acquire_generation, 4.2); without it the engine must
+    already be resident, and an unreachable server is an EngineError the gate records as a failed cross-check.
+    `engines` (the engines.json keys) lets an engine the node does not carry be refused before a request is built.
+
+    The checker writes the inference's own "cross-check" tasks row (running -> done/failed, payload source
+    "inference", NO verdict: it is provenance, not a record) under the approval's task and returns the record with
+    `task_id` naming it; the gate's `_attach` verifies the row and writes its own record row (source "gate").
+    """
+
+    def __init__(
+        self,
+        personas: PersonaRegistry,
+        client_for: Callable[[str], LlamaClient],
+        *,
+        ledger: Ledger,
+        engines: Collection[str] | None = None,
+        lease: Callable[[str, str], AbstractContextManager[Any]] | None = None,
+        plan: Mapping[str, tuple[str, str]] = DEFAULT_CROSS_CHECK_PLAN,
+        max_tokens: int = 400,
+        temperature: float = 0.2,  # low, not zero: reasoning models loop at exactly zero (9.1 correction)
+        max_draft_chars: int = 24_000,
+    ) -> None:
+        self.personas = personas
+        self.client_for = client_for
+        self.ledger = ledger
+        self.engines = frozenset(engines) if engines is not None else None
+        self.lease = lease
+        self.plan = dict(plan)
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.max_draft_chars = max_draft_chars
+
+    def _engine_allowed(self, engine: str, item: ApprovalItem) -> bool:
+        if engine == (item.engine or "") or engine.endswith("-abliterated") or engine in _NEVER_CROSS_CHECK_ENGINES:
+            return False
+        return self.engines is None or engine in self.engines
+
+    def choose(self, item: ApprovalItem) -> tuple[str, str]:
+        """(persona, engine) for the cross-check of `item`: the plan's pair when its engine is available and differs
+        from the draft's, else the other hemisphere lead on the first of its bound engines that differs from the
+        draft's and is neither abliterated nor the Apex engine. Raises ApprovalError when no swap exists."""
+        planned = self.plan.get(item.persona)
+        if planned is not None and planned[0] != item.persona and self._engine_allowed(planned[1], item):
+            return planned
+        persona = _other_lead(self.personas, item.persona)
+        binding = self.personas.binding(persona)
+        for engine in binding.all_engines:
+            if self._engine_allowed(engine, item):
+                return persona, engine
+        raise ApprovalError(
+            f"no engine swap available for the cross-check of a {item.persona}@{item.engine} draft: {persona}'s "
+            f"bound engines {binding.all_engines} leave nothing that differs and is neither abliterated nor Apex (9.2)"
+        )
+
+    def __call__(self, item: ApprovalItem) -> CrossCheckRecord:
+        if item.id is None or not item.task_id:
+            raise ApprovalError("cross-check needs a held item with an id and a task id")
+        persona, engine = self.choose(item)
+        reviewer = self.personas[persona]
+        drafter = self.personas[item.persona]
+        system = CROSS_CHECK_SYSTEM_PROMPT.format(name=reviewer.name or persona, drafter=drafter.name or item.persona,
+                                                  tier=item.tier)
+        draft = item.body if len(item.body) <= self.max_draft_chars else item.body[: self.max_draft_chars] + "\n[...]"
+        user = f"Draft ({item.kind}):\n{draft}\n\nDrafter's reasoning:\n{item.reason or '(none given)'}"
+        task_id = self.ledger.insert_task(
+            "cross-check", status="running", persona=persona, engine=engine, tier=item.tier,
+            parent_task_id=item.task_id, payload={"approval_id": item.id, "source": "inference"},
+        )
+        try:
+            ctx = self.lease(engine, task_id) if self.lease is not None else nullcontext()
+            with ctx:
+                client = self.client_for(engine)
+                # VERIFIED (research tools_server_README.md): llama-server accepts response_format json_object.
+                result = client.chat(
+                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    max_tokens=self.max_tokens, temperature=self.temperature,
+                    response_format={"type": "json_object"},
+                )
+            verdict, notes = _parse_cross_check(result.text or "")
+        except Exception as exc:
+            self.ledger.update_task(task_id, status="failed", error=f"cross-check failed: {_describe_error(exc)}")
+            raise
+        self.ledger.update_task(task_id, status="done", result={"verdict": verdict, "notes": notes})
+        log.info("cross-check inference %s: %s@%s says %s", task_id, persona, engine, verdict)
+        return CrossCheckRecord(engine=engine, persona=persona, verdict=verdict, notes=notes, task_id=task_id)
+
+
+def _parse_cross_check(text: str) -> tuple[str, str]:
+    """The reviewer's {"verdict", "notes"} object; anything else is an ApprovalError (never a defaulted verdict)."""
+    start = text.find("{")
+    if start < 0:
+        raise ApprovalError(f"cross-check reviewer returned no JSON object (len={len(text)})")
+    try:
+        data, _end = _JSON_DECODER.raw_decode(text, start)
+    except json.JSONDecodeError as exc:
+        raise ApprovalError(f"cross-check reviewer returned invalid JSON (offset {exc.pos})") from exc
+    if not isinstance(data, dict):
+        raise ApprovalError(f"cross-check reviewer returned a JSON {type(data).__name__}, not an object")
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict not in CROSS_CHECK_VERDICTS:
+        raise ApprovalError(f"cross-check reviewer gave verdict {verdict!r}, not one of {sorted(CROSS_CHECK_VERDICTS)}")
+    notes = data.get("notes")
+    return verdict, (str(notes).strip() if notes is not None else "")
 
 
 # --- helpers ---------------------------------------------------------------------------------------------------------
@@ -344,6 +527,7 @@ class ApprovalQueue:
         cross_checker: CrossChecker | None = None,
         clock: Callable[[], float] = time.time,
         principal_recipients: frozenset[str] = PRINCIPAL_RECIPIENTS,
+        sensitive_keywords: Collection[str] = SENSITIVE_KEYWORDS,
     ) -> None:
         if personas is None:  # type: ignore[unreachable]  # defensive: a caller passing None must fail loudly
             raise ApprovalError(
@@ -361,12 +545,18 @@ class ApprovalQueue:
         self.personas = personas
         self.cross_checker = cross_checker
         self._clock = clock
+        self.sensitive_keywords: tuple[str, ...] = tuple(sensitive_keywords)
         self.principal_recipients = frozenset(r.strip().lower() for r in principal_recipients if r.strip())
         if not self.principal_recipients:
             raise ApprovalError(
                 "ApprovalQueue needs at least one Principal recipient (PRINCIPAL_RECIPIENTS): a "
                 "Principal-register item must be addressable to the Principal and nobody else"
             )
+
+    def principal(self, *, authenticated_via: str) -> HumanActor:
+        """The Principal as a decision actor, constructed by the API from its authenticated admin identity (the
+        credential that passed `require_admin`), never from a request body (16.3 rule 3)."""
+        return HumanActor("principal", authenticated_via)
 
     # --- submit (16.2) ------------------------------------------------------------------------------------------------
 
@@ -398,6 +588,10 @@ class ApprovalQueue:
         if item.kind in SENSITIVE_KINDS and tier != "sensitive":
             notes.append(f"tier raised {tier}->sensitive: kind {item.kind!r} is a 16.2 sensitive category")
             tier = "sensitive"
+        if item.kind in STANDARD_MINIMUM_KINDS and tier == "routine":
+            notes.append(f"tier raised routine->standard: kind {item.kind!r} is a 16.2 standard category "
+                         f"(16.3 rule 4: held until the Principal approves)")
+            tier = "standard"
         if draft.register is Register.PRINCIPAL:
             # 16.1 rule 1: "The Principal speaks only to Ren or Arthur. Shadow Cabinet output is never surfaced
             # directly; the hemisphere synthesises and speaks." A director's item is relayed to its lead, not sent.
@@ -446,6 +640,18 @@ class ApprovalQueue:
                 f"{sorted(ROUTINE_KINDS)} (16.2)"
             )
             tier = "standard"
+        # 16.3 rule 3: routine auto-send is the one path with no human tap, so the BODY is read, not only the labels.
+        # A "confirmation" that names a transfer, an account or a one-time code, or that runs long, is substance.
+        if tier == "routine":
+            lex = find_sensitive_keywords(body, self.sensitive_keywords)
+            if lex:
+                notes.append(f"tier raised routine->standard: body carries {lex[:3]!r} (16.2 any payment; "
+                             f"16.3 rule 3)")
+                tier, hold = "standard", True
+            elif len(body) > ROUTINE_MAX_CHARS:
+                notes.append(f"tier raised routine->standard: body of {len(body)} chars exceeds the routine "
+                             f"length {ROUTINE_MAX_CHARS} (16.2: a confirmation is not a reply with substance)")
+                tier, hold = "standard", True
         if hold:
             tier = _max_tier(tier, "standard")
         # The gate's own tasks row, always (a caller's row may carry no audience or engine, or not exist): what
@@ -545,7 +751,8 @@ class ApprovalQueue:
                 self.ledger.update_task(item.task_id, status="failed", error=f"routine send failed: {err}")
             failed = replace(item, id=approval_id, status=STATUS_HELD, note=held_note)
             self._notify_held(failed, prefix="SEND FAILED ")
-            raise SendError(f"approval #{approval_id}: routine send to {item.recipient} failed: {err}") from exc
+            # The item is named by id only: the recipient's address must not ride into an HTTP 5xx body or the journal.
+            raise SendError(f"approval #{approval_id}: routine send failed: {err}") from exc
         final_note = "; ".join([*notes, f"{_DELIVERY_MARK}{ref}"])
         self.ledger.decide_approval(approval_id, STATUS_AUTO_SENT, decided_by=GATE_ACTOR, note=final_note)
         if item.task_id:
@@ -606,15 +813,26 @@ class ApprovalQueue:
     # --- decisions ----------------------------------------------------------------------------------------------------
 
     @staticmethod
-    def _human(decided_by: str) -> str:
+    def _human(decided_by: HumanActor | str) -> tuple[str, str]:
+        """(actor name, note fragment). A HumanActor is the authenticated form (16.3 rule 3); a bare label is the
+        transitional form, accepted only from HUMAN_ACTORS and marked as a label in the note so the ledger shows
+        which decisions were made without an authenticated identity (the API must pass `principal()`)."""
+        if isinstance(decided_by, HumanActor):
+            return decided_by.name, f"by {decided_by.name} (authenticated via {decided_by.authenticated_via})"
         if decided_by not in HUMAN_ACTORS:
             raise ApprovalError(f"decided_by {decided_by!r} is not a human actor {sorted(HUMAN_ACTORS)}; nothing "
                                 f"external executes until the Principal taps approve (16.2, 16.3 rule 3)")
-        return decided_by
+        log.warning("approval decision by label %r without an authenticated actor; the API should pass "
+                    "ApprovalQueue.principal(authenticated_via=...) (16.3 rule 3)", decided_by)
+        return decided_by, f"by {decided_by} (label, unauthenticated actor)"
 
-    def approve(self, approval_id: int, *, decided_by: str, note: str | None = None) -> ApprovalItem:
-        """The Principal taps approve: the item is sent. Sensitive items need a cross-check record first."""
-        decided_by = self._human(decided_by)
+    def approve(self, approval_id: int, *, decided_by: HumanActor | str, note: str | None = None) -> ApprovalItem:
+        """The Principal taps approve: the item is sent. Sensitive items need a cross-check record first.
+
+        `decided_by` is the Principal as `HumanActor` (`self.principal(authenticated_via=...)`, built by the API from
+        the identity that passed its admin check, never copied from the request body) or, transitionally, the label
+        "principal". The label is a string comparison and proves nothing about who typed it (16.3 rule 3)."""
+        decided_by, by_note = self._human(decided_by)
         item = self.get(approval_id)
         if item.status != STATUS_HELD:
             raise NotPending(f"approval #{approval_id} is {item.status!r}, not held")
@@ -632,7 +850,7 @@ class ApprovalQueue:
                     f"approval #{approval_id}: TF_OMEGA needs both leads (8.3 dual sign-off): the "
                     f"cross-check must be {other}'s, not {have!r}"
                 )
-        decision_note = _join(item.note, note, f"approved by {decided_by}") or ""
+        decision_note = _join(item.note, note, f"approved {by_note}") or ""
         if not self._claim(approval_id, STATUS_HELD, STATUS_APPROVED, decided_by=decided_by, note=decision_note):
             raise NotPending(f"approval #{approval_id} was decided concurrently; it is no longer held")
         return self._deliver(item, decision_note, decided_by)
@@ -644,7 +862,7 @@ class ApprovalQueue:
         except Exception as exc:
             err = _describe_error(exc)
             self._set(item.id, note=f"{decision_note}; send failed: {err}")  # stays "approved": stalled() lists it
-            raise SendError(f"approval #{item.id}: send to {item.recipient} failed after approval: {err}") from exc
+            raise SendError(f"approval #{item.id}: send failed after approval: {err}") from exc
         final_note = f"{decision_note}; {_DELIVERY_MARK}{ref}"
         self.ledger.decide_approval(item.id, STATUS_SENT, decided_by=decided_by, note=final_note)
         if item.task_id:
@@ -652,12 +870,12 @@ class ApprovalQueue:
         log.info("approval #%s approved by %s and sent: delivery=%s", item.id, decided_by, ref)
         return replace(item, status=STATUS_SENT, delivery_ref=ref, note=final_note, decided_by=decided_by)
 
-    def reject(self, approval_id: int, *, decided_by: str, note: str | None = None) -> ApprovalItem:
-        decided_by = self._human(decided_by)
+    def reject(self, approval_id: int, *, decided_by: HumanActor | str, note: str | None = None) -> ApprovalItem:
+        decided_by, by_note = self._human(decided_by)
         item = self.get(approval_id)
         if item.status != STATUS_HELD:
             raise NotPending(f"approval #{approval_id} is {item.status!r}, not held")
-        final_note = _join(item.note, note, f"rejected by {decided_by}") or ""
+        final_note = _join(item.note, note, f"rejected {by_note}") or ""
         if not self._claim(approval_id, STATUS_HELD, STATUS_REJECTED, decided_by=decided_by, note=final_note):
             raise NotPending(f"approval #{approval_id} was decided concurrently; it is no longer held")
         if item.task_id:
@@ -675,9 +893,9 @@ class ApprovalQueue:
         log.info("approval #%s rejected by %s (strike: rejected-draft, 9.4)", approval_id, decided_by)
         return replace(item, status=STATUS_REJECTED, note=final_note, decided_by=decided_by)
 
-    def resend(self, approval_id: int, *, decided_by: str) -> ApprovalItem:
+    def resend(self, approval_id: int, *, decided_by: HumanActor | str) -> ApprovalItem:
         """Deliver an item that was approved but never delivered (see stalled()); the claim is atomic."""
-        decided_by = self._human(decided_by)
+        decided_by, _by_note = self._human(decided_by)
         item = self.get(approval_id)
         if item.status != STATUS_APPROVED or (item.note and _DELIVERY_MARK in item.note):
             raise NotPending(f"approval #{approval_id} is not an approved, undelivered item")
@@ -822,10 +1040,21 @@ class ApprovalQueue:
             "ORDER BY created_at DESC", (task_id,))
         for r in rows:
             payload: dict[str, Any] = json.loads(r["payload_json"]) if r.get("payload_json") else {}
-            if payload.get("approval_id") == approval_id:
-                return CrossCheckRecord(engine=r.get("engine") or "", persona=r.get("persona") or "",
-                                        verdict=payload.get("verdict", "agree"), notes=payload.get("notes", ""),
-                                        task_id=r["id"])
+            if payload.get("approval_id") != approval_id:
+                continue
+            # Only a row the gate wrote through _attach is a record: `source` "gate" / "attached" and a verdict in
+            # CROSS_CHECK_VERDICTS. The checker's own inference row (source "inference", no verdict) and any row
+            # written through the Ledger API are provenance or noise, never a defaulted "agree" (16.2 "strong
+            # cross-check applied automatically" means one that ran, not one that was assumed).
+            if payload.get("source") not in {"gate", "attached"}:
+                continue
+            verdict = payload.get("verdict")
+            if verdict not in CROSS_CHECK_VERDICTS:
+                log.error("approval #%s: cross-check row %s carries no valid verdict (%r); ignored", approval_id,
+                          r["id"], verdict)
+                continue
+            return CrossCheckRecord(engine=r.get("engine") or "", persona=r.get("persona") or "",
+                                    verdict=str(verdict), notes=str(payload.get("notes") or ""), task_id=r["id"])
         return None
 
     def _from_row(self, row: dict[str, Any]) -> ApprovalItem:

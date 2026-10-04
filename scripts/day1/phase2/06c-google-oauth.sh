@@ -30,18 +30,20 @@
 # and after the install. The only atlas-writable state this step needs is $ATLAS_ETC/secrets/google (tokens,
 # rclone.conf, refreshed by the consumer) and the mount points / VFS cache.
 #
-# SECRETS DIRECTORY (fix round 2; ONE value across every writer): CONVENTIONS §2 gives /etc/atlas/secrets root:root 700
+# SECRETS DIRECTORY (fix round 3; ONE value across every writer): CONVENTIONS §2 gives /etc/atlas/secrets root:root 700
 # and /etc/atlas/secrets/google atlas:atlas 700, which cannot both hold (atlas cannot traverse a root-only parent, so the
-# orchestrator, User=atlas, could never open GOOGLE_TOKEN_<TAG>). The agreed value is `ensure_dir "$ATLAS_ETC/secrets"
-# root:atlas 750`: phase2-services.sh asserts it at the start of EVERY phase-2 run, steps 02, 03, 07, 08, 09 and this
-# step assert the same, every file inside stays 600 owned by its one reader. The earlier revision of this step wrote
-# 710 (a third mode); it now writes 750 like the others. Still outside this writer's files: phase2/09b-vault.sh:119
-# (root:root 700, runs AFTER this step, so a complete Phase 2 leaves the directory 700 until the next driver start) and
-# phase1/02,03,07 (710/700). While 09b stays at 700, verify/v20-google.sh FAILS AT THE GATE (phase2/10-gate.sh re-runs
-# it as root, the proof runs as atlas and cannot traverse) even though this step's own V20 passed: the gate failure is
-# by design (loud, CONVENTIONS §7.4) and its text names the mode, the owner and the time the directory was last
-# changed. 09b must use `ensure_dir "$ATLAS_ETC/secrets" root:atlas 750` and CONVENTIONS §2's row must read
-# root:atlas 750 (recorded for phase2/README-contracts.md).
+# orchestrator, User=atlas, could never open GOOGLE_TOKEN_<TAG>). This step writes `ensure_dir "$ATLAS_ETC/secrets"
+# root:atlas 710`: traverse-only for the atlas group, which is all an atlas-side reader needs to open its own 600 file
+# BY NAME. The r bit (750, this step's fix-round-2 value) would additionally let every atlas-group process, i.e. the
+# account that runs model-driven code, list the names of every secret file (cloudflare.env, restic.pass, luks-data.key,
+# smb.cred ...), which nothing needs. 710 is what phase2-services.sh asserts at the start of EVERY phase-2 run and what
+# phase2/09b-vault.sh (the last step before the gate, so the mode a finished Phase 2 ends with) writes; phase1/02,03,07
+# and phase2/02,03,07,08,09 still write 750 (outside this writer's files), so the directory flip-flops 710/750 between
+# steps until they adopt 710. Both modes let atlas traverse, so this step's V20 and the gate's V20 re-run pass whichever
+# step ran last (the earlier header's "fails at the gate by design" described a root:root 700 that 09b no longer
+# writes); verify/v20-google.sh prints the measured mode, owner and change time when traversal does fail. Request (for
+# phase2/README-contracts.md §3 item 10, which asks the same): CONVENTIONS §2's row reads `root:atlas 710` and every
+# ensure_dir of the directory uses it.
 #
 # The OAuth client JSON comes from $ATLAS_SRV/staging/inbox/google-oauth-client.json (Section 22: the client exists).
 # If it is absent this step prints exactly where to put it, records V20 FAIL (not deferred) and stops the phase;
@@ -56,8 +58,10 @@
 # from the backup set (a FUSE mount without allow_other is invisible to root, and Drive is Google's copy anyway).
 # Contract this file defines for others:
 #   * $ATLAS_ETC/secrets/google/client_secret.json (atlas 600), <email>.json tokens (atlas 600) and rclone.conf
-#     (atlas 600, rewritten by rclone on token refresh); dir atlas 700; parent root:atlas 750 (see above).
-#   * $ATLAS_ETC/google.env (root:atlas 640): GOOGLE_TOKEN_DIR, GOOGLE_CLIENT_JSON, GOOGLE_TOKEN_<TAG>=<path>,
+#     (atlas 600, rewritten by rclone on token refresh); dir atlas 700; parent root:atlas 710 (see above).
+#   * $ATLAS_ETC/google.env (root:atlas 640, the mode of every Phase 2 settings file: atlas.env, voice.env, tools.env;
+#     it carries paths and the two addresses, which are settings, not secrets, and already stand in atlas.env's
+#     GOOGLE_ACCOUNTS, the phase log and verify.jsonl): GOOGLE_TOKEN_DIR, GOOGLE_CLIENT_JSON, GOOGLE_TOKEN_<TAG>=<path>,
 #     GOOGLE_EMAIL_<TAG>=<email>, GOOGLE_TOKEN_ACCESS=direct (the atlas process opens the paths itself), RCLONE_BIN,
 #     RCLONE_CONF=/etc/atlas/secrets/google/rclone.conf, RCLONE_REMOTE_<TAG>=gdrive-<tag>, GDRIVE_ROOT=$ATLAS_SRV/gdrive,
 #     GDRIVE_MOUNT_<TAG>=$ATLAS_SRV/gdrive/<tag>, GDRIVE_UNIT_<TAG>=atlas-gdrive@<tag>.service. The orchestrator reads
@@ -65,7 +69,9 @@
 #   * /etc/systemd/system/atlas-gdrive@.service (written by this step from the heredoc below; its content belongs in
 #     scripts/day1/systemd/atlas-gdrive@.service per CONVENTIONS §1 once that directory's writer adds it): User=atlas,
 #     `rclone mount gdrive-%i: $ATLAS_SRV/gdrive/%i --config $RCLONE_CONF --vfs-cache-mode writes`, EnvironmentFile
-#     google.env + proxy.env, Restart=on-failure. Layout rows for CONVENTIONS §2: /srv/atlas/gdrive/<tag> (atlas 700,
+#     google.env + proxy.env, After=/Wants= network-online.target AND squid.service (rclone reaches Google only through
+#     the allowlist proxy, so the mount must not start before squid listens; like systemd/atlas-ddns.service),
+#     Restart=on-failure. Layout rows for CONVENTIONS §2: /srv/atlas/gdrive/<tag> (atlas 700,
 #     FUSE), /var/cache/atlas/rclone/<tag> (atlas, VFS cache).
 
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
@@ -147,8 +153,9 @@ _g_venv() {
 }
 
 _g_client() {
-  # root:atlas 750: the ONE agreed mode (header: SECRETS DIRECTORY); every file inside stays 600 owned by its reader.
-  ensure_dir "$ATLAS_ETC/secrets" root:atlas 750
+  # root:atlas 710 (header: SECRETS DIRECTORY): traverse-only for atlas, no listing; every file inside stays 600 owned
+  # by its reader.
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710
   ensure_dir "$G_DIR" atlas:atlas 700
   if [[ ! -s "$G_CLIENT" ]]; then
     if [[ ! -s "$G_SRC" ]]; then
@@ -175,11 +182,13 @@ MSG
   fi
   # The consumer must be able to open it now, not in Phase 3.
   svc_user_run test -r "$G_CLIENT" \
-    || die "atlas cannot read $G_CLIENT: $(stat -c '%A %U:%G, changed %y' "$ATLAS_ETC/secrets") on $ATLAS_ETC/secrets blocks traversal. Every writer's ensure_dir of that directory must be root:atlas 750 (header: SECRETS DIRECTORY)"
+    || die "atlas cannot read $G_CLIENT: $(stat -c '%A %U:%G, changed %y' "$ATLAS_ETC/secrets") on $ATLAS_ETC/secrets blocks traversal. Every writer's ensure_dir of that directory must be root:atlas 710 (750 also traverses; header: SECRETS DIRECTORY)"
 }
 
-# _g_last_json OUTPUT -> the last line (the JSON the helper prints last).
-_g_last_json() { printf '%s\n' "$1" | grep -E '^\{' | tail -n1; }
+# _g_last_json OUTPUT -> the last JSON line (the helper prints it last), or "" when there is none. `|| true` (fix round
+# 3): with pipefail a helper that died before emit() (ImportError, SIGKILL) made grep's exit 1 abort the step through the
+# generic ERR trap instead of reaching the `ok != 1` branch, whose ${out:0:200} fallback shows the traceback head.
+_g_last_json() { printf '%s\n' "$1" | grep -E '^\{' | tail -n1 || true; }
 
 _g_authorise_all() {
   local i=0 acct email tag port out json ok n total
@@ -202,7 +211,11 @@ _g_authorise_all() {
       record_v V20 fail "$tag $email: $err"
       die "Google authorisation for $email failed: $err. Re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 (an already-authorised account is not asked again)"
     fi
-    n="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"gmail labels {d[\"gmail_labels\"]}, calendars {d[\"calendars\"]}, drive user {d[\"drive_user\"]}")' <<<"$json")"
+    # Plain double quotes inside the single-quoted program (fix round 3, blocker): the earlier `\"key\"` inside f-string
+    # fields was a SyntaxError on every CPython and, without a fallback, aborted the step right AFTER the Principal's
+    # browser consent. A summary problem can never abort a step whose expensive part has already succeeded.
+    n="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print("gmail labels {}, calendars {}, drive user {}".format(d.get("gmail_labels", "?"), d.get("calendars", "?"), d.get("drive_user", "?")))' <<<"$json" 2>/dev/null)" \
+      || n="(summary unavailable)"
     log "Google $tag ($email): authorised; $n"
     [[ "$(stat -c '%a %U' "$tokf")" == "600 atlas" ]] || { chown atlas:atlas "$tokf"; chmod 600 "$tokf"; }
     ensure_kv "$G_ENVF" "GOOGLE_TOKEN_${tag^^}" "$tokf"
@@ -305,8 +318,10 @@ _g_gdrive_units() {
 # Settings: /etc/atlas/google.env (RCLONE_CONF, RCLONE_BIN); proxy: /etc/atlas/proxy.env (the allowlist proxy, rule §7.1).
 [Unit]
 Description=ATLAS Google Drive mount (%i) via rclone, Section 13
-After=network-online.target
-Wants=network-online.target
+# rclone reaches Google ONLY through the allowlist proxy (proxy.env, rule §7.1): ordered after squid like
+# atlas-ddns.service, so a boot-time mount does not fail and retry against a proxy that is not listening yet.
+After=network-online.target squid.service
+Wants=network-online.target squid.service
 AssertPathIsDirectory=$G_GDRIVE_ROOT/%i
 
 [Service]
@@ -364,8 +379,8 @@ _g_shred_inbox() {
 
 step_06c() {
   _g_paths
-  # Created with its final mode (root:atlas 640; it carries the Principal's e-mail addresses): a die anywhere in the
-  # step never leaves it world-readable.
+  # Created with its final mode (root:atlas 640, like every Phase 2 settings file; header: the addresses in it are
+  # settings, not secrets): a die anywhere in the step never leaves it world-readable.
   [[ -e "$G_ENVF" ]] || install -m 640 -o root -g atlas /dev/null "$G_ENVF"
   _g_venv
   _g_client
@@ -379,8 +394,8 @@ step_06c() {
   _g_gdrive_units
   _g_shred_inbox
   # V20: pass only when Gmail, Calendar and Drive answered for every account, AS ATLAS (no browser: tokens are on disk),
-  # and the inbox copy is gone. NOTE (header: SECRETS DIRECTORY): this pass is this step's; the gate re-runs V20 after
-  # step 9b, which currently resets $ATLAS_ETC/secrets to 700, and that re-run fails until 9b uses root:atlas 750.
+  # and the inbox copy is gone. The gate re-runs V20 after step 9b, which leaves $ATLAS_ETC/secrets at root:atlas 710
+  # (header: SECRETS DIRECTORY): atlas traverses, so that re-run passes too.
   run_verify V20 v20-google.sh || die "V20 failed after authorisation (see the verify table)"
   notify "Phase 2 step 6c done: Google OAuth completed for $(wc -w <<<"$GOOGLE_ACCOUNTS") account(s), Drive mounted under $G_GDRIVE_ROOT (V20)"
   log "step 06c done: tokens and rclone.conf in $G_DIR, Drive mounts under $G_GDRIVE_ROOT, settings in $G_ENVF"

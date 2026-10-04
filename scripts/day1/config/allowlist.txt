@@ -7,9 +7,14 @@
 #   grep TCP_DENIED /var/log/squid/access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head
 # then add it here (in the repository copy) and reload the proxy WITHOUT re-running step 4:
 #   sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt
-# (copies the file over /opt/atlas/day1/config/allowlist.txt, re-renders squid AND the host DNS forwarder (dnsmasq:
-# the host resolves only the names listed here plus the node's own DOMAIN, Section 12.5), reloads both; no ufw reset,
-# no dist-upgrade, no reboot). `--force 04` is NOT the way: it resets ufw, repeats the update and ends in a reboot.
+# (copies the file over /opt/atlas/day1/config/allowlist.txt, re-renders squid AND the host DNS forwarder (dnsmasq),
+# reloads both; no ufw reset, no dist-upgrade, no reboot). `--force 04` is NOT the way: it resets ufw, repeats the
+# update and ends in a reboot.
+# HOST DNS (Section 12.5): dnsmasq forwards to the LAN resolvers exactly the names listed here plus two names derived
+# from /etc/atlas/atlas.env settings, $DOMAIN (so V5 can resolve $VPN_HOST) and the host part of $WINDOWS_SHARE when
+# it is a name; everything else is NXDOMAIN. Nothing else is added by any script (rule §7.1: this file and nothing else).
+# A host listed only for DNS/UDP (not HTTP) says so in its comment; squid would admit it on 80/443 too, which is why
+# only Canonical's NTP host is in that position.
 # The render REFUSES (dies) when this file names a host from the "NEVER listed" group below or a wildcard that would
 # re-admit one (".googleapis.com", ".google.com", ".ubuntu.com", ".amazonaws.com", ".azure.com"), and logs the sha256
 # of the rendered list so any later change is visible in the phase log (Section 16.3 item 6).
@@ -32,6 +37,10 @@
 # (only the release-upgrade beacon used it; step 4 sets Prompt=never and no script runs `apt changelog`).
 .archive.ubuntu.com
 security.ubuntu.com
+# NTP, UDP 123 only (Section 3.1 default time source): listed so dnsmasq forwards the name for systemd-timesyncd's
+# re-resolution; phase1/04-system.sh pins timesyncd and the ufw UDP 123 rules to its addresses. No script fetches
+# anything from it over HTTP.
+ntp.ubuntu.com
 
 # --- Mozilla apt repository: Firefox as a .deb, never the snap stub (adjudicated conflict 5) -------------------------
 packages.mozilla.org
@@ -39,12 +48,15 @@ packages.mozilla.org
 # --- Docker: Docker's own apt repo, Docker Hub registry and blob CDN, GitHub Container Registry ----------------------
 # A pull touches registry-1.docker.io (manifests), auth.docker.io (token) and the blob CDN; index.docker.io (login,
 # search) and hub.docker.com (the website) are not part of a pull and are deliberately absent.
+# Blob CDN host VERIFIED live (fix round 3) against registry-1.docker.io for library/ubuntu:26.04, library/alpine and
+# binwiederhier/ntfy:v2.28.0: every GET /v2/<repo>/blobs/<digest> answers 307 to
+# https://production.cloudfront.docker.com/registry-v2/... (NOT production.cloudflare.docker.com, which an earlier
+# revision and the platform research carried; squid would deny the CONNECT and step 6's pull would die). ghcr.io
+# layers redirect to pkg-containers.githubusercontent.com (VERIFIED the same way for wg-easy).
 download.docker.com
 registry-1.docker.io
 auth.docker.io
-production.cloudflare.docker.com
-# UNVERIFIED: Docker Hub moved layer blobs to a Cloudflare R2 bucket in 2024; this is the host seen in practice.
-docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
+production.cloudfront.docker.com
 ghcr.io
 pkg-containers.githubusercontent.com
 
@@ -128,18 +140,24 @@ dev.wix.com
 .wixstatic.com
 .parastorage.com
 
-# --- Pay.com (developer API at api.pay.com; header format UNVERIFIED, see services research 5.3) ----------------------
-.pay.com
+# --- Pay.com (Section 13: the developer API, not the marketing site and its analytics subdomains) ---------------------
+# UNVERIFIED host name (services research 5.3 names api.pay.com; header format unverified). Named host, never ".pay.com":
+# if the Phase 2 writer sees another pay.com host TCP_DENIED, it is added here BY NAME.
+api.pay.com
 
 # --- RewardPay (browser only, no public API found; Sydney) -------------------------------------------------------------
-.rewardpay.com.au
+# UNVERIFIED: the login/app hosts the agent-driven browser needs; the first supervised browser session shows the
+# real set in access.log (TCP_DENIED lines), to be added here BY NAME, never as ".rewardpay.com.au".
+www.rewardpay.com.au
+app.rewardpay.com.au
 
 # --- Sentinel feeds (D6, Section 9.3): CoinDesk, an ASX and US index feed, RSS news. ---------------------------------
 # config/sentinel-feeds.json names the feeds; this file stays the ONLY allowlist (rule §7.1), so phase1/04-system.sh
 # (_squid_render) checks every host in sentinel-feeds.json against this group and DIES when one is missing, which
 # keeps the two files in sync loudly rather than merging them silently. UNVERIFIED: these are the conventional free
-# endpoints for each D6 item.
-.coindesk.com
+# endpoints for each D6 item. Named hosts (www.coindesk.com is what sentinel-feeds.json uses; add data-api.coindesk.com
+# BY NAME if the Sentinel writer moves to the API), never ".coindesk.com".
+www.coindesk.com
 query1.finance.yahoo.com
 query2.finance.yahoo.com
 stooq.com
