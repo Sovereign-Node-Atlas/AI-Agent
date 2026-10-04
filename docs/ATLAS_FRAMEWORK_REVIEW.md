@@ -3,9 +3,9 @@
 | Field | Value |
 |---|---|
 | Document | ATLAS_FRAMEWORK_REVIEW.md |
-| Version | 0.3.1 — Day 1 script build: research corrections folded in |
+| Version | 0.3.2 — Day 1 scripts delivered; one decision reopened (D15) |
 | Date | 2026-09-21 |
-| Supersedes | v0.3 (2026-09-21); v0.2.1 and v0.2 (2026-09-21); v0.1 (2026-09-18) |
+| Supersedes | v0.3.1 (2026-09-27); v0.3 (2026-09-21); v0.2.1 and v0.2 (2026-09-21); v0.1 (2026-09-18) |
 | Scope | Everything agreed in the design conversation, through the Principal's completed confirmation workbook and the September hardware change |
 | Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions resolved, risks, and what Day 1 must prove before anything is trusted |
 | Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21. Nothing has been executed. The Day 1 scripts under `scripts/day1/` are written against this document; the fact-checking that preceded them corrected the baseline in the places listed in Section 23, none of which reopens a decision. |
@@ -612,7 +612,7 @@ An earlier version placed Arthur's estate memory collection inside the vault. Th
 
 ## 11. Vault — AGREED, simplified
 
-An encrypted gocryptfs folder at `/srv/atlas/vault`, on top of the LUKS data volume. Opened by a button in the interface that prompts for the passphrase directly; the passphrase never passes through a model or a chat message. Locked by command and auto-locked after 15 minutes idle (**D13 closed**). No RAM scrubbing, no forensic claims; those were removed from the design at the Principal's instruction. Contents are backed up as ciphertext only. Session handling of vault content is in Section 10.5.
+An encrypted gocryptfs folder under `/srv/atlas/vault` (ciphertext in `vault/cipher`, which is backed up; plaintext mounted at `vault/open` only while unlocked, never backed up), on top of the LUKS data volume. Opened by a button in the interface that prompts for the passphrase directly; the passphrase never passes through a model or a chat message. Locked by command and auto-locked after 15 minutes idle (**D13 closed**). No RAM scrubbing, no forensic claims; those were removed from the design at the Principal's instruction. Contents are backed up as ciphertext only. Session handling of vault content is in Section 10.5.
 
 ---
 
@@ -620,7 +620,7 @@ An encrypted gocryptfs folder at `/srv/atlas/vault`, on top of the LUKS data vol
 
 ### 12.1 Open WebUI — AGREED
 
-Open WebUI is the face, not the brain. It runs in Docker, installs as an app on phone and laptop, handles chat, voice, and file upload, and presents the orchestrator as a single model named A.T.L.A.S. Ren and Arthur are additionally exposed as direct models for when the Principal wants one hemisphere alone. The 4-Way Router's Filter function relays every prompt to the orchestrator (Section 7.1).
+Open WebUI is the face, not the brain. It runs in Docker, handles chat, voice, and file upload (installing it as a home-screen app needs TLS on the WireGuard address, a Day 2 addition, Section 23 S27), and presents the orchestrator as a single model named A.T.L.A.S. Ren and Arthur are additionally exposed as direct models for when the Principal wants one hemisphere alone. The 4-Way Router's Filter function relays every prompt to the orchestrator (Section 7.1).
 
 **Offline hardening, mandatory:** offline mode and Hugging Face offline flags set; update checks, community sharing, web search, and any external embedding fetch disabled; speech settings pointed at local Kokoro and Whisper; chat retention per D9. Without this, the node quietly is not zero-cloud.
 
@@ -672,6 +672,8 @@ Accessed on demand only, with write capability, as a shared folder the node moun
 | Anything without an API | Local browser automation, Playwright text-based DOM reading, UI-TARS 2.0 for vision-driven GUI work | Works with every engine in the set | Per action tier |
 
 APIs are preferred over the browser wherever they exist: faster, unaffected by page redesigns, and they deliver structured data. Money never moves without the Principal; two-factor prompts are never automated.
+
+**Day 1 scope (v0.3.2):** Day 1 installs the Google OAuth tokens and proves Gmail, Calendar and Drive are reachable (V20); the Xero, Cloudflare, Wix, Pay.com and RewardPay connectors and the outbound send channels behind the approval gate are Day 2 work. On Day 1 the approval queue holds, logs and approves exactly as Section 16.2 requires, and an approved item reports "no send channel configured" rather than sending (V15 proves the gate logic with a stub sender; Section 23 S26).
 
 ---
 
@@ -881,10 +883,12 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 6. Phase 2 tools (15.1): IfcOpenShell, Bonsai, MCP4IFC, Radiance, OpenStudio/EnergyPlus, KiCad CLI, Playwright, the cross-platform build container (Android and Windows targets only).
 6b. Relocate the Cloudflare token automatically: scoped token into a mode-600 environment file owned by the updater service, outside `/srv/atlas` and outside restic's include set, then delete `CLOUDFLARE.txt` (R7, D-closed).
 6c. Google OAuth pause: the script prints one authorisation link per account, waits for the Principal to approve in a browser, then continues. Two accounts, roughly five minutes total (V20).
+6d. AEGIS sandbox image (Section 16.4): built and proved by killing a runaway process under the memory cap (V17). *Added in v0.3.2; the build showed Section 17 had no home for V17.*
 7. restic repository on the second drive; nightly timer; first backup; first restore test.
 8. Sentinel timer, enabled with the feeds closed under D6: CoinDesk, an ASX and US index feed, RSS news, node telemetry. Pruning timer.
 9. Windows PC share mount unit, on-demand.
-10. **Gate:** every service healthy; V3 second half (`llama-cli --list-devices` reports ~170 GB), V6, V7 (listening test, deferred if the reference recordings do not exist yet), V12, V20, V23 recorded. The Arbiter's refusal logic is unit-tested here against stub footprints; the real two-engine test is V21 in Phase 3.
+9b. Vault (Section 11): gocryptfs initialised with a passphrase the Principal types once, the open/lock/idle mechanics proved, and the memory rule proved (V18). *Added in v0.3.2.*
+10. **Gate:** every service healthy; V3 second half (`llama-cli --list-devices` reports ~170 GB), V6, V7 (listening test, deferred if the reference recordings do not exist yet), V12, V13, V14 first half, V15, V16, V17, V18, V20, V23 recorded, plus V10's resident-router half. The Arbiter's refusal logic is unit-tested here against stub footprints; the real two-engine test is V21 in Phase 3. Tool installs whose inputs could not be verified in advance (Bonsai, Blender, OpenStudio/EnergyPlus, MCP4IFC, the build container) record a deferred `T-<tool>` row and never block the gate; `--force 06` re-runs them.
 
 ### Phase 3 — Core LLM pull (long, detached, resumable)
 
@@ -946,7 +950,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 
 ---
 
-## 19. Decisions — all closed
+## 19. Decisions — fourteen closed, one reopened by the build (D15)
 
 | # | Decision | The Principal's answer | Note |
 |---|---|---|---|
@@ -964,6 +968,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 | D12 | Meditron-70B: include or skip | Included in Phase 3 at Q8_0 | Accepted, with "include now" noted |
 | D13 | Vault idle auto-lock period | 15 minutes | Accepted as recommended |
 | D14 | Director mailboxes or aliases | Aliases auto-generated from each director's name on the Workspace domain, firstname.lastname pattern | Accepted, with automatic generation requested |
+| D15 | Secure Boot and the TPM binding (reopens D2) | **OPEN.** D2 disables Secure Boot; S9 binds the TPM2 unlock to PCR 7. With Secure Boot off, PCR 7 is the same for any boot medium, so the data volume unseals for any OS booted on this hardware: the encryption then protects against disk removal, not theft of the whole node. Pre-flight stops until the Principal chooses. Options: **(a)** enable Secure Boot in the BIOS and keep PCR 7 — reverses D2, but this stack has no out-of-tree kernel modules (amdgpu and WireGuard are in-tree, Docker needs none), so the module-signing friction D2 feared does not arise, and no script change is needed; **(b)** keep Secure Boot off and bind PCRs 0+4+7 (firmware and boot-loader measurements), which also defeats foreign boot media, at the cost of a re-enrolment with the recovery key after a firmware or GRUB update — a one-line change to the Phase 1 script; **(c)** keep Secure Boot off and accept the weaker binding by writing `ATLAS_ACCEPT_PCR7_NO_SB=1` in `/etc/atlas/atlas.env`, recorded on every V2 row | **Recommendation: (a).** Awaiting the Principal; the workbook carries the row |
 
 ---
 
@@ -983,6 +988,8 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 | R19 | DeepSeek V4 Flash llama.cpp support is newer than the other engines | Medium | Medium, Apex tier only | Own row in the Phase 3 gate; a failure defers the engine without blocking the phase or the other six |
 | R20 | Wi-Fi throughput and stability over a ~690 GB download | Medium | Low, time only | Phases 3 and 4 detached and resumable; retries are free |
 | R21 | XFCE and xrdp widen the surface beyond a headless server | Low | Medium | Bound to LAN and WireGuard only, never internet-facing; no desktop autologin |
+| R22 | The `atlas` service user is in the `docker` group, which is root-equivalent on the host; the orchestrator needs the socket for the sandbox and Phase 4 containers | Medium | High if the orchestrator is ever compromised | Accepted for Day 1 and recorded in every script header; Day 2 options are rootless Docker or a socket proxy that allows only the sandbox and engine images. New in v0.3.2 |
+| R23 | TPM2 unlock bound to PCR 7 with Secure Boot disabled unseals for any boot medium (see D15) | Medium | High for physical theft of the node | Decision D15; until it is made, Phase 1 pre-flight refuses to enrol. New in v0.3.2 |
 | R10 | Sustained thermal load in a small chassis | Medium | Low | Monitor temperatures in Cockpit; the chip's configurable ceiling is 120 W and the Principal is adding external cooling |
 | R11 | CGNAT prevents inbound WireGuard | Low, port forward already succeeded | High for remote access | V5 from mobile data, static IP from the ISP if needed |
 | R12 | Fictitious directors corresponding as humans, AI non-disclosure | Medium | Medium to high, legal | Gideon's sensitive-tier check, approval gate, 16.5 |
@@ -1023,6 +1030,8 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 | V22 | DeepSeek V4 Flash loads at `UD-Q4_K_XL` and generates; if not, it is deferred without blocking the phase | Phase 3 gate |
 | V23 | Cloudflare token relocated to a mode-600 environment file and `CLOUDFLARE.txt` deleted | Phase 2 step 6b |
 
+**Scope notes added in v0.3.2.** V15 proves the gate logic (hold, auto-send-and-log, cross-check required for sensitive) against a stub send channel; the real channels are Day 2 (Section 13). V14's second half and V21 prove the Arbiter against real engines, but the Deep Think rubric weights and the Ouroboros similarity threshold are untuned until the first real sessions, and Section 9.1's timings are estimates until then. The scripts also record rows that are not V items: `T-<tool>` (deferred Phase 2 tool installs), `P4-wheels` (the Phase 4 wheel-index pre-flight) and the V2 acknowledgement text when D15 option (c) is chosen; they appear in the gate tables and in the workbook's evidence column, never as pass/fail rows of their own.
+
 ---
 
 ## 22. Pre-execution checklist
@@ -1034,11 +1043,15 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 - [x] Answer D1 through D14. **Done**, all fourteen closed in Section 19.
 - [x] Decide where the LUKS recovery key and restic passphrase live (D3). **Done**: node plus external USB.
 - [x] Confirm the Sentinel feed list (D6), the director alias pattern (D14), and the Apple build path (D11, removed).
-- [x] Store the USB recovery drive away from the node, not beside it (R16). **Done.**
-- [x] Create the Google Cloud OAuth client for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). **Client created.** The consent click itself still happens during Phase 2; Google requires the account owner to click Allow. Drop the client JSON into `/srv/atlas/staging/inbox/google-oauth-client.json` once Phase 1 has created that folder.
+- [ ] Have the USB recovery drive present on Day 1 and **write it at the Day 1 close-out**: the LUKS recovery key (shown once in Phase 1 step 2), the restic passphrase (`/etc/atlas/secrets/restic.pass`, shown once in Phase 2 step 7) and the vault passphrase you chose (step 9b); then store it away from the node, not beside it (R16). *Reworded in v0.3.2: the material does not exist before Day 1, so the drive cannot be "stored" yet.*
+- [ ] **New in v0.3.2:** your SSH public key in `~/.ssh/authorized_keys` on the node before Phase 1 (step 4 turns password login off; pre-flight stops if the file is missing).
+- [ ] **New in v0.3.2:** fill the `CONFIRM` keys in `/etc/atlas/atlas.env` when the first run installs it: `GOOGLE_ACCOUNTS` (two addresses, each tagged `corporate` or `estate`), `WINDOWS_SHARE` (`//host/share`), `FAMILY_NAMES` (for the router's hard rule), `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE` (Google's Android SDK licence, needed by the build container), and `ATLAS_ACCEPT_PCR7_NO_SB` only if D15 is decided as option (c). The first run prints every blank key with an example value and stops.
+- [ ] **New in v0.3.2:** `/etc/atlas/secrets/smb.cred` (root, mode 600; `username=`, `password=`, `domain=` lines) for the Windows share account; Phase 2 checks it at minute 0 and prints the command that creates it without the password touching a command line.
+- [ ] **New in v0.3.2:** decide D15 (Secure Boot and the TPM binding) before Phase 1 step 2.
+- [x] Create the Google Cloud OAuth client for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). **Client created.** The consent click itself still happens during Phase 2; Google requires the account owner to click Allow. The client must be of the **Desktop app** type (its JSON has a top-level `installed` key; a `web` key is the wrong type and Phase 2 stops at minute 0 saying so). Drop the JSON into `/srv/atlas/staging/inbox/google-oauth-client.json` once Phase 1 has created that folder.
 - [ ] **New in v0.3.1:** create a Hugging Face access token (read scope) and, with the same account, accept the licences of the gated models on huggingface.co: `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0` (V6), `black-forest-labs/FLUX.1-dev` and `stabilityai/stable-audio-open-1.0` (Phase 4). Phase 2 asks for the token once at its start and stores it under `/etc/atlas/secrets/`; a 403 during a pull names the licence page to visit.
 - [ ] **New in v0.3.1:** have the Cloudflare zone id for `sovereign-node.link` to hand (Overview page of the zone). A `Zone:DNS:Edit`-only token cannot look the zone up by name; Phase 1 step 7 asks for the id once if the token cannot list zones.
-- [x] Source reference recordings for Alaric's gravelly voice and, if the British male presets collide, Gideon's. **Sourced.** The Day 1 script names the directory they are copied into before Phase 2; if absent, both fall back to the nearest Kokoro preset and V7 is recorded as deferred, not failed.
+- [x] Source reference recordings for Alaric's gravelly voice and, if the British male presets collide, Gideon's. **Sourced.** Drop them as `alaric.*` and `gideon.*` (WAV, MP3 or M4A; step 5 converts to 16 kHz mono WAV) into `/srv/atlas/staging/inbox/voice-references/` once Phase 1 has created the folder; if absent, both fall back to the nearest Kokoro preset and V7 is recorded as deferred, not failed.
 - [x] Have a monitor and keyboard available for Phase 1 only, in case first boot needs a hand. **Done.**
 
 **Automated on the Principal's instruction, no action needed**
@@ -1048,7 +1061,7 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 
 **Build-side preconditions**
 
-- [x] Ubuntu Server 26.04.1 installed on the 4 TB drive; 8 TB drive unpartitioned. **Done.**
+- [x] Ubuntu Server 26.04.1 installed on the 4 TB drive **with the installer's encrypted-LVM (LUKS) option** (Section 3.5 requires both volumes encrypted; pre-flight stops on an unencrypted OS volume); 8 TB drive unpartitioned. **Done** per the returned workbook; confirm the encryption option was taken.
 - [x] BIOS: UMA minimum, IOMMU on, fTPM on, Secure Boot disabled (D2). **Done.**
 - [x] LAN address reserved for the node on the router, over Wi-Fi; UDP 51820 forward confirmed to that address. **Done.**
 - [x] Internet bandwidth known, so the ~690 GB Phase 3 download can be planned. **Done**; the figure was not recorded in the workbook, so the 100 Mbps planning assumption in 15.4 stands until stated.
@@ -1063,7 +1076,7 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 
 ## 23. Day 1 script build — corrections folded into the baseline (v0.3.1)
 
-The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass over every package, image, model repository and flag the baseline names. Where the checked fact disagreed with the document, the scripts follow the fact and the document is amended above. None of these reopens a decision (D1–D14) or a resolution (C1–C26); each is a correction of a literal the baseline typed before it was checked. Listed here so the Principal can see what moved and why.
+The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass over every package, image, model repository and flag the baseline names. Where the checked fact disagreed with the document, the scripts follow the fact and the document is amended above. None of S1–S23 reopens a decision (D1–D14) or a resolution (C1–C26); each is a correction of a literal the baseline typed before it was checked. S24–S28, added when the scripts were complete, record what the build itself had to add or could not deliver on Day 1; S25 reopens D2 as D15. Listed here so the Principal can see what moved and why.
 
 | # | Where | What the baseline said | What is true (September 2026) | Effect on Day 1 |
 |---|---|---|---|---|
@@ -1087,11 +1100,17 @@ The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass 
 | S18 | 15.2 | Florence-2 `microsoft/Florence-2-large` | Needs remote code and breaks on current transformers | Native `florence-community` checkpoints |
 | S19 | 15.2, 22 | FLUX.1-dev and Stable Audio Open pulled in Phase 4 | Both gated: licence acceptance on huggingface.co plus a token | New Section 22 item; the scripts fail with the licence URL on a 403 |
 | S20 | 15.2, 16.5 | PointLLM | Licence CC-BY-NC-4.0 | Recorded under 16.5 with the other research-licensed items |
-| S21 | 3.1 | Ubuntu 26.04 | Ships `sudo-rs`, which rejects `sudo -E` | Phases run as root; the orchestrator's control path is a NOPASSWD sudoers fragment with exactly three `systemctl` verbs |
+| S21 | 3.1 | Ubuntu 26.04 | Ships `sudo-rs`, which rejects `sudo -E` | Phases run as root; the orchestrator's control path is two NOPASSWD sudoers fragments: `atlas-engines` (exactly `systemctl start|stop|restart llama-server@*`) and `atlas-vault` (the gocryptfs open/lock/status helper) |
 | S22 | 21 V4 | "Unsupported architectures silently fall back" | llama.cpp errors out at context creation rather than falling back | V4 is the `llama_kv_cache ... K (q8_0) V (q8_0)` log line plus a health check |
 | S23 | 9.3 vs 9.7 | Sentinel on a systemd timer; Celery replaces separate schedulers | Both, read together | The timers only enqueue the Celery task; Celery executes. AEGIS nightly and the 72-hour prune use the same pattern, with restic's own timer as the fallback if the orchestrator is down |
 
-**Watch-list additions from the build:** UI-TARS 2.0 (S16). **Reserved for the Principal:** the kernel-7.0 hang reports in S15, if V11 fails for that reason.
+| S24 | 17, 21 | Phase 2 had no step for V17 or V18 | The sandbox and the vault need an install step | Steps 6d and 9b added to Section 17 |
+| S25 | 3.5, 17 step 2, D2 | PCR 7 binding with Secure Boot disabled | Unseals for any boot medium | Decision D15 reopened; pre-flight refuses to enrol until it is made (R23) |
+| S26 | 13, 21 V15 | Approval gate "sends" on approve | No outbound channel exists on Day 1 (Section 13 connectors are Day 2) | V15 proves the gate against a stub sender; an approved item reports "no send channel configured" |
+| S27 | 12.1 | Open WebUI "installs as an app" | A home-screen app needs TLS; Day 1 serves plain HTTP on LAN and WireGuard | Day 2: TLS front on the WireGuard address |
+| S28 | 3.6, 16.4 | Service user in `render` and `video` only | The sandbox and Phase 4 need the Docker socket, so `atlas` is also in `docker` (root-equivalent) | Recorded as R22, accepted for Day 1 |
+
+**Watch-list additions from the build:** UI-TARS 2.0 (S16). **Reserved for the Principal:** the kernel-7.0 hang reports in S15, if V11 fails for that reason; decision D15.
 
 ---
 
@@ -1144,7 +1163,8 @@ Open WebUI Filter  --relay-->  Orchestrator
 | `/srv/atlas/engines` | 8 TB | PyTorch engine weights and images | No, manifest only |
 | `/srv/atlas/data` | 8 TB | ChromaDB, graph store, SQLite, slot saves | Yes |
 | `/srv/atlas/workspace`, `/srv/atlas/sandbox` | 8 TB | Working files, sandbox runs | Yes |
-| `/srv/atlas/vault` | 8 TB | gocryptfs container | Yes, as ciphertext |
+| `/srv/atlas/vault/cipher` | 8 TB | gocryptfs ciphertext | Yes, as ciphertext |
+| `/srv/atlas/vault/open` | 8 TB | gocryptfs mount point, populated only while unlocked | Never |
 | `/srv/cold` | 4 TB | Pruned-memory archives | Yes |
 | `/srv/backups` | 4 TB | restic repository | Is the backup |
 | `/var/log` | 4 TB | Logs, 30 days hot | Rotated |
