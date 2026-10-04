@@ -183,28 +183,41 @@ class PersonaRegistry(Mapping[str, Persona]):
         raise ConfigError(f"no persona matches owner name {name!r} (task-forces.json owners must name a persona)")
 
 
-LEAD_MINIMUM_EXTERNAL_TIER = "standard"  # 16.1 rule 2: a hemisphere lead never speaks externally at routine tier
+# The lowest tier a lead's file may declare. Ren: 16.1 rule 2 (a hemisphere lead never speaks externally at routine
+# tier, which auto-sends). Arthur: 16.5 (recorded, binding as a flag): "Arthur's division holds family and health data
+# and should treat every external disclosure as sensitive-tier".
+LEAD_MINIMUM_EXTERNAL_TIER: dict[str, str] = {"ren": "standard", "arthur": "sensitive"}
+_LEAD_MINIMUM_SECTION: dict[str, str] = {"ren": "16.1 rule 2", "arthur": "16.5"}
 
 
 def external_tier(persona: Persona) -> str:
     """The tier at which a persona speaks externally (6.2 column; the file's value must agree with 6.2).
 
     Directors: the 6.2 value, with a warning when the file disagrees. Leads (ren, arthur): the file's declared tier
-    (an inference the Principal confirms, config/README.md), refused loudly when it is below `standard` so a lead's
-    outbound item can never auto-send (16.1 rule 2, 16.2 routine behaviour).
+    (an inference the Principal confirms, config/README.md), refused loudly when it is below the lead's minimum in
+    LEAD_MINIMUM_EXTERNAL_TIER (Ren: `standard`, 16.1 rule 2, so a lead's outbound item can never auto-send; Arthur:
+    `sensitive`, 16.5, every external disclosure of family and health data is sensitive-tier).
     """
     expected = SECTION_6_2_EXTERNAL_TIER.get(persona.key)
     declared = persona.speaks_externally_tier
     if expected is not None and declared != expected:
         # The document wins over the file (CONVENTIONS.md preamble); say so rather than silently pick one.
-        log.warning("persona %s declares speaks_externally_tier=%s but Section 6.2 says %s; using 6.2",
-                    persona.key, declared, expected)
+        log.warning(
+            "persona %s declares speaks_externally_tier=%s but Section 6.2 says %s; using 6.2",
+            persona.key,
+            declared,
+            expected,
+        )
         return expected
     if declared not in TIERS:
         raise ConfigError(f"persona {persona.key}: speaks_externally_tier {declared!r} is not one of {TIERS}")
-    if persona.key in HEMISPHERE_LEADS.values() and TIERS.index(declared) < TIERS.index(LEAD_MINIMUM_EXTERNAL_TIER):
-        raise ConfigError(f"persona {persona.key}: a hemisphere lead cannot speak externally at {declared!r} tier "
-                          f"(16.1 rule 2; minimum {LEAD_MINIMUM_EXTERNAL_TIER}); fix config/personas/{persona.key}.md")
+    minimum = LEAD_MINIMUM_EXTERNAL_TIER.get(persona.key)
+    if minimum is not None and TIERS.index(declared) < TIERS.index(minimum):
+        raise ConfigError(
+            f"persona {persona.key}: a hemisphere lead cannot speak externally at {declared!r} tier "
+            f"({_LEAD_MINIMUM_SECTION[persona.key]}; minimum {minimum}); "
+            f"fix config/personas/{persona.key}.md"
+        )
     return declared
 
 

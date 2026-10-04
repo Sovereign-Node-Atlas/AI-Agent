@@ -6,6 +6,7 @@ StubNotifier) come from atlas.router / atlas.approval. Only tests import this fi
 from __future__ import annotations
 
 import subprocess
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,10 +52,21 @@ def make_arbiter(
 
 
 class StubLlama:
-    """An EngineStreamer that yields OpenAI chunks for `text`, or raises when `fail` is set."""
+    """An EngineStreamer that yields OpenAI chunks for `text`, or raises when `fail` is set. With a `gate`
+    (threading.Event) the stream emits its first word, sets `started`, and holds the generation until the gate is set:
+    that is how a test keeps one generation running while another request arrives."""
 
-    def __init__(self, text: str = "Stub answer.", *, fail: str | None = None, spec: EngineSpec | None = None) -> None:
+    def __init__(
+        self,
+        text: str = "Stub answer.",
+        *,
+        fail: str | None = None,
+        spec: EngineSpec | None = None,
+        gate: threading.Event | None = None,
+    ) -> None:
         self.text, self.fail, self.spec = text, fail, spec
+        self.gate = gate
+        self.started = threading.Event()
         self.requests: list[dict[str, Any]] = []
 
     def stream(
@@ -72,6 +84,10 @@ class StubLlama:
         for i, w in enumerate(words):
             piece = w if i == len(words) - 1 else w + " "
             yield {"choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
+            if i == 0:
+                self.started.set()
+                if self.gate is not None and not self.gate.wait(timeout=10.0):
+                    raise EngineError("stub gate never opened")
         yield {
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             "timings": {"prompt_n": 10, "predicted_n": len(words), "predicted_per_second": 30.0},
@@ -83,9 +99,10 @@ class StubLlamaFactory:
     text: str = "Stub answer from the engine."
     fail: str | None = None
     made: list[StubLlama] = field(default_factory=list)
+    gates: dict[str, threading.Event] = field(default_factory=dict)  # engine key -> gate for a blocking stream
 
     def __call__(self, spec: EngineSpec) -> StubLlama:
-        s = StubLlama(self.text, fail=self.fail, spec=spec)
+        s = StubLlama(self.text, fail=self.fail, spec=spec, gate=self.gates.get(spec.key))
         self.made.append(s)
         return s
 

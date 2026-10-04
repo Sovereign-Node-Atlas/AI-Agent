@@ -28,14 +28,16 @@ The time bound is enforced INSIDE the container (the image's ENTRYPOINT wraps ev
 kill shows as exit 137 (128 + SIGKILL; proven by V17) and `docker inspect .State.OOMKilled` is the authoritative
 flag when the container still exists. GNU timeout returns 124 when the wall clock expires.
 
-Network (16.4 "no network unless the task's tier grants it"), honestly: `network=True` drops `--network none` and
-the container joins the default bridge, whose egress phase1/docker-egress-rules.sh limits to the pinned resolvers
-(everything else from a bridge to the LAN is dropped and logged) while squid listens on loopback only (§8). A job
-with network therefore reaches DNS and nothing else today: fail-closed, and less than the words promise. A dedicated
-`atlas-sandbox` bridge with squid bound on its gateway is the recorded remedy (README-contracts.md), not made here.
-Two rules the code does enforce: a grant is refused unless `atlas-docker-egress.service` is active (README-contracts
-"the orchestrator must refuse a network grant when ... is not active"), and `network` is a CALLER argument the caller
-must derive from the task's tier, never from model output (nothing in this package maps a tier to it yet).
+Network (16.4 "no network unless the task's tier grants it"): `run(network=True)` is REFUSED today, whatever the
+state of atlas-docker-egress.service (fix round 2). Reason: dropping `--network none` puts the job on the default
+bridge, and a bridge reaches the allowlist proxy NOT AT ALL (squid listens on loopback only, §8) while any DNS it could
+reach (phase1/docker-egress-rules.sh now drops bridge->53 too, but a pinned recursive resolver would be exactly this)
+is a tunnel: a recursive resolver forwards `<base32 chunk>.attacker.example` to the attacker's authoritative server,
+so everything staged in /work leaves the node while every HTTP byte is "denied and logged" (12.5). Pinning a resolver
+does not close that; only an `atlas-sandbox` bridge with squid bound on its gateway and bridge->53 dropped does, and
+that is the recorded remedy (README-contracts.md "Sandbox"), not made here. Until then a grant would buy nothing but
+the leak, so the honest behaviour is to refuse it loudly. `build_argv(network=True)` is kept for that future, and
+`network` stays a CALLER argument to be derived from the task's tier, never from model output.
 
 DOCKER SOCKET == HOST ROOT (recorded, fix round; the same words in docker/sandbox/Dockerfile, phase2/README-contracts
 and systemd/atlas-orchestrator.service): the account that runs this line, `atlas`, is in the docker group
@@ -56,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -80,8 +83,11 @@ EGRESS_UNIT = "atlas-docker-egress.service"
 EXIT_OOM_KILLED = 137
 EXIT_TIMEOUT = 124
 EXIT_TIMEOUT_KILLED = 137  # SIGKILL from the in-container timeout (or GNU timeout's -k); disambiguated by elapsed time
+# A job id becomes a path component under SANDBOX_DIR and a container name: plain characters only (fix round 2).
+JOB_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 __all__ = [
+    "JOB_ID_RE",
     "DockerRunner",
     "SandboxConfig",
     "SandboxError",
@@ -90,6 +96,7 @@ __all__ = [
     "SubprocessDocker",
     "build_argv",
     "egress_unit_active",
+    "parse_memory_mb",
     "run",
     "sandbox_config_from_env",
 ]
@@ -107,6 +114,11 @@ class SandboxConfig:
     tmpfs_size: str = DEFAULT_TMPFS
     fsize: int = DEFAULT_FSIZE
     gid: int = -1  # the group the container runs with; -1 = this process's gid (atlas on the node)
+    # The 16.4 caps the operator configured (SANDBOX_MEMORY, SANDBOX_CPUS, SANDBOX_TIMEOUT_S; fix round 2): run()
+    # defaults its arguments to these, never to the code constants, once a config is given.
+    memory_mb: int = DEFAULT_MEMORY_MB
+    cpus: float = DEFAULT_CPUS
+    timeout_s: int = DEFAULT_TIMEOUT_S
 
     @property
     def base_path(self) -> Path:
@@ -117,23 +129,48 @@ class SandboxConfig:
         return self.gid if self.gid >= 0 else os.getgid()
 
 
+def parse_memory_mb(value: str) -> int:
+    """SANDBOX_MEMORY in docker's --memory syntax as README-contracts writes it (`2g`, `512m`, `1t`; a bare number is
+    MiB, the unit build_argv emits) -> MiB."""
+    s = value.strip().lower()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?", s)
+    if not m:
+        raise SandboxError(f"SANDBOX_MEMORY={value!r} is not a size (expected e.g. 2g, 2048m)")
+    num, unit = float(m.group(1)), m.group(2)
+    factor_mb = {"": 1.0, "k": 1 / 1024, "m": 1.0, "g": 1024.0, "t": 1024.0 * 1024}[unit]
+    mb = int(num * factor_mb)
+    if mb < 6:
+        raise SandboxError(f"SANDBOX_MEMORY={value!r} is below docker's 6m minimum")
+    return mb
+
+
 def sandbox_config_from_env(env: dict[str, str] | None = None) -> SandboxConfig:
-    """SANDBOX_* keys of /etc/atlas/orchestrator.env (written by phase2/10-gate.sh)."""
+    """SANDBOX_* keys of /etc/atlas/orchestrator.env (written by phase2/10-gate.sh; README-contracts.md "Sandbox")."""
     env = dict(os.environ if env is None else env)
+
+    def _int(key: str, default: int) -> int:
+        raw = env.get(key)
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise SandboxError(f"{key}={raw!r} is not an integer") from exc
+
     try:
-        pids = int(env.get("SANDBOX_PIDS") or DEFAULT_PIDS)
+        cpus = float(env.get("SANDBOX_CPUS") or DEFAULT_CPUS)
     except ValueError as exc:
-        raise SandboxError(f"SANDBOX_PIDS={env.get('SANDBOX_PIDS')!r} is not an integer") from exc
-    try:
-        fsize = int(env.get("SANDBOX_FSIZE") or DEFAULT_FSIZE)
-    except ValueError as exc:
-        raise SandboxError(f"SANDBOX_FSIZE={env.get('SANDBOX_FSIZE')!r} is not an integer") from exc
+        raise SandboxError(f"SANDBOX_CPUS={env.get('SANDBOX_CPUS')!r} is not a number") from exc
+    mem = env.get("SANDBOX_MEMORY")
     return SandboxConfig(
         image=env.get("SANDBOX_IMAGE") or DEFAULT_IMAGE,
         base_dir=env.get("SANDBOX_DIR") or DEFAULT_DIR,
-        pids=pids,
+        pids=_int("SANDBOX_PIDS", DEFAULT_PIDS),
         tmpfs_size=env.get("SANDBOX_TMPFS_SIZE") or DEFAULT_TMPFS,
-        fsize=fsize,
+        fsize=_int("SANDBOX_FSIZE", DEFAULT_FSIZE),
+        memory_mb=parse_memory_mb(mem) if mem else DEFAULT_MEMORY_MB,
+        cpus=cpus,
+        timeout_s=_int("SANDBOX_TIMEOUT_S", DEFAULT_TIMEOUT_S),
     )
 
 
@@ -340,9 +377,9 @@ def _staged_path(work_dir: Path, name: str) -> Path:
 
 def run(
     code_or_cmd: str | Sequence[str],
-    memory_mb: int = DEFAULT_MEMORY_MB,
-    cpus: float = DEFAULT_CPUS,
-    timeout_s: int = DEFAULT_TIMEOUT_S,
+    memory_mb: int | None = None,
+    cpus: float | None = None,
+    timeout_s: int | None = None,
     network: bool = False,
     *,
     runner: DockerRunner | None = None,
@@ -354,27 +391,37 @@ def run(
 ) -> SandboxResult:
     """Run Python source (str -> /work/main.py) or a command (sequence -> argv inside the container) under the caps.
 
+    `memory_mb`, `cpus`, `timeout_s` default to the configured SANDBOX_MEMORY / SANDBOX_CPUS / SANDBOX_TIMEOUT_S.
     Returns the exit code, stdout, stderr and `killed_by_cap` (exit 137 before the timeout). Nothing here raises for a
     failing program; only a broken sandbox contract (no docker, no image, no timeout binary, unwritable SANDBOX_DIR,
-    a network grant without the egress rules) raises.
+    a bad job id, a network grant) raises.
     """
     runner = runner or SubprocessDocker()
     config = config or sandbox_config_from_env()
+    memory_mb = config.memory_mb if memory_mb is None else memory_mb
+    cpus = config.cpus if cpus is None else cpus
+    timeout_s = config.timeout_s if timeout_s is None else timeout_s
+    if network:
+        # Module docstring: the bridge egress is DNS-only at best, which is a tunnel around the allowlist (12.5).
+        raise SandboxError(
+            "network grants are not available: the bridge egress is DNS-only, which is a tunnel around the allowlist "
+            f"(12.5); see README-contracts 'Sandbox' (the atlas-sandbox bridge with squid on its gateway). "
+            f"{EGRESS_UNIT} {'is' if egress_active() else 'is NOT'} active, which changes nothing here"
+        )
     if not runner.image_exists(config.image):
         raise SandboxError(
             f"sandbox image {config.image!r} is not present locally and is never pulled (--pull never); build it "
             "from docker/sandbox/Dockerfile (phase2/10-gate.sh does: docker build -t atlas-sandbox:py3.12)"
         )
-    if network and not egress_active():
-        raise SandboxError(
-            f"network grant refused: {EGRESS_UNIT} is not active, so a bridged container would not be confined to "
-            "the allowlist proxy (README-contracts.md 'Sandbox')"
-        )
     job_id = job_id or uuid.uuid4().hex[:12]
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise SandboxError(f"job id {job_id!r} is not [A-Za-z0-9_-]{{1,64}}: it names a directory and a container")
     work_dir = config.base_path / job_id
     try:
-        work_dir.mkdir(parents=True, exist_ok=False)
-        # setgid group dir: uid 65534 in the container writes through the group bit; nothing world-accessible.
+        config.base_path.mkdir(parents=True, exist_ok=True)
+        # setgid group dir created with its final mode (umask may only tighten it: no 0755 window); uid 65534 in the
+        # container writes through the group bit; nothing world-accessible.
+        work_dir.mkdir(mode=0o2770, exist_ok=False)
         os.chmod(work_dir, 0o2770)
     except OSError as exc:
         raise SandboxError(

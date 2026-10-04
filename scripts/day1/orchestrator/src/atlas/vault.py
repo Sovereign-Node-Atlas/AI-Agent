@@ -11,6 +11,12 @@ Two things live here:
   * `SessionTags`: the vault session tag of Section 10.5. Anything read from under VAULT_MOUNT_DIR tags the session
     `vault` for the life of that session; atlas.memory honours the tag by DROPPING every write from a vault-tagged
     session (logged, never silently) unless the Principal explicitly says "remember this" (`remember=True`).
+    Two files (fix round 2): the tmpfs mirror VAULT_SESSION_FILE (/run/atlas/vault-sessions.json, the fast path every
+    process polls) and a DURABLE store VAULT_SESSION_STORE (/srv/atlas/data/orchestrator/vault-sessions.json,
+    atlas-owned, mode 600) so a reboot mid-session does not drop a tag set through the `atlas_vault` flag or the
+    X-Atlas-Vault header ("for the life of that session"). Both hold session ids and timestamps only, never content.
+    Loading MERGES (never replaces) the in-process set, so a tag whose file write failed still holds, and a failed
+    save is retried on the next call; `clear()` is the only way a tag goes away.
 
 `vault_session_test(idle_seconds, file)` is the V18 helper `atlas-admin vault-session-test --file PATH` calls
 (admin.py's parser accepts --file and passes it; one signature, no argv fallback since the fix round): read a file
@@ -20,7 +26,10 @@ one JSON line, exit 0 only when the write was suppressed.
 Passphrase guessing (fix round): `VaultController.open` counts refusals; from the fourth attempt on it sleeps
 2^(n-2) s (capped at 60 s) before calling the helper, logs the count, and at five refusals pushes an ntfy notice
 ("vault passphrase refused N times"); a successful open or a lock resets the counter. scrypt slows each try, this
-bounds the loop.
+bounds the loop. Fix round 2: the sleep and the helper call happen under ONE lock, so N concurrent POST /vault/open
+requests are strictly sequential (N attempts cost the full backoff, not one window), and the counter is persisted in
+VAULT_REFUSALS_FILE (beside the durable session store) so an orchestrator restart does not reset it. The helper's
+stderr goes to the log only; the HTTP client gets a fixed message (atlas.api).
 
 Helper exit codes (phase2/09b-vault.sh, VERIFIED in that file): open -> 0 mounted, 1 refused (gocryptfs exit 12 =
 wrong passphrase), 2 contract error; lock -> 0; status prints "open" or "locked".
@@ -44,7 +53,11 @@ log = logging.getLogger("atlas.vault")
 
 DEFAULT_HELPER = "/usr/local/bin/atlas-vault"
 DEFAULT_MOUNT_DIR = "/srv/atlas/vault/open"
-DEFAULT_SESSION_FILE = "/run/atlas/vault-sessions.json"
+DEFAULT_SESSION_FILE = "/run/atlas/vault-sessions.json"  # tmpfs mirror (VAULT_SESSION_FILE)
+# Durable store (VAULT_SESSION_STORE): ids and timestamps only, under the atlas-owned data tree (CONVENTIONS.md §2),
+# so a reboot keeps the tag (10.5 "for the life of that session"); the refusal counter sits beside it.
+DEFAULT_SESSION_STORE = "/srv/atlas/data/orchestrator/vault-sessions.json"
+DEFAULT_REFUSALS_FILE = "/srv/atlas/data/orchestrator/vault-refusals.json"
 SUDO = "sudo"
 
 __all__ = [
@@ -96,38 +109,75 @@ def _unescape(field: str) -> str:
 
 
 class SessionTags:
-    """Which sessions are vault-tagged. In-process, with an optional file mirror so atlas-admin (another process)
-    and the Celery workers see the same set; the file lives on the orchestrator's tmpfs RuntimeDirectory."""
+    """Which sessions are vault-tagged (Section 10.5). In-process, mirrored to `path` (the tmpfs file every process
+    polls) and to `durable` (survives a reboot). Files hold `{"vault": {session_id: ts}}` and nothing else.
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    Rules (fix round 2): a load MERGES the files into the in-process set, never replaces it, so a tag whose save
+    failed (e.g. /run/atlas not yet writable) still holds and is saved again on the next call; `clear()` is the only
+    path that removes a tag, and it removes it from both files.
+    """
+
+    def __init__(self, path: str | Path | None = None, durable: str | Path | None = None) -> None:
         self.path = Path(path) if path else None
+        self.durable = Path(durable) if durable else None
         self._lock = threading.Lock()
         self._vault: dict[str, float] = {}
+        self._dirty = False
         self._load()
 
+    @classmethod
+    def from_env(cls, env: dict[str, str] | None = None) -> SessionTags:
+        """VAULT_SESSION_FILE (tmpfs mirror) and VAULT_SESSION_STORE (durable) from orchestrator.env, with the
+        defaults above; the production constructor for the orchestrator, the Celery workers and atlas-admin."""
+        env = dict(os.environ if env is None else env)
+        return cls(
+            env.get("VAULT_SESSION_FILE") or DEFAULT_SESSION_FILE,
+            env.get("VAULT_SESSION_STORE") or DEFAULT_SESSION_STORE,
+        )
+
+    def _files(self) -> list[Path]:
+        return [p for p in (self.path, self.durable) if p is not None]
+
     def _load(self) -> None:
-        if self.path is None or not self.path.is_file():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            self._vault = {str(k): float(v) for k, v in dict(data.get("vault", {})).items()}
-        except (OSError, ValueError, AttributeError) as exc:
-            log.warning("vault sessions file %s unreadable (%s); starting empty", self.path, exc)
+        """Merge every file into the in-process set. A file that is missing or lacks a tag the set holds (the tmpfs
+        mirror after a reboot, a stale rewrite by another process) marks the set dirty, so the next save rebuilds it."""
+        per_file: list[set[str]] = []
+        for p in self._files():
+            if not p.is_file():
+                per_file.append(set())
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                tags = {str(k): float(v) for k, v in dict(data.get("vault", {})).items()}
+            except (OSError, ValueError, AttributeError, TypeError) as exc:
+                log.warning("vault sessions file %s unreadable (%s); the in-process set stands", p, exc)
+                per_file.append(set())
+                continue
+            self._vault.update(tags)
+            per_file.append(set(tags))
+        if any(keys != set(self._vault) for keys in per_file):
+            self._dirty = True
 
     def _save(self) -> None:
-        if self.path is None:
-            return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"vault": self._vault}), encoding="utf-8")
-            os.chmod(tmp, 0o600)
-            tmp.replace(self.path)
-        except OSError as exc:
-            log.warning("vault sessions file %s not written (%s); the in-process tag still holds", self.path, exc)
+        ok = True
+        payload = json.dumps({"vault": self._vault})
+        for p in self._files():
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix(".tmp")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                os.chmod(tmp, 0o600)
+                tmp.replace(p)
+            except OSError as exc:
+                ok = False
+                log.warning("vault sessions file %s not written (%s); the in-process tag holds, save retried", p, exc)
+        self._dirty = not ok
 
     def tag_vault(self, session_id: str) -> None:
         with self._lock:
+            self._load()
             if session_id not in self._vault:
                 log.info("session %s is now vault-tagged: memory writes from it are dropped (Section 10.5)", session_id)
             self._vault[session_id] = time.time()
@@ -138,15 +188,19 @@ class SessionTags:
             return False
         with self._lock:
             self._load()
+            if self._dirty:
+                self._save()
             return session_id in self._vault
 
     def clear(self, session_id: str) -> None:
         with self._lock:
+            self._load()
             self._vault.pop(session_id, None)
             self._save()
 
     def vault_sessions(self) -> list[str]:
         with self._lock:
+            self._load()
             return sorted(self._vault)
 
 
@@ -172,6 +226,7 @@ class VaultController:
         timeout_s: float = 180.0,
         sleep: Callable[[float], None] = time.sleep,
         notify: Callable[..., object] | None = None,
+        refusals_file: str | Path | None = None,
     ) -> None:
         self.helper = helper
         self.mount_dir = mount_dir
@@ -181,8 +236,38 @@ class VaultController:
         self.timeout_s = timeout_s
         self._sleep = sleep
         self._notify = notify
-        self._lock = threading.Lock()
-        self.refusals = 0  # consecutive refused open attempts (per process)
+        self._lock = threading.Lock()  # counter and file
+        self._open_lock = threading.Lock()  # ONE open attempt at a time: backoff sleep + helper call (fix round 2)
+        self.refusals_file = Path(refusals_file) if refusals_file else None
+        self.refusals = 0  # consecutive refused open attempts; persisted in refusals_file when one is configured
+        self.last_refusal_ts: float | None = None
+        self._load_refusals()
+
+    def _load_refusals(self) -> None:
+        if self.refusals_file is None or not self.refusals_file.is_file():
+            return
+        try:
+            data = json.loads(self.refusals_file.read_text(encoding="utf-8"))
+            self.refusals = int(data.get("refusals", 0))
+            ts = data.get("last_refusal_ts")
+            self.last_refusal_ts = float(ts) if ts is not None else None
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            log.warning("vault refusals file %s unreadable (%s); counter starts at 0", self.refusals_file, exc)
+
+    def _save_refusals(self) -> None:
+        if self.refusals_file is None:
+            return
+        try:
+            self.refusals_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.refusals_file.with_suffix(".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"refusals": self.refusals, "last_refusal_ts": self.last_refusal_ts}))
+            tmp.replace(self.refusals_file)
+        except OSError as exc:
+            log.warning(
+                "vault refusals file %s not written (%s); the in-process counter holds", self.refusals_file, exc
+            )
 
     def backoff_s(self) -> float:
         """The delay before the next helper call: 0 up to BACKOFF_AFTER refusals, then 2^(n-2) s capped."""
@@ -193,7 +278,9 @@ class VaultController:
     def _refused(self) -> None:
         with self._lock:
             self.refusals += 1
+            self.last_refusal_ts = time.time()
             n = self.refusals
+            self._save_refusals()
         log.warning("vault open refused by the helper (wrong passphrase or mount failure); %d refusal(s) in a row", n)
         if n == NOTIFY_AT and self._notify is not None:
             try:
@@ -209,6 +296,8 @@ class VaultController:
     def _reset_refusals(self) -> None:
         with self._lock:
             self.refusals = 0
+            self.last_refusal_ts = None
+            self._save_refusals()
 
     def _argv(self, verb: str) -> list[str]:
         # `sudo -n`: never prompt (sudo-rs); the fragment allows exactly open|lock|status.
@@ -228,14 +317,20 @@ class VaultController:
             raise VaultError(f"atlas-vault {verb} did not return within {self.timeout_s:.0f}s") from exc
 
     def open(self, passphrase: str) -> VaultResult:
-        """Pipe the passphrase to `atlas-vault open`. The passphrase is in this call's memory only."""
+        """Pipe the passphrase to `atlas-vault open`. The passphrase is in this call's memory only. Attempts are
+        strictly sequential (`_open_lock` spans the backoff sleep AND the helper call), so concurrent requests cannot
+        multiply the tries per backoff window."""
         if not passphrase:
             return VaultResult(False, self.status().state, "empty passphrase", 1)
-        delay = self.backoff_s()
-        if delay > 0:
-            log.warning("vault open delayed %.0fs after %d refusals (guessing backoff)", delay, self.refusals)
-            self._sleep(delay)
-        proc = self._call("open", stdin_text=passphrase + "\n")
+        with self._open_lock:
+            delay = self.backoff_s()
+            if delay > 0:
+                log.warning("vault open delayed %.0fs after %d refusals (guessing backoff)", delay, self.refusals)
+                self._sleep(delay)
+            proc = self._call("open", stdin_text=passphrase + "\n")
+            return self._after_open(proc)
+
+    def _after_open(self, proc: subprocess.CompletedProcess[str]) -> VaultResult:
         if proc.returncode == 0:
             state = "open" if self.status().state == "open" else "locked"
             if state != "open":
@@ -253,7 +348,8 @@ class VaultController:
             self._refused()
             return VaultResult(False, "locked", "refused: passphrase incorrect or mount failed", 1)
         err = (proc.stderr or proc.stdout or "").strip()[:400]
-        raise VaultError(f"atlas-vault open exited {proc.returncode}: {err}")
+        log.error("atlas-vault open exited %d: %s", proc.returncode, err)  # the detail stays in the journal
+        raise VaultError(f"atlas-vault open exited {proc.returncode} (contract error; see the orchestrator journal)")
 
     def lock(self) -> VaultResult:
         proc = self._call("lock")
@@ -291,12 +387,12 @@ def build_vault_controller(
 ) -> VaultController:
     """Production wiring from /etc/atlas/orchestrator.env (VAULT_* keys mirrored by phase2/09b-vault.sh)."""
     env = dict(os.environ if env is None else env)
-    session_file = env.get("VAULT_SESSION_FILE") or DEFAULT_SESSION_FILE
     return VaultController(
         helper=env.get("VAULT_HELPER") or DEFAULT_HELPER,
         mount_dir=env.get("VAULT_MOUNT_DIR") or DEFAULT_MOUNT_DIR,
-        sessions=sessions or SessionTags(session_file),
+        sessions=sessions or SessionTags.from_env(env),
         notify=notify,
+        refusals_file=env.get("VAULT_REFUSALS_FILE") or DEFAULT_REFUSALS_FILE,
     )
 
 

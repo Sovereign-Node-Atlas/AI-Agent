@@ -157,12 +157,31 @@ def test_v10_line_pass_carries_footprint_and_control() -> None:
     assert result == "pass" and "footprint 70.0 GB" in msg and "control orchestrator" in msg
 
 
-def test_v10_line_crash_at_8k_is_a_fail() -> None:
+def test_v10_line_crash_at_8k_fails_unless_s6_tolerates_it() -> None:
+    res = _good("qwen3.5-122b")
+    res.crashed_at_8k = True
+    res.load_error = "8k prefill crashed the server (died during the prefill)"
+    assert lt.v10_line(res, SPEC)[0] == "fail"
+    # Section 23 S6: nemotron's death at 8k is a warning with the issue number, recorded, never a phase-blocking fail.
     res = _good("nemotron-3-super")
     res.crashed_at_8k = True
-    res.load_error = f"8k prefill crashed the server ({lt.NEMOTRON_ISSUE})"
+    res.released = True
+    res.known_issue_note = f"8k prefill crashed the server: {lt.NEMOTRON_ISSUE}; Section 23 S6 records a warning"
+    res.warn(res.known_issue_note)
     result, msg = lt.v10_line(res, SPEC)
-    assert result == "fail" and "#20732" in msg
+    assert result == "pass" and "#20732" in msg and "warn:" in msg
+
+
+def test_run_timeout_is_a_recorded_failure_not_a_traceback() -> None:
+    p = lt.run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2)
+    assert p.returncode == 124 and "timed out" in p.stderr
+
+
+def test_admin_header_goes_to_arbiter_routes_only() -> None:
+    ctl = lt.Control.__new__(lt.Control)
+    ctl.headers = {lt.ADMIN_TOKEN_HEADER: "secret"}
+    assert ctl._hdr("/arbiter/load") == ctl.headers
+    assert ctl._hdr("/internal/deep-think/plan") == {} and ctl._hdr("/internal/v1/chat/completions") == {}
 
 
 def test_v10_line_external_stop_is_a_fail_not_a_crash() -> None:
@@ -213,7 +232,7 @@ def _ctx(tmp_path: Path, engines: list[dict[str, Any]]) -> Any:
 
 ENGINES = [
     {"key": "gpt-oss-120b", "arbiter_class": "core", "expected_decode_tok_s": [30, 55], "ctx_size": 262144},
-    {"key": "deepseek-v4-flash", "arbiter_class": "apex", "kv_ladder": ["q4_0", "q8_0", "f16"], "kv_class": "q4_0",
+    {"key": "deepseek-v4-flash", "arbiter_class": "apex", "kv_ladder": ["f16", "q8_0", "q4_0"], "kv_class": "q4_0",
      "ctx_size_f16_cap": 16384, "ctx_size": 32768},
     {"key": "qwen2.5-vl-72b", "arbiter_class": "vision", "expected_decode_tok_s": [2, 4], "ctx_size": 262144},
     {"key": "router-qwen3.5-4b", "arbiter_class": "resident"},
@@ -257,55 +276,66 @@ def test_summarize_counts_missing_and_off_band(tmp_path: Path, capsys: pytest.Ca
     assert [r for v, r, _ in recs if v == "V10"].count("fail") == 3
 
 
-# --- the ladder decision ----------------------------------------------------------------------------------------------
+# --- the ladder decision (engines.json kv_ladder_rule: descent f16 -> q8_0 -> q4_0, lowest coherent rung reached) ----
 
-LADDER = ["q4_0", "q8_0", "f16"]
+LADDER = ["f16", "q8_0", "q4_0"]
 
 
-def _rung(kv: str, load_ok: bool, coherent: bool, proof: bool = True) -> dict[str, Any]:
-    return {"kv": kv, "load_ok": load_ok, "coherent": coherent, "kv_proof_ok": proof and load_ok}
+def _rung(kv: str, load_ok: bool, coherent: bool, proof: bool = True, **extra: Any) -> dict[str, Any]:
+    return {"kv": kv, "load_ok": load_ok, "coherent": coherent, "kv_proof_ok": proof and load_ok, **extra}
 
 
 def test_ladder_q4_win_keeps_baseline() -> None:
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("q4_0", True, True)], "q4_0", 16384, "", True, "", 28.0,
-                         500.0)
+    rungs = [_rung("f16", True, True), _rung("q8_0", True, True), _rung("q4_0", True, True)]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 28.0, 500.0)
     assert v.winner == "q4_0" and v.v4_result == "pass" and v.clear_ov == ["kv_type", "ctx_size"] and not v.set_ov
-    assert v.v22_result == "pass" and "q8_0=not tried" in v.summary and not v.deviation
+    assert v.v22_result == "pass" and "not tried" not in v.summary and not v.deviation
+    assert "Section 4.3 target reached" in v.v4_msg
 
 
 def test_ladder_q8_win_names_the_incoherent_baseline() -> None:
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("q4_0", True, False), _rung("q8_0", True, True)],
-                         "q4_0", 16384, "", True, "", 28.0, 500.0)
+    rungs = [_rung("f16", True, True), _rung("q8_0", True, True), _rung("q4_0", True, False)]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 28.0, 500.0)
     assert v.winner == "q8_0" and v.v4_result == "pass"
     assert "q8_0 applied (Section 4.3 setting q4_0 incoherent: q4_0=incoherent" in v.v4_msg
     assert v.set_ov == [("kv_type", "q8_0")] and v.clear_ov == ["ctx_size"] and v.deviation
 
 
 def test_ladder_f16_win_defers_v4_and_passes_v22_with_cap() -> None:
-    rungs = [_rung("q4_0", False, False), _rung("q8_0", True, False), _rung("f16", True, True)]
+    rungs = [_rung("f16", True, True), _rung("q8_0", False, False)]
     v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 20.0, 400.0)
     assert v.winner == "f16" and v.v4_result == "deferred" and "unquantised KV" in v.v4_msg
     assert v.v22_result == "pass" and "unquantised KV" in v.v22_msg
     assert ("ctx_size", "16384") in v.set_ov and ("kv_type", "f16") in v.set_ov
-    assert "q4_0=load failed" in v.summary and "q8_0=incoherent" in v.summary
+    assert "q8_0=load failed" in v.summary and "q4_0=not tried" in v.summary
 
 
-def test_ladder_no_winner_defers_both_and_first_coherent_wins() -> None:
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung(kv, True, False) for kv in LADDER], "q4_0", 16384,
-                         "", True, "", None, None)
+def test_ladder_no_winner_defers_both_and_lowest_coherent_wins() -> None:
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, False)], "q4_0", 16384, "", True, "", None,
+                         None)
     assert v.winner == "" and v.v4_result == "deferred" and v.v22_result == "deferred"
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("q4_0", True, True), _rung("q8_0", True, True)],
+    assert v.clear_ov == ["kv_type", "ctx_size"]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True), _rung("q8_0", True, True)],
                          "q4_0", 16384, "", True, "", 1.0, 1.0)
-    assert v.winner == "q4_0"
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("q4_0", True, True)], "q4_0", 16384, "", False,
+    assert v.winner == "q8_0"  # the LAST coherent rung (lowest reached), never f16 while a quantised rung is coherent
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True), _rung("q8_0", True, True),
+                                                       _rung("q4_0", True, True)], "q4_0", 16384, "", False,
                          "GTT still 200 GB", 1.0, 1.0)
-    assert v.v22_result == "deferred" and "GTT still 200 GB" in v.v22_msg
+    assert v.winner == "q4_0" and v.v22_result == "deferred" and "GTT still 200 GB" in v.v22_msg
+
+
+def test_ladder_measurement_failure_keeps_the_rung_and_defers_v22() -> None:
+    # A coherent, proven rung whose measurement failed is still the winner (not incoherence); V22 is deferred (R19).
+    rungs = [_rung("f16", True, True), _rung("q8_0", True, True, measure_error="8k prefill crashed the server")]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 25.0, 450.0)
+    assert v.winner == "q8_0" and v.v4_result == "pass" and v.v22_result == "deferred"
+    assert "measurement failed at q8_0: 8k prefill crashed" in v.v22_msg
+    assert "q8_0=coherent (measurement failed)" in v.summary
 
 
 class FakeControl:
     def __init__(self, fail_loads: set[str]) -> None:
         self.mode = "orchestrator"
-        self.fallback_reason = ""
         self.fail_loads = fail_loads
         self.loads: list[str] = []
         self.registered: list[int] = []
@@ -325,9 +355,8 @@ class FakeControl:
         return ""
 
 
-def test_ladder_engine_continues_after_a_load_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                      capsys: pytest.CaptureFixture[str]) -> None:
-    ctx = _ctx(tmp_path, ENGINES)
+def _ladder_harness(ctx: Any, ctl: FakeControl, monkeypatch: pytest.MonkeyPatch, measure: Any,
+                    ) -> tuple[list[Any], dict[str, str]]:
     rendered: list[tuple[list[tuple[str, str]], list[str]]] = []
     current = {"kv": ""}
 
@@ -339,7 +368,6 @@ def test_ladder_engine_continues_after_a_load_failure(tmp_path: Path, monkeypatc
         return {"ATLAS_MODEL_PRESENT": "1", "LLAMA_ARG_PORT": "8105", "ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "1",
                 "ATLAS_KV_TYPE": current["kv"]}
 
-    ctl = FakeControl(fail_loads={"q4_0"})
     monkeypatch.setattr(ctx, "render", fake_render)
     # Control.load sees the key; the fake reads the rung through the rendered kv type instead.
     monkeypatch.setattr(ctl, "load", lambda _k, c, p, port: FakeControl.load(ctl, f"x:{current['kv']}", c, p, port))
@@ -348,25 +376,78 @@ def test_ladder_engine_continues_after_a_load_failure(tmp_path: Path, monkeypatc
     monkeypatch.setattr(lt, "prove_kv", lambda key, kv, *_a: (True, f"{key}: {kv} applied", kv))
     monkeypatch.setattr(lt, "coherence_check", lambda _port, _model: (True, "fine"))
     monkeypatch.setattr(lt, "swap_out", lambda *_a: (0.0, "no previous engine"))
-    monkeypatch.setattr(lt, "unload_and_release", lambda *_a: (True, 5.0, "GTT back"))
+    monkeypatch.setattr(lt, "release_or_poll", lambda *_a: (True, 5.0, "GTT back"))
     monkeypatch.setattr(lt, "gtt_used_bytes", lambda: 160 * lt.GB)
+    monkeypatch.setattr(lt, "run_measurements", measure)
+    return rendered, current
+
+
+def test_ladder_engine_descends_and_keeps_the_rung_above_a_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _ctx(tmp_path, ENGINES)
+    ctl = FakeControl(fail_loads={"q4_0"})
 
     def fake_measure(_ctx: Any, res: Any, *_a: Any) -> None:
         res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
 
-    monkeypatch.setattr(lt, "run_measurements", fake_measure)
+    rendered, _ = _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
     res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
     lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
-    assert ctl.loads == ["q4_0", "q8_0"]  # q4_0 load failed -> continued; q8_0 won -> stopped (rule 2, 3)
+    assert ctl.loads == ["f16", "q8_0", "q4_0"]  # f16 and q8_0 coherent -> descended; q4_0 failed -> q8_0 stands
     assert res.kv_applied == "q8_0" and res.ok and res.v22_result == "pass"
-    assert [r["kv"] for r in res.ladder] == ["q4_0", "q8_0"] and res.ladder[0]["note"].startswith("load failed")
+    assert [r["kv"] for r in res.ladder] == ["f16", "q8_0", "q4_0"] and res.ladder[2]["note"].startswith("load failed")
+    assert rendered[0] == ([("kv_type", "f16"), ("ctx_size", "16384")], ["coresident"])
+    assert rendered[1] == ([("kv_type", "q8_0")], ["coresident", "ctx_size"])
     assert rendered[-1] == ([("kv_type", "q8_0")], ["ctx_size"])
-    assert res.footprint_bytes == 150 * lt.GB and ctl.registered == [150 * lt.GB]
+    assert res.footprint_bytes == 150 * lt.GB and ctl.registered == [150 * lt.GB, 150 * lt.GB]
     recs = _records(capsys)
     assert recs[-1][0] == "V4" and recs[-1][1] == "pass"
     assert "Section 4.3 setting q4_0 load failed: q4_0=load failed" in recs[-1][2]
     saved = json.loads(ctx.result_path("deepseek-v4-flash").read_text())
     assert saved["control_mode"] == "orchestrator" and saved["baseline_deviation"].startswith("KV q8_0")
+    assert not lt.pending_path(ctx).exists()  # the journal of the temporary rung overrides is closed
+
+
+def test_ladder_engine_stops_on_a_measurement_failure_with_v22_deferred(tmp_path: Path,
+                                                                        monkeypatch: pytest.MonkeyPatch,
+                                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _ctx(tmp_path, ENGINES)
+    ctl = FakeControl(fail_loads=set())
+
+    def fake_measure(_ctx: Any, res: Any, _key: str, *_a: Any) -> None:
+        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
+        if res.ladder[-1]["kv"] == "q8_0":
+            res.crashed_at_8k, res.load_error = True, "8k prefill crashed the server (died during the prefill)"
+
+    _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
+    lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
+    assert ctl.loads == ["f16", "q8_0"]  # q8_0 coherent but its measurement failed: the ladder stops, q8_0 stands
+    assert res.kv_applied == "q8_0" and res.v22_result == "deferred" and not res.ok
+    assert "measurement failed at q8_0" in res.v22_msg and ctl.registered == [150 * lt.GB]  # only f16 was registered
+    assert _records(capsys)[-1][1] == "pass"
+
+
+def test_pending_overrides_journal_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ctx(tmp_path, ENGINES)
+    (tmp_path / "overrides.json").write_text(json.dumps({"nemotron-3-super": {"ctx_size": 131072}}))
+    rendered: list[tuple[str, list[tuple[str, str]], list[str]]] = []
+
+    def fake_render(key: str, set_ov: Any = (), clear_ov: Any = ()) -> dict[str, str]:
+        rendered.append((key, list(set_ov), list(clear_ov)))
+        return {"ATLAS_CTX_SIZE": "x"}
+
+    monkeypatch.setattr(ctx, "render", fake_render)
+    e1 = lt.pending_begin(ctx, "nemotron-3-super", ["ctx_size"], "probe")
+    e2 = lt.pending_begin(ctx, "qwen2.5-vl-72b", ["coresident"], "pair", clear_always=["coresident"])
+    assert e1["set"] == {"ctx_size": 131072} and e1["clear"] == [] and e2["set"] == {} and e2["clear"] == ["coresident"]
+    assert len(lt.pending_read(ctx)) == 2
+    lt.pending_recover(ctx)  # an interrupted run: both restored, newest first, journal gone
+    assert rendered == [("qwen2.5-vl-72b", [], ["coresident"]), ("nemotron-3-super", [("ctx_size", "131072")], [])]
+    assert not lt.pending_path(ctx).exists() and lt.pending_read(ctx) == []
+    e3 = lt.pending_begin(ctx, "nemotron-3-super", ["ctx_size"], "probe")
+    lt.pending_end(ctx, e3)
+    assert not lt.pending_path(ctx).exists()
 
 
 # --- prompts and coherence --------------------------------------------------------------------------------------------
@@ -439,6 +520,9 @@ def test_orch_url_must_be_loopback() -> None:
 def test_drm_root_hook_refused_on_the_node(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ATLAS_DRM_ROOT", str(tmp_path))
     monkeypatch.setenv("ATLAS_ETC", "/etc/atlas")
+    with pytest.raises(lt.Infra):
+        lt.drm_root()
+    monkeypatch.setenv("ATLAS_ETC", "/etc//atlas/")  # canonical compare: still the node
     with pytest.raises(lt.Infra):
         lt.drm_root()
     monkeypatch.setenv("ATLAS_ETC", str(tmp_path))

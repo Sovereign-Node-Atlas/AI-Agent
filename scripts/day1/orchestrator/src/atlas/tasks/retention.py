@@ -10,17 +10,26 @@ is NOT automated here (rule "do not automate anything that will fail": the DB is
 Settings (orchestrator.env, phase2/02 and 03): OPENWEBUI_URL, OPENWEBUI_ADMIN_TOKEN_FILE (the bare API key or JWT on
 one line, phase2/03-openwebui.sh), OPENWEBUI_CHAT_RETENTION_DAYS (90).
 
-Rules: pinned chats are kept (phase2/03-openwebui.sh contract). Vault-tagged chats (any message starting with the
-`[VAULT]` override, or `meta.tags` containing "vault") are deleted WITHOUT a summary: "vault sessions are never
-retained" (10.4, 10.5). Every summary goes through the orchestrator: /internal/route decides the hemisphere with the
-router's hard rules, /internal/v1/chat/completions on the resident router model writes the summary; that model is
-outside the Arbiter's ledger (4.1), so the call takes no lock but waits while a weight-bearing generation runs
-(atlas.api._generation_lock, 9.7 C15). The summary lands in that hemisphere's collection as a permanent
-(non-temporal) entry.
+Rules. D9 (10.4) is binding without exception: "chats are retained 90 days in Open WebUI, then summarised into the
+Vector Cortex and purged". PINNED chats are a recorded DEVIATION from D9's second half (fix round 2):
+phase2/03-openwebui.sh keeps the Open WebUI record of a pinned chat, and this task honours that, but D9's memory half
+still holds: an expired pinned chat IS summarised into the Vector Cortex at 90 days (once per version of the chat: the
+summary document records `chat_updated_at`, and a chat whose summary is already current is skipped), only its Open
+WebUI record is kept.
+Keeping the record is a Section 23-style correction for the Principal to confirm or reverse, not a rule of the
+baseline; `kept_pinned` in the result counts them so the deviation is visible in the ledger.
+Vault-tagged chats (the `[VAULT]` token anywhere in a user message, `meta.tags` containing "vault", or a session the
+orchestrator's SessionTags marks vault through the durable store, fix round 2) are deleted WITHOUT a summary: "vault
+sessions are never retained" (10.4, 10.5). Every summary goes through the orchestrator: /internal/route decides the
+hemisphere with the router's hard rules, /internal/v1/chat/completions on the resident router model writes the
+summary; that call holds the orchestrator's one generation slot like any other generation (atlas.api.GenerationSlot,
+4.2 rule 3, 9.7 C15). The summary lands in that hemisphere's collection as a permanent (non-temporal) entry.
 
-The admin token file (OPENWEBUI_ADMIN_TOKEN_FILE, atlas:atlas 600 under /etc/atlas/secrets) must be readable by the
-gpu worker: a failure names the path and the owner:mode of the file and its directory (fix round), because the
-directory's mode (root:root 700 in phase1) is the usual cause and the journal must say so.
+The admin token file (OPENWEBUI_ADMIN_TOKEN_FILE, atlas:atlas 600) must be readable by the gpu worker: a failure names
+the path and the owner:mode of the file and its directory (fix round), because the directory's mode is the usual
+cause and the journal must say so. The §2-compatible layout is /etc/atlas/secrets root:root 700 with atlas-read
+secrets in /etc/atlas/secrets/atlas/ (atlas:atlas 700, files 600) and the *_TOKEN_FILE keys pointing there;
+phase2/02-orchestrator.sh currently widens the directory to root:atlas 750 instead (cross-writer item).
 """
 
 from __future__ import annotations
@@ -61,7 +70,8 @@ class RetentionResult:
     summarised: int = 0
     deleted: int = 0
     vault_deleted: int = 0
-    kept_pinned: int = 0
+    kept_pinned: int = 0  # expired pinned chats whose Open WebUI record was kept (the D9 deviation, module docstring)
+    pinned_summarised: int = 0  # ... of which a (new or refreshed) summary was written this run
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -74,6 +84,7 @@ class RetentionResult:
             "deleted": self.deleted,
             "vault_deleted": self.vault_deleted,
             "kept_pinned": self.kept_pinned,
+            "pinned_summarised": self.pinned_summarised,
             "errors": self.errors,
         }
 
@@ -119,15 +130,22 @@ def _messages(chat: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [m for m in hm.values() if isinstance(m, dict)] if isinstance(hm, dict) else []
 
 
-def is_vault_chat(chat: Mapping[str, Any]) -> bool:
+def is_vault_chat(chat: Mapping[str, Any], sessions: Any | None = None) -> bool:
+    """atlas.api.history_has_vault_prefix's rule (the token ANYWHERE in a user message, fix round 2), the `vault` tag,
+    or the orchestrator's session tags (`sessions.is_vault(chat id)`: a session tagged through the atlas_vault flag or
+    the X-Atlas-Vault header, kept in the durable store across reboots)."""
     meta = chat.get("meta") if isinstance(chat.get("meta"), dict) else {}
     tags = meta.get("tags") or []
     if any(str(t).lower() == "vault" for t in tags):
         return True
     for m in _messages(chat):
-        if m.get("role") == "user" and str(m.get("content", "")).lstrip().upper().startswith(VAULT_PREFIX):
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        if m.get("role") == "user" and VAULT_PREFIX in str(content or "").upper():
             return True
-    return False
+    cid = chat.get("id")
+    return bool(sessions is not None and cid and sessions.is_vault(str(cid)))
 
 
 def transcript(chat: Mapping[str, Any], max_chars: int = MAX_CHARS_PER_CHAT) -> str:
@@ -145,6 +163,7 @@ def transcript(chat: Mapping[str, Any], max_chars: int = MAX_CHARS_PER_CHAT) -> 
 
 
 def select_expired(chats: Sequence[Mapping[str, Any]], cutoff: float, result: RetentionResult) -> list[dict[str, Any]]:
+    """Every chat older than the cutoff, pinned ones included (they are summarised, not deleted; run_retention)."""
     out: list[dict[str, Any]] = []
     for c in chats:
         result.scanned += 1
@@ -154,12 +173,26 @@ def select_expired(chats: Sequence[Mapping[str, Any]], cutoff: float, result: Re
             continue
         if updated >= cutoff:
             continue
-        if c.get("pinned"):
-            result.kept_pinned += 1
-            continue
         out.append(dict(c))
     result.expired = len(out)
     return out
+
+
+def _summary_is_current(memory: Any, cid: str, updated_at: float) -> bool:
+    """True when either hemisphere collection already holds `chat-summary-<cid>` for this version of the chat."""
+    for collection in ("estate", "corporate"):
+        try:
+            hits = memory.get(collection, hemisphere=collection, ids=[f"chat-summary-{cid}"])
+        except Exception as exc:  # a read failure means "summarise again", never "skip silently"
+            log.warning("retention: cannot read %s for chat %s (%s); summarising", collection, cid, exc)
+            return False
+        for h in hits:
+            try:
+                if float(h.metadata.get("chat_updated_at") or 0) >= updated_at:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
 
 
 def summary_messages(title: str, text: str) -> list[dict[str, str]]:
@@ -187,22 +220,30 @@ def run_retention(
     now: float | None = None,
     task_id: str | None = None,
     dry_run: bool = False,
+    sessions: Any | None = None,
 ) -> RetentionResult:
-    """`orchestrator` is atlas.tasks.OrchestratorClient (route + generate); `memory` an atlas.memory.MemoryStore."""
+    """`orchestrator` is atlas.tasks.OrchestratorClient (route + generate); `memory` an atlas.memory.MemoryStore;
+    `sessions` an atlas.vault.SessionTags (vault tags set through the flag/header, module docstring)."""
     now = now or time.time()
     result = RetentionResult(days=days, cutoff=now - days * 86400.0)
     chats = owui.all_chats()
     for chat in select_expired(chats, result.cutoff, result):
         cid = str(chat.get("id"))
         title = str(chat.get("title") or "untitled")
+        pinned = bool(chat.get("pinned"))
         try:
-            if is_vault_chat(chat):
+            if is_vault_chat(chat, sessions):
                 if not dry_run:
-                    owui.delete_chat(cid)
+                    owui.delete_chat(cid)  # pinned or not: "vault sessions are never retained" (10.4)
                 result.vault_deleted += 1
                 result.deleted += 1
                 log.info("retention: vault-tagged chat %s deleted without summary (10.4, 10.5)", cid)
                 continue
+            if pinned:
+                # The D9 deviation (module docstring): the record stays, the memory half of D9 still happens.
+                result.kept_pinned += 1
+                if _summary_is_current(memory, cid, float(chat.get("updated_at") or 0)):
+                    continue
             text = transcript(chat)
             if text.strip():
                 route = orchestrator.route(text[:4000])
@@ -233,6 +274,11 @@ def run_retention(
                     if not wr.written:
                         raise RuntimeError(f"summary not written ({wr.reason}); chat kept")
                 result.summarised += 1
+                if pinned:
+                    result.pinned_summarised += 1
+            if pinned:
+                log.info("retention: pinned chat %s summarised, Open WebUI record kept (D9 deviation)", cid)
+                continue
             if not dry_run:
                 owui.delete_chat(cid)
             result.deleted += 1
@@ -240,13 +286,15 @@ def run_retention(
             result.errors.append(f"{cid}: {type(exc).__name__}: {exc}")
             log.error("retention: chat %s not processed: %s", cid, exc)
     log.info(
-        "retention: scanned %d, expired %d, summarised %d, deleted %d (vault %d), pinned kept %d, errors %d",
+        "retention: scanned %d, expired %d, summarised %d, deleted %d (vault %d), pinned kept %d (%d summarised), "
+        "errors %d",
         result.scanned,
         result.expired,
         result.summarised,
         result.deleted,
         result.vault_deleted,
         result.kept_pinned,
+        result.pinned_summarised,
         len(result.errors),
     )
     return result
@@ -268,8 +316,9 @@ def chat_retention(self: Any) -> dict[str, Any]:
         except RuntimeError as exc:
             raise RuntimeError(
                 f"OPENWEBUI_ADMIN_TOKEN_FILE={token_file} unreadable by this worker ({exc}; "
-                f"{_owner_mode(token_file)}); the directory must be traversable by atlas (root:atlas 710 or an "
-                "atlas-owned subdirectory)"
+                f"{_owner_mode(token_file)}). CONVENTIONS.md §2 keeps /etc/atlas/secrets root:root 700, so put the "
+                "atlas-read secrets in /etc/atlas/secrets/atlas/ (atlas:atlas 700, files atlas:atlas 600) and point "
+                "OPENWEBUI_ADMIN_TOKEN_FILE there in orchestrator.env"
             ) from exc
         owui = OpenWebUIClient(url, token)
         orch = OrchestratorClient()
@@ -282,6 +331,7 @@ def chat_retention(self: Any) -> dict[str, Any]:
                 days=days,
                 engine=env.get("ATLAS_CLASSIFIER_ENGINE") or "router-qwen3.5-4b",
                 task_id=self.request.id,
+                sessions=store.sessions,
             )
         finally:
             owui.close()

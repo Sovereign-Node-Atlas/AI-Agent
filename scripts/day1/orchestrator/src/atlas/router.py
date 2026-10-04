@@ -14,12 +14,20 @@ Order of evaluation, fixed (7.2; Appendix A "keyword hard rules -> Eleanor class
      director(s), the default tier, the domain cards (8.4: at most `max_domain_cards`, Tier C never speculatively)
      and, for TF_OMEGA, the Apex engine (6.1, 6.2). The first owner is the dispatch persona (8.5: "the director is
      the sole lead and the sole inference session"); `dispatch_engine` is that director's engine (8.5 step 4).
-     `persona`/`engine` stay the synthesising hemisphere lead (16.1 rule 1, 8.5 step 7).
+     `persona`/`engine` stay the synthesising hemisphere lead (16.1 rule 1, 8.5 step 7). The preset's hemisphere tag
+     decides which lead that is (8.1 "the tags decide default routing"): a corporate classifier verdict on an estate
+     preset is re-led to Arthur (reason "hemisphere:estate(8.1 preset tag)"), so the dispatch, the lead and the
+     memory collections (7.3) agree. Only a hard hit (7.2 rule 1) or a typed persona override (7.2 rule 4) keeps a
+     lead from the other hemisphere, and then the mismatch is on the record ("hemisphere-mismatch:...").
+     Domain cards (8.2): Tier A/B cards also load on a keyword match outside a preset (a `**Triggers:**` line in the
+     card, or the card's own name phrases in the text); Tier C stays explicit-only (8.4 rule 4).
   4. Manual overrides (7.2 rule 4): a prefix from config/router-rules.json `overrides`, typed at the start of the
      message; longest matching key wins, case-sensitive (config/README.md). An override is the Principal's explicit
      order, so it is honoured only on Principal-typed messages: callers that route stored or inbound content
      (retention re-routing, /internal/route, email ingestion) pass `allow_overrides=False` and the prefix is
-     recorded as "override-ignored:<key>" and treated as text.
+     recorded as "override-ignored:<key>" and treated as text; the classifier's Deep Think depth (9.1 task-weight
+     estimate) is likewise ignored on such text ("deep-think-ignored:<depth>"), so an inbound document cannot
+     commandeer the Apex engine.
 
 Tier (16.2) is the maximum of: the preset's default; sensitive on a hard hit, a sensitive privacy tag, a hit on the
 sensitive lexicon (payment, legal, financial, security words) or a security-adjacent domain card (8.2 posture:
@@ -27,7 +35,15 @@ sensitive lexicon (payment, legal, financial, security words) or a security-adja
 
 Every decision is written to ledger.routing_decisions with its reason (7.2 rule 5). The reason string and the logs
 carry categories only, never the message or the classifier's raw output (the ledger stores message_sha256, not text).
+A hit on one of FAMILY_NAMES is the category "family-name" in the reason, the privacy tags and the journal line; the
+literal name is kept only in the ledger's hard_keyword_hit column (the ledger file is mode 0640, the journal is not;
+10.4) and on the in-memory decision's `hard_keyword_hits`.
 The router never talks to a weight-bearing engine; the classifier is the resident 4B model, and tests stub it.
+
+Contract not stated in CONVENTIONS.md (for the config writer): a Tier A/B card may carry a line
+`**Triggers:** word, phrase, ...` (comma-separated, matched like task-force triggers) that loads it on a keyword
+match (8.2 "Tier B loads on a clear task-force or keyword match"). Cards without the line still load when the text
+names them (the multi-word parts of the H1 name), so the shipped tree works today; the line sharpens it.
 """
 
 from __future__ import annotations
@@ -42,7 +58,6 @@ from typing import Any, Protocol
 
 from atlas.config import (
     HEMISPHERES,
-    PERSONA_KEYS,
     TIERS,
     AtlasConfig,
     ConfigError,
@@ -70,6 +85,7 @@ __all__ = [
     "RouterError",
     "RoutingDecision",
     "StubClassifier",
+    "card_keyword_hit",
     "detect_task_force",
     "find_hard_keywords",
     "find_sensitive_keywords",
@@ -80,6 +96,10 @@ __all__ = [
 
 TIER_ORDER: dict[str, int] = {t: i for i, t in enumerate(TIERS)}  # routine < standard < sensitive
 DEEP_THINK_DEPTHS: tuple[str, ...] = ("quick", "standard", "deep")  # 9.1
+FAMILY_NAME_CATEGORY = "family-name"  # what a FAMILY_NAMES hit is called outside the ledger (10.4; module docstring)
+# 6.2 "Override" column: Gideon "Qwen3.5-122B for long contracts", Minerva "Qwen3.5-122B for records"; 6.3 "Qwen3.5
+# loads only for long documents". The engine key is CONVENTIONS.md §8's.
+LONG_DOCUMENT_ENGINE = "qwen3.5-122b"
 # Override actions that name a persona route (router-rules.json `routes` keys). Every other action is a command.
 PERSONA_ACTIONS: frozenset[str] = frozenset({"ren", "arthur", "ren-abliterated", "arthur-qwen", "arthur-abliterated"})
 # UNVERIFIED: ~4 characters per token for English prose (a common rule of thumb) — the long-document trigger's
@@ -141,7 +161,10 @@ class ClassifierVerdict:
             hemi = None
         persona = data.get("persona")
         persona = persona.strip().lower() if isinstance(persona, str) else None
-        if persona not in PERSONA_KEYS:
+        # The classifier is asked for "ren" | "arthur" (CLASSIFIER_SYSTEM_PROMPT) but its JSON is free text under the
+        # json_object grammar: a director's name is a legal answer and would be a route that names no lead. Only the
+        # two leads are accepted; anything else falls back to the hemisphere (kept verbatim in `raw` for the record).
+        if persona not in HEMISPHERE_LEADS.values():
             persona = None
         tf = data.get("task_force")
         tf = tf.strip().upper() if isinstance(tf, str) else None
@@ -153,8 +176,15 @@ class ClassifierVerdict:
         depth = depth.strip().lower() if isinstance(depth, str) else None
         if depth not in DEEP_THINK_DEPTHS:
             depth = None
-        return cls(hemisphere=hemi, persona=persona, task_force=tf, long_document=bool(data.get("long_document")),
-                   privacy_tags=tags, deep_think_depth=depth, raw=dict(data))
+        return cls(
+            hemisphere=hemi,
+            persona=persona,
+            task_force=tf,
+            long_document=bool(data.get("long_document")),
+            privacy_tags=tags,
+            deep_think_depth=depth,
+            raw=dict(data),
+        )
 
 
 class Classifier(Protocol):
@@ -194,14 +224,19 @@ private health, logistics, family and anything touching the Principal's private 
 Corporate work that brushes family context stays "corporate" with privacy_tags set. "long_document" is true when the \
 message carries or clearly asks to process a long document. "task_force" is the single best-matching preset or null.
 Task-force codes: %(codes)s"""
-
-# VERIFIED: research/src/tools_server_server-common.cpp accepts `response_format` of type "json_object" (turned into a
-# json_schema of {"type": "object"}, so the reply is grammar-constrained to a bare JSON object) and "json_schema";
-# any other type is rejected with invalid_argument (HTTP 400). engines.json runs router-qwen3.5-4b with --reasoning
-# off, so max_tokens is not consumed by thinking tokens. The 4xx retry below is a defensive fallback for a different
-# server build; the JSON-object scan handles a server that ignores the field.
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 _HTTP_4XX_RE = re.compile(r"\bHTTP 4\d\d\b")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _first_json_object(text: str) -> tuple[Any, str] | None:
+    """The first complete JSON value starting at the first "{" (raw_decode, so trailing text or a second object is
+    ignored instead of making the span invalid). None when there is no "{"; raises json.JSONDecodeError when the
+    object itself is malformed. The second element is the span, for DEBUG logging only."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    data, end = _JSON_DECODER.raw_decode(text, start)
+    return data, text[start:end]
 
 
 class LlamaClassifier:
@@ -225,8 +260,12 @@ class LlamaClassifier:
         messages = [{"role": "system", "content": self._system}, {"role": "user", "content": text}]
         try:
             try:
-                result = self._client.chat(messages, max_tokens=self._max_tokens, temperature=self._temperature,
-                                           response_format={"type": "json_object"})
+                result = self._client.chat(
+                    messages,
+                    max_tokens=self._max_tokens,
+                    temperature=self._temperature,
+                    response_format={"type": "json_object"},
+                )
             except EngineError as first:
                 # engines._raise_for_status formats "chat: <url> -> HTTP <code> <detail>"; only a 4xx (a rejected
                 # parameter) earns the retry; a 5xx (loading, crashed) is a real outage.
@@ -237,17 +276,17 @@ class LlamaClassifier:
         except EngineError as exc:
             raise ClassifierError(f"resident classifier unreachable or failed: {exc}") from exc
         text = result.text or ""
-        m = _JSON_OBJECT_RE.search(text)
         # The model's raw output can quote the Principal's message; it goes to DEBUG only, never into an exception
         # message (which the router copies into the ledger reason and the ERROR log).
-        if not m:
+        try:
+            found = _first_json_object(text)
+        except json.JSONDecodeError as exc:
+            log.debug("classifier: invalid JSON in the reply: %r", text[:500])
+            raise ClassifierError(f"resident classifier returned invalid JSON (offset {exc.pos})") from exc
+        if found is None:
             log.debug("classifier: no JSON object in the reply: %r", text[:500])
             raise ClassifierError(f"resident classifier returned no JSON object (len={len(text)})")
-        try:
-            data = json.loads(m.group(0))
-        except json.JSONDecodeError as exc:
-            log.debug("classifier: invalid JSON in the reply: %r", m.group(0)[:500])
-            raise ClassifierError(f"resident classifier returned invalid JSON (offset {exc.pos})") from exc
+        data, _span = found
         if not isinstance(data, dict):
             raise ClassifierError(f"resident classifier returned a JSON {type(data).__name__}, not an object")
         return ClassifierVerdict.from_json(data, task_force_codes=self._codes)
@@ -291,10 +330,22 @@ def parse_override(message: str, overrides: Mapping[str, str]) -> OverrideMatch 
 # --- hard keywords (7.2 rule 1) -------------------------------------------------------------------------------------
 
 
+# 7.2 rule 1 lists "will" verbatim, meaning the testamentary document. As a bare whole word it is also the modal verb
+# ("the vendor will send the draft"), and matching that would route most ordinary corporate traffic to Arthur at
+# sensitive tier, so the 4-Way Router would mostly not route. The noun sense is matched instead: a determiner or
+# possessive before it ("my will", "the will", "his will", "a new will", "updated will"), the fixed phrase
+# "will and testament", or the plural "wills". If the Principal wants the bare word, that is a config/README.md
+# decision, not a silent default.
+_WILL_NOUN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:(?:my|the|his|her|their|our|your|a|new|last|latest|old|updated?|revised|existing|"
+    r"current|original|signed|draft|living)\s+will|will\s+and\s+testament|wills)(?![A-Za-z0-9])"
+)
+
+
 def _keyword_regex(keyword: str) -> re.Pattern[str]:
     # Whole-word, case-insensitive; multi-word keywords (a family name with a space) match as a phrase.
-    # Note: 7.2 rule 1 lists "will" verbatim; that matches the modal verb too. The document decides the list, and a
-    # false positive routes to the defensive hemisphere, which is the safe direction (7.3).
+    if keyword.strip().lower() == "will":
+        return _WILL_NOUN_RE
     return re.compile(r"(?<![A-Za-z0-9])" + re.escape(keyword.strip()) + r"(?![A-Za-z0-9])", re.IGNORECASE)
 
 
@@ -368,15 +419,47 @@ def card_explicitly_named(text: str, card: DomainCard) -> bool:
     return False
 
 
-def select_domain_cards(text: str, task_force: TaskForce | None, cards: Mapping[int, DomainCard],
-                        max_cards: int, explicit: Sequence[int] = ()) -> tuple[list[int], list[int]]:
-    """(selected, dropped): the caller's explicit cards first, then the preset's cards, then Tier C cards the text
-    names, capped at `max_cards` (8.4 rule 2).
+# The card-level trigger line (module docstring: a contract for the config writer, not in CONVENTIONS.md).
+_CARD_TRIGGERS_RE = re.compile(r"^\*\*Triggers:\*\*\s*(?P<list>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def card_triggers(card: DomainCard) -> list[str]:
+    """The card's `**Triggers:**` entries (comma-separated), or [] when the card carries none."""
+    m = _CARD_TRIGGERS_RE.search(card.text)
+    if not m:
+        return []
+    return [t.strip().lower() for t in m.group("list").split(",") if t.strip()]
+
+
+def card_keyword_hit(text: str, card: DomainCard) -> str | None:
+    """8.2 "Tier B loads on a clear task-force or keyword match" (Tier A "without hesitation"): the trigger or name
+    phrase of a Tier A/B card that the text carries, or None. Tier C is never matched here (8.4 rule 4)."""
+    if card.is_tier_c:
+        return None
+    for trigger in card_triggers(card):
+        if _trigger_regex(trigger).search(text):
+            return trigger
+    for phrase in _card_phrases(card):
+        if re.search(r"(?<![A-Za-z0-9])" + re.escape(phrase) + r"(?![A-Za-z0-9])", text, re.IGNORECASE):
+            return phrase
+    return None
+
+
+def select_domain_cards(
+    text: str,
+    task_force: TaskForce | None,
+    cards: Mapping[int, DomainCard],
+    max_cards: int,
+    explicit: Sequence[int] = (),
+    keyword_hits: dict[int, str] | None = None,
+) -> tuple[list[int], list[int]]:
+    """(selected, dropped): the caller's explicit cards first, then the preset's cards, then Tier A/B cards the text
+    matches by keyword (8.2), then Tier C cards the text names, capped at `max_cards` (8.4 rule 2).
 
     Tier C cards are included only when explicitly named or explicitly requested (8.4 rule 4), never from a preset.
-    A text-inferred Tier C card is placed after the preset so a preset never loses one of its own cards to an
-    inference. `dropped` lists the cards that did not fit; the caller must split the work into a relay (8.5), not
-    widen the cap.
+    A text-inferred card is placed after the preset so a preset never loses one of its own cards to an inference.
+    `dropped` lists the cards that did not fit; the caller must split the work into a relay (8.5), not widen the cap.
+    `keyword_hits`, when given, is filled with {card number: the trigger or phrase that matched} for the reason.
     """
     for n in explicit:
         if n not in cards:
@@ -388,11 +471,22 @@ def select_domain_cards(text: str, task_force: TaskForce | None, cards: Mapping[
             if card is None:
                 raise RouterError(f"{task_force.code} names domain {ref.domain}, which has no card")
             if card.is_tier_c and ref.domain not in chosen:
-                log.warning("%s preset names Tier C card %d; skipped (8.4 rule 4: explicit match only)",
-                            task_force.code, ref.domain)
+                log.warning(
+                    "%s preset names Tier C card %d; skipped (8.4 rule 4: explicit match only)",
+                    task_force.code,
+                    ref.domain,
+                )
                 continue
             if ref.domain not in chosen:
                 chosen.append(ref.domain)
+    for n, card in cards.items():
+        if n in chosen or card.is_tier_c:
+            continue
+        hit = card_keyword_hit(text, card)
+        if hit is not None:
+            chosen.append(n)
+            if keyword_hits is not None:
+                keyword_hits[n] = hit
     for n, card in cards.items():
         if card.is_tier_c and n not in chosen and card_explicitly_named(text, card):
             chosen.append(n)
@@ -473,9 +567,9 @@ class Router:
     """The 4-Way Router. One instance per orchestrator process; `route()` is pure apart from the ledger write.
 
     `on_classifier_error`: "raise" (the default) makes a dead resident classifier a RouterError, so the caller
-    returns a 5xx and the outage is a strike, never a silently routed answer (4.1 keeps the 4B model resident, V10a
-    proves it; CONVENTIONS.md §7.4). "arthur" / "ren" are explicit degraded-mode opt-ins that route to that lead
-    with the outage in the reason.
+    returns a 5xx and the outage is a strike, never a silently routed answer (4.1 keeps the 4B model resident; V10,
+    whose Phase 2 gate half is the resident 4B router model, Section 21, proves it; CONVENTIONS.md §7.4). "arthur" /
+    "ren" are explicit degraded-mode opt-ins that route to that lead with the outage in the reason.
     """
 
     def __init__(self, config: AtlasConfig, classifier: Classifier, ledger: Ledger, *,
@@ -503,9 +597,16 @@ class Router:
 
     # --- public -------------------------------------------------------------------------------------------------------
 
-    def route(self, message: str, *, task_id: str | None = None, task_force: str | None = None,
-              explicit_domains: Sequence[int] = (), context: Mapping[str, Any] | None = None,
-              allow_overrides: bool = True) -> RoutingDecision:
+    def route(
+        self,
+        message: str,
+        *,
+        task_id: str | None = None,
+        task_force: str | None = None,
+        explicit_domains: Sequence[int] = (),
+        context: Mapping[str, Any] | None = None,
+        allow_overrides: bool = True,
+    ) -> RoutingDecision:
         """Decide where a message goes and log it. `task_force` and `explicit_domains` are the explicit-command path
         (8.5 step 1 "or an explicit command"); TF_OMEGA can only arrive that way. `allow_overrides=False` is for
         text the Principal did not type (stored transcripts, inbound documents): a prefix is text, not an order."""
@@ -535,12 +636,15 @@ class Router:
             else:
                 command = ov.action
 
-        # 2. hard keywords (7.2 rule 1: "regardless of anything else", so a [REN*] override on a hit is overruled)
+        # 2. hard keywords (7.2 rule 1: "regardless of anything else", so a [REN*] override on a hit is overruled).
+        # A FAMILY_NAMES hit is spoken of as "family-name" everywhere but the ledger column (module docstring).
         hits = find_hard_keywords(body, self.rules.hard_keywords)
+        family = {n.strip().lower() for n in self.config.settings.family_names}
+        labels = list(dict.fromkeys(FAMILY_NAME_CATEGORY if h.lower() in family else h for h in hits))
         if hits:
-            reasons.append(f"hard-rule:{hits[0]}" + (f"(+{','.join(hits[1:])})" if len(hits) > 1 else ""))
+            reasons.append(f"hard-rule:{labels[0]}" + (f"(+{','.join(labels[1:])})" if len(labels) > 1 else ""))
             if forced_route is not None and not forced_route.startswith(self._hard_route):
-                reasons.append(f"overruled-by-hard-rule:{hits[0]}(7.2 rule 1)")
+                reasons.append(f"overruled-by-hard-rule:{labels[0]}(7.2 rule 1)")
                 forced_route = None
 
         # 3. classifier (always consulted; its verdict is overruled by 1 and 2 but recorded, V16). Only the error's
@@ -559,7 +663,12 @@ class Router:
             log.debug("router: classifier exception", exc_info=exc)
         classifier_route = None
         if verdict is not None:
-            classifier_route = verdict.persona or (HEMISPHERE_LEADS.get(verdict.hemisphere or "") or None)
+            # Only a lead is a route (from_json already drops a director's name; a verdict built elsewhere is held to
+            # the same rule here rather than becoming a route that names no lead).
+            if verdict.persona in HEMISPHERE_LEADS.values():
+                classifier_route = verdict.persona
+            else:
+                classifier_route = HEMISPHERE_LEADS.get(verdict.hemisphere or "") or None
 
         # 4. the route
         if forced_route is not None:
@@ -571,56 +680,22 @@ class Router:
             route = self._hard_route
         elif classifier_route is not None:
             route = classifier_route
-            reasons.append(f"classifier:{verdict.hemisphere or classifier_route}"
-                           + (f"(tags {','.join(verdict.privacy_tags)})" if verdict and verdict.privacy_tags else ""))
+            reasons.append(
+                f"classifier:{verdict.hemisphere or classifier_route}"
+                + (f"(tags {','.join(verdict.privacy_tags)})" if verdict and verdict.privacy_tags else "")
+            )
         else:
             if self.on_classifier_error == "raise":
-                raise RouterError(f"no route: classifier gave no verdict ({classifier_error or 'empty verdict'}); "
-                                  f"the resident router model is down (4.1, 7.2 rule 2)")
+                raise RouterError(
+                    f"no route: classifier gave no verdict ({classifier_error or 'empty verdict'}); "
+                    f"the resident router model is down (4.1, 7.2 rule 2)"
+                )
             route = self.on_classifier_error
             reasons.append(f"classifier-unavailable({classifier_error or 'empty verdict'}):default-{route}")
             log.error("router: classifier unavailable (%s); degraded mode, defaulting to %s", classifier_error, route)
-        if classifier_error and (forced_route is not None or hits):
+        # 7.2 rule 5: an outage is on the record whenever something other than the classifier decided the route.
+        if classifier_error and (forced_route is not None or hits or command == "vault-session"):
             reasons.append(f"classifier-unavailable({classifier_error})")
-
-        # long-document trigger (7.1 "Arthur, override: ... or long-document trigger")
-        est_tokens = len(body) // CHARS_PER_TOKEN_ESTIMATE
-        long_doc = bool(verdict and verdict.long_document) or est_tokens >= self.rules.long_document_tokens
-        if long_doc:
-            if route == "arthur" and "arthur-qwen" in self.rules.routes:
-                route = "arthur-qwen"
-                reasons.append("long-document:arthur-qwen")
-            else:
-                # No corporate long-document route exists in router-rules.json (7.1 names it for Arthur only); the
-                # engine stays as routed and the flag is carried for the caller.
-                reasons.append("long-document")
-
-        persona = "ren" if route.startswith("ren") else "arthur" if route.startswith("arthur") else None
-        if persona is None:
-            raise RouterError(f"route {route!r} names no hemisphere lead (routes must start with ren/arthur)")
-        hemisphere = self.personas[persona].hemisphere
-
-        # Deep Think (9.1): "[DEEP THINK: problem] or the router's task-weight estimate. Eleanor's classifier picks a
-        # depth; the Principal can force any depth with a prefix." A typed prefix wins; with no override at all the
-        # classifier's depth is the task-weight trigger.
-        if command == "deep-think" and depth is None and verdict and verdict.deep_think_depth:
-            depth = verdict.deep_think_depth
-            reasons.append(f"deep-think:{depth}(classifier)")
-        elif command == "deep-think":
-            reasons.append(f"deep-think:{depth or 'unset'}")
-        elif ov is None and verdict and verdict.deep_think_depth:
-            command, depth = "deep-think", verdict.deep_think_depth
-            reasons.append(f"deep-think:{depth}(classifier task-weight, 9.1)")
-
-        # engine
-        if command == "deep-think" and depth == "deep":
-            if "deep-think:deep" not in self.rules.routes:
-                raise ConfigError("router-rules.json routes has no 'deep-think:deep' (9.1 deep tier, Apex engine)")
-            engine = self.rules.routes["deep-think:deep"]
-        else:
-            engine = self.rules.routes[route]
-        if engine not in self.config.engines:
-            raise ConfigError(f"route {route!r} names engine {engine!r}, which is not in engines.json")
 
         # 5. task force (7.2 rule 3, 8.3, 8.5 steps 1-2)
         tf: TaskForce | None = None
@@ -639,6 +714,63 @@ class Router:
                 if cand.trigger != "principal-only":
                     tf = cand
                     reasons.append(f"task-force:{tf.code}(classifier)")
+
+        # The preset's hemisphere tag decides the lead (8.1 "the tags decide default routing"; 8.5 step 7 "the result
+        # reports to Ren or Arthur"): the owning director's lead synthesises, so the dispatch, the lead and the memory
+        # collections agree (7.3). A hard hit (7.2 rule 1) and a typed persona override (7.2 rule 4, the Principal's
+        # explicit order) outrank the tag; then the mismatch is recorded rather than resolved. TF_OMEGA is "both".
+        lead_for_route = "ren" if route.startswith("ren") else "arthur" if route.startswith("arthur") else None
+        if lead_for_route is None:
+            raise RouterError(f"route {route!r} names no hemisphere lead (routes must start with ren/arthur)")
+        if tf is not None and tf.hemisphere in HEMISPHERES:
+            tf_lead = HEMISPHERE_LEADS[tf.hemisphere]
+            if tf_lead != lead_for_route:
+                if hits:
+                    reasons.append(f"hemisphere-mismatch:{tf.hemisphere}(hard rule keeps {lead_for_route}, 7.2 rule 1)")
+                elif forced_route is not None:
+                    reasons.append(f"hemisphere-mismatch:{tf.hemisphere}(override keeps {lead_for_route}, 7.2 rule 4)")
+                else:
+                    route, lead_for_route = tf_lead, tf_lead
+                    reasons.append(f"hemisphere:{tf.hemisphere}(8.1 preset tag)")
+        persona = lead_for_route
+        hemisphere = self.personas[persona].hemisphere
+
+        # long-document trigger (7.1 "Arthur, override: ... or long-document trigger"), after the lead is settled
+        est_tokens = len(body) // CHARS_PER_TOKEN_ESTIMATE
+        long_doc = bool(verdict and verdict.long_document) or est_tokens >= self.rules.long_document_tokens
+        if long_doc:
+            if route == "arthur" and "arthur-qwen" in self.rules.routes:
+                route = "arthur-qwen"
+                reasons.append("long-document:arthur-qwen")
+            else:
+                # No corporate long-document route exists in router-rules.json (7.1 names it for Arthur only); the
+                # engine stays as routed and the flag is carried for the caller (a director's 6.2 override is below).
+                reasons.append("long-document")
+
+        # Deep Think (9.1): "[DEEP THINK: problem] or the router's task-weight estimate. Eleanor's classifier picks a
+        # depth; the Principal can force any depth with a prefix." A typed prefix wins; with no override at all the
+        # classifier's depth is the task-weight trigger, but only on text the Principal typed: an inbound document
+        # rated "deep" must not commandeer the Apex engine (9.1 sanctions the estimate for the Principal's messages).
+        if command == "deep-think" and depth is None and verdict and verdict.deep_think_depth:
+            depth = verdict.deep_think_depth
+            reasons.append(f"deep-think:{depth}(classifier)")
+        elif command == "deep-think":
+            reasons.append(f"deep-think:{depth or 'unset'}")
+        elif allow_overrides and ov is None and verdict and verdict.deep_think_depth:
+            command, depth = "deep-think", verdict.deep_think_depth
+            reasons.append(f"deep-think:{depth}(classifier task-weight, 9.1)")
+        elif not allow_overrides and verdict and verdict.deep_think_depth:
+            reasons.append(f"deep-think-ignored:{verdict.deep_think_depth}(not a Principal-typed message)")
+
+        # engine
+        if command == "deep-think" and depth == "deep":
+            if "deep-think:deep" not in self.rules.routes:
+                raise ConfigError("router-rules.json routes has no 'deep-think:deep' (9.1 deep tier, Apex engine)")
+            engine = self.rules.routes["deep-think:deep"]
+        else:
+            engine = self.rules.routes[route]
+        if engine not in self.config.engines:
+            raise ConfigError(f"route {route!r} names engine {engine!r}, which is not in engines.json")
         if tf is not None and tf.engine:
             # 6.1 "Apex escalation: DeepSeek V4 Flash, on ... TF_OMEGA"; 6.2 Gideon "Apex engine for TF_OMEGA".
             if tf.engine not in self.config.engines:
@@ -659,10 +791,25 @@ class Router:
             # Apex engine for a director whose file does not list it is a ConfigError, not a silent widening.
             dispatch_engine = self.personas.engine_for(dispatch_persona, tf.engine or None)
             reasons.append(f"dispatch:{dispatch_persona}@{dispatch_engine}(8.5 step 4)")
+            # 6.2 "Override" column: a director bound to Qwen3.5 for long documents (Gideon: long contracts; Minerva:
+            # records) runs a long-document dispatch on it (6.3 "Qwen3.5 loads only for long documents"); the Apex
+            # engine of a preset is never displaced.
+            if (
+                long_doc
+                and not tf.engine
+                and LONG_DOCUMENT_ENGINE in self.personas.binding(dispatch_persona).override_engines
+            ):
+                dispatch_engine = self.personas.engine_for(dispatch_persona, LONG_DOCUMENT_ENGINE)
+                reasons.append(f"long-document:{dispatch_persona}@{LONG_DOCUMENT_ENGINE}(6.2 override)")
 
         # 6. domain cards (8.4), before the tier: a security-adjacent card makes the dispatch sensitive (8.2)
-        selected, dropped = select_domain_cards(body, tf, self.config.domain_cards, self.rules.max_domain_cards,
-                                                explicit_domains)
+        keyword_hits: dict[int, str] = {}
+        selected, dropped = select_domain_cards(
+            body, tf, self.config.domain_cards, self.rules.max_domain_cards, explicit_domains, keyword_hits
+        )
+        for n in selected:
+            if n in keyword_hits:
+                reasons.append(f"cards:{n}(keyword {keyword_hits[n]!r}, 8.2 Tier A/B)")
         if dropped:
             reasons.append(f"cards-dropped:{dropped}(8.4 rule 2: relay needed)")
 
@@ -670,7 +817,7 @@ class Router:
         # (family/medical/estate are 16.2's sensitive examples), a sensitive privacy tag, a sensitive-lexicon hit
         # (any payment, legal, financial, security), a security-adjacent card (8.2 posture), and never routine on an
         # abliterated engine (6.1 C6 addendum / R13: "its output passes the same approval gate").
-        tags = list(dict.fromkeys([h.lower() for h in hits] + list(verdict.privacy_tags if verdict else ())))
+        tags = list(dict.fromkeys([lab.lower() for lab in labels] + list(verdict.privacy_tags if verdict else ())))
         tag_hits = sorted(set(tags) & SENSITIVE_TAGS)
         lexicon_hits = find_sensitive_keywords(body, self.sensitive_keywords)
         domain_hits = sorted(set(selected) & SENSITIVE_DOMAINS)
@@ -699,14 +846,32 @@ class Router:
             reasons.append(f"tier:{tier}({tf.code})")
 
         decision = RoutingDecision(
-            route=route, persona=persona, hemisphere=hemisphere, engine=engine, tier=tier,
-            reason="; ".join(reasons), body=body, message_sha256=digest, task_force=tf.code if tf else None,
-            directors=directors, dispatch_persona=dispatch_persona, dispatch_engine=dispatch_engine,
-            domain_cards=tuple(selected), dropped_cards=tuple(dropped), privacy_tags=tuple(tags),
-            hard_keyword_hits=tuple(hits), sensitive_hits=tuple(lexicon_hits),
-            override=ov.key if ov else None, override_action=ov.action if ov else None,
-            command=command, deep_think_depth=depth, long_document=long_doc, classifier_route=classifier_route,
-            classifier_verdict=verdict, task_id=task_id, dual_sign_off=bool(tf and tf.dual_sign_off),
+            route=route,
+            persona=persona,
+            hemisphere=hemisphere,
+            engine=engine,
+            tier=tier,
+            reason="; ".join(reasons),
+            body=body,
+            message_sha256=digest,
+            task_force=tf.code if tf else None,
+            directors=directors,
+            dispatch_persona=dispatch_persona,
+            dispatch_engine=dispatch_engine,
+            domain_cards=tuple(selected),
+            dropped_cards=tuple(dropped),
+            privacy_tags=tuple(tags),
+            hard_keyword_hits=tuple(hits),
+            sensitive_hits=tuple(lexicon_hits),
+            override=ov.key if ov else None,
+            override_action=ov.action if ov else None,
+            command=command,
+            deep_think_depth=depth,
+            long_document=long_doc,
+            classifier_route=classifier_route,
+            classifier_verdict=verdict,
+            task_id=task_id,
+            dual_sign_off=bool(tf and tf.dual_sign_off),
         )
         self._log(decision)
         return decision

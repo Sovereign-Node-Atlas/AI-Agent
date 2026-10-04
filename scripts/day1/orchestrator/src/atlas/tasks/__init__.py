@@ -4,14 +4,20 @@ Modules: sentinel (9.3), prune (9.6), aegis (9.5), ouroboros (9.4), retention (D
 
 Every task runs in a Celery worker process, NOT in the orchestrator's process. The Engine Arbiter is an object inside
 the orchestrator, so a task that needs a model calls the orchestrator's loopback API (`OrchestratorClient`): its
-/internal/v1/chat/completions loads a weight-bearing engine through the Arbiter (4.2 rule 2) and generates on it under
-the single generation lock (rule 3). The three resident small models (router-qwen3.5-4b, bge-m3, the reranker) are
-outside the Arbiter's ledger by design (4.1 "always loaded", 5.3): a generation on one of them takes NO lock; it
-waits while a weight-bearing generation is running (so "a background task that calls an LLM partway through still
-queues behind the resident engine", 9.7 C15, holds in that direction) but a chat generation never waits for it. That
-is the whole claim; nothing in this package holds a lock for a 4B call (fix round, rule §7.4).
+/internal/v1/chat/completions loads a weight-bearing engine through the Arbiter (4.2 rule 2) and generates under the
+orchestrator's ONE generation slot (rule 3: "exactly one may generate at any moment ... including background work").
+Every generation holds that slot, the three resident small models (router-qwen3.5-4b, bge-m3's chat use, the
+reranker) included (fix round 2, atlas.api.GenerationSlot): a 4B call for a BLUF or a summary queues behind a running
+chat generation AND a chat generation queues behind the 4B call, strict FIFO (rule 4; 9.7 C15 in both directions).
+The only model call outside the slot is the router's classifier verdict (7.2 rule 2), which precedes every generation.
+A client may therefore wait up to ATLAS_GENERATION_WAIT_S (atlas.api.DEFAULT_GENERATION_WAIT_S, 1800 s) in the FIFO
+before its own generation even starts, so the client's read timeout is that value PLUS a generation
+(DEFAULT_TIMEOUT_SLACK_S); the two are sized together, never equal (fix round 2: an equal timeout fired the moment
+the orchestrator began generating, orphaning the child row).
 Only 127.0.0.1 is ever dialled; trust_env=False keeps the allowlist proxy out of loopback traffic. When the
 orchestrator's admin routes carry a token (ORCH_ADMIN_TOKEN_FILE, atlas.api), the client sends it as X-Atlas-Token.
+`generate(..., audience="principal")` asks the orchestrator to run the never-delegate rewrite (16.1 rule 5) on the
+answer, for text that reaches the Principal (a Sentinel BLUF pushed to the phone).
 
 Ledger rule: `atlas-admin enqueue` inserts the task row with the Celery task id BEFORE sending (admin.py); the worker
 finds that row and updates it. Beat-scheduled and chained tasks have no row yet, so `TaskRecord.start()` inserts one.
@@ -37,9 +43,11 @@ from atlas.ledger import Ledger
 log = logging.getLogger("atlas.tasks")
 
 __all__ = [
+    "DEFAULT_TIMEOUT_SLACK_S",
     "OrchestratorClient",
     "TaskRecord",
     "admin_token",
+    "generation_timeout_s",
     "notify",
     "open_task_ledger",
     "read_secret_line",
@@ -126,9 +134,12 @@ def notify(
         headers["Tags"] = ",".join(tags)
     token_file = env.get("NTFY_TOKEN_FILE")
     if token_file:
-        # No silent `is_file()` gate (fix round): a token file this worker cannot traverse to (/etc/atlas/secrets must
-        # be root:atlas 750, the file atlas:atlas 600) is an ERROR in the journal, and the push still goes out so the
-        # server's refusal is visible too; ntfy's default-deny auth would drop an unauthenticated push.
+        # No silent `is_file()` gate (fix round): a token file this worker cannot traverse to is an ERROR in the
+        # journal (CONVENTIONS.md §2 keeps /etc/atlas/secrets root:root 700, so an atlas-read secret belongs in an
+        # atlas-owned subdirectory, /etc/atlas/secrets/atlas/ 700 with files 600, and NTFY_TOKEN_FILE points there;
+        # phase2/02-orchestrator.sh currently widens the directory to root:atlas 750 instead, a cross-writer item),
+        # and the push still goes out so the server's refusal is visible too; ntfy's default-deny auth would drop an
+        # unauthenticated push.
         try:
             headers["Authorization"] = f"Bearer {read_secret_line(token_file, 'NTFY_TOKEN')}"
         except RuntimeError as exc:
@@ -151,11 +162,29 @@ def notify(
         return False
 
 
+DEFAULT_GENERATION_WAIT_S = 1800.0  # must equal atlas.api.DEFAULT_GENERATION_WAIT_S (ATLAS_GENERATION_WAIT_S)
+DEFAULT_TIMEOUT_SLACK_S = 900.0  # one generation on top of the slot wait
+
+
+def generation_timeout_s(env: Mapping[str, str] | None = None) -> float:
+    """The client's read timeout: the orchestrator's slot wait (ATLAS_GENERATION_WAIT_S) plus a generation."""
+    env = dict(os.environ if env is None else env)
+    try:
+        wait = float(env.get("ATLAS_GENERATION_WAIT_S") or DEFAULT_GENERATION_WAIT_S)
+    except ValueError:
+        wait = DEFAULT_GENERATION_WAIT_S
+    return wait + DEFAULT_TIMEOUT_SLACK_S
+
+
 class OrchestratorClient:
     """Loopback client for the orchestrator (atlas.api): generation through the Arbiter, routing, strikes."""
 
     def __init__(
-        self, base_url: str | None = None, *, timeout_s: float = 1800.0, transport: httpx.BaseTransport | None = None
+        self,
+        base_url: str | None = None,
+        *,
+        timeout_s: float | None = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         env = os.environ
         self.base_url = (base_url or env.get("ORCH_URL") or f"http://127.0.0.1:{env.get('ORCH_PORT') or 8800}").rstrip(
@@ -165,8 +194,14 @@ class OrchestratorClient:
         token = admin_token()
         if token:
             headers["X-Atlas-Token"] = token
+        read_s = generation_timeout_s() if timeout_s is None else timeout_s
+        self.timeout_s = read_s
         self._http = httpx.Client(
-            base_url=self.base_url, timeout=timeout_s, trust_env=False, transport=transport, headers=headers
+            base_url=self.base_url,
+            timeout=httpx.Timeout(connect=10.0, read=read_s, write=60.0, pool=60.0),
+            trust_env=False,
+            transport=transport,
+            headers=headers,
         )
         self.last_child_task_id: str | None = None  # the orchestrator's child ledger row of the last generate()
 
@@ -187,8 +222,10 @@ class OrchestratorClient:
         max_tokens: int = 1024,
         temperature: float = 0.3,
         task_id: str | None = None,
+        audience: str | None = None,
     ) -> str:
-        """POST /internal/v1/chat/completions {model: <engine key>} -> the assistant text (Arbiter-locked)."""
+        """POST /internal/v1/chat/completions {model: <engine key>} -> the assistant text (generation-slot held).
+        `audience="principal"`: the orchestrator runs the never-delegate rewrite on the answer (16.1 rule 5)."""
         body: dict[str, Any] = {
             "model": engine,
             "messages": list(messages),
@@ -198,6 +235,8 @@ class OrchestratorClient:
         }
         if task_id:
             body["atlas_task_id"] = task_id
+        if audience:
+            body["atlas_audience"] = audience
         r = self._http.post("/internal/v1/chat/completions", json=body)
         if r.status_code >= 400:
             raise RuntimeError(f"orchestrator generate on {engine} -> HTTP {r.status_code}: {r.text[:300]}")

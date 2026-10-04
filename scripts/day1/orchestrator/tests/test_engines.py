@@ -28,6 +28,29 @@ def _client(handler: Any) -> LlamaClient:
     return LlamaClient("http://127.0.0.1:8101", transport=httpx.MockTransport(handler))
 
 
+def test_llama_client_dials_loopback_only() -> None:
+    # Rule §7.1: the client ignores HTTPS_PROXY (trust_env=False), which is legitimate only for the loopback
+    # llama-server instances of §8; anything else is refused before a request exists, so no module can use it to reach
+    # past the allowlist proxy at the library level.
+    calls: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(200, json={"status": "ok"})
+
+    for bad in ("http://10.0.0.5:8101", "https://example.com", "https://127.0.0.1:8101", "http://192.168.1.10:8101",
+                "http://host.docker.internal:8101", "ftp://127.0.0.1:8101"):
+        with pytest.raises(EngineError, match="loopback llama-server instances only"):
+            LlamaClient(bad, transport=httpx.MockTransport(handler))
+    assert calls == []
+    for ok in ("http://127.0.0.1:8101", "http://localhost:8101/", "http://[::1]:8101", "http://LOCALHOST:8101"):
+        assert LlamaClient(ok, transport=httpx.MockTransport(handler)).health().ok
+    assert len(calls) == 4
+    spec = EngineSpec(key="x", mode="chat", arbiter_class="core", kv_class="q4_0", footprint_gb=1, ctx_size=1,
+                      parallel=1, index=1, port=8101)
+    assert LlamaClient.for_engine(spec).base_url == "http://127.0.0.1:8101"
+
+
 def test_health_503_while_loading_then_200() -> None:
     state = {"ready": False}
 
@@ -151,7 +174,13 @@ def test_systemd_controller_uses_plain_sudo_and_the_unit_name(engines: dict[str,
         assert "-E" not in cmd  # adjudicated conflict 7: never sudo -E; -n is non-interactive (sudo and sudo-rs)
         assert kw["stdin"] is subprocess.DEVNULL  # sudo-rs can never wait for a password
     _, kw = runner.calls[0]
-    assert kw["timeout"] == 900.0  # TimeoutStartSec=900 in systemd/llama-server@.service
+    # Python's deadline is STRICTLY longer than the unit's TimeoutStartSec=900 (systemd/llama-server@.service) so
+    # systemd's timeout fires first and the exit-code path with the journalctl hint is taken; were it shorter,
+    # subprocess.run would try to kill root's sudo child and report EPERM instead of the cause (fix round).
+    assert kw["timeout"] == 960.0 == 900.0 + SystemdEngineController.START_TIMEOUT_MARGIN_S
+    assert ctl.start_timeout_s > 900.0 and ctl.stop_timeout_s > 120.0  # TimeoutStopSec=120
+    _, kw_stop = runner.calls[1]
+    assert kw_stop["timeout"] == ctl.stop_timeout_s == 180.0
 
 
 def test_systemd_controller_failure_names_the_journal() -> None:
@@ -195,3 +224,11 @@ def test_stub_controller_moves_the_probe(engines: dict[str, EngineSpec]) -> None
     assert probe.used_bytes == 40
     with pytest.raises(EngineControlError):
         StubController(fail_start=["x"]).start("x")
+    with pytest.raises(EngineError) as ei:  # the post-start /health failure of SystemdEngineController.start
+        StubController(fail_start=["x"], start_error=EngineError).start("x")
+    assert type(ei.value) is EngineError
+    stuck = StubController(engines=engines, probe=probe, footprints={"gpt-oss-120b": 30}, fail_stop=["gpt-oss-120b"])
+    stuck.start("gpt-oss-120b")
+    with pytest.raises(EngineControlError, match="password is required"):
+        stuck.stop("gpt-oss-120b")
+    assert stuck.is_active("gpt-oss-120b") and probe.used_bytes == 70  # the unit kept running, the counter stayed up

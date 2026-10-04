@@ -165,16 +165,20 @@ def retrieve_scars(
     persona: str | None = None,
     domain: str | None = None,
 ) -> list[Scar]:
-    """The closest scars within the distance threshold, optionally narrowed to a persona or domain tag.
+    """The closest scars within the distance threshold, ALWAYS within the dispatch's hemisphere, optionally narrowed
+    to a persona or domain tag.
 
     The dispatch path (atlas.api._retrieve) passes NO persona filter (fix round): the Principal's own `[LOG STRIKE:]`
     scars and automatic ones from any persona are the 9.4 injection input ("the closest few scars above a similarity
     threshold"); similarity, not authorship, decides. The filters remain for callers that want one persona's scars.
+    The HEMISPHERE clause is not optional (fix round 2): a scar's text carries the Principal's message as its context
+    (record_strike), so an estate scar surfacing in a Ren prompt would move estate words across the membrane (7.3,
+    10.1 "every dispatch's reads are bound to its hemisphere"). memory.write stamps `hemisphere` on every document.
     """
     if not query.strip() or k < 1:
         return []
     where: dict[str, Any] | None = None
-    clauses: list[dict[str, Any]] = []
+    clauses: list[dict[str, Any]] = [{"hemisphere": hemisphere}]
     if persona:
         clauses.append({"persona": persona.lower()})
     if domain:

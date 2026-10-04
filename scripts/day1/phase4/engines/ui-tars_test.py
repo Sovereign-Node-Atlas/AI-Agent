@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """UI-TARS-1.5-7B one GUI-grounding turn on a synthetic screenshot (rocm-containers.md §6.5: repo VERIFIED, loading
-code UNVERIFIED — Qwen2.5-VL convention, SDPA attention on AOTriton). Writes ui_tars.txt."""
+code UNVERIFIED — Qwen2.5-VL convention, SDPA attention on AOTriton). The dtype keyword spelling is decided once by
+p4common.load_kwargs from the transformers version (no try/except retry: a 16 GB load runs exactly once under the
+load watchdog). Writes ui_tars.txt."""
 
 from __future__ import annotations
 
@@ -8,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from p4common import Test, synthetic_image
+from p4common import Test, load_kwargs, synthetic_image
 
 REPO = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -19,11 +21,9 @@ def main(t: Test) -> None:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     proc = AutoProcessor.from_pretrained(REPO, min_pixels=256 * 28 * 28, max_pixels=1280 * 28 * 28)
-    try:
-        model = AutoModelForImageTextToText.from_pretrained(REPO, dtype=torch.bfloat16, attn_implementation="sdpa")
-    except TypeError:
-        model = AutoModelForImageTextToText.from_pretrained(REPO, torch_dtype=torch.bfloat16,
-                                                            attn_implementation="sdpa")
+    kw = load_kwargs(AutoModelForImageTextToText, torch.bfloat16, disable_mmap=False)
+    t.note(f"from_pretrained kwargs: {sorted(kw)}")
+    model = AutoModelForImageTextToText.from_pretrained(REPO, attn_implementation="sdpa", **kw)
     model = model.to(t.device).eval()
     t.loaded()
     shot = Image.open(synthetic_image(t.out / "screenshot.png", "gui")).convert("RGB")

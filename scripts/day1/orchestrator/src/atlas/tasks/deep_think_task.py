@@ -1,25 +1,31 @@
-"""Deep Think as a Celery task on the gpu queue (Section 9.1, 9.7): the chat path runs Deep Think inline; a
-background job (a task force marked heavy, a Sentinel escalation) runs it here. Every engine call goes through the
-orchestrator's /internal/v1/chat/completions, which loads through the Engine Arbiter and takes its generation lock
-for a weight-bearing engine (a resident small model only waits for a running generation, atlas.api._generation_lock);
-the plan itself is the orchestrator's (/internal/deep-think/plan), so the downgrade of rule 8 is honoured.
+"""Deep Think as a Celery task on the gpu queue (Section 9.1, 9.7): the chat path runs the QUICK tier inline and
+enqueues standard/deep here (atlas.api._enqueue_deep_think, fix round 2: 9.7 "the chat interface returns to the
+Principal immediately"); a background job (a task force marked heavy, a Sentinel escalation) runs here too. Every
+engine call goes through the orchestrator's /internal/v1/chat/completions, which loads through the Engine Arbiter and
+holds the orchestrator's one generation slot (atlas.api.GenerationSlot: every generation, resident small models
+included); the plan itself is the orchestrator's (/internal/deep-think/plan), so the downgrade of rule 8 is honoured.
+
+The final answer goes through the never-delegate rewrite (16.1 rule 5; governance.never_delegate_rewrite) with the
+PRINCIPAL register before it is stored when `audience` is "principal" (the chat path's default): the Principal reads
+the stored answer, so nothing task-shaped may be in it. Intermediate calls (generator, adversary, refine) are not
+rewritten: they are the engines talking to each other. When done, ntfy tells the Principal where the answer is.
 
 Vault rule (10.5, fix round): a `session_id` that atlas.vault.SessionTags marks vault is REFUSED unless
 `remember=True` (the Principal's explicit "remember this"), because the answer would otherwise persist outside the
-vault. The Celery RESULT (Redis db 1, kept `result_expires` days) carries only a small summary; the answer and the
-log go to the ledger row (the `result` column) and nowhere else."""
+vault (the chat path runs such a session inline instead). The Celery RESULT (Redis db 1, kept `result_expires` days)
+carries only a small summary; the answer and the log go to the ledger row (the `result` column) and nowhere else."""
 
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from celery import shared_task
 
 from atlas import deep_think
-from atlas.vault import DEFAULT_SESSION_FILE, SessionTags
+from atlas.governance import never_delegate_rewrite
+from atlas.vault import SessionTags
 
 log = logging.getLogger("atlas.tasks.deep_think")
 
@@ -34,17 +40,18 @@ def deep_think_task(
     parent_task_id: str | None = None,
     session_id: str | None = None,
     remember: bool = False,
+    audience: str = "principal",
 ) -> dict[str, Any]:
-    from atlas.tasks import OrchestratorClient, TaskRecord
+    from atlas.tasks import OrchestratorClient, TaskRecord, notify
 
     rec = TaskRecord(
         self.request.id,
         "deep-think",
         queue="gpu",
         parent_task_id=parent_task_id,
-        payload={"tier": tier, "chars": len(problem), "session_id": session_id},
+        payload={"tier": tier, "chars": len(problem), "session_id": session_id, "audience": audience},
     )
-    sessions = SessionTags(os.environ.get("VAULT_SESSION_FILE") or DEFAULT_SESSION_FILE)
+    sessions = SessionTags.from_env()
     if sessions.is_vault(session_id) and not remember:
         msg = (
             f"session {session_id} is vault-tagged: a Deep Think answer would persist in the ledger and the result "
@@ -75,11 +82,26 @@ def deep_think_task(
         raise
     finally:
         client.close()
+    answer = res.answer
+    governance: dict[str, Any] | None = None
+    if audience.strip().lower() == "principal":
+        rw = never_delegate_rewrite(answer, "principal")  # 16.1 rule 5 before anything the Principal reads is stored
+        answer = rw.text
+        governance = {"register": "principal", "rewrites": len(rw.rewrites), "flagged": list(rw.flagged)[:20]}
+        if rw.flagged:
+            log.warning("deep think %s: never-delegate pass flagged %d sentence(s)", self.request.id, len(rw.flagged))
     summary = {
         "tier_requested": tier,
         "tier_granted": granted,
-        "chars": len(res.answer),
+        "chars": len(answer),
         "duration_s": res.duration_s,
         "task_id": self.request.id,
+        "governance": governance,
     }
-    return rec.done({**summary, "answer": res.answer, "log": res.log}, returned=summary)
+    out = rec.done({**summary, "answer": answer, "log": res.log}, returned=summary)
+    notify(
+        f"Deep Think ({granted}) finished in {res.duration_s:.0f}s: {len(answer)} chars. The answer is on ledger "
+        f"task {self.request.id} (tasks.result_json).",
+        title="ATLAS Deep Think",
+    )
+    return out

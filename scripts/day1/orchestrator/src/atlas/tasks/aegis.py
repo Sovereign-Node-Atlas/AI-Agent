@@ -2,17 +2,17 @@
 
 Division of labour (atlas-aegis.service header, CONVENTIONS.md §8 "AEGIS nightly is the same pattern"):
   * atlas-aegis.timer starts atlas-aegis.service as ROOT (the restic passphrase and /srv/backups are root-only).
-  * ExecStartPre runs `atlas-admin enqueue aegis-freeze --wait 900` -> `atlas.tasks.aegis_freeze` here: pause the
-    `gpu` consumer (cancel_consumer: the running task finishes, nothing new starts), raise the freeze flag that
-    atlas.memory honours (every writer in this package spools or waits), and give ChromaDB and the LightRAG store a
-    consistent moment (below). Returns a dict; the unit (its helper) fails the backup when the freeze fails while the
-    orchestrator is up.
-    THE `cpu` CONSUMER IS NEVER CANCELLED (fix round, blocker): the thaw is itself a Celery task on the cpu queue
-    (`atlas-admin enqueue aegis-thaw`, admin.py routes it there), so cancelling cpu would leave the thaw undeliverable,
-    the flag up and every memory write refused until a worker restart. The cpu side is quiesced by the freeze flag
-    alone (every memory writer honours it; a cpu task that starts during the backup spools its writes). The unit's
-    helper additionally re-adds both consumers over celery's broadcast channel before it enqueues the thaw, so an
-    older freeze that did cancel cpu is recovered too; add_consumer on a queue already consumed is harmless.
+  * ExecStartPre runs `atlas-admin enqueue aegis-freeze --wait 900` -> `atlas.tasks.aegis_freeze` here: pause BOTH
+    consumers, `cpu` and `gpu` (9.5 Freeze row: "the orchestrator pauses the Celery queues"; cancel_consumer: the
+    running task finishes, nothing new starts, so no Sentinel pulse file, Docling/graph work or sandbox run lands in
+    the restic include set mid-snapshot), raise the freeze flag that atlas.memory honours (every writer in this
+    package spools or waits), and give ChromaDB and the LightRAG store a consistent moment (below). Returns a dict;
+    the unit (its helper) fails the backup when the freeze fails while the orchestrator is up.
+    HOW THE THAW STAYS DELIVERABLE with `cpu` cancelled (fix round 2; fix round 1 had left cpu running for this):
+    systemd/atlas-aegis.service's `finish` step re-adds both consumers over celery's BROADCAST channel (`celery control
+    add_consumer cpu|gpu`), which a worker still reads while its task queues are cancelled, and only then enqueues
+    `aegis-thaw`; a worker that does not answer is restarted and the unit is reported FAILED. That is the unit's stated
+    contract ("Contract with the `atlas` package"), and this task's thaw() re-adds both consumers again, harmlessly.
   * ExecStart runs restic itself (as root); ExecStopPost enqueues `aegis-thaw` -> `atlas.tasks.aegis_thaw`: flag
     down, consumers back, and the memory spool (writes deferred during the freeze) replayed.
   * The manual `[EXECUTE AEGIS BACKUP]` trigger (9.5) is `atlas.tasks.aegis_manual_backup`, which runs
@@ -54,10 +54,11 @@ INCLUDE_CANDIDATES: tuple[str, ...] = ("/etc/atlas/restic.include", "/etc/atlas/
 EXCLUDE_FILE = "/etc/atlas/restic-exclude.txt"
 DEFAULT_VAULT_MOUNT_DIR = "/srv/atlas/vault/open"  # atlas.vault.DEFAULT_MOUNT_DIR; vault.env VAULT_MOUNT_DIR
 KEEP_DAILY, KEEP_MONTHLY = 30, 12  # D9
-# The thaw travels on `cpu` (admin.py ENQUEUE_TASKS + celery_app task_default_queue), so `cpu` is never in this set.
-FREEZE_QUEUES: tuple[str, ...] = ("gpu",)
+# Both queues pause (9.5). The thaw travels on `cpu` (admin.py ENQUEUE_TASKS + celery_app task_default_queue) and is
+# deliverable because atlas-aegis.service re-adds the consumers over the broadcast channel before enqueueing it.
+FREEZE_QUEUES: tuple[str, ...] = ("cpu", "gpu")
 THAW_QUEUES: tuple[str, ...] = ("cpu", "gpu")  # re-adding an already-consumed queue is a no-op reply
-THAW_QUEUE = "cpu"  # where atlas.tasks.aegis_thaw is delivered; tests assert it is never frozen
+THAW_QUEUE = "cpu"  # where atlas.tasks.aegis_thaw is delivered (the unit's broadcast add_consumer precedes it)
 QUEUES = FREEZE_QUEUES  # kept name: what freeze() pauses
 AEGIS_UNIT = "atlas-aegis.service"
 START_CONFIRM_S = 30.0  # how long trigger_unit waits for systemd to report the unit activating/active
@@ -138,18 +139,12 @@ def freeze(
     settle_s: float | None = None,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Pause consumers, raise the flag, settle. `control` is celery's app.control (injected for tests).
-
-    Refuses to cancel THAW_QUEUE whatever the caller passes: the thaw must stay deliverable (blocker, fix round).
+    """Pause consumers (both queues, 9.5), raise the flag, settle. `control` is celery's app.control (injected for
+    tests). The thaw's deliverability is the unit's broadcast add_consumer (module docstring), not an exemption here.
     """
     env = dict(os.environ if env is None else env)
     flag = _flag_path(env)
     paused: dict[str, Any] = {}
-    if THAW_QUEUE in queues:
-        raise ValueError(
-            f"freeze must never cancel the {THAW_QUEUE!r} consumer: atlas.tasks.aegis_thaw is delivered on it "
-            "(admin.py enqueue aegis-thaw); the freeze flag quiesces the cpu writers instead (Section 9.5)"
-        )
     if control is not None:
         for q in queues:
             try:

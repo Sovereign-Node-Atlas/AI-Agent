@@ -48,11 +48,15 @@ LABEL org.atlas.rocm-base.version="1" \
       org.atlas.rocm-base.section="3.4,17.4.1" \
       org.atlas.rocm-base.rocm="${ROCM_VER}"
 
+# PYTHONNOUSERSITE=1 (fix round 2): the shared bind-mounted HOME could carry a ~/.local/lib/python3.12/site-packages
+# planted by any earlier install; the system python (and every --system-site-packages venv) must never import from it,
+# even in a hand run that bypasses lib-engine.sh (which sets it again at run time).
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1
 
 # Python 3.12 (Ubuntu 24.04's default), build tools for source builds (SAM 2 without CUDA, tokenizers), media libs
 # (ffmpeg for Wan/Stable Audio, sox and libsndfile for CosyVoice), and the X/GL runtime libs the Blender tarball needs

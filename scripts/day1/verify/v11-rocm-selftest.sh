@@ -9,8 +9,12 @@
 # Usage: v11-rocm-selftest.sh [IMAGE]   (default: base_image.tag of config/phase4-engines.json, built by
 #        phase4-engines.sh step 01; the image must already exist — this script builds nothing)
 # Relies on /etc/atlas/docker.env (Phase 1 step 6: ATLAS_UID ATLAS_GID RENDER_GID VIDEO_GID) and on
-# $ATLAS_SRV/engines existing (Phase 1 step 3). Writes $ATLAS_SRV/engines/v11.json (the full step table) and
-# $ATLAS_SRV/engines/v11-runflags.txt (contract for phase4/lib-engine.sh GPU runs: one docker flag per line).
+# $ATLAS_SRV/engines existing (Phase 1 step 3). Writes $ATLAS_SRV/engines/v11.json (the full step table, written by
+# the container as atlas; nothing reads it back) and $ATLAS_STATE/phase4/v11-runflags.txt (contract for
+# phase4/lib-engine.sh GPU runs: one docker flag per line). The flags file is ROOT-HELD (fix round 2): it decides whether
+# every later GPU test container runs without the default seccomp profile and with the host IPC namespace, so it must
+# not sit on the atlas-writable tree that every build/pull/test container mounts read-write; lib-engine.sh refuses a
+# flags file not owned by uid 0.
 #
 # Container flags (fix round). Appendix B's container line is /dev/kfd, /dev/dri and the service user in render/video.
 # The research §6.2 line adds seccomp=unconfined (marked optional) and --ipc=host; SYS_PTRACE is "only for
@@ -30,7 +34,8 @@ if [[ -z "$image" ]]; then
 fi
 denv="$ATLAS_ETC/docker.env"
 engines="$ATLAS_SRV/engines"
-flags_file="$engines/v11-runflags.txt"
+flags_dir="$ATLAS_STATE/phase4"
+flags_file="$flags_dir/v11-runflags.txt"
 command -v docker >/dev/null || { echo "V11 fail: docker is not installed (Phase 1 step 6)"; exit 1; }
 [[ -r "$denv" ]] || { echo "V11 fail: $denv missing (Phase 1 step 6 writes the container uids/gids)"; exit 1; }
 [[ -d "$engines" ]] || { echo "V11 fail: $engines missing (data volume not mounted, Phase 1 step 3)"; exit 1; }
@@ -67,6 +72,7 @@ v11_run() {
     --pids-limit 1024 --memory 32g --memory-swap 32g \
     --network none "$@" \
     -e HOME=/srv/atlas/engines/home -e HF_HUB_OFFLINE=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e DO_NOT_TRACK=1 \
+    -e PYTHONNOUSERSITE=1 \
     -e V11_OUT=/srv/atlas/engines/v11.json \
     -v "$engines:/srv/atlas/engines" \
     -v "$ATLAS_DAY1_DIR/phase4:/opt/atlas/phase4:ro" \
@@ -76,14 +82,19 @@ v11_run() {
   rm -f "$out"
 }
 
-# write_flags LINE... — record the flag set the GPU runs must use (never through a symlink: the tree is atlas-writable).
+# write_flags LINE... — record the flag set the GPU runs must use, root-held under $ATLAS_STATE/phase4 (header).
 write_flags() {
+  mkdir -p "$flags_dir" 2>/dev/null || true
   [[ -L "$flags_file" ]] && rm -f "$flags_file"
-  {
+  if {
     echo "# written by verify/v11-rocm-selftest.sh $(date -Is): the docker flags every Phase 4 GPU run adds"
     echo "# (empty = the default seccomp profile passed; phase4/lib-engine.sh accepts only the two lines below)"
     printf '%s\n' "$@"
-  } >"$flags_file" 2>/dev/null || warn "could not write $flags_file (run as root)"
+  } >"$flags_file.tmp" 2>/dev/null; then
+    { chmod 644 "$flags_file.tmp" && mv -f "$flags_file.tmp" "$flags_file"; } || warn "could not install $flags_file"
+  else
+    warn "could not write $flags_file (run as root)"
+  fi
 }
 
 t0=$SECONDS

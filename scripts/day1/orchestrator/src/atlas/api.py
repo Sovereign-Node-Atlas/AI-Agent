@@ -6,19 +6,32 @@ Endpoints
     GET  /v1/models                    {"data":[{"id":"atlas"},{"id":"ren"},{"id":"arthur"}]} (12.1)
     POST /v1/chat/completions          OpenAI shape, stream true/false. "atlas" runs the 4-Way Router; "ren"/"arthur"
                                        force the hemisphere (the router's own [REN]/[ARTHUR] override, 7.2 rule 4;
-                                       a hard-keyword hit still wins, 7.2 rule 1, and the redirect is said and
-                                       recorded as an "overridden-routing" strike). An ENGINE KEY as the model (the
-                                       CONVENTIONS.md §8 keys) is the Phase 3 load-test contract (phase3/loadtest.py:
-                                       "accepts model: <engine key>"): it runs the internal pipeline (no router, no
-                                       memory) through the Arbiter's load and generation lock; /v1/models still lists
-                                       only the three ids of 12.1.
+                                       a hard-keyword hit still wins, 7.2 rule 1: the redirect is said to the
+                                       Principal and logged as the router's routing decision, nothing more, because
+                                       the hard rule doing what 7.2 rule 1 mandates is not a 9.4 mistake). Anything
+                                       else is 404: ENGINE KEYS are NOT served here (fix round 2). The Phase 3
+                                       load-test contract is POST /internal/v1/chat/completions (phase3/loadtest.py
+                                       ORCH_CHAT_PATH), loopback only, so the public route never offers a path around
+                                       the router, the layered prompt, the scars, the vault rule and the never-delegate
+                                       pass (7.1 C8: the same router governs every entry point).
                                        Pipeline (Appendix A): router -> layered prompt (prompts.build_system_prompt,
                                        4.4) -> ledger task -> Engine Arbiter load (waits in its queue) -> generation
-                                       lock -> llama-server SSE relayed as OpenAI chunks, each sentence through the
+                                       slot -> llama-server SSE relayed as OpenAI chunks, each sentence through the
                                        never-delegate rewrite (16.1 rule 5; governance.never_delegate_rewrite) with
                                        the PRINCIPAL register set -> memory write (unless vault-tagged) -> ledger
                                        done; on failure an Ouroboros strike. The router's `command` (deep-think,
-                                       ouroboros-strike, aegis, vault-session) is honoured.
+                                       ouroboros-strike, aegis, vault-session) is honoured: a vault-session message
+                                       tags the session AND is answered (the tag, not the loss of the message, is the
+                                       10.5 rule); Deep Think standard/deep is enqueued on the Celery gpu queue
+                                       (atlas.tasks.deep_think) and the reply names the task id, quick runs inline
+                                       (9.7: the interface returns at once; 9.1: nothing is hard-capped).
+                                       Open WebUI task calls (0.11.4 title/tags/follow-up generation: the last user
+                                       message starts with "### Task:" and embeds the whole chat) run on the routed
+                                       engine but WITHOUT retrieval, the never-delegate rewrite, a memory write or a
+                                       strike on failure: they are UI chores, not Principal turns. Cross-writer:
+                                       docker/core/compose.yml should set ENABLE_TITLE_GENERATION,
+                                       ENABLE_TAGS_GENERATION, ENABLE_FOLLOW_UP_GENERATION and
+                                       ENABLE_AUTOCOMPLETE_GENERATION to "false" so they do not happen at all.
     POST /vault/open {passphrase}      pipes it to atlas-vault; never logged (Section 11); /vault/lock; /vault/status
     GET  /approvals[?status=held]      the queue (16.2); POST /approvals/{id}/approve|reject {decided_by, note}
     POST /arbiter/register             {engine, total_bytes, task_id}: Phase 3/4 record a measured footprint (rule 1)
@@ -37,13 +50,21 @@ Endpoints
     POST /internal/route               {message} -> the router's decision as JSON (retention needs the hemisphere)
     POST /internal/deep-think/plan     {tier} -> the Arbiter's plan (4.2 rule 8)
 
-Authentication (fix round). Every route except GET /health and /v1/* is an admin route: it needs the header
-`X-Atlas-Token` equal to the token in ORCH_ADMIN_TOKEN_FILE (a file under /etc/atlas/secrets, `ORCH_ADMIN_TOKEN=...`
-or the bare token; atlas.tasks.admin_token reads the same file for the Celery side). When no token file is configured
-(the Day 1 state: phase2/02-orchestrator.sh does not write one yet, see the notes), the admin routes accept LOOPBACK
-clients only, so a non-loopback bind never exposes the approval gate, the vault button or engine-keyed generation.
-/internal/* is loopback-only in both modes. Section 11 ("opened by a button") and 16.2 ("until the Principal taps
-approve") need the interface to reach these routes over LAN/WireGuard, which is what the token is for.
+Authentication (fix round). Every route except GET /health and GET /v1/models is an admin route: it needs the token
+in ORCH_ADMIN_TOKEN_FILE (a file under /etc/atlas/secrets, `ORCH_ADMIN_TOKEN=...` or the bare token;
+atlas.tasks.admin_token reads the same file for the Celery side), given as the header `X-Atlas-Token` or as
+`Authorization: Bearer <token>` (the header Open WebUI sends OPENAI_API_KEY in; cross-writer: phase2/03-openwebui.sh
+should write the admin token into openwebui.env as OPENAI_API_KEY instead of the dummy `atlas-local`). When no token
+file is configured (the Day 1 state: phase2/02-orchestrator.sh does not write one yet, see the notes), the admin
+routes accept LOOPBACK clients only. POST /v1/chat/completions (fix round 2) is open to loopback clients always and,
+off loopback, needs the token whenever one is configured: without that, any LAN device reaching ORCH_PORT could read
+estate memory into prompts, log strikes, tag sessions and start an AEGIS run. /internal/* is loopback-only in both
+modes. LOOPBACK TRUST INCLUDES EVERY HOST-NETWORKED CONTAINER: Open WebUI runs with network_mode: host
+(docker/core/compose.yml), so it reaches /internal/* and, without a token, every admin route as 127.0.0.1;
+ORCH_HOST=127.0.0.1 (the default) remains the supported bind, and Section 11 ("opened by a button") and 16.2 ("until
+the Principal taps approve") reach these routes THROUGH the host-networked Open WebUI over loopback. POST /vault/open
+carries the passphrase in clear HTTP, so off loopback it is refused unless the request arrived over TLS
+(request.url.scheme == "https"); a LAN/WireGuard bind therefore needs TLS terminated in front of the orchestrator.
 
 Not implemented here, stated so no gate or writer relies on it (fix round, rule §7.4): Section 8.5 task-force
 dispatch (director dispatch, sequential relay, synthesis by the lead). The router's `directors` are echoed in the
@@ -68,8 +89,10 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -96,11 +119,25 @@ log = logging.getLogger("atlas.api")
 MODELS: tuple[str, ...] = ("atlas", "ren", "arthur")  # Section 12.1
 LEAD_OVERRIDE: dict[str, str] = {"ren": "[REN]", "arthur": "[ARTHUR]"}  # router-rules.json override keys
 DEFAULT_LOAD_WAIT_S = 900.0  # a swap is 15-45 s (4.2 rule 4); a queued load waits behind a running generation
+# How long a request waits for the single generation slot (ATLAS_GENERATION_WAIT_S). A Celery task that generates
+# through /internal (atlas.tasks.OrchestratorClient) may spend this whole time queued behind a running generation
+# BEFORE its own generation starts, so that client's read timeout is this value plus a generation
+# (OrchestratorClient.DEFAULT_TIMEOUT_SLACK_S); the two are sized together (fix round 2).
 DEFAULT_GENERATION_WAIT_S = 1800.0
 DEFAULT_MAX_TOKENS = 4096
+# D9 (10.4): a chat lives 90 days in Open WebUI, then its SUMMARY replaces it in the Vector Cortex (retention.py). The
+# raw turn written per request (Appendix A "memory writes") is therefore temporal with the same 90-day life, and the
+# prune deletes expired chat turns WITHOUT archiving them (prune.py): a purged chat does not live on under /srv/cold.
+CHAT_TURN_TTL_HOURS = 24.0 * 90
 ADMIN_TOKEN_HEADER = "x-atlas-token"
 LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1"})
-VAULT_PREFIX = "[VAULT]"  # the router's vault-session override key; retention.is_vault_chat uses the same rule
+# The router's vault-session override key. A session is vault-tagged when the token appears ANYWHERE in a user message
+# (fix round 2), not only at its start: an Open WebUI task call embeds the whole chat history inside one user message
+# ("USER: [VAULT] ..."), and fail-closed is the only safe reading of 10.5. retention.is_vault_chat uses the same rule.
+VAULT_PREFIX = "[VAULT]"
+# Open WebUI 0.11.4's own background generations (title, tags, follow-ups, autocomplete) arrive as a user message that
+# starts with this marker (backend/open_webui/utils/task.py templates; VERIFIED in the fix-round-2 review).
+OWUI_TASK_MARKER = "### Task:"
 # Sentence boundary for the streaming never-delegate pass: the same rule as governance._SENTENCE_SPLIT, so a chunk
 # flushed here is rewritten exactly as the whole text would be (the rewrite is per sentence).
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])|\n+")
@@ -108,6 +145,7 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])|\n+")
 __all__ = [
     "AppDeps",
     "EngineStreamer",
+    "GenerationSlot",
     "HttpEngineStreamer",
     "NoChannelSender",
     "NtfyNotifier",
@@ -116,6 +154,7 @@ __all__ = [
     "build_app",
     "build_production_deps",
     "history_has_vault_prefix",
+    "is_owui_task_call",
     "main",
 ]
 
@@ -197,7 +236,9 @@ class RouteInfo:
             override=get("override"),
             hard_keyword_hit=str(hits[0]) if hits else get("hard_keyword_hit"),
             reason=str(get("reason") or ""),
-            message=str(get("body") or get("message") or fallback_message),
+            # The router's `body` is the prefix-stripped message and may be EMPTY on purpose ("[VAULT]" alone): an
+            # explicit body wins over the raw message; only its absence falls back.
+            message=str(body if (body := get("body")) is not None else (get("message") or fallback_message)),
             command=get("command"),
             deep_think=get("deep_think_depth") or get("deep_think"),
             directors=tuple(get("directors") or ()),
@@ -275,6 +316,67 @@ class HttpEngineStreamer:
         self._http.close()
 
 
+class GenerationSlot:
+    """The single generation slot of Section 4.2 rule 3 ("exactly one may generate at any moment ... it applies
+    everywhere, including background work") for EVERY generation this orchestrator makes, the three resident small
+    models included (fix round 2: a 4B call for a Sentinel BLUF, a retention summary or a LightRAG extraction used to
+    run beside a weight-bearing generation because it took no ticket in the Arbiter's FIFO).
+
+    Why it is here and not only in the Arbiter: the Arbiter's lock is bound to its residency ledger, and the resident
+    small models are outside that ledger by design (4.1, 5.3: never budgeted, always loaded), so they cannot hold it.
+    This slot is the superset: a strict FIFO (rule 4) over all generations; a weight-bearing generation takes this
+    slot FIRST and then the Arbiter's lock inside it (which is therefore always free), so the Arbiter still records
+    every weight-bearing generation for rule 6 (never preempt mid-generation) and its ledger view. The classifier
+    call inside Router.route stays outside: it precedes every generation (7.2 rule 2) and is not one.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._cv = threading.Condition(threading.Lock())
+        self._queue: deque[str] = deque()
+        self._holder: tuple[str, str] | None = None  # (engine key, task id)
+        self._clock = clock
+
+    @property
+    def holder(self) -> tuple[str, str] | None:
+        with self._cv:
+            return self._holder
+
+    @property
+    def queue(self) -> tuple[str, ...]:
+        with self._cv:
+            return tuple(self._queue)
+
+    @contextlib.contextmanager
+    def acquire(self, key: str, *, task_id: str, timeout_s: float | None = None) -> Iterator[None]:
+        deadline = None if timeout_s is None else self._clock() + timeout_s
+        with self._cv:
+            self._queue.append(task_id)
+            try:
+                while self._holder is not None or self._queue[0] != task_id:
+                    remaining = None if deadline is None else deadline - self._clock()
+                    if remaining is not None and remaining <= 0:
+                        held = self._holder
+                        raise ArbiterError(
+                            f"task {task_id}: {key} waited {timeout_s:.0f}s for the generation slot behind "
+                            f"{held[0] if held else '?'} (task {held[1] if held else '?'}); "
+                            f"{len(self._queue) - 1} ahead in the FIFO (Section 4.2 rule 4)"
+                        )
+                    self._cv.wait(timeout=None if remaining is None else min(remaining, 1.0))
+                self._queue.popleft()
+                self._holder = (key, task_id)
+            except BaseException:
+                if task_id in self._queue:
+                    self._queue.remove(task_id)
+                self._cv.notify_all()
+                raise
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._holder = None
+                self._cv.notify_all()
+
+
 @dataclass
 class AppDeps:
     config: AtlasConfig
@@ -291,9 +393,12 @@ class AppDeps:
     load_wait_s: float = DEFAULT_LOAD_WAIT_S
     generation_wait_s: float = DEFAULT_GENERATION_WAIT_S
     write_chat_turns: bool = True
-    chat_turn_ttl_hours: float = 24 * 30  # 10.4: operational data 30 days hot; the 72 h prune archives on expiry
-    enqueue: Callable[[str, dict[str, Any]], str | None] | None = None  # Celery send (aegis manual trigger)
+    chat_turn_ttl_hours: float = CHAT_TURN_TTL_HOURS  # D9: the raw turn lives as long as the chat it came from
+    enqueue: Callable[[str, dict[str, Any]], str | None] | None = None  # Celery send (aegis trigger, Deep Think)
     ready: bool = True
+    # The ONE generation slot of 4.2 rule 3 for every generation this process makes, resident small models included
+    # (see GenerationSlot). Built per AppDeps so tests get their own.
+    slot: GenerationSlot = field(default_factory=lambda: GenerationSlot())
     # Admin routes (everything but /health and /v1/*): `admin_token` from ORCH_ADMIN_TOKEN_FILE, compared in constant
     # time against X-Atlas-Token; with no token only `trusted_hosts` (loopback) may call them. /internal/* is always
     # limited to `trusted_hosts`.
@@ -317,6 +422,9 @@ class ChatRequest(BaseModel):
     atlas_session: str | None = None
     atlas_user: str | None = None
     atlas_task_id: str | None = None
+    # /internal only: "principal" when the text will reach the Principal (a Sentinel BLUF pushed to the phone), so the
+    # never-delegate rewrite (16.1 rule 5) runs on it too; None/"internal" for text another process consumes.
+    atlas_audience: str | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -422,13 +530,19 @@ def _text_of(content: Any) -> str:
 
 
 def history_has_vault_prefix(messages: Sequence[Mapping[str, Any]]) -> bool:
-    """True when ANY user message of the chat starts with [VAULT] (10.5: tagged for the life of the session). The
-    same rule as retention.is_vault_chat, so a filter-less client and a restarted Open WebUI (whose filter forgets
-    its in-process set) are covered by the history Open WebUI resends with every turn."""
-    return any(
-        m.get("role") == "user" and _text_of(m.get("content")).lstrip().upper().startswith(VAULT_PREFIX)
-        for m in messages
-    )
+    """True when [VAULT] appears in ANY user message of the chat (10.5: tagged for the life of the session). The same
+    rule as retention.is_vault_chat, so a filter-less client and a restarted Open WebUI (whose filter forgets its
+    in-process set) are covered by the history Open WebUI resends with every turn. Anywhere in the text, not only at
+    its start (fix round 2): an Open WebUI task call carries the chat history INSIDE one user message."""
+    return any(m.get("role") == "user" and VAULT_PREFIX in _text_of(m.get("content")).upper() for m in messages)
+
+
+def is_owui_task_call(messages: Sequence[Mapping[str, Any]]) -> bool:
+    """Open WebUI 0.11.4 fires title/tags/follow-up/autocomplete generations after every turn as a plain chat
+    completion on the chat's model whose last user message starts with "### Task:" (OWUI_TASK_MARKER) and embeds the
+    whole history. They are UI chores, not Principal turns: the pipeline runs them on the routed engine with no
+    retrieval, no never-delegate rewrite, no memory write and no strike on failure."""
+    return _last_user_text(messages).lstrip().startswith(OWUI_TASK_MARKER)
 
 
 def _session_of(req: ChatRequest, request: Request | None) -> tuple[str, bool, str | None]:
@@ -542,14 +656,25 @@ def build_app(deps: AppDeps) -> FastAPI:
         if host not in deps.trusted_hosts:
             raise HTTPException(403, f"internal routes accept loopback clients only (got {host or 'unknown'})")
 
+    def check_token(request: Request) -> None:
+        """X-Atlas-Token, or Authorization: Bearer <token> (what Open WebUI sends OPENAI_API_KEY as)."""
+        assert deps.admin_token
+        given = request.headers.get(ADMIN_TOKEN_HEADER)
+        if not given:
+            auth = request.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                given = auth[7:].strip()
+        if not given:
+            raise HTTPException(
+                401, f"missing {ADMIN_TOKEN_HEADER} / Authorization: Bearer (ORCH_ADMIN_TOKEN_FILE is configured)"
+            )
+        if not hmac.compare_digest(given.encode("utf-8"), deps.admin_token.encode("utf-8")):
+            raise HTTPException(403, "the admin token does not match")
+
     def require_admin(request: Request) -> None:
-        """Admin routes: X-Atlas-Token when a token is configured, else loopback only (module docstring)."""
+        """Admin routes: the token when one is configured, else loopback only (module docstring)."""
         if deps.admin_token:
-            given = request.headers.get(ADMIN_TOKEN_HEADER)
-            if not given:
-                raise HTTPException(401, f"missing {ADMIN_TOKEN_HEADER} (ORCH_ADMIN_TOKEN_FILE is configured)")
-            if not hmac.compare_digest(given.encode("utf-8"), deps.admin_token.encode("utf-8")):
-                raise HTTPException(403, f"{ADMIN_TOKEN_HEADER} does not match")
+            check_token(request)
             return
         host = _client_host(request)
         if host not in deps.trusted_hosts:
@@ -559,8 +684,25 @@ def build_app(deps: AppDeps) -> FastAPI:
                 f"(got {host or 'unknown'})",
             )
 
+    def require_chat(request: Request) -> None:
+        """/v1/chat/completions (fix round 2): loopback always; off loopback the token, whenever one is configured.
+        Without a token the route stays as open as the bind (ORCH_HOST defaults to 127.0.0.1)."""
+        if deps.admin_token and _client_host(request) not in deps.trusted_hosts:
+            check_token(request)
+
+    def require_vault_transport(request: Request) -> None:
+        """The passphrase crosses the wire in the request body (Section 11): off loopback only over TLS."""
+        if _client_host(request) in deps.trusted_hosts or request.url.scheme == "https":
+            return
+        raise HTTPException(
+            403,
+            "POST /vault/open accepts the passphrase from loopback (the host-networked Open WebUI) or over TLS only; "
+            "a LAN/WireGuard bind needs TLS terminated in front of the orchestrator (module docstring)",
+        )
+
     admin = [Depends(require_admin)]
     internal = [Depends(require_loopback)]
+    chat = [Depends(require_chat)]
 
     @app.get("/health")
     def health() -> JSONResponse:
@@ -571,6 +713,8 @@ def build_app(deps: AppDeps) -> FastAPI:
             "memory": deps.memory is not None,
             "outbound_channel": not isinstance(deps.approval.sender, NoChannelSender),
             "admin_token": bool(deps.admin_token),
+            "generating": deps.slot.holder,
+            "generation_queue": list(deps.slot.queue),
         }
         return JSONResponse(status, status_code=200 if deps.ready else 503)
 
@@ -582,23 +726,30 @@ def build_app(deps: AppDeps) -> FastAPI:
             "data": [{"id": m, "object": "model", "created": now, "owned_by": "atlas"} for m in MODELS],
         }
 
-    @app.post("/v1/chat/completions")
+    @app.post("/v1/chat/completions", dependencies=chat)
     def chat_completions(req: ChatRequest, request: Request) -> Any:
         if not req.messages:
             raise HTTPException(422, "messages[] is empty")
-        if req.model in deps.config.engines:
-            # Phase 3 contract (phase3/loadtest.py header): an engine key runs the internal pipeline through the
-            # Arbiter's load and generation lock, so a second request provably queues (V21, V14b).
-            gen = _chat_pipeline(deps, req, session_id=req.atlas_session or "engine", override=None, internal=True)
-            return _respond(gen, req.stream)
         if req.model not in MODELS:
-            raise HTTPException(
-                404, f"model {req.model!r} is not served; /v1/models lists {list(MODELS)}; engine keys are accepted"
+            # Engine keys included (fix round 2): generation on a named engine is /internal/v1/chat/completions,
+            # loopback only, so no client of the public route can step around the router and the governance path.
+            hint = (
+                "; engine keys are served on POST /internal/v1/chat/completions (loopback only)"
+                if req.model in deps.config.engines
+                else ""
             )
+            raise HTTPException(404, f"model {req.model!r} is not served; /v1/models lists {list(MODELS)}{hint}")
         session_id, vault_flag, override = _session_of(req, request)
         if vault_flag:
             deps.sessions.tag_vault(session_id)
-        gen = _chat_pipeline(deps, req, session_id=session_id, override=override, internal=False)
+        gen = _chat_pipeline(
+            deps,
+            req,
+            session_id=session_id,
+            override=override,
+            internal=False,
+            owui_task=is_owui_task_call(req.messages),
+        )
         return _respond(gen, req.stream)
 
     @app.post("/internal/v1/chat/completions", dependencies=internal)
@@ -639,12 +790,14 @@ def build_app(deps: AppDeps) -> FastAPI:
 
     # --- vault (Section 11; README-contracts.md) ----------------------------------------------------------------
 
-    @app.post("/vault/open", dependencies=admin)
+    @app.post("/vault/open", dependencies=[*admin, Depends(require_vault_transport)])
     def vault_open(req: VaultOpenRequest) -> JSONResponse:
         try:
             res = deps.vault.open(req.passphrase)
         except VaultError as exc:
-            raise HTTPException(500, str(exc)) from exc
+            # The helper's stderr stays in the journal (vault.py logs it); the client gets a fixed message.
+            log.error("vault open: %s", exc)
+            raise HTTPException(500, "atlas-vault open failed; see the orchestrator journal") from exc
         return JSONResponse(res.as_dict(), status_code=200 if res.ok else 403)
 
     @app.post("/vault/lock", dependencies=admin)
@@ -854,38 +1007,27 @@ def _error_chunk(cid: str, model: str, created: int, status: int, message: str, 
 
 
 @contextlib.contextmanager
-def _wait_idle_slot(deps: AppDeps, key: str, task_id: str) -> Iterator[None]:
-    """A resident small model generates only while NO weight-bearing generation is running (4.2 rule 3, 9.7 C15:
-    'a background task that calls an LLM partway through still queues behind the resident engine'). It takes no
-    ticket in the Arbiter's FIFO (a chat generation never waits for a 4B call; 4.1 keeps these models outside the
-    ledger), so this is a wait, not a lock; the Arbiter's state is polled through its public `generating`."""
-    deadline = time.monotonic() + deps.generation_wait_s
-    while deps.arbiter.generating is not None:
-        if time.monotonic() >= deadline:
-            gen = deps.arbiter.generating
-            raise ArbiterError(
-                f"task {task_id}: {key} waited {deps.generation_wait_s:.0f}s behind the running generation "
-                f"{gen[0] if gen else '?'}"
-            )
-        time.sleep(0.25)
-    yield
-
-
-def _generation_lock(deps: AppDeps, spec: EngineSpec, task_id: str) -> contextlib.AbstractContextManager[None]:
-    """The single generation slot (4.2 rules 3-4) for weight-bearing engines. The three resident small models are
-    outside the Arbiter's ledger by design (4.1, 5.3: never budgeted; the router classifies before every big
-    generation), so a request on one of them takes no ticket, but it WAITS while a weight-bearing generation runs
-    (`_wait_idle_slot`), which is the only claim any docstring in this package makes about a 4B call."""
-    if spec.is_resident:
-        return _wait_idle_slot(deps, spec.key, task_id)
-    return deps.arbiter.acquire_generation(spec.key, task_id=task_id, timeout_s=deps.generation_wait_s)
+def _generation_lock(deps: AppDeps, spec: EngineSpec, task_id: str) -> Iterator[None]:
+    """The single generation slot (4.2 rules 3-4) for EVERY generation, resident small models included (fix round 2):
+    `deps.slot` is one strict FIFO over all of them, so a 4B call (Sentinel BLUF, retention summary, LightRAG
+    extraction) holds the slot exactly like gpt-oss does and a weight-bearing request queues behind it, and the other
+    way round (9.7 C15 in both directions). A weight-bearing engine additionally takes the Arbiter's own lock inside
+    the slot, so the Arbiter still knows which engine is generating (rule 6, never preempted; its ledger view)."""
+    with deps.slot.acquire(spec.key, task_id=task_id, timeout_s=deps.generation_wait_s):
+        if spec.is_resident:
+            yield  # outside the Arbiter's residency ledger by design (4.1, 5.3), inside the one slot
+            return
+        with deps.arbiter.acquire_generation(spec.key, task_id=task_id, timeout_s=deps.generation_wait_s):
+            yield
 
 
 def _retrieve(deps: AppDeps, info: RouteInfo) -> dict[str, list[str]]:
     """Layer 4 (4.4): the closest scars (9.4) and the hemisphere's own memory; a retrieval failure is logged, not
     hidden, and the dispatch continues without it. Scars carry NO persona filter (fix round): 9.4 injects 'the
     closest few scars above a similarity threshold', so the Principal's own [LOG STRIKE:] scars and automatic ones
-    from any persona reach every dispatch; similarity decides, not authorship."""
+    from any persona reach every dispatch; similarity decides, not authorship. They DO carry the hemisphere (fix
+    round 2, inside retrieve_scars): a scar records the Principal's message as its context, and an estate scar in a
+    corporate prompt would carry estate words across the membrane (7.3, 10.1)."""
     out: dict[str, list[str]] = {"memory": [], "scars": []}
     if deps.memory is None:
         return out
@@ -904,47 +1046,46 @@ def _retrieve(deps: AppDeps, info: RouteInfo) -> dict[str, list[str]]:
     return out
 
 
-def _forced_lead_redirect(deps: AppDeps, req_model: str, info: RouteInfo, *, task_id: str, session_id: str) -> str:
+def _forced_lead_redirect(req_model: str, info: RouteInfo, *, task_id: str) -> str:
     """7.2 rule 1 over the model picker (fix round): `model=ren` is a preference the router's hard keywords overrule
-    (router.py records "overruled-by-hard-rule"). When that happened the Principal is told why, and the overruled
-    routing is a 9.4 'overridden routing decision' strike. Returns the note to show (empty when nothing happened)."""
+    (router.py records "overruled-by-hard-rule" in the routing_decisions row, which is the logging 7.2 rule 1 asks
+    for). The Principal is told why. No strike (fix round 2): 9.4's "overridden routing decision" is a router
+    decision the Principal had to override, something to learn from; the hard rule doing exactly what rule 1 mandates
+    is not an error and has no correction, and every such scar would be one more of the irrelevant pile 9.4 warns
+    about. Returns the note to show (empty when nothing happened)."""
     forced = LEAD_OVERRIDE.get(req_model)
     if forced is None or info.hard_keyword_hit is None or info.persona == req_model:
         return ""
-    note = (
+    log.info(
+        "task %s: model picker %r overruled by hard keyword %r -> %s (7.2 rule 1)",
+        task_id,
+        req_model,
+        info.hard_keyword_hit,
+        info.persona,
+    )
+    return (
         f"[ATLAS] Routed to {info.persona.title()} on {info.engine}: the hard keyword "
         f"{info.hard_keyword_hit!r} (7.2 rule 1) overrides the {req_model!r} model selection.\n\n"
     )
-    try:
-        record_strike(
-            info.persona,
-            info.task_force or info.route,
-            f"model picker {req_model!r} redirected by hard keyword {info.hard_keyword_hit!r}",
-            f"overridden routing: {forced} requested, hard rule sent it to {info.persona}",
-            ledger=deps.ledger,
-            memory=deps.memory,
-            kind="overridden-routing",
-            source="api",
-            task_id=task_id,
-            hemisphere=info.hemisphere,
-            session_id=session_id,
-            vault=deps.sessions.is_vault(session_id),
-        )
-    except Exception:
-        log.exception("overridden-routing strike not recorded for task %s", task_id)
-    return note
 
 
 def _chat_pipeline(
-    deps: AppDeps, req: ChatRequest, *, session_id: str, override: str | None, internal: bool
+    deps: AppDeps,
+    req: ChatRequest,
+    *,
+    session_id: str,
+    override: str | None,
+    internal: bool,
+    owui_task: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """A generator of OpenAI chunks; sync on purpose (Starlette iterates it in a worker thread, so the Arbiter waits
-    never block the event loop)."""
+    never block the event loop). `owui_task`: an Open WebUI title/tags/follow-up call (is_owui_task_call): routed
+    engine, no retrieval, no rewrite, no memory write, no strike."""
     created = int(time.time())
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     message = _last_user_text(req.messages)
     ledger = deps.ledger
-    kind = "internal-generate" if internal else "chat"
+    kind = "internal-generate" if internal else ("owui-task" if owui_task else "chat")
     if internal:
         # A child row (fix round): the caller's atlas_task_id is the PARENT (a Celery task still running); this
         # generation must never mark that row done or failed mid-flight.
@@ -970,6 +1111,7 @@ def _chat_pipeline(
                     "session": session_id,
                     "chars": len(message),
                     "vault": deps.sessions.is_vault(session_id),
+                    "owui_task": owui_task,
                 },
             )
         else:
@@ -977,6 +1119,10 @@ def _chat_pipeline(
     info: RouteInfo | None = None
     streamer: Any = None
     rewriter: _Rewriter | None = None
+    # The never-delegate pass (16.1 rule 5) runs on everything the PRINCIPAL will read: every chat turn, and an
+    # internal generation whose caller declared the audience "principal" (a Sentinel BLUF pushed to the phone).
+    # Open WebUI task calls produce JSON/titles the UI parses, never Principal prose: no pass (it would mangle them).
+    write_turn = not internal and not owui_task
     try:
         if internal:
             spec = deps.config.engine(req.model)
@@ -990,6 +1136,8 @@ def _chat_pipeline(
             )
             ledger.update_task(task_id, engine=spec.key, persona=info.persona, tier=info.tier)
             messages: list[dict[str, Any]] = list(req.messages)
+            if (req.atlas_audience or "").strip().lower() == "principal":
+                rewriter = _Rewriter("principal")
             yield _chunk(
                 cid,
                 req.model,
@@ -1002,7 +1150,25 @@ def _chat_pipeline(
             decision = deps.router.route(routed, task_id=task_id, context={"session_id": session_id})
             info = RouteInfo.from_decision(decision, message)
             ledger.update_task(task_id, persona=info.persona, engine=info.engine, tier=info.tier)
-            if info.command in ("ouroboros-strike", "aegis", "vault-session"):
+            note = ""
+            if info.command == "vault-session":
+                # 10.5 / 11: the tag is the rule, not the loss of the message (fix round 2). Tag first, so the memory
+                # write at the end of THIS turn is already dropped; an empty body gets the notice alone.
+                note = _command(deps, info, session_id=session_id, task_id=task_id)
+                if not info.message.strip():
+                    yield _chunk(
+                        cid,
+                        req.model,
+                        created,
+                        role="assistant",
+                        content=note,
+                        finish="stop",
+                        extra={"atlas": {"task_id": task_id, **info.as_dict()}},
+                    )
+                    ledger.update_task(task_id, status="done", result={"command": info.command})
+                    return
+                note += "\n\n"
+            elif info.command in ("ouroboros-strike", "aegis"):
                 text = _command(deps, info, session_id=session_id, task_id=task_id)
                 yield _chunk(
                     cid,
@@ -1017,7 +1183,8 @@ def _chat_pipeline(
                 return
             spec = deps.config.engine(info.engine)
             cards = [deps.config.domain_cards[n] for n in info.domain_cards if n in deps.config.domain_cards]
-            built = deps.build_system_prompt(info.decision or info.persona, cards, _retrieve(deps, info))
+            retrieved = None if owui_task else _retrieve(deps, info)
+            built = deps.build_system_prompt(info.decision or info.persona, cards, retrieved)
             system_prompt = _prompt_text(built)
             messages = [{"role": "system", "content": system_prompt}] + [
                 dict(m) for m in req.messages if m.get("role") != "system"
@@ -1027,23 +1194,56 @@ def _chat_pipeline(
                     if m.get("role") == "user":
                         m["content"] = info.message  # the override prefix is the router's, not the engine's
                         break
-            note = _forced_lead_redirect(deps, req.model, info, task_id=task_id, session_id=session_id)
+            note += _forced_lead_redirect(req.model, info, task_id=task_id)
             head = {"task_id": task_id, **info.as_dict()}
             head["forced_lead"] = req.model if req.model in LEAD_OVERRIDE else None
-            yield _chunk(cid, req.model, created, role="assistant", content=note or None, extra={"atlas": head})
-            rewriter = _Rewriter("principal")
+            head["owui_task"] = owui_task
+            if not owui_task:
+                rewriter = _Rewriter("principal")
             if info.command == "deep-think":
-                text = _run_deep_think(deps, info.deep_think or "standard", info, task_id)
-                text = rewriter.feed(text) + rewriter.flush()
+                tier = info.deep_think or "standard"
+                tid = _enqueue_deep_think(deps, tier, info, task_id=task_id, session_id=session_id)
+                if tid is not None:
+                    # 9.7: the interface returns at once; 9.1: nothing is hard-capped. The answer lands in the
+                    # ledger row of the Celery task (result column) and ntfy reports it (deep_think_task).
+                    text = (
+                        f"{note}Deep Think ({tier}) is running in the background as task {tid} on the gpu queue; "
+                        f"it takes {'5 to 8' if tier == 'standard' else '15 to 30'} minutes and swaps engines "
+                        f"(9.1). The answer is stored on that task's ledger row (sqlite3 "
+                        f"{deps.config.settings.db_path}: tasks.id = {tid!r}) and pushed through ntfy when done."
+                    )
+                    yield _chunk(
+                        cid,
+                        req.model,
+                        created,
+                        role="assistant",
+                        content=text,
+                        finish="stop",
+                        extra={"atlas": {**head, "deep_think_task_id": tid}},
+                    )
+                    ledger.update_task(
+                        task_id, status="done", result={"deep_think": tier, "celery_task_id": tid, "enqueued": True}
+                    )
+                    return
+                yield _chunk(cid, req.model, created, role="assistant", content=note or None, extra={"atlas": head})
+                text = _run_deep_think(deps, tier, info, task_id)
+                text = rewriter.feed(text) + rewriter.flush() if rewriter is not None else text
                 yield _chunk(cid, req.model, created, content=text, finish="stop")
                 ledger.update_task(
                     task_id,
                     status="done",
-                    result={"deep_think": info.deep_think, "chars": len(text), "governance": rewriter.summary()},
+                    result={
+                        "deep_think": tier,
+                        "chars": len(text),
+                        "inline": True,
+                        "governance": rewriter.summary() if rewriter is not None else None,
+                    },
                 )
-                _remember_turn(deps, info, session_id, message, text)
+                if write_turn:
+                    _remember_turn(deps, info, session_id, message, text)
                 return
-        # Engine Arbiter: load (waits in its queue behind a running generation), then the single generation lock.
+            yield _chunk(cid, req.model, created, role="assistant", content=note or None, extra={"atlas": head})
+        # Engine Arbiter: load (waits in its queue behind a running generation), then the single generation slot.
         _maybe_remeasure(deps)
         decision_load = deps.arbiter.request_load(spec.key, task_id=task_id, wait_s=deps.load_wait_s)
         if not decision_load.granted:
@@ -1085,21 +1285,53 @@ def _chat_pipeline(
             if rewriter.flagged:
                 log.warning("task %s: never-delegate pass flagged %d sentence(s)", task_id, len(rewriter.flagged))
         ledger.update_task(task_id, status="done", result=result)
-        if not internal:
+        if write_turn:
             _remember_turn(deps, info, session_id, message, text)
     except ReleaseTimeout as exc:
         # Rule 5 failure: the Arbiter is halted; nothing more loads until a human looks. Say so, loudly.
-        _fail(deps, task_id, info, message, exc, status=503, session_id=session_id)
+        _fail(deps, task_id, info, message, exc, status=503, session_id=session_id, strike=not owui_task)
         yield _error_chunk(cid, req.model, created, 503, f"engine memory not released; arbiter halted: {exc}", task_id)
     except ArbiterError as exc:
         status = exc.args[1] if len(exc.args) > 1 and isinstance(exc.args[1], int) else 503
-        _fail(deps, task_id, info, message, exc, status=status, session_id=session_id)
+        _fail(deps, task_id, info, message, exc, status=status, session_id=session_id, strike=not owui_task)
         yield _error_chunk(cid, req.model, created, status, str(exc.args[0]), task_id)
     except (EngineError, ConfigError, RouterError, RuntimeError, httpx.HTTPError) as exc:
-        _fail(deps, task_id, info, message, exc, status=502, session_id=session_id)
+        _fail(deps, task_id, info, message, exc, status=502, session_id=session_id, strike=not owui_task)
         yield _error_chunk(cid, req.model, created, 502, f"{type(exc).__name__}: {exc}", task_id)
     finally:
         _close_quietly(streamer)
+
+
+def _enqueue_deep_think(deps: AppDeps, tier: str, info: RouteInfo, *, task_id: str, session_id: str) -> str | None:
+    """Standard and deep Deep Think go to the Celery gpu queue (atlas.tasks.deep_think; 9.7 "the chat interface
+    returns to the Principal immediately"); quick stays inline (one engine, 1-2 minutes). Returns the Celery task id,
+    or None when the tier runs inline: quick; a vault-tagged session (deep_think_task refuses it, 10.5: the answer
+    would persist in the ledger and the result backend outside the vault, so the inline stream is the only honest
+    path); or no Celery in this process (said in the log, never pretended)."""
+    if tier not in ("standard", "deep"):
+        return None
+    if deps.sessions.is_vault(session_id):
+        log.info("task %s: Deep Think %s runs inline: session %s is vault-tagged (10.5)", task_id, tier, session_id)
+        return None
+    if deps.enqueue is None:
+        log.warning("task %s: Deep Think %s runs inline: Celery is not wired into this process", task_id, tier)
+        return None
+    try:
+        tid = deps.enqueue(
+            "atlas.tasks.deep_think",
+            {
+                "problem": info.message,
+                "tier": tier,
+                "parent_task_id": task_id,
+                "session_id": session_id,
+                "audience": "principal",
+            },
+        )
+    except Exception as exc:  # kombu OperationalError when Redis is down: run inline and say so
+        log.error("task %s: Deep Think %s not enqueued (%s); running inline", task_id, tier, exc)
+        deps.ledger.update_task(task_id, error=f"enqueue failed: {type(exc).__name__}: {exc}"[:500])
+        return None
+    return str(tid) if tid else None
 
 
 def _close_quietly(streamer: Any) -> None:
@@ -1121,10 +1353,13 @@ def _fail(
     *,
     status: int,
     session_id: str | None = None,
+    strike: bool = True,
 ) -> None:
     err = f"{type(exc).__name__}: {exc.args[0] if exc.args else exc}"
     log.error("chat task %s failed (%d): %s", task_id, status, err)
     deps.ledger.update_task(task_id, status="failed", error=err)
+    if not strike:
+        return  # an Open WebUI title/tags chore that failed is a ledger row, not a 9.4 strike
     persona = info.persona if info else "atlas"
     domain = (info.task_force or info.route) if info else "routing"
     try:
@@ -1149,6 +1384,10 @@ def _fail(
 
 
 def _remember_turn(deps: AppDeps, info: RouteInfo, session_id: str, user_text: str, answer: str) -> None:
+    """Appendix A "memory writes (unless vault-tagged)": the turn goes to the hemisphere collection as a TEMPORAL
+    document with D9's 90-day life (CHAT_TURN_TTL_HOURS): the chat is summarised into the Vector Cortex at 90 days
+    (retention.py) and the raw turn expires with it; prune.py deletes expired `chat-turn` documents without archiving
+    them, so the purge of 10.4 holds (fix round 2). MemoryStore.write drops the write for a vault-tagged session."""
     if deps.memory is None or not deps.write_chat_turns or not answer.strip():
         return
     doc = f"User: {user_text.strip()[:2000]}\n{info.persona.title()}: {answer.strip()[:6000]}"
@@ -1214,7 +1453,7 @@ def _command(deps: AppDeps, info: RouteInfo, *, session_id: str, task_id: str) -
         deps.sessions.tag_vault(session_id)
         st = deps.vault.status()
         return (
-            "This session is now vault-tagged: nothing said here is written to memory (Section 10.5). "
+            "[ATLAS] This session is now vault-tagged: nothing said here is written to memory (Section 10.5). "
             f"Vault is {st.state}." + ("" if st.state == "open" else " Open it with the vault button.")
         )
     if info.command == "ouroboros-strike":
@@ -1293,7 +1532,7 @@ def build_production_deps() -> AppDeps:
         except EngineError as exc:
             raise RuntimeError(f"startup: cannot query/stop {spec.systemd_unit}: {exc}") from exc
     arbiter.measure_resident_set()
-    sessions = SessionTags(os.environ.get("VAULT_SESSION_FILE") or "/run/atlas/vault-sessions.json")
+    sessions = SessionTags.from_env()  # tmpfs mirror + the durable store (vault.py; survives a reboot)
     memory: MemoryStore | None = None
     try:
         memory = build_memory_store(sessions=sessions)

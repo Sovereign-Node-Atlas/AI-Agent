@@ -6,8 +6,10 @@
 # transformers pinned to a 2023 commit, tokenizers==0.12.1 (wheels for cp36-cp310 only, VERIFIED PyPI: built from the
 # Rust sdist with rustc/cargo in a derived image), open3d==0.16.0 (no cp312 wheel: unpinned), deepspeed/flash-attn
 # dropped. All UNVERIFIED on 3.12. cargo fetches crates from index.crates.io / static.crates.io (crates.io for the
-# registry redirect): these hosts must be in config/allowlist.txt (owned by the Phase 1 writer; reported) and the proxy
-# re-rendered, or the build stops here with that message instead of a TCP_DENIED deep in the pip log.
+# registry redirect): these hosts must be in config/allowlist.txt (owned by the Phase 1 writer; VERIFIED absent on
+# 2026-10-04, so V8 is deferred by construction until they are added) and the proxy reloaded with
+# `phase1-platform.sh --reload-allowlist` (NOT `--force 04`, which resets ufw, repeats the dist-upgrade and reboots),
+# or the build stops here with that message instead of a TCP_DENIED deep in the pip log.
 # Test: pointllm_test.py (a synthetic 8192-point cloud, one question, float16) -> pointllm_answer.txt.
 P4_KEY="pointllm"
 # shellcheck source=phase4/lib-engine.sh
@@ -33,10 +35,12 @@ print("kept:", keep, file=sys.stderr); print("dropped:", dropped, file=sys.stder
 PY
 
 p4_build() {
+  # The allowlist check reads the /opt copy the driver runs from (atlas-day1.sh refreshes it from the repository on
+  # every run), so an edit in the repository counts once the node has been re-run from it.
   local al="$P4_DAY1/config/allowlist.txt" h
   for h in index.crates.io static.crates.io crates.io; do
     grep -qxF "$h" "$al" 2>/dev/null \
-      || die "$P4_KEY: $h is not in config/allowlist.txt: cargo (tokenizers==0.12.1 has no cp312 wheel, the Rust sdist is built) would be denied by squid. Add index.crates.io, static.crates.io and crates.io to the allowlist, re-render the proxy (sudo ./atlas-day1.sh phase1 --force 04), then re-run (V8 stays deferred until then)"
+      || die "$P4_KEY: $h is not in config/allowlist.txt: cargo (tokenizers==0.12.1 has no cp312 wheel, the Rust sdist is built) would be denied by squid. Add index.crates.io, static.crates.io and crates.io to scripts/day1/config/allowlist.txt in the repository, then: sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt (no ufw reset, no reboot; --force 04 is NOT the way), then delete $P4_RESULT and re-run: sudo ./atlas-day1.sh phase4 --force 04 (V8 stays deferred until then)"
   done
   # Derived image: Ubuntu 24.04's rustc/cargo for the tokenizers 0.12.1 source build (UNVERIFIED that 2022 Rust code
   # builds with rustc 1.75; a failure is the recorded reason for V8 deferred).

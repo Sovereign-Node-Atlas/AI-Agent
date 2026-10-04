@@ -19,14 +19,20 @@ the request, so the cached prefix survives (4.4 "every dispatch that changes the
 invalidates the cached prefix").
 
 Layer 4 is hemisphere-isolated (7.3: "enforced by separate memory collections, separate context windows"): the
-builder is the last component that knows which hemisphere is speaking, so a memory mapping that carries the other
+builder is the last component that knows whose context window this is, so a memory mapping that carries the other
 hemisphere's collection (`estate` / `documents_estate` into a corporate prompt, or the reverse) is a ValueError,
-never silently merged and never silently dropped.
+never silently merged and never silently dropped. The hemisphere is the layer-1 persona's own (the persona whose
+context window the prompt is): for a task-force dispatch that is the owning director, which the router keeps in the
+lead's hemisphere (8.1 preset tag) except on a hard hit or a typed override; when the decision's lead is in the other
+hemisphere the builder logs the 7.3 tension and still keys on the dispatch persona. The `sentinel` collection is
+admitted only into a prompt of its 9.3 owners, Alaric (threats) and Silas (markets) under Arthur; C12 resolved
+"Sentinel fed to Ren" as a contradiction, so a Ren (or any other) prompt carrying it is a ValueError.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -36,9 +42,12 @@ from atlas.config import HEMISPHERES, DomainCard, Persona
 from atlas.personas import PersonaRegistry, load_persona_registry
 from atlas.router import RoutingDecision
 
+log = logging.getLogger("atlas.prompts")
+
 __all__ = [
     "GOVERNANCE_BLOCK",
     "LAYER_SEPARATOR",
+    "SENTINEL_READERS",
     "PromptBuilder",
     "SystemPrompt",
     "build_system_prompt",
@@ -131,16 +140,22 @@ def governance_hash() -> str:
 
 
 # Keys a memory mapping may carry (10.1 collections plus the pipeline's generic "memory"/"documents" buckets). The
-# hemisphere-specific ones are admitted only for the speaking hemisphere.
-_SHARED_MEMORY_KEYS: tuple[str, ...] = ("memory", "documents", "sentinel")
+# hemisphere-specific ones are admitted only for the speaking hemisphere; `sentinel` only for its 9.3 owners.
+_SHARED_MEMORY_KEYS: tuple[str, ...] = ("memory", "documents")
+SENTINEL_KEY = "sentinel"
+# 9.3 "Owners: Alaric for threats, Silas for markets, under Arthur. RESOLVED (C12): not Ren."
+SENTINEL_READERS: frozenset[str] = frozenset({"arthur", "alaric", "silas"})
 
 
-def _split_memory(memory: Sequence[str] | Mapping[str, Any] | None, hemisphere: str) -> tuple[list[str], list[str]]:
+def _split_memory(
+    memory: Sequence[str] | Mapping[str, Any] | None, hemisphere: str, persona_key: str = ""
+) -> tuple[list[str], list[str]]:
     """Accept a flat list of memory snippets, or a mapping of 10.1 collections ({"memory": [...], "scars": [...],
-    "<hemisphere>": [...], "documents_<hemisphere>": [...], "sentinel": [...]}) restricted to `hemisphere`.
+    "<hemisphere>": [...], "documents_<hemisphere>": [...], "sentinel": [...]}) restricted to `hemisphere` and, for
+    `sentinel`, to a persona in SENTINEL_READERS (9.3 / C12).
 
-    The other hemisphere's collections present and non-empty, or an unknown key, raise ValueError (7.3 isolation;
-    CONVENTIONS.md §7.4 never silent)."""
+    The other hemisphere's collections present and non-empty, an unknown key, or `sentinel` for a persona who does
+    not own it raise ValueError (7.3 isolation; CONVENTIONS.md §7.4 never silent)."""
     if memory is None:
         return [], []
     if hemisphere not in HEMISPHERES:
@@ -148,14 +163,24 @@ def _split_memory(memory: Sequence[str] | Mapping[str, Any] | None, hemisphere: 
     if not isinstance(memory, Mapping):
         return [str(m) for m in memory if str(m).strip()], []
     allowed = (*_SHARED_MEMORY_KEYS, hemisphere, f"documents_{hemisphere}")
+    if persona_key in SENTINEL_READERS:
+        allowed = (*allowed, SENTINEL_KEY)
     for key, value in memory.items():
         if key == "scars" or key in allowed:
             continue
         if not value:
             continue  # an empty bucket for the other hemisphere carries nothing and is tolerated
+        if key == SENTINEL_KEY:
+            raise ValueError(
+                f"memory key 'sentinel' is not admitted into a prompt for {persona_key or hemisphere!r} "
+                f"(9.3: Sentinel's owners are {sorted(SENTINEL_READERS)} under Arthur; C12 resolved "
+                f"'Sentinel fed to Ren' as a contradiction)"
+            )
         other = [h for h in HEMISPHERES if h != hemisphere]
-        raise ValueError(f"memory key {key!r} is not admitted into a {hemisphere} prompt (7.3: the {other} "
-                         f"collections stay in their own context window; allowed keys: {sorted(allowed)} + scars)")
+        raise ValueError(
+            f"memory key {key!r} is not admitted into a {hemisphere} prompt (7.3: the {other} "
+            f"collections stay in their own context window; allowed keys: {sorted(allowed)} + scars)"
+        )
     mem: list[str] = []
     for key in allowed:
         mem.extend(str(m) for m in (memory.get(key) or ()) if str(m).strip())
@@ -199,14 +224,33 @@ class PromptBuilder:
             return decision.directors[0]
         return decision.persona
 
-    def build_system_prompt(self, decision: RoutingDecision | str, cards: Sequence[DomainCard] = (),
-                            memory: Sequence[str] | Mapping[str, Any] | None = None) -> SystemPrompt:
+    def build_system_prompt(
+        self,
+        decision: RoutingDecision | str,
+        cards: Sequence[DomainCard] = (),
+        memory: Sequence[str] | Mapping[str, Any] | None = None,
+    ) -> SystemPrompt:
         """Layers 1-4 for the decision's dispatch persona (or a persona key), the given cards (verbatim) and the
         speaking hemisphere's retrieved memory."""
         persona_key = self.persona_key_for(decision)
         prefix, prefix_hash = self.stable_prefix(persona_key)
-        # The routed hemisphere decides which memory collections may enter (7.3); a bare key uses its own.
-        hemisphere = self.personas[persona_key].hemisphere if isinstance(decision, str) else decision.hemisphere
+        # Layer 4 is the layer-1 persona's own hemisphere (7.3 "separate context windows": the collections that may
+        # enter a context window are those of the persona whose window it is). The router keeps the dispatch in the
+        # lead's hemisphere (8.1 preset tag); when a hard hit (7.2 rule 1) or a typed override (7.2 rule 4) left the
+        # lead in the other hemisphere, that is said out loud here rather than letting the lead's collections leak
+        # into a director's window (or the director's be refused).
+        hemisphere = self.personas[persona_key].hemisphere
+        if not isinstance(decision, str) and decision.hemisphere != hemisphere:
+            log.warning(
+                "prompt for %s (%s) under lead %s (%s): layer-4 memory keyed on the dispatch persona's "
+                "hemisphere %s (7.3); reason=%s",
+                persona_key,
+                hemisphere,
+                decision.persona,
+                decision.hemisphere,
+                hemisphere,
+                decision.reason,
+            )
         parts = [prefix]
         # Layer 3: cards in the router's order, verbatim (8.4 rule 1), capped by the router (8.4 rule 2).
         card_numbers = tuple(c.number for c in cards)
@@ -215,14 +259,18 @@ class PromptBuilder:
             cards_text = _HEADER_CARDS + LAYER_SEPARATOR + LAYER_SEPARATOR.join(c.text.strip() for c in cards)
             parts.append(cards_text)
         # Layer 4: memory, then scars, last.
-        mem, scars = _split_memory(memory, hemisphere)
+        mem, scars = _split_memory(memory, hemisphere, persona_key)
         if mem:
             parts.append(_HEADER_MEMORY + LAYER_SEPARATOR + LAYER_SEPARATOR.join(m.strip() for m in mem))
         if scars:
             parts.append(_HEADER_SCARS + LAYER_SEPARATOR + LAYER_SEPARATOR.join(s.strip() for s in scars))
-        return SystemPrompt(text=LAYER_SEPARATOR.join(parts), stable_prefix_hash=prefix_hash,
-                            cards_hash=_sha256(cards_text) if cards_text else "", persona=persona_key,
-                            domain_cards=card_numbers)
+        return SystemPrompt(
+            text=LAYER_SEPARATOR.join(parts),
+            stable_prefix_hash=prefix_hash,
+            cards_hash=_sha256(cards_text) if cards_text else "",
+            persona=persona_key,
+            domain_cards=card_numbers,
+        )
 
 
 @lru_cache(maxsize=1)

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Florence-2-large caption/OCR/detection (rocm-containers.md §6.5, VERIFIED from transformers florence2.md; the
--large repo id is UNVERIFIED-by-snippet). No trust_remote_code (conflict 15). Writes florence2.json."""
+-large repo id is UNVERIFIED-by-snippet). No trust_remote_code (conflict 15). The dtype keyword spelling is decided
+once by p4common.load_kwargs from the transformers version (no try/except retry under the load watchdog).
+Writes florence2.json."""
 
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from p4common import Test, synthetic_image
+from p4common import Test, load_kwargs, synthetic_image
 
 REPO = "florence-community/Florence-2-large"
 
@@ -19,10 +21,9 @@ def main(t: Test) -> None:
     from PIL import Image
     from transformers import AutoProcessor, Florence2ForConditionalGeneration
 
-    try:
-        model = Florence2ForConditionalGeneration.from_pretrained(REPO, dtype=torch.bfloat16)
-    except TypeError:
-        model = Florence2ForConditionalGeneration.from_pretrained(REPO, torch_dtype=torch.bfloat16)
+    kw = load_kwargs(Florence2ForConditionalGeneration, torch.bfloat16, disable_mmap=False)
+    t.note(f"from_pretrained kwargs: {sorted(kw)}")
+    model = Florence2ForConditionalGeneration.from_pretrained(REPO, **kw)
     model = model.to(t.device).eval()
     proc = AutoProcessor.from_pretrained(REPO)
     t.loaded()

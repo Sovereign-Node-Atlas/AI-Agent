@@ -11,7 +11,9 @@ at all, and an archive under /srv/cold is in the restic include set), and the Pr
 What "temporal" means in code (atlas.memory sets the fields on every write): `temporal == True` and either
 `expires_at < now` (the writer gave a TTL) or `ts < now - PRUNE_WINDOW_HOURS` (default 72). Collections swept:
 corporate, estate, documents_corporate, documents_estate, sentinel. Graph documents come from the LightRAG index the
-memory wrapper keeps (doc ids with the same fields).
+memory wrapper keeps (doc ids with the same fields). Expired `chat-turn` documents (the raw turns atlas.api writes
+with D9's 90-day TTL) are DELETED WITHOUT ARCHIVE (fix round 2): D9 says summarised then purged, and /srv/cold is in
+restic's include set, so an archived turn would outlive the purge; the chat summary is the retained form.
 
 Archive: `/srv/cold/prune/prune-<UTC stamp>.tar.zst` holding one JSON file per collection and one for the graph,
 written with Python's `compression.zstd` (3.14+) when present, else the `zstd` binary, else (fix round) stdlib
@@ -58,6 +60,7 @@ class PruneResult:
     archive: str = ""
     moved: dict[str, int] = field(default_factory=dict)
     graph_moved: int = 0
+    purged: dict[str, int] = field(default_factory=dict)  # expired chat turns deleted WITHOUT archive (D9)
     invariant_breaches: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -72,6 +75,7 @@ class PruneResult:
             "archive": self.archive,
             "moved": self.moved,
             "graph_moved": self.graph_moved,
+            "purged": self.purged,
             "total": self.total,
             "invariant_breaches": self.invariant_breaches,
             "errors": self.errors,
@@ -93,7 +97,20 @@ def _vault_marked(meta: dict[str, Any]) -> bool:
 
 
 def _hemisphere_for(collection: str) -> str:
-    return sorted(COLLECTION_HEMISPHERES[collection])[0]
+    """The ONE hemisphere a swept collection is bound to (10.1). Every swept collection is single-bound (sentinel is
+    estate-only since fix round 2; scars, the only shared collection, is exempt), so an ambiguous binding here is a
+    configuration error worth stopping on, never a silent pick."""
+    bound = COLLECTION_HEMISPHERES[collection]
+    if len(bound) != 1:
+        raise MemoryStoreError(f"collection {collection!r} is bound to {sorted(bound)}; the sweep needs one hemisphere")
+    return next(iter(bound))
+
+
+def _purge_without_archive(meta: dict[str, Any]) -> bool:
+    """D9 (10.4): a chat is summarised at 90 days and PURGED. The raw `chat-turn` documents atlas.api writes carry
+    that same 90-day TTL, so when they expire they are deleted, never archived under /srv/cold (which restic backs
+    up): the summary is the retained form (fix round 2)."""
+    return str(meta.get("kind", "")) == "chat-turn"
 
 
 def _collect_expired(
@@ -220,15 +237,29 @@ def run_sweep(
     now = now or time.time()
     result = PruneResult(ts=now, window_hours=window_hours)
     to_move: dict[str, list[Hit]] = {}
+    to_purge: dict[str, list[Hit]] = {}
     breaches: dict[str, list[str]] = {}
     for col in collections:
         if col in EXEMPT_COLLECTIONS:
             continue
         try:
-            to_move[col] = _collect_expired(store, col, now, window_hours, result, breaches)
+            expired = _collect_expired(store, col, now, window_hours, result, breaches)
         except MemoryStoreError as exc:
             result.errors.append(f"{col}: {exc}")
             log.error("prune: cannot read %s: %s", col, exc)
+            continue
+        to_move[col] = [h for h in expired if not _purge_without_archive(h.metadata)]
+        to_purge[col] = [h for h in expired if _purge_without_archive(h.metadata)]
+    for col, hits in to_purge.items():
+        if not hits:
+            continue
+        try:
+            store.delete(col, [h.id for h in hits], hemisphere=_hemisphere_for(col))
+            result.purged[col] = len(hits)
+            log.info("prune: %d expired chat turn(s) purged from %s without archive (D9, 10.4)", len(hits), col)
+        except MemoryStoreError as exc:
+            result.errors.append(f"purge {col}: {exc}")
+            log.error("prune: %s", result.errors[-1])
     graph_rows = []
     graph = store.graph
     if graph is not None:
@@ -303,8 +334,8 @@ def run_sweep(
             log.error("prune: %s", result.errors[-1])
     for r in graph_rows:
         try:
-            graph.delete_document(r.doc_id)  # type: ignore[union-attr]
-            result.graph_moved += 1
+            if graph.delete_document(r.doc_id):  # type: ignore[union-attr]  # False = spooled for the AEGIS thaw
+                result.graph_moved += 1
         except Exception as exc:
             result.errors.append(f"graph delete {r.doc_id}: {exc}")
             log.error("prune: %s", result.errors[-1])

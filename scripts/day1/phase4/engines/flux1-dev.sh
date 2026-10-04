@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # phase4/engines/flux1-dev.sh — FLUX.1-dev, green (Section 15.2; Section 17 Phase 4 step 2, first in order of value).
-# Gated repo: HF_TOKEN from /etc/atlas/secrets/hf-token.env; a 401/403 stops this engine with the licence URL to accept
-# (adjudicated conflict 16). The Principal accepted the dev non-commercial licence (Section 15.5).
+# Gated repo: HF_TOKEN from /etc/atlas/secrets/hf-token.env, read by root and staged as a copy the container uid can
+# read (mode 400, private root-only tmpfs) for this engine's pull run only (lib-engine.sh header "HF_TOKEN"); an
+# absent token file stops this engine before any container starts, naming the Phase 2 prompt and the licence URL; a
+# 401/403 stops it with the licence URL to accept (adjudicated conflict 16). The Principal accepted the dev
+# non-commercial licence (Section 15.5).
 # Research: rocm-containers.md §3.1 (diffusers snippet VERIFIED from flux.md; pip list unpinned; the pull skips the
 # duplicate single-file weights via allow_patterns). Test: flux1-dev_test.py (20 steps, guidance 3.5, bf16, no offload).
 P4_KEY="flux1-dev"

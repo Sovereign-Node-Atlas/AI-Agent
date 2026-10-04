@@ -12,10 +12,11 @@ description: Thin relay into the orchestrator (Section 7.1): forwards the overri
 #   1. reads the leading override prefix of the current user message ("[REN]", "[ARTHUR:LONG]", "[DEEP THINK: ...]",
 #      "[LOG STRIKE: ...]", "[VAULT]", ... the set is config/router-rules.json, owned by the orchestrator; the filter
 #      forwards the bracketed token verbatim and never interprets it);
-#   2. sets the "vault" flag when ANY user message of the chat starts with "[VAULT]" (Section 10.5: vault-tagged for
+#   2. sets the "vault" flag when "[VAULT]" appears in ANY user message of the chat (Section 10.5: vault-tagged for
 #      the life of the session). The whole history Open WebUI resends with every turn is scanned (the same rule as
-#      atlas.tasks.retention.is_vault_chat), so the flag survives a container restart or a reboot; the in-process
-#      set is only an accelerator (fix round: the last-message-only rule lost the tag after a restart);
+#      atlas.api.history_has_vault_prefix and atlas.tasks.retention.is_vault_chat: the token anywhere in the text,
+#      fix round 2, fail-closed), so the flag survives a container restart or a reboot; the in-process set is only an
+#      accelerator (fix round: the last-message-only rule lost the tag after a restart);
 #   3. forwards both, plus the chat id as the session id and the user's id, as TOP-LEVEL body fields the orchestrator
 #      understands (atlas_override, atlas_vault, atlas_session, atlas_user).
 # VERIFIED against Open WebUI v0.11.4 (fix-round review of routers/openai.py, main.py, utils/middleware.py): top-level
@@ -72,11 +73,10 @@ class Filter:
 
     @staticmethod
     def history_has_vault(body: dict[str, Any]) -> bool:
-        """True when any user message of the chat starts with [VAULT] (retention.is_vault_chat's rule)."""
+        """True when [VAULT] appears in any user message of the chat (the orchestrator's rule, fail-closed)."""
         for m in body.get("messages") or []:
-            if isinstance(m, dict) and m.get("role") == "user":
-                if _text_of(m.get("content")).lstrip().upper().startswith(VAULT_TOKEN):
-                    return True
+            if isinstance(m, dict) and m.get("role") == "user" and VAULT_TOKEN in _text_of(m.get("content")).upper():
+                return True
         return False
 
     @staticmethod

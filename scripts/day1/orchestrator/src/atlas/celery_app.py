@@ -12,7 +12,8 @@
 Task names are the contract with atlas.admin.ENQUEUE_TASKS (that file states it): atlas.tasks.sentinel_pulse,
 atlas.tasks.prune_sweep, atlas.tasks.aegis_freeze, atlas.tasks.aegis_thaw, atlas.tasks.chat_retention.
 Facts typed from services-tools.md §3 (VERIFIED celery docs): broker_url, result_backend, broker_transport_options
-visibility_timeout ("raise it above the longest task"), task_routes, task_default_queue, crontab(), `-s` schedule file.
+visibility_timeout ("raise it above the longest task"; set to 24 h here, see the conf comment: a task longer than
+that must be split), task_routes, task_default_queue, crontab(), `-s` schedule file.
 """
 
 from __future__ import annotations
@@ -59,8 +60,12 @@ app = Celery(
 app.conf.update(
     task_default_queue=QUEUE_CPU,
     task_routes={name: {"queue": QUEUE_GPU} for name in GPU_TASKS},
-    # > the longest task (a LightRAG indexing pass, a Deep Think round, a Docling set): 6 h, as the research snippet.
-    broker_transport_options={"visibility_timeout": 6 * 3600},
+    # "raise it above the longest task" (services-tools.md §3): with task_acks_late=True a task that outlives this
+    # window is REDELIVERED by Redis and runs a second time, i.e. two engine holders for one job on the gpu queue.
+    # 9.7 names a multi-hour backtest and a LightRAG indexing pass; 9.1 says a heavy Deep Think "runs as long as it
+    # needs", so 6 h was not above the longest task (fix round 2). 24 h covers every uncapped job this package knows;
+    # a task expected to exceed 24 h must be split into resumable parts, never run as one Celery task.
+    broker_transport_options={"visibility_timeout": 24 * 3600},
     result_expires=7 * 24 * 3600,
     task_acks_late=True,
     worker_prefetch_multiplier=1,

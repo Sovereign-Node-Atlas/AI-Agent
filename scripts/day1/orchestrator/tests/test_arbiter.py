@@ -1,7 +1,8 @@
 """V14a: the Engine Arbiter against stub footprints (Section 4.2 rules 1-9, Section 21 V14, Phase 2 gate).
 
 Numbers: GTT total 192 GiB (amdgpu.gttsize=196608, Appendix B), resident set 22 GiB -> budget 170 GiB (Section 4.1).
-Footprints are engines.json's Section 5.1 figures (decimal GB), KV from the Section 4.3 model in atlas.arbiter.
+Footprints are engines.json's Section 5.1 figures read as GiB (EngineSpec.footprint_bytes, the upper bound), KV from
+the Section 4.3 model in atlas.arbiter.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ from atlas.arbiter import (
     kv_estimate_bytes,
     read_unit_profile,
 )
-from atlas.config import EngineSpec
-from atlas.engines import EngineControlError, StubController
+from atlas.config import EngineSpec, load_phase4_engines
+from atlas.engines import EngineControlError, EngineError, StubController
 from atlas.ledger import Ledger
 
 GTT_TOTAL = 196608 * 1024 * 1024  # 206158430208 bytes, the V3 figure
@@ -335,6 +336,59 @@ def test_failed_start_releases_the_reservation(engines: dict[str, EngineSpec]) -
     assert arb.request_load("gpt-oss-120b", task_id="t2").granted  # not halted: the memory was never taken
 
 
+def test_post_start_health_failure_releases_the_reservation(engines: dict[str, EngineSpec]) -> None:
+    # SystemdEngineController.start raises the PARENT EngineError when `systemctl start` returned 0 but /health never
+    # answered 200 (wait_ready). The placeholder and `_busy` must go all the same, or one flapping unit wedges every
+    # later load of every engine behind "arbiter busy: loading <key>" (fix round).
+    ledger = Ledger(":memory:")
+    ledger.init_db()
+    arb, _, probe, _ = make(engines, ledger=ledger)
+    arb.controller = StubController(engines=engines, probe=probe, fail_start=["gpt-oss-120b"], start_error=EngineError)
+    with pytest.raises(EngineError, match="start of gpt-oss-120b refused"):
+        arb.request_load("gpt-oss-120b", task_id="t1")
+    assert arb.busy is None and arb.resident == {} and arb.status()["busy"] is None and arb.charged_bytes == 0
+    assert arb.request_load("qwen2.5-vl-72b", task_id="t2").granted
+    rows = [(r["engine"], r["decision"], r["reason"]) for r in ledger.list_arbiter_decisions(limit=20)]
+    assert any(e == "gpt-oss-120b" and d == "error" and "start failed" in why and "reservation released" in why
+               for e, d, why in rows)
+
+
+def test_failed_stop_gives_the_victim_back(engines: dict[str, EngineSpec]) -> None:
+    # `sudo -n systemctl stop` fails (sudoers fragment missing, systemctl timed out): the victim keeps running, so the
+    # ledger must say it is serving again (4.2 rule 1) instead of leaving `unloading=True` for the life of the process.
+    ledger = Ledger(":memory:")
+    ledger.init_db()
+    arb, _, probe, _ = make(engines, ledger=ledger)
+    assert arb.request_load("gpt-oss-120b", task_id="t1").granted
+    arb.controller = StubController(engines=engines, probe=probe, fail_stop=["gpt-oss-120b"])
+    arb.controller.active.add("gpt-oss-120b")
+    # Eviction path: nemotron (133 GiB) does not fit beside gpt-oss in 170 GiB, so gpt-oss is the victim; the stop
+    # fails; nothing changed and nothing is wedged.
+    with pytest.raises(EngineControlError, match="password is required"):
+        arb.request_load("nemotron-3-super", task_id="t2")
+    victim = arb.resident["gpt-oss-120b"]
+    assert victim.serving and not victim.unloading and "nemotron-3-super" not in arb.resident
+    assert arb.busy is None and arb.try_generation("gpt-oss-120b", task_id="g1").granted
+    arb.release_generation(task_id="g1")
+    # Direct unload path: same failure, same recovery; the ledger holds the error row with the systemctl hint.
+    with pytest.raises(EngineControlError):
+        arb.request_unload("gpt-oss-120b", task_id="t3")
+    assert arb.resident["gpt-oss-120b"].serving and arb.busy is None
+    errors = [(r["task_id"], r["engine"], r["action"], r["reason"])
+              for r in ledger.list_arbiter_decisions(limit=50) if r["decision"] == "error"]
+    assert [e[:3] for e in reversed(errors)] == [("t2", "gpt-oss-120b", "unload"), ("t2", "nemotron-3-super", "load"),
+                                                 ("t3", "gpt-oss-120b", "unload")]
+    for _tid, engine, action, why in errors:
+        if action == "unload":
+            assert "stop failed" in why and "systemctl is-active llama-server@gpt-oss-120b" in why
+        else:
+            assert why.startswith(f"eviction of gpt-oss-120b failed; {engine} not loaded, reservation released")
+    # Once the cause is fixed (the stop works again) the retry succeeds.
+    arb.controller.fail_stop.clear()
+    assert arb.request_unload("gpt-oss-120b", task_id="t4").granted
+    assert arb.resident == {} and arb.request_load("nemotron-3-super", task_id="t5").granted
+
+
 def test_never_preempts_mid_generation(engines: dict[str, EngineSpec]) -> None:
     arb, controller, _, _ = make(engines, budget_gib=100.0)  # room for one Ren-class engine only
     assert arb.request_load("gpt-oss-120b", task_id="t1").granted
@@ -370,7 +424,11 @@ def test_queued_load_with_wait_proceeds_when_generation_ends(engines: dict[str, 
 # --- rule 7: apex exclusivity ------------------------------------------------------------------------------------
 
 
-def test_apex_unloads_everything_and_refuses_others(engines: dict[str, EngineSpec]) -> None:
+def test_apex_unloads_everything_and_is_evicted_when_idle(engines: dict[str, EngineSpec]) -> None:
+    # Rule 7: requesting the Apex engine unloads every co-resident engine first, and nothing else loads while it is
+    # resident. Its guarantee is exclusivity of residency, not permanence: an idle Apex engine is the first victim of
+    # the next load (Section 6.3 wants gpt-oss back "by default"), so no human has to POST /arbiter/unload after a
+    # Deep Think deep run or TF_OMEGA (fix round).
     ledger = Ledger(":memory:")
     ledger.init_db()
     arb, _, probe, _ = make(engines, ledger=ledger)
@@ -382,14 +440,24 @@ def test_apex_unloads_everything_and_refuses_others(engines: dict[str, EngineSpe
     assert list(arb.resident) == [APEX_KEY]
     assert engines[APEX_KEY].is_apex and engines[APEX_KEY].exclusive
     assert probe.used_bytes == RESIDENT_SET + engines[APEX_KEY].footprint_bytes  # memory of both victims came back
-    refused = arb.request_load("gpt-oss-120b", task_id="t3")
-    assert refused.decision is Decision.REFUSED and "exclusive" in refused.reason
+    # Apex generating: a Ren load is QUEUED (rule 6), never preempted, and the Apex engine stays.
+    assert arb.try_generation(APEX_KEY, task_id="g-apex").granted
+    queued = arb.request_load("gpt-oss-120b", task_id="t3")
+    assert queued.decision is Decision.QUEUED and "never preempted" in queued.reason
     assert list(arb.resident) == [APEX_KEY]
-    assert arb.request_unload(APEX_KEY, task_id="t4").granted
-    assert arb.request_load("gpt-oss-120b", task_id="t5").granted
-    decisions = [(r["engine"], r["decision"], r["action"]) for r in ledger.list_arbiter_decisions(limit=50)]
-    assert ("gpt-oss-120b", "refused", "load") in decisions
-    assert (APEX_KEY, "granted", "load") in decisions
+    arb.release_generation(task_id="g-apex")
+    # Apex idle: the Ren load is GRANTED with the Apex engine as its sole victim, released through rule 5.
+    back = arb.request_load("gpt-oss-120b", task_id="t4")
+    assert back.granted and back.evicted == (APEX_KEY,)
+    assert list(arb.resident) == ["gpt-oss-120b"]
+    assert probe.used_bytes == RESIDENT_SET + engines["gpt-oss-120b"].footprint_bytes
+    assert arb.request_load("qwen2.5-vl-72b", task_id="t5").granted  # the everyday pairing is back
+    decisions = [(r["engine"], r["decision"], r["action"], r["reason"])
+                 for r in ledger.list_arbiter_decisions(limit=50)]
+    assert ("gpt-oss-120b", "queued", "load") in [d[:3] for d in decisions]
+    assert (APEX_KEY, "granted", "load") in [d[:3] for d in decisions]
+    assert any(e == APEX_KEY and dec == "granted" and act == "unload" and "rule 7" in why
+               for e, dec, act, why in decisions)
 
 
 def test_apex_request_queues_while_a_victim_generates(engines: dict[str, EngineSpec]) -> None:
@@ -500,6 +568,35 @@ def test_confirm_loaded_records_the_measured_footprint(engines: dict[str, Engine
     assert arb.projected_footprint("gpt-oss-120b").measured is True
     status = arb.status()
     assert status["resident"][0]["measured_bytes"] == measured and status["budget_bytes"] == 170 * GIB
+
+
+def test_register_measured_accepts_phase4_engines(engines: dict[str, EngineSpec], config_dir: Path) -> None:
+    # Section 4.2: every weight-bearing process, the Phase 4 container engines included, passes through the Arbiter;
+    # Phase 4 step 5 registers each passing engine with its measured footprint (POST /arbiter/register). Those keys come
+    # from config/phase4-engines.json (class phase4), and a key in neither file is still accepted as class phase4 with
+    # a logged warning, never a 404 (fix round).
+    phase4 = load_phase4_engines(config_dir)
+    assert "flux1-dev" in phase4 and phase4["flux1-dev"].is_phase4 and phase4["flux1-dev"].arbiter_class == "phase4"
+    assert not phase4["flux1-dev"].is_apex and phase4["flux1-dev"].kv_class == "none"
+    ledger = Ledger(":memory:")
+    ledger.init_db()
+    arb, _, _, _ = make({**engines, **phase4}, ledger=ledger)
+    arb.register_measured("flux1-dev", 24 * GIB, task_id="p4-05")
+    measured = {m["engine"]: m for m in arb.status()["measured"]}
+    assert measured["flux1-dev"] == {"engine": "flux1-dev", "class": "phase4", "measured_bytes": 24 * GIB}
+    rows = ledger.list_arbiter_decisions(task_id="p4-05")
+    assert rows[0]["action"] == "measure" and rows[0]["decision"] == "granted" and "class phase4" in rows[0]["reason"]
+    # A Phase 4 engine is never loaded as a llama-server unit: the answer is a reason, not a systemctl call.
+    refused = arb.request_load("flux1-dev", task_id="p4-x")
+    assert refused.decision is Decision.REFUSED and "Section 15.2" in refused.reason
+    # Not in either file: accepted as class phase4 from the request, and the spec it creates carries the measurement.
+    arb.register_measured("ui-tars-1.5-7b", 16 * GIB, task_id="p4-06")
+    assert arb.engines["ui-tars-1.5-7b"].is_phase4 and arb.engines["ui-tars-1.5-7b"].footprint_bytes == 16 * GIB
+    assert {m["engine"]: m["class"] for m in arb.status()["measured"]}["ui-tars-1.5-7b"] == "phase4"
+    with pytest.raises(ArbiterError, match="not an engine key"):
+        arb.register_measured("x y;z", 1)
+    with pytest.raises(ArbiterError, match="negative"):
+        arb.register_measured("flux1-dev", -1)
 
 
 def test_resident_small_models_are_never_budgeted(engines: dict[str, EngineSpec]) -> None:

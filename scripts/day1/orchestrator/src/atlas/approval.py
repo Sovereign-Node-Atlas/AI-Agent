@@ -4,20 +4,31 @@ Every outbound item passes through `ApprovalQueue.submit()`; it is a code path, 
 
     routine     pre-approved categories only (ROUTINE_KINDS: acknowledgement, scheduling, confirmation; 16.2): sent at
                 once through the Sender, logged in ledger.approvals as auto-sent. Any other kind labelled routine is
-                raised to standard: the label alone never sends anything (16.3 rule 3).
+                raised to standard, in BOTH the external and the Principal register: the label alone never sends
+                anything (16.3 rule 3).
     standard    held (status "held") until the Principal approves; a Notifier announces it (16.2 "push through ntfy")
     sensitive   held and flagged with the director's reasoning; the strong cross-check (9.2, a second persona on a
-                different engine) is run automatically at submit through `cross_checker` and attached; `approve()`
-                refuses (CrossCheckRequired) while no record is attached, the backstop when no checker is wired or
-                it failed. `needs_cross_check()` lists what is waiting for one.
+                different engine) is run automatically at submit through `cross_checker` and attached, whatever the
+                register (9.2 "applies the strong version automatically to the sensitive tier"); `approve()` refuses
+                (CrossCheckRequired) while no record is attached, the backstop when no checker is wired or it failed.
+                `needs_cross_check()` lists what is waiting for one. An item the Principal marked `important` is
+                cross-checked too (9.2 "and to anything the Principal marks important").
+
+The gate floors the tier itself for the categories 16.2 names sensitive (SENSITIVE_KINDS: payment, transfer, invoice,
+contract, signature, dns, legal, medical, estate, security, vault): a caller's "standard" on a payment is raised to
+sensitive (16.3 rule 1: money never moves without the Principal; the gate is the control, not the label).
 
 Register (6.4) decides what the gate does with a draft:
   * EXTERNAL (audience external/recipient): the full gate: the persona's Section 6.2 "speaks externally" tier is a
     floor; an admission of AI nature or a self-reference (governance.disclosure_check, 16.1 rule 4) is never
-    auto-sent, it is held with the hits in the note; sensitive items get the cross-check.
-  * PRINCIPAL (audience principal): the never-delegate rewrite pass (16.1 rule 5; governance.never_delegate_rewrite)
-    is applied and the rewritten text is what is stored and sent; a task-shaped sentence the pass could only flag
-    holds the item (never auto-sent) with the sentences in the note.
+    auto-sent, it is held with the hits in the note.
+  * PRINCIPAL (audience principal): only a hemisphere lead may address the Principal (16.1 rule 1 "The Principal
+    speaks only to Ren or Arthur. Shadow Cabinet output is never surfaced directly"): a director's item is refused
+    with the lead to relay to. The recipient must be the Principal's own channel (PRINCIPAL_RECIPIENTS, or the
+    queue's `principal_recipients`): a Principal-register item addressed elsewhere is refused, since the register
+    is what the gate keys on and one mislabelled field must not send external mail. The never-delegate rewrite pass
+    (16.1 rule 5; governance.never_delegate_rewrite) is applied and the rewritten text is what is stored and sent;
+    a task-shaped sentence the pass could only flag holds the item (never auto-sent) with the sentences in the note.
   * INTERNAL (director/lead/internal/system): the 8.5 step 6-7 relays are dispatches, not outbound items: they are
     recorded as their own `tasks` row (kind "relay", parent = the item's task) and returned with status "relayed";
     nothing is sent, nothing is announced, nothing is held.
@@ -25,15 +36,23 @@ Register (6.4) decides what the gate does with a draft:
 Decisions are human-only: `approve()`/`reject()` take `decided_by` from HUMAN_ACTORS (16.3 rule 3) and claim the row
 atomically (UPDATE ... WHERE status = 'held'), so two processes over the same SQLite file cannot both send. A row
 approved but not delivered (a crash between the claim and the send) stays "approved" without a "delivery" note and
-is listed by `stalled()` for `resend()`.
+is listed by `stalled()` for `resend()`. A rejected draft is a 9.4 automatic strike input: `reject()` writes the
+`strikes` row (kind "rejected-draft", as tasks/ouroboros.STRIKE_KINDS spells it). A `dual_sign_off` item (TF_OMEGA,
+8.3 "Sensitive, dual sign-off", Ren and Arthur jointly) is approvable only when its cross-check record is the other
+hemisphere lead's: both leads must have signed before the Principal sees it.
 
 Storage is the ledger only (no in-memory state that a restart would lose): approvals rows for the items, a `tasks`
-row per item (carrying the drafting engine and the audience), and a `tasks` row of kind "cross-check" (parent =
-the approval's task id) for each cross-check record. Only the Ledger's public API is used (`transaction()` for the
-conditional claims and note updates). Sending and notifying go through the Sender and Notifier protocols; tests use
-the stubs (StubSender, StubNotifier) so nothing leaves the node. The push notification is a minimal announcement
-(tier, id, persona, kind, cross-check verdict): recipient, subject, draft, reasoning and disclosure hits stay in the
-ledger row for the interface's queue view, never in ntfy's cache or the journal.
+row of kind "approval" per item that the gate itself inserts (carrying the drafting engine, the audience, the register
+and the flags; the caller's own task id, when given, is its parent_task_id, so a re-read item always finds them), and
+a `tasks` row of kind "cross-check" (parent = the approval's task id) for each cross-check record. A record attached
+by hand must name, in `task_id`, the done "cross-check" tasks row of the inference that produced it, with the same
+persona and engine (provenance: a fabricated "agree" is refused); the automatic path records the inference itself.
+Only the Ledger's public API is used (`transaction()` for the conditional claims and note updates). Sending and
+notifying go through the Sender and Notifier protocols; tests use the stubs (StubSender, StubNotifier) so nothing
+leaves the node. The push notification is a minimal announcement (tier, id, persona, kind, cross-check verdict), and
+the item handed to the Notifier is stripped the same way (no recipient, subject, draft, reasoning, disclosure or
+cross-check notes): what the ledger row holds for the interface's queue view never reaches ntfy's cache or the
+journal, whatever a concrete notifier does with its second argument.
 """
 
 from __future__ import annotations
@@ -62,7 +81,9 @@ log = logging.getLogger("atlas.approval")
 
 __all__ = [
     "HUMAN_ACTORS",
+    "PRINCIPAL_RECIPIENTS",
     "ROUTINE_KINDS",
+    "SENSITIVE_KINDS",
     "ApprovalError",
     "ApprovalItem",
     "ApprovalQueue",
@@ -88,11 +109,43 @@ STATUS_SENT = "sent"
 STATUS_RELAYED = "relayed"  # ApprovalItem status for an internal relay: a tasks row, never an approvals row
 # 16.2 routine: "Meeting scheduling, confirmations, acknowledgements. Pre-approved categories". Nothing else auto-sends.
 ROUTINE_KINDS: frozenset[str] = frozenset({"acknowledgement", "scheduling", "confirmation"})
+# 16.2 sensitive: "Legal, financial, medical, estate, security, any payment"; 16.3 rules 1, 2, 4, 5 (money, contracts,
+# DNS, the vault). An item of one of these kinds is sensitive whatever tier the caller typed.
+SENSITIVE_KINDS: frozenset[str] = frozenset(
+    {
+        "payment",
+        "transfer",
+        "invoice",
+        "contract",
+        "signature",
+        "dns",
+        "legal",
+        "medical",
+        "estate",
+        "security",
+        "vault",
+    }
+)
 # 16.3 rule 3 / 16.2 "nothing external executes until the Principal taps approve": the only actor that decides.
 HUMAN_ACTORS: frozenset[str] = frozenset({"principal"})
+# The Principal's own channel: the only recipient a PRINCIPAL-register item may name (module docstring). The pipeline
+# may widen it per queue (`principal_recipients`) with the Principal's real addresses; it is never widened from the
+# item itself.
+PRINCIPAL_RECIPIENTS: frozenset[str] = frozenset({"principal"})
 GATE_ACTOR = "gate"  # decided_by on rows the gate itself moved (routine auto-approval)
 _DELIVERY_MARK = "delivery "  # note fragment that proves a send completed
-_REDACT_RE = re.compile(r"(Bearer\s+\S+|\b(?:key|token|secret|password|apikey|api_key)=\S+)", re.IGNORECASE)
+# What a Sender's or cross-checker's exception text may carry and must not reach a ledger note, an HTTP body or the
+# journal: bearer tokens, auth headers (with their scheme word), key=value / "key": "value" credentials, and basic-auth
+# in a URL (://user:pass@host).
+_REDACT_RE = re.compile(
+    r"(Bearer\s+\S+"
+    r"|(?:Authorization|X-Atlas-Token|Cookie|Set-Cookie|Proxy-Authorization)\s*[:=]\s*(?:(?:Basic|Bearer|Digest|Token)"
+    r"\s+)?\S+"
+    r"|(?<![A-Za-z0-9_])\"?(?:key|token|secret|password|passphrase|apikey|api_key|access_token|refresh_token)\"?"
+    r"\s*[:=]\s*\"?\S+"
+    r"|://[^/\s:@]+:[^@\s]+@)",
+    re.IGNORECASE,
+)
 
 
 class ApprovalError(RuntimeError):
@@ -118,7 +171,9 @@ class SendError(ApprovalError):
 class ApprovalItem:
     """One outbound item. `reason` is the director's reasoning (16.2 sensitive: "flagged with the director's
     reasoning"); `body` the draft; `audience` sets the register (6.4); `engine` the engine that drafted it (filled
-    from the persona's default at submit when not given; the cross-check must run elsewhere, 9.2)."""
+    from the persona's default at submit when not given; the cross-check must run elsewhere, 9.2); `task_id` the
+    caller's task (the routing decision's), kept as the parent of the gate's own tasks row; `dual_sign_off` carries
+    RoutingDecision.dual_sign_off (TF_OMEGA, 8.3); `important` is the Principal's mark (9.2: cross-checked too)."""
 
     tier: str
     persona: str
@@ -130,6 +185,8 @@ class ApprovalItem:
     audience: str = "external"
     task_id: str | None = None
     engine: str | None = None
+    dual_sign_off: bool = False
+    important: bool = False
     id: int | None = None
     status: str | None = None
     register: Register | None = None
@@ -171,7 +228,11 @@ class Sender(Protocol):
 
 
 class Notifier(Protocol):
-    """Announces waiting items (16.2: "A push notification through ntfy announces items waiting")."""
+    """Announces waiting items (16.2: "A push notification through ntfy announces items waiting").
+
+    `item` is the announcement view of the item (id, tier, persona, kind, status, cross-check verdict), never the
+    full row: the gate strips recipient, subject, body, reasoning, note, disclosure and cross-check notes before the
+    call (`_notice_item`), so a concrete notifier cannot leak them whatever it does with its second argument."""
 
     def notify(self, message: str, item: ApprovalItem) -> None: ...
 
@@ -225,15 +286,41 @@ def _max_tier(a: str, b: str) -> str:
 
 def _describe_error(exc: BaseException) -> str:
     """Type name plus the first line of the message, truncated and with credentials redacted: what may go into a
-    ledger note or an HTTP error body. The full exception goes to DEBUG only."""
+    ledger note or an HTTP error body. Even the DEBUG line carries only the redacted first line, never the whole
+    exception (a DEBUG journal would otherwise hold a Sender's credential verbatim)."""
     first = (str(exc).splitlines() or [""])[0]
     first = _REDACT_RE.sub("[redacted]", first)[:200]
-    log.debug("approval gate: underlying error", exc_info=exc)
+    log.debug("approval gate: underlying error %s: %s", type(exc).__name__, first)
     return f"{type(exc).__name__}: {first}" if first else type(exc).__name__
 
 
 def _join(*parts: str | None) -> str | None:
     return "; ".join(p for p in parts if p) or None
+
+
+def _notice_item(item: ApprovalItem) -> ApprovalItem:
+    """The announcement view handed to the Notifier (module docstring): identity and tier only."""
+    cc = item.cross_check
+    return replace(
+        item,
+        recipient="",
+        subject=None,
+        body="",
+        reason="",
+        note=None,
+        disclosure=None,
+        rewrite=None,
+        cross_check=replace(cc, notes="") if cc is not None else None,
+    )
+
+
+def _other_lead(personas: PersonaRegistry, persona: str) -> str:
+    """The hemisphere lead who is not `persona`'s own (8.3 TF_OMEGA: Ren and Arthur jointly)."""
+    own = personas.lead_of(persona).key
+    for key in personas:
+        if personas.is_lead(key) and key != own:
+            return key
+    raise ApprovalError(f"no second hemisphere lead besides {own!r} in the persona registry (6.1)")
 
 
 # --- the queue ------------------------------------------------------------------------------------------------------
@@ -247,20 +334,39 @@ class ApprovalQueue:
     sensitive items; without it they are held and approve() refuses until a record is attached.
     """
 
-    def __init__(self, ledger: Ledger, sender: Sender, notifier: Notifier, *, personas: PersonaRegistry,
-                 cross_checker: CrossChecker | None = None, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        ledger: Ledger,
+        sender: Sender,
+        notifier: Notifier,
+        *,
+        personas: PersonaRegistry,
+        cross_checker: CrossChecker | None = None,
+        clock: Callable[[], float] = time.time,
+        principal_recipients: frozenset[str] = PRINCIPAL_RECIPIENTS,
+    ) -> None:
         if personas is None:  # type: ignore[unreachable]  # defensive: a caller passing None must fail loudly
-            raise ApprovalError("ApprovalQueue needs the persona registry: the Section 6.2 external-tier floor is a "
-                                "gate control, not an option (16.1 rule 3)")
+            raise ApprovalError(
+                "ApprovalQueue needs the persona registry: the Section 6.2 external-tier floor is a "
+                "gate control, not an option (16.1 rule 3)"
+            )
         if notifier is None:  # type: ignore[unreachable]
-            raise ApprovalError("ApprovalQueue needs a Notifier: 16.2 announces held items through ntfy; pass "
-                                "NullNotifier() explicitly for a context without one")
+            raise ApprovalError(
+                "ApprovalQueue needs a Notifier: 16.2 announces held items through ntfy; pass "
+                "NullNotifier() explicitly for a context without one"
+            )
         self.ledger = ledger
         self.sender = sender
         self.notifier: Notifier = notifier
         self.personas = personas
         self.cross_checker = cross_checker
         self._clock = clock
+        self.principal_recipients = frozenset(r.strip().lower() for r in principal_recipients if r.strip())
+        if not self.principal_recipients:
+            raise ApprovalError(
+                "ApprovalQueue needs at least one Principal recipient (PRINCIPAL_RECIPIENTS): a "
+                "Principal-register item must be addressable to the Principal and nobody else"
+            )
 
     # --- submit (16.2) ------------------------------------------------------------------------------------------------
 
@@ -282,20 +388,44 @@ class ApprovalQueue:
             return self._relay(item, draft.register, engine)
 
         notes: list[str] = []
-        tier = item.body and item.tier
+        tier = item.tier
         body = item.body
         rewrite: RewriteResult | None = None
         disclosure: DisclosureResult | None = None
         hold = False  # never auto-send, whatever the tier
+        # 16.2 "Sensitive: Legal, financial, medical, estate, security, any payment"; 16.3 rule 1. The gate is the
+        # control: the caller's tier on one of these kinds is a label, and the router's lexicon does not reach here.
+        if item.kind in SENSITIVE_KINDS and tier != "sensitive":
+            notes.append(f"tier raised {tier}->sensitive: kind {item.kind!r} is a 16.2 sensitive category")
+            tier = "sensitive"
         if draft.register is Register.PRINCIPAL:
+            # 16.1 rule 1: "The Principal speaks only to Ren or Arthur. Shadow Cabinet output is never surfaced
+            # directly; the hemisphere synthesises and speaks." A director's item is relayed to its lead, not sent.
+            if not self.personas.is_lead(item.persona):
+                lead = self.personas.lead_of(item.persona).key
+                raise ApprovalError(
+                    f"persona {item.persona!r} may not address the Principal: only a hemisphere lead "
+                    f"speaks to the Principal (16.1 rule 1); relay to {lead}"
+                )
+            # The register is what this gate keys on, so a PRINCIPAL item must go to the Principal and nowhere else:
+            # a mislabelled audience on an external address would otherwise skip the 6.2 floor and the disclosure
+            # check and, at routine tier, auto-send external mail (16.1 rule 3, 16.3 rule 3).
+            if item.recipient.strip().lower() not in self.principal_recipients:
+                raise ApprovalError(
+                    f"principal-register item addressed to a non-Principal recipient "
+                    f"{item.recipient!r}; the Principal's channel is "
+                    f"{sorted(self.principal_recipients)} (6.4 register, 16.1 rule 3)"
+                )
             # 16.1 rule 5: the never-delegate rewrite pass, on the code path (Appendix A: before the outbound gate).
             rewrite = never_delegate_rewrite(body, item.audience)
             body = rewrite.text
             if rewrite.rewrites:
                 notes.append(f"never-delegate: {len(rewrite.rewrites)} rewrite(s) (16.1 rule 5)")
             if rewrite.flagged:
-                notes.append(f"never-delegate: {len(rewrite.flagged)} task-shaped sentence(s) flagged for a human "
-                             f"(16.1 rule 5; held, never auto-sent): " + " | ".join(rewrite.flagged))
+                notes.append(
+                    f"never-delegate: {len(rewrite.flagged)} task-shaped sentence(s) flagged for a human "
+                    f"(16.1 rule 5; held, never auto-sent): " + " | ".join(rewrite.flagged)
+                )
                 hold = True
         else:
             # 6.2 floor: a persona never speaks externally below its declared tier.
@@ -303,39 +433,85 @@ class ApprovalQueue:
             if TIER_ORDER[floor] > TIER_ORDER[tier]:
                 notes.append(f"tier raised {tier}->{floor} (Section 6.2 floor for {item.persona})")
                 tier = floor
-            # 16.2: routine is a pre-approved category, not a label a pipeline step may attach to substance.
-            if tier == "routine" and item.kind not in ROUTINE_KINDS:
-                notes.append(f"tier raised routine->standard: kind {item.kind!r} is not a pre-approved category "
-                             f"{sorted(ROUTINE_KINDS)} (16.2)")
-                tier = "standard"
             # 16.1 rule 4: an external admission of AI nature (or the system naming itself) never auto-sends.
             disclosure = disclosure_check(body)
             if disclosure.disclosed:
                 notes.append(f"disclosure: {', '.join(disclosure.hits)} (16.1 rule 4; held, never auto-sent)")
                 hold = True
+        # 16.2: routine is a pre-approved category, not a label a pipeline step may attach to substance; the rule is
+        # the same for the Principal's register (a substantive reply to the Principal is not a confirmation either).
+        if tier == "routine" and item.kind not in ROUTINE_KINDS:
+            notes.append(
+                f"tier raised routine->standard: kind {item.kind!r} is not a pre-approved category "
+                f"{sorted(ROUTINE_KINDS)} (16.2)"
+            )
+            tier = "standard"
         if hold:
             tier = _max_tier(tier, "standard")
-        task_id = item.task_id or new_task_id()
-        if item.task_id is None:
-            self.ledger.insert_task("approval", task_id=task_id, status="queued", persona=item.persona, engine=engine,
-                                    tier=tier, payload={"kind": item.kind, "recipient": item.recipient,
-                                                        "subject": item.subject, "audience": draft.audience})
-        item = replace(item, tier=tier, body=body, task_id=task_id, engine=engine, register=draft.register,
-                       disclosure=disclosure, rewrite=rewrite)
+        # The gate's own tasks row, always (a caller's row may carry no audience or engine, or not exist): what
+        # _from_row reads back; the caller's task is the parent (8.6: "reports ... under a task ID").
+        task_id = self.ledger.insert_task(
+            "approval",
+            task_id=new_task_id(),
+            status="queued",
+            persona=item.persona,
+            engine=engine,
+            tier=tier,
+            parent_task_id=item.task_id,
+            payload={
+                "kind": item.kind,
+                "recipient": item.recipient,
+                "subject": item.subject,
+                "audience": draft.audience,
+                "register": str(draft.register),
+                "dual_sign_off": bool(item.dual_sign_off),
+                "important": bool(item.important),
+                "caller_task_id": item.task_id,
+            },
+        )
+        item = replace(
+            item,
+            tier=tier,
+            body=body,
+            task_id=task_id,
+            engine=engine,
+            register=draft.register,
+            disclosure=disclosure,
+            rewrite=rewrite,
+        )
 
         if tier == "routine" and not hold:
             return self._auto_send(item, notes)
-        # standard / sensitive (or a hold): held, cross-checked when sensitive and external, announced.
+        # standard / sensitive (or a hold): held, cross-checked when sensitive (or marked important), announced.
         approval_id = self.ledger.insert_approval(
-            task_id=task_id, tier=tier, kind=item.kind, status=STATUS_HELD, persona=item.persona,
-            recipient=item.recipient, subject=item.subject, draft=body, reasoning=item.reason or None,
-            note="; ".join(notes) or None)
+            task_id=task_id,
+            tier=tier,
+            kind=item.kind,
+            status=STATUS_HELD,
+            persona=item.persona,
+            recipient=item.recipient,
+            subject=item.subject,
+            draft=body,
+            reasoning=item.reason or None,
+            note="; ".join(notes) or None,
+        )
         item = replace(item, id=approval_id, status=STATUS_HELD, note="; ".join(notes) or None)
-        if tier == "sensitive" and draft.is_external:
+        if tier == "sensitive":
+            # 9.2 "applies the strong version automatically to the sensitive tier": every register, so a sensitive
+            # Principal-facing item (an estate or medical answer) is not stranded behind approve()'s backstop.
             item = self._run_cross_check(item)
+        elif item.important:
+            # 9.2 "... and to anything the Principal marks important."
+            item = self._run_cross_check(item, why="Principal marked important (9.2)")
         self._notify_held(item)
-        log.info("approval #%s held: tier=%s persona=%s kind=%s cross_check=%s", approval_id, tier, item.persona,
-                 item.kind, item.cross_check.verdict if item.cross_check else None)
+        log.info(
+            "approval #%s held: tier=%s persona=%s kind=%s cross_check=%s",
+            approval_id,
+            tier,
+            item.persona,
+            item.kind,
+            item.cross_check.verdict if item.cross_check else None,
+        )
         return item
 
     def _relay(self, item: ApprovalItem, reg: Register, engine: str) -> ApprovalItem:
@@ -378,13 +554,19 @@ class ApprovalQueue:
                  ref)
         return replace(item, id=approval_id, status=STATUS_AUTO_SENT, delivery_ref=ref, note=final_note)
 
-    def _run_cross_check(self, item: ApprovalItem) -> ApprovalItem:
-        """9.2 / 16.2: the strong cross-check, applied automatically to a held sensitive item."""
+    def _run_cross_check(self, item: ApprovalItem, why: str | None = None) -> ApprovalItem:
+        """9.2 / 16.2: the strong cross-check, applied automatically to a held sensitive (or important) item."""
         assert item.id is not None
+        if why:
+            note = _join(item.note, f"cross-check: {why}")
+            self._set(item.id, note=note)
+            item = replace(item, note=note)
         if self.cross_checker is None:
-            note = _join(item.note, "cross-check: pending (no cross-checker configured; approve() refuses until "
-                                    "attach_cross_check(), 9.2)")
-            log.warning("approval #%s is sensitive and no cross-checker is configured (9.2, 16.2)", item.id)
+            note = _join(
+                item.note,
+                "cross-check: pending (no cross-checker configured; approve() refuses until attach_cross_check(), 9.2)",
+            )
+            log.warning("approval #%s needs a cross-check and no cross-checker is configured (9.2, 16.2)", item.id)
             self._set(item.id, note=note)
             return replace(item, note=note)
         try:
@@ -395,17 +577,29 @@ class ApprovalQueue:
             log.error("approval #%s: automatic cross-check failed: %s", item.id, err)
             self._set(item.id, note=note)
             return replace(item, note=note)
-        return self.attach_cross_check(item.id, record, notify=False)
+        # The gate ran the inference itself, so it vouches for the record (provenance: the automatic path). A record
+        # that breaks the 9.2 rules (same persona, same engine) is refused like a failed check: held, no record,
+        # approve() refuses; the item itself is never lost to the refusal.
+        try:
+            attached = self._attach(item.id, record, notify=False, automatic=True)
+        except ApprovalError as exc:
+            note = _join(item.note, f"cross-check refused: {exc}; approve() refuses until one is attached (9.2)")
+            log.error("approval #%s: automatic cross-check record refused: %s", item.id, exc)
+            self._set(item.id, note=note)
+            return replace(item, note=note)
+        # Keep the submitted item's register, rewrite and disclosure (the row re-read carries only what is stored).
+        return replace(item, cross_check=attached.cross_check, note=attached.note)
 
     def _notify_held(self, item: ApprovalItem, prefix: str = "") -> None:
         # Minimal on purpose (16.2 "announces items waiting"): ntfy caches and forwards this to a phone, so no
-        # recipient, subject, draft head, reasoning or disclosure text leaves the ledger.
+        # recipient, subject, draft head, reasoning or disclosure text leaves the ledger; the item handed over is the
+        # announcement view (_notice_item), not the row.
         msg = f"{prefix}[{item.tier}] approval #{item.id} waiting: {item.persona} ({item.kind})"
         if item.cross_check is not None:
             cc = item.cross_check
             msg += f" | cross-check: {cc.persona}@{cc.engine} says {cc.verdict}"
         try:
-            self.notifier.notify(msg, item)
+            self.notifier.notify(msg, _notice_item(item))
         except Exception as exc:  # a notifier outage must not lose the held item (it is in the ledger)
             log.error("notifier failed for approval #%s: %s", item.id, _describe_error(exc))
 
@@ -425,8 +619,19 @@ class ApprovalQueue:
         if item.status != STATUS_HELD:
             raise NotPending(f"approval #{approval_id} is {item.status!r}, not held")
         if item.tier == "sensitive" and item.cross_check is None:
-            raise CrossCheckRequired(f"approval #{approval_id} is sensitive tier and has no cross-check record "
-                                     f"(16.2: strong cross-check applied before the Principal approves)")
+            raise CrossCheckRequired(
+                f"approval #{approval_id} is sensitive tier and has no cross-check record "
+                f"(16.2: strong cross-check applied before the Principal approves)"
+            )
+        if item.dual_sign_off:
+            # 8.3 TF_OMEGA "Sensitive, dual sign-off", Ren and Arthur jointly: the record must be the other lead's.
+            other = _other_lead(self.personas, item.persona)
+            if item.cross_check is None or item.cross_check.persona != other:
+                have = item.cross_check.persona if item.cross_check else None
+                raise ApprovalError(
+                    f"approval #{approval_id}: TF_OMEGA needs both leads (8.3 dual sign-off): the "
+                    f"cross-check must be {other}'s, not {have!r}"
+                )
         decision_note = _join(item.note, note, f"approved by {decided_by}") or ""
         if not self._claim(approval_id, STATUS_HELD, STATUS_APPROVED, decided_by=decided_by, note=decision_note):
             raise NotPending(f"approval #{approval_id} was decided concurrently; it is no longer held")
@@ -457,7 +662,17 @@ class ApprovalQueue:
             raise NotPending(f"approval #{approval_id} was decided concurrently; it is no longer held")
         if item.task_id:
             self.ledger.update_task(item.task_id, status="cancelled", error=f"rejected: {note or ''}".strip())
-        log.info("approval #%s rejected by %s", approval_id, decided_by)
+        # 9.4 "Strike input ... automatic: ... rejected draft"; 8.6 "subject to the same tiered approval and Ouroboros
+        # logging". The gate is the only component that knows a draft was rejected, so it writes the strike. The kind
+        # is the one tasks/ouroboros.STRIKE_KINDS spells (not imported: that module pulls Celery and the memory store).
+        self.ledger.insert_strike(
+            task_id=item.task_id,
+            kind="rejected-draft",
+            source="approval-gate",
+            description=f"approval #{approval_id} ({item.persona}, {item.kind}, {item.tier}) rejected by {decided_by}: "
+            f"{note or ''}".rstrip(": "),
+        )
+        log.info("approval #%s rejected by %s (strike: rejected-draft, 9.4)", approval_id, decided_by)
         return replace(item, status=STATUS_REJECTED, note=final_note, decided_by=decided_by)
 
     def resend(self, approval_id: int, *, decided_by: str) -> ApprovalItem:
@@ -480,23 +695,65 @@ class ApprovalQueue:
         """Attach the strong cross-check (9.2) to a held item: a tasks row of kind "cross-check", the verdict in the
         approval's note, and (by default) a fresh announcement carrying the verdict.
 
-        Refused when the record is not a second persona on a different engine (9.2).
+        Refused when the record is not a second persona on a different engine (9.2), or when it has no provenance:
+        `record.task_id` must name the done "cross-check" tasks row of the inference that produced it, with the same
+        persona and engine, so a fabricated verdict cannot satisfy approve()'s backstop (16.2 "strong cross-check").
         """
+        return self._attach(approval_id, record, notify=notify, automatic=False)
+
+    def _attach(self, approval_id: int, record: CrossCheckRecord, *, notify: bool, automatic: bool) -> ApprovalItem:
         item = self.get(approval_id)
         if item.status != STATUS_HELD:
             raise NotPending(f"approval #{approval_id} is {item.status!r}, not held")
         if not item.task_id:
             raise ApprovalError(f"approval #{approval_id} has no task id; cannot attach a cross-check")
         if record.persona == item.persona:
-            raise ApprovalError(f"cross-check for approval #{approval_id} must be a second persona, not the drafting "
-                                f"persona {item.persona!r} (9.2)")
+            raise ApprovalError(
+                f"cross-check for approval #{approval_id} must be a second persona, not the drafting "
+                f"persona {item.persona!r} (9.2)"
+            )
         if item.engine and record.engine == item.engine:
-            raise ApprovalError(f"cross-check for approval #{approval_id} must run on a different engine than the "
-                                f"draft's {item.engine!r} (9.2 strong version: an engine swap)")
+            raise ApprovalError(
+                f"cross-check for approval #{approval_id} must run on a different engine than the "
+                f"draft's {item.engine!r} (9.2 strong version: an engine swap)"
+            )
+        inference_task: str | None = None
+        if record.task_id is not None:
+            prov = self.ledger.get_task(record.task_id)
+            if (
+                prov is None
+                or prov.get("kind") != "cross-check"
+                or prov.get("status") != "done"
+                or (prov.get("engine") or "") != record.engine
+                or (prov.get("persona") or "") != record.persona
+            ):
+                raise ApprovalError(
+                    f"cross-check for approval #{approval_id} names task {record.task_id!r}, which is "
+                    f"not a done 'cross-check' task by {record.persona}@{record.engine} (9.2 "
+                    f"provenance: the record must come from an inference that ran)"
+                )
+            inference_task = record.task_id
+        elif not automatic:
+            raise ApprovalError(
+                f"cross-check for approval #{approval_id} has no task_id: a record attached by hand "
+                f"must name the done 'cross-check' tasks row of the inference that produced it (9.2 "
+                f"provenance); only the gate's own automatic cross-check may omit it"
+            )
         cc_task = self.ledger.insert_task(
-            "cross-check", task_id=record.task_id, status="done", persona=record.persona, engine=record.engine,
-            tier=item.tier, parent_task_id=item.task_id,
-            payload={"approval_id": approval_id, "verdict": record.verdict, "notes": record.notes})
+            "cross-check",
+            status="done",
+            persona=record.persona,
+            engine=record.engine,
+            tier=item.tier,
+            parent_task_id=item.task_id,
+            payload={
+                "approval_id": approval_id,
+                "verdict": record.verdict,
+                "notes": record.notes,
+                "inference_task_id": inference_task,
+                "source": "gate" if automatic else "attached",
+            },
+        )
         stored = replace(record, task_id=cc_task)
         summary = f"cross-check: {record.persona}@{record.engine} says {record.verdict}"
         if record.notes:
@@ -504,8 +761,13 @@ class ApprovalQueue:
         note = _join(item.note, summary)
         self._set(approval_id, note=note)
         item = replace(item, cross_check=stored, note=note)
-        log.info("approval #%s cross-check attached: %s on %s says %s", approval_id, record.persona, record.engine,
-                 record.verdict)
+        log.info(
+            "approval #%s cross-check attached: %s on %s says %s",
+            approval_id,
+            record.persona,
+            record.engine,
+            record.verdict,
+        )
         if notify:
             self._notify_held(item)
         return item
@@ -573,11 +835,24 @@ class ApprovalQueue:
         payload: dict[str, Any] = {}
         if task and task.get("payload_json"):
             payload = json.loads(task["payload_json"])
+        reg = payload.get("register")
         return ApprovalItem(
-            tier=row["tier"], persona=row.get("persona") or "", recipient=row.get("recipient") or "",
-            body=row.get("draft") or "", reason=row.get("reasoning") or "", kind=row.get("kind") or "email",
-            subject=row.get("subject"), audience=payload.get("audience") or "external", task_id=task_id,
-            engine=(task or {}).get("engine"), id=approval_id, status=row.get("status"),
-            note=row.get("note"), decided_by=row.get("decided_by"),
+            register=Register(reg) if reg in {r.value for r in Register} else None,
+            tier=row["tier"],
+            persona=row.get("persona") or "",
+            recipient=row.get("recipient") or "",
+            body=row.get("draft") or "",
+            reason=row.get("reasoning") or "",
+            kind=row.get("kind") or "email",
+            subject=row.get("subject"),
+            audience=payload.get("audience") or "external",
+            task_id=task_id,
+            engine=(task or {}).get("engine"),
+            dual_sign_off=bool(payload.get("dual_sign_off")),
+            important=bool(payload.get("important")),
+            id=approval_id,
+            status=row.get("status"),
+            note=row.get("note"),
+            decided_by=row.get("decided_by"),
             cross_check=self._cross_check_for(task_id, approval_id),
         )

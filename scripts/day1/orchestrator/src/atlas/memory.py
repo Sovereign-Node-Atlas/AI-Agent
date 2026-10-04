@@ -10,8 +10,11 @@ Rules this module is the code path for (rule §7.7: code, not prompt instruction
     frozen after that is SPOOLED to a JSONL file under `spool_dir` (MEMORY_SPOOL_DIR, default
     /srv/atlas/data/orchestrator/spool) and replayed by `replay_spool()` from the AEGIS thaw task ("then writes
     resume", 9.5 Freeze row; fix round: a nightly backup runs minutes to hours and no chat turn, scar or BLUF is lost
-    to it). With no spool configured (tests) the write raises MemoryFrozen as before. A spooled write has already
-    passed the hemisphere and vault checks; the replay commits it as it was.
+    to it). The graph layer spools the same way (fix round 2: `graph-insert` / `graph-delete` ops, replayed through
+    LightRAGStore). With no spool configured (tests) the write raises MemoryFrozen as before. A spooled write has
+    already passed the hemisphere and vault checks; the replay commits it as it was. Spool files hold memory CONTENT
+    in plaintext, so the directory is 0700 and every file is created 0600 (CONVENTIONS.md §2), and they sit in
+    restic's include set exactly like the Chroma persist dir they are destined for.
   * Telemetry (rule §7.1, 12.1): the chromadb client is built with Settings(anonymized_telemetry=False) so no PostHog
     beacon is attempted on client start (chromadb-client 1.5.9 defaults it on; VERIFIED in the fix-round review).
   * Embeddings come from the resident bge-m3 llama-server (EMBEDDING_URL, /v1/embeddings; gguf-models.md §9) and are
@@ -41,6 +44,7 @@ import socket
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,10 +61,13 @@ COLLECTION_HEMISPHERES: dict[str, frozenset[str]] = {
     "documents_corporate": frozenset({"corporate"}),
     "estate": frozenset({"estate"}),
     "documents_estate": frozenset({"estate"}),
-    # Scars are tagged per persona and domain (9.4) and injected before any task in either hemisphere.
+    # Scars are tagged per persona and domain (9.4) and injected before any task in either hemisphere; every scar
+    # document carries `hemisphere`, and tasks.ouroboros.retrieve_scars filters on it (fix round 2).
     "scars": frozenset({"corporate", "estate"}),
-    # Sentinel output sits under Arthur (9.3) but its BLUF entries concern both hemispheres (markets are Silas's).
-    "sentinel": frozenset({"corporate", "estate"}),
+    # Sentinel sits under Arthur (9.3, C12: "not Ren"), so its collection is ESTATE-bound like every other collection
+    # ("each collection is bound to a hemisphere", 10.1; fix round 2). Silas owns the market anomalies as a FIELD of
+    # the BLUF (owners), not as a Ren-side read: a corporate dispatch never reads Sentinel output.
+    "sentinel": frozenset({"estate"}),
 }
 DEFAULT_FREEZE_FLAG = "/run/atlas/aegis-freeze"
 DEFAULT_GRAPH_INDEX = "atlas-graph-index.sqlite3"
@@ -412,13 +419,11 @@ class MemoryStore:
         assert self.spool_dir is not None
         with self._lock:
             if self._spool_file is None:
-                self.spool_dir.mkdir(parents=True, exist_ok=True)
+                _private_dir(self.spool_dir)
                 name = f"spool-{socket.gethostname()}-{os.getpid()}-{int(self._clock() * 1000)}.jsonl"
                 self._spool_file = self.spool_dir / name
             line = json.dumps({**op, "spooled_at": self._clock()}, ensure_ascii=False, default=str)
-            with self._spool_file.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-            os.chmod(self._spool_file, 0o600)
+            _append_private(self._spool_file, line + "\n")
         log.warning(
             "memory %s SPOOLED (AEGIS freeze): collection=%s docs=%d -> %s (replayed at thaw, Section 9.5)",
             op.get("op"),
@@ -468,7 +473,7 @@ class MemoryStore:
                         log.error("spool replay: %s", exc)
             if failed:
                 keep = f.with_name(f.name.replace(".jsonl", ".failed.jsonl"))
-                keep.write_text("\n".join(failed) + "\n", encoding="utf-8")
+                _append_private(keep, "\n".join(failed) + "\n")  # content stays private (0600), kept for the operator
                 out.setdefault("failed_files", []).append(str(keep))
             work.unlink()
             out["files"].append(str(f))
@@ -487,6 +492,10 @@ class MemoryStore:
             )
         elif kind == "delete":
             self._commit_delete(str(op["collection"]), list(op["ids"]))
+        elif kind in ("graph-insert", "graph-delete"):
+            if self.graph is None:
+                raise MemoryStoreError(f"spooled {kind} but this store has no graph layer to replay it into")
+            self.graph.commit_spooled(op)
         else:
             raise MemoryStoreError(f"unknown spooled op {kind!r}")
 
@@ -530,9 +539,14 @@ class MemoryStore:
                 if name not in COLLECTION_HEMISPHERES:
                     raise MemoryStoreError(f"unknown collection {name!r}")
                 try:
-                    # embedding_function=None: vectors are always supplied by us (UNVERIFIED that chromadb-client 1.5.9
-                    # never instantiates its default ONNX function when None is passed; a network attempt would be
-                    # refused by the allowlist and surface here as an error, never as a silent download).
+                    # embedding_function=None: vectors are ALWAYS supplied by this module (every add/upsert/query call
+                    # carries `embeddings`; tests/test_vault_tagging.py asserts it). UNVERIFIED: that chromadb-client
+                    # 1.5.9 records "no embedding function" for None and raises on a documents-only call instead of
+                    # instantiating its default ONNX function (whose model download the allowlist would deny, so the
+                    # failure would be loud either way). A custom EmbeddingFunction subclass was considered and not
+                    # adopted: its persisted-config interface (name/get_config/build_from_config) is UNVERIFIED for
+                    # 1.5.9 and a mismatch would break collection creation at Phase 2 step 4 (rule §7.4: do not
+                    # automate what may fail).
                     col = self.backend.get_or_create_collection(name, embedding_function=None)
                 except TypeError:
                     col = self.backend.get_or_create_collection(name)
@@ -579,7 +593,13 @@ class MemoryStore:
                 m.setdefault("session_id", session_id)
             m = {k: v for k, v in m.items() if isinstance(v, (str, int, float, bool))}  # Chroma metadata scalars only
             metas.append(m)
-        out_ids = list(ids) if ids is not None else [f"{collection}-{int(now * 1000)}-{i}" for i in range(len(docs))]
+        # Generated ids carry a random suffix (fix round 2): the orchestrator and the gpu worker write to the same
+        # collection within one millisecond, and Chroma refuses `add` on an existing id (the turn would be lost).
+        out_ids = (
+            list(ids)
+            if ids is not None
+            else [f"{collection}-{int(now * 1000)}-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(docs))]
+        )
         if len(out_ids) != len(docs):
             raise MemoryStoreError(f"{len(out_ids)} ids for {len(docs)} documents")
         if not self._wait_thaw():
@@ -672,6 +692,22 @@ class MemoryStore:
             return False
 
 
+def _private_dir(path: Path) -> None:
+    """mkdir -p with mode 0700 whatever the umask; the spool holds memory content in plaintext (CONVENTIONS.md §2)."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+
+
+def _append_private(path: Path, text: str) -> None:
+    """Append to a file created 0600 (no 0644 window between create and chmod)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+
+
 def _hits(res: Mapping[str, Any], *, nested: bool) -> list[Hit]:
     ids = res.get("ids") or []
     docs = res.get("documents") or []
@@ -735,9 +771,14 @@ class LightRAGStore:
 
     One LightRAG instance per hemisphere (`workspace=`), built lazily; `rag_factory(hemisphere)` injects a double.
     LLM calls go to the orchestrator's internal OpenAI-shaped endpoint (ORCH_URL/internal/v1) on the resident router
-    model (R6: extraction on Eleanor's model); that model is outside the Engine Arbiter's ledger (4.1), so the call
-    takes no lock but waits while a weight-bearing generation runs (atlas.api._generation_lock, 9.7 C15).
-    Embeddings go straight to the resident bge-m3 server.
+    model (R6: extraction on Eleanor's model); every such call holds the orchestrator's ONE generation slot like any
+    weight-bearing generation (atlas.api.GenerationSlot, 4.2 rule 3, 9.7 C15), so an extraction never runs beside a
+    chat generation and a chat queues behind an extraction in FIFO order. Embeddings go straight to the resident
+    bge-m3 server.
+
+    AEGIS freeze (9.5, fix round 2): an insert or delete during the freeze waits `freeze_wait_s`, then is SPOOLED to
+    `spool_dir` (the same directory as MemoryStore's; ops `graph-insert` / `graph-delete`) and replayed by
+    MemoryStore.replay_spool through `commit_spooled` at thaw. With no spool_dir it raises MemoryFrozen after the wait.
 
     LightRAG 1.5.7 API (services-tools.md §2.2 verified `openai_complete_if_cache`, `initialize_storages` and the
     env keys; the fix-round wheel review confirmed the rest): `LightRAG(working_dir=, workspace=, llm_model_func=,
@@ -756,10 +797,13 @@ class LightRAGStore:
         embedding_dim: int,
         sessions: SessionTags | None = None,
         freeze_flag: str | Path | None = DEFAULT_FREEZE_FLAG,
+        freeze_wait_s: float = 120.0,
+        spool_dir: str | Path | None = None,
         index_path: str | Path | None = None,
         rag_factory: Callable[[str], Any] | None = None,
         tiktoken_cache_dir: str | Path | None = None,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.working_dir = Path(working_dir)
         self.llm_base_url = llm_base_url.rstrip("/")
@@ -769,12 +813,16 @@ class LightRAGStore:
         self.embedding_dim = embedding_dim
         self.sessions = sessions or SessionTags()
         self.freeze_flag = Path(freeze_flag) if freeze_flag else None
+        self.freeze_wait_s = freeze_wait_s
+        self.spool_dir = Path(spool_dir) if spool_dir else None
+        self._spool_file: Path | None = None
         self.index_path = Path(index_path) if index_path else self.working_dir / DEFAULT_GRAPH_INDEX
         self._rag_factory = rag_factory
         self.tiktoken_cache_dir = Path(tiktoken_cache_dir) if tiktoken_cache_dir else None
         self._rags: dict[str, Any] = {}
         self._loop: _LoopThread | None = None
         self._clock = clock
+        self._sleep = sleep
         self._lock = threading.RLock()
         self._index_ready = False
 
@@ -833,9 +881,11 @@ class LightRAGStore:
         f = tiktoken_cache_file(cache_dir)
         if not f.is_file():
             raise MemoryStoreError(
-                f"tiktoken table cl100k_base is not cached at {f}; seed it once through the proxy with: "
-                f"TIKTOKEN_CACHE_DIR={cache_dir} python -c 'import tiktoken; tiktoken.get_encoding(\"cl100k_base\")' "
-                "(phase2/04-memory.sh does this); the graph refuses to start rather than fetch it at run time"
+                f"tiktoken table cl100k_base is not cached at {f}. The table is seeded by phase2/04-memory.sh ONLY "
+                "after the Principal adds openaipublic.blob.core.windows.net to config/allowlist.txt under a "
+                "'build-time, one-time' group (16.3 item 6: the allowlist is the Principal's to change) and the proxy "
+                "is re-rendered; config/allowlist.txt does not carry that host today. Never fetched at run time: the "
+                "graph refuses to start instead"
             )
         os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(cache_dir))
 
@@ -909,9 +959,55 @@ class LightRAGStore:
         if loop is not None:
             loop.stop()
 
-    def _wait_thaw(self) -> None:
-        if self.freeze_flag is not None and self.freeze_flag.exists():
-            raise MemoryFrozen(f"AEGIS freeze flag {self.freeze_flag} present; graph writes are refused (Section 9.5)")
+    def is_frozen(self) -> bool:
+        return self.freeze_flag is not None and self.freeze_flag.exists()
+
+    def _wait_thaw(self) -> bool:
+        """Mirror of MemoryStore._wait_thaw: True = write now; False = still frozen, spool it; MemoryFrozen when
+        still frozen and there is no spool."""
+        if not self.is_frozen():
+            return True
+        deadline = self._clock() + self.freeze_wait_s
+        log.info("graph write waits: AEGIS freeze flag %s present (Section 9.5)", self.freeze_flag)
+        while self.is_frozen():
+            if self._clock() >= deadline:
+                if self.spool_dir is not None:
+                    return False
+                raise MemoryFrozen(
+                    f"AEGIS freeze flag {self.freeze_flag} still present after {self.freeze_wait_s:.0f}s and no "
+                    "spool directory is configured; the graph write is refused (Section 9.5)"
+                )
+            self._sleep(1.0)
+        return True
+
+    def _spool(self, op: dict[str, Any]) -> None:
+        assert self.spool_dir is not None
+        with self._lock:
+            if self._spool_file is None:
+                _private_dir(self.spool_dir)
+                name = f"spool-graph-{socket.gethostname()}-{os.getpid()}-{int(self._clock() * 1000)}.jsonl"
+                self._spool_file = self.spool_dir / name
+            _append_private(self._spool_file, json.dumps({**op, "spooled_at": self._clock()}, default=str) + "\n")
+        log.warning(
+            "graph %s SPOOLED (AEGIS freeze): doc=%s -> %s (replayed at thaw)", op["op"], op["doc_id"], self._spool_file
+        )
+
+    def commit_spooled(self, op: Mapping[str, Any]) -> None:
+        """Replay one spooled graph op (called by MemoryStore._commit from replay_spool; the flag is already down)."""
+        kind = op.get("op")
+        if kind == "graph-insert":
+            self._commit_insert(
+                str(op["text"]),
+                doc_id=str(op["doc_id"]),
+                hemisphere=str(op["hemisphere"]),
+                metadata=dict(op.get("metadata") or {}),
+                temporal=bool(op.get("temporal")),
+                ttl_hours=float(op["ttl_hours"]) if op.get("ttl_hours") is not None else None,
+            )
+        elif kind == "graph-delete":
+            self._commit_delete(str(op["doc_id"]))
+        else:
+            raise MemoryStoreError(f"unknown spooled graph op {kind!r}")
 
     # --- API -------------------------------------------------------------------------------------------------------
 
@@ -936,7 +1032,36 @@ class LightRAGStore:
                 "graph insert DROPPED: doc=%s session=%s reason=vault-tagged (Section 10.5)", doc_id, session_id
             )
             return WriteResult(written=False, dropped=True, reason="session is vault-tagged (Section 10.5)")
-        self._wait_thaw()
+        if not self._wait_thaw():
+            self._spool(
+                {
+                    "op": "graph-insert",
+                    "text": text,
+                    "doc_id": doc_id,
+                    "hemisphere": hemisphere,
+                    "metadata": dict(metadata or {}),
+                    "temporal": temporal,
+                    "ttl_hours": ttl_hours,
+                    "session_id": session_id,
+                }
+            )
+            return WriteResult(
+                written=False, spooled=True, reason="AEGIS freeze: spooled, committed at thaw (Section 9.5)"
+            )
+        return self._commit_insert(
+            text, doc_id=doc_id, hemisphere=hemisphere, metadata=metadata, temporal=temporal, ttl_hours=ttl_hours
+        )
+
+    def _commit_insert(
+        self,
+        text: str,
+        *,
+        doc_id: str,
+        hemisphere: str,
+        metadata: Mapping[str, Any] | None,
+        temporal: bool,
+        ttl_hours: float | None,
+    ) -> WriteResult:
         rag = self.rag(hemisphere)
         self._run(rag.ainsert(text, ids=[doc_id]))
         now = self._clock()
@@ -971,8 +1096,15 @@ class LightRAGStore:
         result = self._run(rag.aquery(question, param=param) if param is not None else rag.aquery(question))
         return str(result)
 
-    def delete_document(self, doc_id: str) -> None:
-        self._wait_thaw()
+    def delete_document(self, doc_id: str) -> bool:
+        """True when deleted now; False when spooled for the thaw (the index row stays until the replay)."""
+        if not self._wait_thaw():
+            self._spool({"op": "graph-delete", "doc_id": doc_id})
+            return False
+        self._commit_delete(doc_id)
+        return True
+
+    def _commit_delete(self, doc_id: str) -> None:
         hemisphere = self.hemisphere_of(doc_id)
         if hemisphere is None:
             raise MemoryStoreError(f"graph document {doc_id!r} is not in the index; which hemisphere holds it?")
@@ -1047,9 +1179,10 @@ def build_memory_store(
         )
     except Exception as exc:
         raise MemoryStoreError(f"ChromaDB client for {chroma_url} could not be created: {exc}") from exc
-    sessions = sessions or SessionTags(env.get("VAULT_SESSION_FILE") or "/run/atlas/vault-sessions.json")
+    sessions = sessions or SessionTags.from_env(env)
     embed = llama_embedding_fn(embedding_url, env.get("EMBEDDING_MODEL") or "embed-bge-m3")
     freeze_flag = env.get("AEGIS_FREEZE_FLAG") or DEFAULT_FREEZE_FLAG
+    spool_dir = env.get("MEMORY_SPOOL_DIR") or DEFAULT_SPOOL_DIR
     graph: LightRAGStore | None = None
     if with_graph and env.get("LIGHTRAG_WORKING_DIR"):
         try:
@@ -1066,13 +1199,7 @@ def build_memory_store(
             embedding_dim=dim,
             sessions=sessions,
             freeze_flag=freeze_flag,
+            spool_dir=spool_dir,
             tiktoken_cache_dir=env.get("TIKTOKEN_CACHE_DIR") or None,
         )
-    return MemoryStore(
-        backend,
-        embed,
-        sessions=sessions,
-        freeze_flag=freeze_flag,
-        graph=graph,
-        spool_dir=env.get("MEMORY_SPOOL_DIR") or DEFAULT_SPOOL_DIR,
-    )
+    return MemoryStore(backend, embed, sessions=sessions, freeze_flag=freeze_flag, graph=graph, spool_dir=spool_dir)

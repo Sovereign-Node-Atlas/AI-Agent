@@ -1,12 +1,15 @@
 """The orchestrator API with TestClient: /v1/models lists three; a chat completion streams through the REAL router
 (stub classifier), the REAL prompt builder, the REAL Arbiter over stub controller/probe and a StubLlama; the approval
 flow runs the REAL ApprovalQueue over StubSender; vault, strike and arbiter endpoints; the admin token and the
-loopback rule; the never-delegate pass; the Phase 3 load-test contract (/arbiter/load, engine-keyed chat). No live
-service."""
+loopback rule; the never-delegate pass; the Phase 3 load-test contract (/arbiter/load, engine-keyed generation on
+/internal only); the one generation slot shared by resident and weight-bearing models; the hemisphere scope of scars;
+Open WebUI task calls; Deep Think on the gpu queue. No live service."""
 
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +17,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from atlas import vault as vault_mod
-from atlas.api import ADMIN_TOKEN_HEADER, AppDeps, NoChannelSender, build_app, history_has_vault_prefix
+from atlas.api import (
+    ADMIN_TOKEN_HEADER,
+    CHAT_TURN_TTL_HOURS,
+    AppDeps,
+    NoChannelSender,
+    build_app,
+    history_has_vault_prefix,
+    is_owui_task_call,
+)
 from atlas.approval import ApprovalQueue, StubNotifier, StubSender
 from atlas.config import load_config
 from atlas.ledger import Ledger
@@ -31,6 +42,7 @@ COMMAND_OVERRIDES = {
     "[EXECUTE AEGIS BACKUP]": "aegis",
     "[VAULT]": "vault-session",
     "[DEEP THINK:QUICK]": "deep-think:quick",
+    "[DEEP THINK:STANDARD]": "deep-think:standard",
 }
 
 
@@ -61,6 +73,12 @@ def harness(config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     router = Router(config, StubClassifier(classify), ledger, personas=personas)
     sender, notifier = StubSender(), StubNotifier()
     approval = ApprovalQueue(ledger, sender, notifier, personas=personas)
+    enqueued: list[tuple[str, dict[str, Any]]] = []
+
+    def enqueue(name: str, kw: dict[str, Any]) -> str:
+        enqueued.append((name, kw))
+        return "celery-task-1"
+
     deps = AppDeps(
         config=config,
         ledger=ledger,
@@ -74,13 +92,14 @@ def harness(config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         memory=memory,
         load_wait_s=5.0,
         generation_wait_s=5.0,
-        enqueue=lambda name, kw: "celery-task-1",
+        enqueue=enqueue,
         trusted_hosts=frozenset({"127.0.0.1", "::1", "testclient"}),  # TestClient's client host
     )
     app = build_app(deps)
     return {
         "client": TestClient(app),
         "deps": deps,
+        "enqueued": enqueued,
         "ledger": ledger,
         "arbiter": arbiter,
         "controller": controller,
@@ -120,6 +139,10 @@ def test_models_lists_atlas_ren_arthur(harness: dict[str, Any]) -> None:
     assert client.get("/health").status_code == 200
     assert _chat(client, "x", model="gpt-4").status_code == 404
     assert _chat(client, "x", model="gpt-4").json()["detail"].startswith("model 'gpt-4' is not served")
+    # An engine key is NOT served on the public route (fix round 2): /internal, loopback only, is the Phase 3 path.
+    r = _chat(client, "x", model="gpt-oss-120b")
+    assert r.status_code == 404 and "/internal/v1/chat/completions" in r.json()["detail"]
+    assert harness["arbiter"].resident == {} and harness["llama"].made == []
 
 
 # --- chat -------------------------------------------------------------------------------------------------------------
@@ -160,8 +183,12 @@ def test_chat_streams_sse_through_router_prompt_arbiter_and_llama(harness: dict[
     row = harness["ledger"].get_task(task_id)
     assert row["status"] == "done" and row["engine"] == "gpt-oss-120b" and row["persona"] == "ren"
     assert harness["ledger"].list_routing_decisions(task_id=task_id)
-    # The exchange was remembered in the corporate collection (not vault-tagged).
-    assert harness["chroma"].collections["corporate"].count() == 1
+    # The exchange was remembered in the corporate collection (not vault-tagged), temporal with D9's 90-day life.
+    rows = harness["chroma"].collections["corporate"].rows
+    assert len(rows) == 1
+    (_doc, meta, _vec) = next(iter(rows.values()))
+    assert meta["kind"] == "chat-turn" and meta["temporal"] is True
+    assert abs((meta["expires_at"] - meta["ts"]) - CHAT_TURN_TTL_HOURS * 3600) < 5 and CHAT_TURN_TTL_HOURS == 24 * 90
 
 
 def test_chat_non_stream_returns_one_completion(harness: dict[str, Any]) -> None:
@@ -191,7 +218,8 @@ def test_ren_and_arthur_force_the_hemisphere_and_hard_rules_win(harness: dict[st
 
 def test_model_picker_ren_cannot_bypass_the_privacy_membrane(harness: dict[str, Any]) -> None:
     """7.2 rule 1 over the UI model picker: `model=ren` + a hard keyword goes to Arthur, the Principal is told why,
-    and the overruled routing is a 9.4 strike."""
+    and the hit is LOGGED (the routing decision) but is no 9.4 strike (fix round 2: the hard rule doing its job is not
+    an error and would only swell the scar pile)."""
     client: TestClient = harness["client"]
     r = _chat(client, "my medical results came back", model="ren")
     assert r.status_code == 200, r.text
@@ -201,8 +229,10 @@ def test_model_picker_ren_cannot_bypass_the_privacy_membrane(harness: dict[str, 
     assert "overruled-by-hard-rule:medical" in head["reason"]
     text = r.json()["choices"][0]["message"]["content"]
     assert text.startswith("[ATLAS] Routed to Arthur") and "'medical'" in text and "Stub answer" in text
-    strikes = harness["ledger"].list_strikes(task_id=head["task_id"])
-    assert len(strikes) == 1 and strikes[0]["kind"] == "overridden-routing"
+    assert harness["ledger"].list_strikes(task_id=head["task_id"]) == []
+    decisions = harness["ledger"].list_routing_decisions(task_id=head["task_id"])
+    assert decisions and any("overruled-by-hard-rule" in json.dumps(d) for d in decisions)
+    assert "scars" not in harness["chroma"].collections or harness["chroma"].collections["scars"].count() == 0
     # The turn remembered under the ESTATE hemisphere (Arthur's), never corporate.
     cols = harness["chroma"].collections
     assert cols["estate"].count() == 1 and ("corporate" not in cols or cols["corporate"].count() == 0)
@@ -216,11 +246,21 @@ def test_vault_tagged_session_is_not_remembered(harness: dict[str, Any]) -> None
     cols = harness["chroma"].collections
     assert "estate" not in cols or cols["estate"].count() == 0  # retrieval may create it; the write never lands
     assert harness["deps"].memory.dropped[-1]["session_id"] == "chat-vault"
-    # The [VAULT] prefix from the filter does the same through the router's command.
+    # The [VAULT] prefix from the filter does the same through the router's command, and the message itself is still
+    # answered (fix round 2: the tag is the rule, not the loss of the first vault-tagged message).
+    made_before = len(harness["llama"].made)
     r = _chat(client, "[VAULT] open the estate papers", atlas_session="chat-2", atlas_override="[VAULT]")
-    assert "vault-tagged" in r.json()["choices"][0]["message"]["content"]
+    text = r.json()["choices"][0]["message"]["content"]
+    assert text.startswith("[ATLAS] This session is now vault-tagged") and "Stub answer" in text
     assert r.json()["atlas"]["command"] == "vault-session" and r.json()["atlas"]["persona"] == "arthur"
     assert harness["sessions"].is_vault("chat-2")
+    assert len(harness["llama"].made) == made_before + 1
+    assert harness["llama"].made[-1].requests[0]["messages"][-1]["content"] == "open the estate papers"
+    assert harness["deps"].memory.dropped[-1]["session_id"] == "chat-2"  # tagged BEFORE the turn's memory write
+    # An empty body gets the notice alone: nothing is dispatched.
+    r = _chat(client, "[VAULT]", atlas_session="chat-3")
+    assert "vault-tagged" in r.json()["choices"][0]["message"]["content"]
+    assert len(harness["llama"].made) == made_before + 1 and harness["sessions"].is_vault("chat-3")
 
 
 def test_vault_prefix_earlier_in_the_history_tags_the_session(harness: dict[str, Any]) -> None:
@@ -350,10 +390,16 @@ def test_never_delegate_pass_rewrites_the_stream(harness: dict[str, Any]) -> Non
 
 
 def test_engine_key_model_runs_the_internal_pipeline_and_queues(harness: dict[str, Any]) -> None:
-    """Phase 3 contract (phase3/loadtest.py): `model: <engine key>` on /v1/chat/completions goes through the
-    Arbiter's load and generation lock, no router, no memory write."""
+    """Phase 3 contract (phase3/loadtest.py ORCH_CHAT_PATH): `model: <engine key>` on /internal/v1/chat/completions
+    goes through the Arbiter's load and the generation slot, no router, no memory write."""
     client: TestClient = harness["client"]
-    r = _chat(client, "Write a 250-word essay about lighthouses.", model="gpt-oss-120b")
+    r = client.post(
+        "/internal/v1/chat/completions",
+        json={
+            "model": "gpt-oss-120b",
+            "messages": [{"role": "user", "content": "Write a 250-word essay about lighthouses."}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert r.json()["choices"][0]["message"]["content"] == "Stub answer from the engine."
     assert r.json()["atlas"]["engine"] == "gpt-oss-120b" and "timings" in r.json()
@@ -395,7 +441,24 @@ def test_admin_token_guards_every_route_but_health_and_v1(harness: dict[str, Any
     deps.trusted_hosts = frozenset({"127.0.0.1"})  # TestClient is not loopback now
     client = TestClient(build_app(deps))
     assert client.get("/health").status_code == 200 and client.get("/v1/models").status_code == 200
-    assert _chat(client, "hello").status_code == 200
+    # Off loopback in token mode the chat path needs the token too (fix round 2), as X-Atlas-Token or as the
+    # Authorization: Bearer header Open WebUI sends OPENAI_API_KEY in.
+    assert _chat(client, "hello").status_code == 401
+    body = {"model": "atlas", "messages": [{"role": "user", "content": "hello"}]}
+    assert client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer nope"}).status_code == 403
+    assert (
+        client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer s3cret-token"}).status_code
+        == 200
+    )
+    assert (
+        client.post("/v1/chat/completions", json=body, headers={ADMIN_TOKEN_HEADER: "s3cret-token"}).status_code == 200
+    )
+    # The passphrase never crosses a wire in the clear: off loopback /vault/open needs TLS even with the token.
+    r = client.post("/vault/open", json={"passphrase": "x"}, headers={ADMIN_TOKEN_HEADER: "s3cret-token"})
+    assert r.status_code == 403 and "TLS" in r.json()["detail"]
+    tls = TestClient(build_app(deps), base_url="https://testserver")
+    r = tls.post("/vault/open", json={"passphrase": "hunter2"}, headers={ADMIN_TOKEN_HEADER: "s3cret-token"})
+    assert r.status_code == 200 and r.json()["state"] == "open"
     for method, path in (
         ("GET", "/vault/status"),
         ("POST", "/vault/lock"),
@@ -471,9 +534,142 @@ def test_deep_think_quick_runs_through_the_engine(harness: dict[str, Any]) -> No
     assert r.status_code == 200
     assert "Stub answer" in r.json()["choices"][0]["message"]["content"]
     assert r.json()["atlas"]["command"] == "deep-think" and r.json()["atlas"]["deep_think"] == "quick"
-    # quick: generator + adversary + refine on ONE engine, several calls, no second engine loaded.
+    # quick: generator + adversary + refine on ONE engine, several calls, no second engine loaded, nothing enqueued.
     engines = {s.spec.key for s in harness["llama"].made}
     assert engines == {"gpt-oss-120b"} and len(harness["llama"].made) >= 4
+    assert harness["enqueued"] == []
+
+
+def test_deep_think_standard_goes_to_the_gpu_queue_and_the_interface_returns(harness: dict[str, Any]) -> None:
+    """9.7: long work runs under Celery and "the chat interface returns to the Principal immediately"; 9.1: nothing is
+    hard-capped. Standard/deep are enqueued as atlas.tasks.deep_think; the reply names the task and where the answer
+    lands. A vault-tagged session runs inline instead (deep_think_task refuses it, 10.5)."""
+    client: TestClient = harness["client"]
+    r = _chat(client, "[DEEP THINK:STANDARD] best exit structure?", atlas_session="dt-1")
+    assert r.status_code == 200, r.text
+    head = r.json()["atlas"]
+    assert head["command"] == "deep-think" and head["deep_think"] == "standard"
+    assert head["deep_think_task_id"] == "celery-task-1"
+    text = r.json()["choices"][0]["message"]["content"]
+    assert "celery-task-1" in text and "ledger" in text
+    assert harness["llama"].made == []  # nothing generated inline
+    name, kw = harness["enqueued"][-1]
+    assert name == "atlas.tasks.deep_think"
+    assert kw["tier"] == "standard" and kw["problem"] == "best exit structure?" and kw["session_id"] == "dt-1"
+    assert kw["parent_task_id"] == head["task_id"] and kw["audience"] == "principal"
+    row = harness["ledger"].get_task(head["task_id"])
+    assert row["status"] == "done" and json.loads(row["result_json"])["celery_task_id"] == "celery-task-1"
+    # Vault-tagged: inline, with the engines, nothing enqueued.
+    r = _chat(client, "[DEEP THINK:STANDARD] the will", atlas_session="dt-vault", atlas_vault=True)
+    assert r.status_code == 200, r.text
+    assert "Stub answer" in r.json()["choices"][0]["message"]["content"] and len(harness["enqueued"]) == 1
+    assert (
+        harness["llama"].made
+        and json.loads(harness["ledger"].get_task(r.json()["atlas"]["task_id"])["result_json"])["inline"]
+    )
+
+
+def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -> None:
+    """4.2 rule 3 ("exactly one may generate at any moment ... including background work"): a router-qwen3.5-4b
+    generation through /internal holds the slot, so a gpt-oss chat that arrives meanwhile QUEUES behind it (9.7 C15)
+    and starts only when the 4B stream has finished."""
+    client: TestClient = harness["client"]
+    deps: AppDeps = harness["deps"]
+    gate = threading.Event()
+    harness["llama"].gates["router-qwen3.5-4b"] = gate
+    results: dict[str, Any] = {}
+
+    def small() -> None:
+        results["small"] = client.post(
+            "/internal/v1/chat/completions",
+            json={"model": "router-qwen3.5-4b", "messages": [{"role": "user", "content": "BLUF this"}]},
+        )
+
+    def big() -> None:
+        results["big"] = _chat(client, "Draft the AEC bid summary.", atlas_session="queued-chat")
+
+    t_small = threading.Thread(target=small)
+    t_small.start()
+    deadline = time.monotonic() + 5
+    while not any(s.spec.key == "router-qwen3.5-4b" and s.started.is_set() for s in harness["llama"].made):
+        assert time.monotonic() < deadline, "the 4B stream never started"
+        time.sleep(0.02)
+    assert deps.slot.holder is not None and deps.slot.holder[0] == "router-qwen3.5-4b"
+    t_big = threading.Thread(target=big)
+    t_big.start()
+    deadline = time.monotonic() + 5
+    while not deps.slot.queue:
+        assert time.monotonic() < deadline, "the gpt-oss request never queued for the slot"
+        time.sleep(0.02)
+    # gpt-oss is LOADED (residency is free, rule 3) but not generating: the 4B call holds the only slot.
+    assert "gpt-oss-120b" in harness["arbiter"].resident
+    assert not any(s.spec.key == "gpt-oss-120b" and s.started.is_set() for s in harness["llama"].made)
+    assert harness["arbiter"].generating is None  # the Arbiter's own lock is taken only inside the slot
+    gate.set()
+    t_small.join(timeout=10)
+    t_big.join(timeout=10)
+    assert results["small"].status_code == 200 and results["big"].status_code == 200
+    assert results["big"].json()["choices"][0]["message"]["content"] == "Stub answer from the engine."
+    assert deps.slot.holder is None and deps.slot.queue == () and harness["arbiter"].generating is None
+    assert client.get("/health").json()["generating"] is None
+
+
+def test_estate_scar_context_never_reaches_a_corporate_prompt(harness: dict[str, Any]) -> None:
+    """9.4 scars are scoped to the dispatch's hemisphere (7.3, 10.1): a strike logged in an estate session carries
+    the Principal's words as context; the next corporate dispatch must not see them, the next estate one does."""
+    client: TestClient = harness["client"]
+    r = _chat(client, "[LOG STRIKE: trustee-names] the trust deed names Mara as trustee", model="arthur")
+    assert r.status_code == 200 and "Strike #1" in r.json()["choices"][0]["message"]["content"]
+    scar_meta = next(iter(harness["chroma"].collections["scars"].rows.values()))[1]
+    assert scar_meta["hemisphere"] == "estate" and scar_meta["persona"] == "arthur"
+    r = _chat(client, "the trust deed names the trustee, again", model="arthur")
+    assert r.json()["atlas"]["hemisphere"] == "estate"
+    estate_system = harness["llama"].made[-1].requests[0]["messages"][0]["content"]
+    assert "trustee-names" in estate_system and "Mara" in estate_system
+    r = _chat(client, "the trust deed names the trustee, again, for the AEC bid")
+    assert r.json()["atlas"]["hemisphere"] == "estate"  # 'trust' is a hard keyword: still Arthur
+    r = _chat(client, "Draft the AEC bid summary, names the Mara trustee deed", model="ren")
+    # 'trust' is not in this text; the picker holds, the dispatch is corporate.
+    assert r.json()["atlas"]["hemisphere"] == "corporate", r.json()["atlas"]
+    corporate_system = harness["llama"].made[-1].requests[0]["messages"][0]["content"]
+    assert "trustee-names" not in corporate_system and "Mara as trustee" not in corporate_system
+
+
+def test_openwebui_task_calls_are_chores_not_principal_turns(harness: dict[str, Any]) -> None:
+    """Open WebUI 0.11.4 title/tags/follow-up generation: `### Task:` + the embedded history. Routed engine, but no
+    retrieval, no never-delegate rewrite, no memory write, no strike on failure; and [VAULT] anywhere in the embedded
+    history tags the session (10.5 fail-closed)."""
+    client: TestClient = harness["client"]
+    harness["llama"].text = "Please send me the title. Vault Papers"
+    task = (
+        "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history.\n"
+        "### Chat History:\n<chat_history>\nUSER: [VAULT] the will says the vineyard goes to Mara\n"
+        "ASSISTANT: Noted.\n</chat_history>"
+    )
+    assert is_owui_task_call([{"role": "user", "content": task}])
+    assert history_has_vault_prefix([{"role": "user", "content": task}])
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "atlas", "messages": [{"role": "user", "content": task}]},
+        headers={"x-openwebui-chat-id": "owui-task-chat"},
+    )
+    assert r.status_code == 200, r.text
+    head = r.json()["atlas"]
+    assert head["owui_task"] is True and head["engine"] in ("gpt-oss-120b", "nemotron-3-super")
+    # No rewrite: the UI parses what comes back.
+    assert r.json()["choices"][0]["message"]["content"] == "Please send me the title. Vault Papers"
+    assert harness["sessions"].is_vault("owui-task-chat")
+    cols = harness["chroma"].collections
+    assert all(cols[c].count() == 0 for c in cols)  # nothing remembered, no scar
+    row = harness["ledger"].get_task(head["task_id"])
+    assert row["kind"] == "owui-task" and row["status"] == "done"
+    assert "Lessons from earlier mistakes" not in harness["llama"].made[-1].requests[0]["messages"][0]["content"]
+    # A failing chore is a failed ledger row, not a 9.4 strike.
+    harness["llama"].fail = "llama-server HTTP 500: boom"
+    r = client.post("/v1/chat/completions", json={"model": "atlas", "messages": [{"role": "user", "content": task}]})
+    assert r.status_code == 502
+    assert harness["ledger"].list_strikes() == []
+    assert "scars" not in cols or cols["scars"].count() == 0
 
 
 # --- approvals (16.2) -------------------------------------------------------------------------------------------------
@@ -565,6 +761,8 @@ def test_strike_and_arbiter_endpoints(harness: dict[str, Any]) -> None:
     assert client.post("/strike", json={"persona": "x", "error": "e", "kind": "bogus"}).status_code == 422
     r = client.post("/arbiter/register", json={"engine": "gpt-oss-120b", "total_bytes": 70_000_000_000})
     assert r.status_code == 200 and harness["arbiter"].measured["gpt-oss-120b"] == 70_000_000_000
-    assert client.post("/arbiter/register", json={"engine": "nope", "total_bytes": 1}).status_code == 404
+    # The Arbiter (another writer) accepts a bare unit-style key as a Phase 4 engine with a logged warning (its
+    # register_measured docstring); only a malformed key is UnknownEngine -> 404.
+    assert client.post("/arbiter/register", json={"engine": "no key!", "total_bytes": 1}).status_code == 404
     st = client.get("/arbiter/status").json()
     assert st["budget_bytes"] == 170 * 1024**3 and st["resident"] == [] and st["halted"] is None

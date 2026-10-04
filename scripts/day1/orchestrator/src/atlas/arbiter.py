@@ -647,13 +647,16 @@ class Arbiter:
                     self._busy = None
                     self._cv.notify_all()
             return self._decide(Decision.GRANTED, key, task_id, 0, "resident small model; not budgeted (Section 4.1)")
+        stage = "load"
         try:
             for victim in plan.victims:
                 why = f"evicted for {key}"
                 if self.engines[victim].is_apex:
                     why += " (Section 4.2 rule 7: the Apex engine is exclusive while resident, so it leaves when idle)"
+                stage = f"eviction of {victim}"
                 self._stop_and_confirm(victim, task_id, reason=why)
             used_before = self.probe.gtt_used_bytes()
+            stage = "start"
             self.controller.start(key)
         except ReleaseTimeout:
             with self._cv:
@@ -670,7 +673,13 @@ class Arbiter:
                 self._release_victims(plan.victims)
                 self._busy = None
                 self._cv.notify_all()
-                self._decide(Decision.ERROR, key, task_id, plan.footprint.total_bytes, f"start failed: {exc}")
+                self._decide(
+                    Decision.ERROR,
+                    key,
+                    task_id,
+                    plan.footprint.total_bytes,
+                    f"{stage} failed; {key} not loaded, reservation released: {exc}",
+                )
             raise
         except BaseException as exc:
             # Anything else (a bug, KeyboardInterrupt in a test): the placeholder must never wedge the Arbiter.
@@ -679,8 +688,13 @@ class Arbiter:
                 self._release_victims(plan.victims)
                 self._busy = None
                 self._cv.notify_all()
-                self._decide(Decision.ERROR, key, task_id, plan.footprint.total_bytes,
-                             f"load aborted: {type(exc).__name__}: {exc}")
+                self._decide(
+                    Decision.ERROR,
+                    key,
+                    task_id,
+                    plan.footprint.total_bytes,
+                    f"{stage} aborted: {type(exc).__name__}: {exc}",
+                )
             raise
         # What the counter actually grew by is what rule 5 must see come back after the stop.
         observed = max(0, self.probe.gtt_used_bytes() - used_before)
@@ -692,15 +706,26 @@ class Arbiter:
             res.observed_bytes = observed
             self._busy = None
             self._cv.notify_all()
-            how = (f"unit env {plan.profile.describe()}" if plan.profile else
-                   f"{'coresident ' if plan.coresident else ''}ctx {plan.footprint.ctx} x {plan.footprint.parallel} "
-                   f"slots, kv {plan.footprint.kv_class}")
+            how = (
+                f"unit env {plan.profile.describe()}"
+                if plan.profile
+                else f"{'coresident ' if plan.coresident else ''}ctx {plan.footprint.ctx} x {plan.footprint.parallel} "
+                f"slots, kv {plan.footprint.kv_class}"
+            )
             hint = ""
             if plan.profile and not plan.profile.coresident and plan.victims and plan.spec.ctx_size_coresident:
-                hint = ("; co-residency needs overrides.json coresident=true for this engine "
-                        "(phase2/engine-env.py --set-override, root)")
-            return self._decide(Decision.GRANTED, key, task_id, plan.footprint.total_bytes, f"loaded ({how}){hint}",
-                                evicted=plan.victims)
+                hint = (
+                    "; co-residency needs overrides.json coresident=true for this engine "
+                    "(phase2/engine-env.py --set-override, root)"
+                )
+            return self._decide(
+                Decision.GRANTED,
+                key,
+                task_id,
+                plan.footprint.total_bytes,
+                f"loaded ({how}){hint}",
+                evicted=plan.victims,
+            )
 
     def _plan_evictions(self, spec: EngineSpec, fp: Footprint) -> list[str] | None:
         """Which residents must go so `spec` fits; None when a needed victim is generating (rule 6)."""

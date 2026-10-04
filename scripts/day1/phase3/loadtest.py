@@ -26,7 +26,12 @@ Subcommands (global options first, see main()):
     table                   the Section 17 step 4 table from the result files, plus every baseline_deviation
 
 Result files: <results-dir>/<key>.json, one per engine (schema: EngineResult below), plus baseline.json and
-coresident.json. A result with "ok": true makes the driver skip that engine on a re-run (file-level resumability).
+coresident.json. A result with "ok": true AND "released": true makes the driver skip that engine on a re-run
+(file-level resumability, CONVENTIONS.md §7.3; an engine saved while still resident is re-tested unless `prepare`
+credited its release on the re-run). <results-dir>/pending-overrides.json journals every TEMPORARY overrides.json
+change (ladder rungs, the co-resident vision profile, the V14b probe profile) before it is written; every subcommand
+that touches the node restores and deletes it first, so an interrupted run never leaves a probe profile in production.
+SIGTERM (`systemctl stop atlas-day1-phase3`) is turned into an exception in the main thread so every finally block runs.
 
 Facts typed here and where they were VERIFIED (research/llama-cpp-vulkan.md, research/gguf-models.md, 2026-09-22;
 the research files are cited through config/engines.json _meta where this checkout does not carry them):
@@ -81,20 +86,26 @@ ORCH_ADMIN_TOKEN_FILE is configured (--admin-token-file), else loopback is enoug
   * POST {ORCH_URL}/internal/deep-think/plan {"tier": "deep"|"standard"|"quick", "task_id"} -> {requested, granted,
          engines, required_bytes, budget_bytes, reason, resident_engine} (rule 8; the tier's largest engine is
          projected from its unit env file against the whole budget).
-  When /health is unreachable or not 200, this script says so loudly and falls back to `systemctl start|stop
-  llama-server@<key>` for the loads; V14b/V21 then record fail with that reason, because only the Arbiter can queue,
-  refuse or downgrade. When /health is 200 but /arbiter/status or /arbiter/load|unload is missing, it REFUSES to run
-  (Infra): engines are never controlled behind a serving orchestrator whose ledger would not see it.
+  There is NO systemctl fallback (fix round 3). Section 4.2 is a hard requirement ("every load and unload of any
+  weight-bearing process passes" through the Arbiter) and Section 17 Phase 3 step 2 says "load through the Engine
+  Arbiter": an orchestrator that is not serving is the missing Phase 2 step 2 prerequisite (CONVENTIONS.md §7.5) and an
+  Infra error (§7.4). A unit that is active/activating but not yet 200 (Restart=on-failure, RestartSec=5, an
+  ExecStartPre that waits up to 180 s for Redis) is waited for up to ORCH_WAIT_S, never worked around. When /health is
+  200 but /arbiter/status or /arbiter/load|unload is missing, it REFUSES to run (Infra): engines are never controlled
+  behind a serving orchestrator whose ledger would not see it. The admin header goes to /arbiter/* only; /internal/* is
+  loopback-guarded and never sees the token.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import grp
 import json
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -111,13 +122,19 @@ GIB = 1024**3
 GB = 10**9
 # Section 4.2 rule 5: release confirmation belongs to the Arbiter (its own release_tolerance_bytes and
 # release_timeout_s, not exposed by /arbiter/status). The two figures below are this script's MEASUREMENT window
-# (the "released"/seconds columns of the Section 17 step 4 table) and the only check on the systemctl fallback path;
-# in orchestrator mode the Arbiter's granted/503 answer is the authority and both are reported.
+# (the "released"/seconds columns of the Section 17 step 4 table), polled after EVERY unload and after every unit
+# that went away on its own (a failed load, a server that died at 8k): the process exit is never trusted (rule 5).
+# The Arbiter's granted/503 answer is the authority and both are reported.
 RELEASE_TOLERANCE_BYTES = 2 * GIB
 RELEASE_TIMEOUT_S = 120.0
 LOAD_TIMEOUT_S = 960.0  # llama-server@.service TimeoutStartSec=900 plus margin
 ARBITER_WAIT_S = 900.0  # api.py DEFAULT_LOAD_WAIT_S: how long /arbiter/load|unload may block before "queued"
 STOP_TIMEOUT_S = 180.0  # TimeoutStopSec=120 plus margin
+ORCH_UNIT = "atlas-orchestrator"
+ORCH_WAIT_S = 300.0  # atlas-orchestrator.service: ExecStartPre waits up to 180 s for Redis, TimeoutStartSec=300
+ORCH_TRANSIENT_STATES = ("active", "activating", "reloading", "deactivating")  # systemd ActiveState: wait, do not fail
+PENDING_FILE = "pending-overrides.json"
+ENGINE_ENV_GROUP = "atlas"  # engine-env.py installs root:atlas 640 (CONVENTIONS.md §2)
 REQUEST_TIMEOUT_S = 1200.0  # an 8k prefill on a dense 72B at Q8_0 plus 128 decoded tokens at ~3 tok/s
 PREFILL_SHORT = 512
 PREFILL_LONG = 8192
@@ -130,7 +147,8 @@ ORCH_CHAT_PATH = "/internal/v1/chat/completions"
 LLAMA_CHAT_PATH = "/v1/chat/completions"
 ADMIN_TOKEN_HEADER = "X-Atlas-Token"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
-NEMOTRON_ISSUE = "llama.cpp issue #20732 (Vulkan/HIP memory fault at ~20k-token prompts)"
+NEMOTRON_ISSUE_ID = "#20732"  # engines.json known_issue of nemotron-3-super names it; Section 23 S6 rules on it
+NEMOTRON_ISSUE = f"llama.cpp issue {NEMOTRON_ISSUE_ID} (Vulkan/HIP memory fault at ~20k-token prompts)"
 DEVICELOST_ISSUE = "llama.cpp issue #25664 (kernel 7.x amdgpu lockup_timeout; Phase 1 GRUB line)"
 DEEPSEEK_KV_ISSUES = "llama.cpp issues #25382/#26423"
 COHERENCE_TOKENS_FACTUAL = 1024
@@ -185,6 +203,16 @@ def short(obj: Any, n: int = 300) -> str:
 
 class Infra(RuntimeError):
     """An infrastructure error: the driver stops the phase (exit non-zero)."""
+
+
+class Terminated(Infra):
+    """SIGTERM (`systemctl stop atlas-day1-phase3`, the documented way to abort): raised in the main thread by the
+    handler installed in main() so every `finally` (override restores, pending journal) runs before exit 143."""
+
+
+def _on_sigterm(signum: int, _frame: Any) -> None:
+    raise Terminated(f"signal {signum} (SIGTERM, e.g. systemctl stop atlas-day1-phase3): stopping, restoring temporary "
+                     "overrides; re-run to resume")
 
 
 # --- HTTP (loopback only, never through the allowlist proxy) ----------------------------------------------------------
@@ -246,7 +274,8 @@ def drm_root() -> Path:
     (ATLAS_ETC is the real /etc/atlas) it is refused: the GTT counter is the rule-5 measurement behind every
     'released' verdict and the V21 proof, and a fake tree must never reach it through the environment."""
     override = os.environ.get("ATLAS_DRM_ROOT")
-    if override and os.environ.get("ATLAS_ETC", "/etc/atlas") == "/etc/atlas":
+    # Canonical compare: "/etc/atlas/" or "/etc//atlas" still point at the real config (fix round 3, minor).
+    if override and os.path.realpath(os.environ.get("ATLAS_ETC", "/etc/atlas")) == "/etc/atlas":
         raise Infra("ATLAS_DRM_ROOT is a test-only hook; unset it on the node (ATLAS_ETC is /etc/atlas)")
     return Path(override or "/sys/class/drm")
 
@@ -281,7 +310,20 @@ def fmt_gb(b: float) -> str:
 
 
 def run(cmd: list[str], timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
+    """A timed-out command comes back as exit 124 with the reason in stderr (callers treat non-zero as a recorded
+    failure), never as an uncaught TimeoutExpired traceback that would stop the whole phase."""
+    try:
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                              check=False)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        return subprocess.CompletedProcess(cmd, 124, out, f"{cmd[0]} timed out after {timeout:.0f}s")
+
+
+def orchestrator_state() -> str:
+    """systemd ActiveState of atlas-orchestrator.service ("unknown" when systemctl itself fails)."""
+    p = run(["systemctl", "show", "-p", "ActiveState", "--value", ORCH_UNIT])
+    return p.stdout.strip() or "unknown"
 
 
 def unit_of(key: str) -> str:
@@ -407,10 +449,23 @@ class Ctx:
         if p.returncode != 0:
             raise Infra(f"engine-env.py failed for {key}: {(p.stderr or p.stdout).strip()[:600]}")
         path = self.env_dir / f"{key}.env"
+        # Owner/mode belt, failing loudly like the driver's _p3_render_envs (rule §7.4): engine-env.py's install()
+        # swallows a failed chown because the tests run unprivileged; on the node (root) it must hold.
         try:
             os.chmod(path, 0o640)
-        except OSError:
-            pass
+        except OSError as exc:
+            raise Infra(f"could not set mode 640 on {path}: {exc}") from exc
+        if os.geteuid() == 0:
+            try:
+                want_gid = grp.getgrnam(ENGINE_ENV_GROUP).gr_gid
+            except KeyError as exc:
+                raise Infra(f"group {ENGINE_ENV_GROUP!r} does not exist (Phase 1 creates it)") from exc
+            st = path.stat()
+            if (st.st_uid, st.st_gid) != (0, want_gid):
+                try:
+                    os.chown(path, 0, want_gid)
+                except OSError as exc:
+                    raise Infra(f"could not set root:{ENGINE_ENV_GROUP} on {path}: {exc}") from exc
         return self.env(key)
 
     def override_of(self, key: str, fld: str) -> Any:
@@ -454,6 +509,7 @@ class EngineResult:
     prefill_tps_8k: float | None = None
     prefill_8k_note: str = ""
     crashed_at_8k: bool = False
+    known_issue_note: str = ""  # set when a death at 8k is tolerated as a warning (Section 23 S6, nemotron #20732)
     stopped_externally: bool = False
     band_note: str = ""
     band_fail: str = ""
@@ -494,77 +550,176 @@ def load_result(ctx: Ctx, key: str) -> EngineResult | None:
     return res
 
 
-def read_baseline(ctx: Ctx) -> int:
+def read_baseline_optional(ctx: Ctx) -> int | None:
     p = ctx.results_dir / "baseline.json"
     if not p.is_file():
-        raise Infra(f"{p} missing: run `loadtest.py prepare` first (the driver does)")
+        return None
     return int(json.loads(p.read_text(encoding="utf-8"))["gtt_used_bytes"])
 
 
-# --- engine control: orchestrator Arbiter API, systemctl fallback -----------------------------------------------------
+def read_baseline(ctx: Ctx) -> int:
+    b = read_baseline_optional(ctx)
+    if b is None:
+        raise Infra(f"{ctx.results_dir / 'baseline.json'} missing: run `loadtest.py prepare` first (the driver does)")
+    return b
+
+
+# --- temporary overrides journal (CONVENTIONS.md §7.3 resumable, §7.4) ------------------------------------------------
+
+
+def pending_path(ctx: Ctx) -> Path:
+    return ctx.results_dir / PENDING_FILE
+
+
+def pending_read(ctx: Ctx) -> list[dict[str, Any]]:
+    p = pending_path(ctx)
+    if not p.is_file():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise Infra(f"{p} is not valid JSON: {exc}; the temporary overrides it journals must be restored by hand "
+                    f"(engine-env.py --clear-override) before re-running") from exc
+    return data if isinstance(data, list) else []
+
+
+def pending_write(ctx: Ctx, entries: list[dict[str, Any]]) -> None:
+    p = pending_path(ctx)
+    if not entries:
+        p.unlink(missing_ok=True)
+        return
+    ctx.results_dir.mkdir(parents=True, exist_ok=True)
+    p.with_suffix(".tmp").write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    os.replace(p.with_suffix(".tmp"), p)
+
+
+def pending_begin(ctx: Ctx, key: str, fields: Sequence[str], why: str, clear_always: Sequence[str] = (),
+                  ) -> dict[str, Any]:
+    """Journal a TEMPORARY overrides.json change BEFORE it is written: the prior value of every field (restored on
+    end), or "clear" for fields that are never a legitimate persistent override (coresident: the orchestrator decides
+    co-residency live). A SIGKILL, OOM or power cut between the render and its restore then cannot leave a probe
+    profile (a 256x ctx_size, coresident=true, an f16 ladder rung) in a production unit env file: pending_recover()
+    restores it at the start of the next invocation."""
+    entry: dict[str, Any] = {"id": f"{key}:{why}:{now_iso()}:{random.randrange(10**6)}", "key": key, "why": why,
+                             "set": {}, "clear": []}
+    for f in fields:
+        prior = None if f in clear_always else ctx.override_of(key, f)
+        if prior is None:
+            entry["clear"].append(f)
+        else:
+            entry["set"][f] = prior
+    entries = pending_read(ctx)
+    entries.append(entry)
+    pending_write(ctx, entries)
+    return entry
+
+
+def pending_restore(ctx: Ctx, entry: dict[str, Any]) -> dict[str, str]:
+    set_ov = [(f, str(v)) for f, v in (entry.get("set") or {}).items()]
+    return ctx.render(str(entry["key"]), set_ov, list(entry.get("clear") or []))
+
+
+def pending_end(ctx: Ctx, entry: dict[str, Any]) -> None:
+    entries = [e for e in pending_read(ctx) if e.get("id") != entry.get("id")]
+    pending_write(ctx, entries)
+
+
+def pending_recover(ctx: Ctx) -> None:
+    """Called first by every subcommand that touches the node: restore what an interrupted run left behind, loudly."""
+    entries = pending_read(ctx)
+    if not entries:
+        return
+    for entry in reversed(entries):
+        log(f"RECOVERY: {entry.get('key')} still carries the temporary override of an interrupted run "
+            f"({entry.get('why')}; id {entry.get('id')}): restoring set={entry.get('set')} clear={entry.get('clear')}")
+        env = pending_restore(ctx, entry)
+        log(f"RECOVERY: {entry.get('key')} env restored (kv {env.get('ATLAS_KV_TYPE')}, ctx "
+            f"{env.get('ATLAS_CTX_SIZE')}, parallel {env.get('ATLAS_PARALLEL')}, "
+            f"coresident {env.get('ATLAS_CORESIDENT')})")
+    pending_path(ctx).unlink(missing_ok=True)
+
+
+# --- engine control: the orchestrator's Arbiter API (no fallback) -----------------------------------------------------
 
 
 class Control:
-    """Every load and unload goes through the Arbiter when the orchestrator serves (Section 4.2). The systemctl
-    fallback exists only for an orchestrator that is down; the mode is fixed at construction and never flips mid-run
-    (a serving orchestrator whose Arbiter API is missing is an Infra error, not a fallback)."""
+    """Every load and unload goes through the Arbiter (Section 4.2, a hard requirement: "every load and unload of any
+    weight-bearing process passes" through it; Section 17 Phase 3 step 2 "load through the Engine Arbiter"). There is
+    NO systemctl fallback (fix round 3): an orchestrator that is not serving is the missing Phase 2 step 2 prerequisite
+    (CONVENTIONS.md §7.5) and an Infra error (§7.4), never a reason to start units behind the ledger's back (api.py's
+    startup would stop them as unowned, and V4/V10 would be recorded from loads the Arbiter never saw). A unit that is
+    active/activating but not yet 200 (Restart=on-failure, RestartSec=5, an ExecStartPre that waits for Redis) is
+    waited for up to ORCH_WAIT_S. A serving orchestrator whose Arbiter API is missing is an Infra error too."""
+
+    mode = "orchestrator"  # the only mode; kept as a field because every result file and the step 4 table print it
 
     def __init__(self, orch_url: str, admin_token: str = "") -> None:
         self.orch_url = orch_url.rstrip("/")
-        self.mode = "systemctl"
-        self.fallback_reason = ""
         self.last_decision: dict[str, Any] = {}
         self.headers = {ADMIN_TOKEN_HEADER: admin_token} if admin_token else {}
         self._probe()
 
     # -- probe --
-    def _probe(self) -> None:
+    def _health(self) -> tuple[int, str]:
         try:
-            code, _ = http("GET", f"{self.orch_url}/health", timeout=5)
+            code, body = http("GET", f"{self.orch_url}/health", timeout=5)
         except HttpFail as exc:
-            self.fallback_reason = f"orchestrator {self.orch_url} unreachable ({exc})"
-            log(f"control: {self.fallback_reason}; FALLING BACK to systemctl for loads: V14b and V21 will record fail "
-                "(only the Arbiter queues, refuses and downgrades)")
-            return
+            return 0, str(exc)
+        return code, short(body, 160)
+
+    def _probe(self) -> None:
+        code, detail = self._health()
+        state = orchestrator_state()
+        if code != 200 and state in ORCH_TRANSIENT_STATES:
+            log(f"control: {ORCH_UNIT} is {state} and GET /health answered {code or 'nothing'} ({detail}); waiting up "
+                f"to {ORCH_WAIT_S:.0f}s for it to serve (Restart=on-failure; ExecStartPre waits for Redis)")
+            deadline = time.monotonic() + ORCH_WAIT_S
+            while code != 200 and time.monotonic() < deadline:
+                time.sleep(5)
+                code, detail = self._health()
+                state = orchestrator_state()
+                if state not in ORCH_TRANSIENT_STATES:
+                    break
         if code != 200:
-            self.fallback_reason = f"orchestrator {self.orch_url}/health answered {code}"
-            log(f"control: {self.fallback_reason}; FALLING BACK to systemctl for loads: V14b and V21 will record fail")
-            return
+            raise Infra(f"{ORCH_UNIT} is not serving (unit {state}; GET {self.orch_url}/health -> "
+                        f"{code or 'unreachable'}: {detail}): Phase 2 step 2 prerequisite (CONVENTIONS.md §7.5). Every "
+                        "load passes through the Engine Arbiter (Section 4.2); there is no systemctl fallback. "
+                        f"systemctl start {ORCH_UNIT}, then re-run")
         code, body = self._get("/arbiter/status")
         if code in (401, 403):
             raise Infra(f"GET /arbiter/status answered {code}: the orchestrator's admin routes need X-Atlas-Token "
                         "(pass --admin-token-file, the ORCH_ADMIN_TOKEN_FILE of orchestrator.env)")
         if code != 200 or not isinstance(body, dict):
             raise Infra(f"orchestrator {self.orch_url} is serving (/health 200) but GET /arbiter/status answered "
-                        f"{code}: refusing to control engines behind it (Section 4.2); stop atlas-orchestrator.service "
-                        "or implement /arbiter/*")
+                        f"{code}: refusing to control engines behind it (Section 4.2); implement /arbiter/* (api.py)")
         for route in ("/arbiter/load", "/arbiter/unload", "/arbiter/register"):
             # FastAPI answers 405 for a GET on a POST-only route that exists and 404 when the route is absent.
             rc, _ = self._get(route)
             if rc == 404:
                 raise Infra(f"orchestrator {self.orch_url} is serving without POST {route} (api.py); V10/V14b/V21 "
-                            "cannot be proved behind it: stop atlas-orchestrator.service or implement the route")
-        self.mode = "orchestrator"
+                            "cannot be proved behind it: implement the route")
         halted = body.get("halted")
         if halted:
             raise Infra(f"the Arbiter is halted ({halted}): every load is refused until a human looks (Section 4.2 "
-                        "rule 5); restart atlas-orchestrator.service after checking the GTT counter")
-        log(f"control: orchestrator Arbiter API at {self.orch_url} (resident: "
+                        f"rule 5); restart {ORCH_UNIT}.service after checking the GTT counter")
+        log(f"control: orchestrator Arbiter API at {self.orch_url} (unit {state}; resident: "
             f"{[r.get('engine') for r in body.get('resident', [])]}, budget {fmt_gb(body.get('budget_bytes') or 0)})")
+
+    def _hdr(self, path: str) -> dict[str, str]:
+        """The admin credential goes to /arbiter/* only; /internal/* is loopback-guarded (api.py) and never needs it."""
+        return self.headers if path.startswith("/arbiter/") else {}
 
     def _get(self, path: str) -> tuple[int, Any]:
         try:
-            return http("GET", f"{self.orch_url}{path}", timeout=10, headers=self.headers)
+            return http("GET", f"{self.orch_url}{path}", timeout=10, headers=self._hdr(path))
         except HttpFail as exc:
             raise Infra(f"GET {path} failed while the orchestrator answered /health: {exc}") from exc
 
     def post(self, path: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
         """A POST to an admin/internal route; transport errors surface as HttpFail for the caller to record."""
-        return http("POST", f"{self.orch_url}{path}", body, timeout=timeout, headers=self.headers)
+        return http("POST", f"{self.orch_url}{path}", body, timeout=timeout, headers=self._hdr(path))
 
     def status(self) -> dict[str, Any] | None:
-        if self.mode != "orchestrator":
-            return None
         try:
             code, body = http("GET", f"{self.orch_url}/arbiter/status", timeout=10, headers=self.headers)
         except HttpFail:
@@ -586,93 +741,79 @@ class Control:
 
     # -- load --
     def load(self, key: str, ctx_size: int, parallel: int, port: int) -> float:
-        """Start the engine and wait for /health 200. Returns the load time in seconds. Raises RuntimeError with the
-        reason on failure (the caller records it); Infra only for broken tooling."""
+        """Load through the Arbiter and wait for /health 200. Returns the load time in seconds. Raises RuntimeError with
+        the reason on failure (the caller records it); Infra only for broken tooling."""
         t0 = time.monotonic()
-        if self.mode == "orchestrator":
-            body = {"engine": key, "ctx": ctx_size, "parallel": parallel, "task_id": TASK_ID}
-            deadline = t0 + ARBITER_WAIT_S + LOAD_TIMEOUT_S
-            while True:
-                try:
-                    code, resp = self.post("/arbiter/load", body, timeout=ARBITER_WAIT_S + LOAD_TIMEOUT_S + 60)
-                except HttpFail as exc:
-                    raise RuntimeError(f"POST /arbiter/load {key} failed: {exc} (the orchestrator was serving at "
-                                       "the start of this run; no systemctl fallback behind it)") from exc
-                if code == 503:
-                    raise RuntimeError(f"Arbiter halted, {key} not loaded: HTTP 503 {short(resp)} (Section 4.2 rule 5)")
-                if code != 200 or not isinstance(resp, dict):
-                    raise RuntimeError(f"Arbiter did not load {key}: HTTP {code} {short(resp)}")
-                self.last_decision = resp
-                decision = resp.get("decision")
-                reason = resp.get("reason", "")
-                if decision == "granted":
-                    log(f"control: Arbiter granted {key}: {reason} "
-                        f"(projected {fmt_gb(resp.get('projected_bytes') or 0)})")
+        body = {"engine": key, "ctx": ctx_size, "parallel": parallel, "task_id": TASK_ID}
+        deadline = t0 + ARBITER_WAIT_S + LOAD_TIMEOUT_S
+        while True:
+            try:
+                code, resp = self.post("/arbiter/load", body, timeout=ARBITER_WAIT_S + LOAD_TIMEOUT_S + 60)
+            except HttpFail as exc:
+                raise RuntimeError(f"POST /arbiter/load {key} failed: {exc} (no systemctl fallback: Section 4.2)"
+                                   ) from exc
+            if code == 503:
+                raise RuntimeError(f"Arbiter halted, {key} not loaded: HTTP 503 {short(resp)} (Section 4.2 rule 5)")
+            if code != 200 or not isinstance(resp, dict):
+                raise RuntimeError(f"Arbiter did not load {key}: HTTP {code} {short(resp)}")
+            self.last_decision = resp
+            decision = resp.get("decision")
+            reason = resp.get("reason", "")
+            if decision == "granted":
+                log(f"control: Arbiter granted {key}: {reason} "
+                    f"(projected {fmt_gb(resp.get('projected_bytes') or 0)})")
+                break
+            if decision == "queued":
+                # Rules 4 and 6: never a failure; wait for the ledger, then ask again until the deadline.
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"Arbiter kept {key} queued for {deadline - t0:.0f}s: {reason}")
+                log(f"control: Arbiter queued {key}: {reason}; waiting for the ledger")
+                if self._wait_resident(key, min(deadline, time.monotonic() + 300)):
                     break
-                if decision == "queued":
-                    # Rules 4 and 6: never a failure; wait for the ledger, then ask again until the deadline.
-                    if time.monotonic() > deadline:
-                        raise RuntimeError(f"Arbiter kept {key} queued for {deadline - t0:.0f}s: {reason}")
-                    log(f"control: Arbiter queued {key}: {reason}; waiting for the ledger")
-                    if self._wait_resident(key, min(deadline, time.monotonic() + 300)):
-                        break
-                    continue
-                raise RuntimeError(f"Arbiter {decision or 'answered without a decision'} for {key}: {reason} "
-                                   f"({short(resp, 200)})")
-        else:
-            run(["systemctl", "reset-failed", unit_of(key)])
-            p = run(["systemctl", "start", unit_of(key)], timeout=LOAD_TIMEOUT_S + 30)
-            if p.returncode != 0:
-                raise RuntimeError(f"systemctl start {unit_of(key)} failed (exit {p.returncode}): "
-                                   f"{(p.stderr or p.stdout).strip()[:300]}; journal: {journal_tail(key, 15)[-600:]}")
+                continue
+            raise RuntimeError(f"Arbiter {decision or 'answered without a decision'} for {key}: {reason} "
+                               f"({short(resp, 200)})")
         health_deadline = time.monotonic() + LOAD_TIMEOUT_S
         while time.monotonic() < health_deadline:
             if health_code(port) == 200:
                 secs = time.monotonic() - t0
-                log(f"control: {key} healthy on 127.0.0.1:{port} after {secs:.1f}s (via {self.mode})")
+                log(f"control: {key} healthy on 127.0.0.1:{port} after {secs:.1f}s (via the Arbiter)")
                 return secs
             if not unit_active(key) and time.monotonic() - t0 > 10:
-                raise RuntimeError(f"{unit_of(key)} is not active after start; journal: {journal_tail(key, 20)[-800:]}")
+                raise RuntimeError(f"{unit_of(key)} is not active after the grant; journal: "
+                                   f"{journal_tail(key, 20)[-800:]}")
             time.sleep(2)
         raise RuntimeError(f"{key} did not answer /health 200 within {LOAD_TIMEOUT_S:.0f}s")
 
     # -- unload --
     def unload(self, key: str) -> str:
-        """Unload through the Arbiter (its rule-5 check inside) or, on the systemctl path, stop the unit. Returns the
-        Arbiter's reason. Raises RuntimeError on any answer but granted: a refusal means the engine is busy (Section
-        9.3: never swapped out from under a session) and this script never stops a unit behind a serving Arbiter."""
-        if self.mode == "orchestrator":
-            try:
-                code, resp = self.post("/arbiter/unload", {"engine": key, "task_id": TASK_ID},
-                                       timeout=ARBITER_WAIT_S + STOP_TIMEOUT_S + 60)
-            except HttpFail as exc:
-                raise RuntimeError(f"POST /arbiter/unload {key} failed: {exc}") from exc
-            if code == 503:
-                raise RuntimeError(f"Arbiter halted after unloading {key}: HTTP 503 {short(resp)} (Section 4.2 rule "
-                                   "5: the GTT counter did not drop; restart atlas-orchestrator.service after looking)")
-            if code != 200 or not isinstance(resp, dict):
-                raise RuntimeError(f"Arbiter refused to unload {key}: HTTP {code} {short(resp, 200)}")
-            self.last_decision = resp
-            if resp.get("decision") != "granted":
-                raise RuntimeError(f"Arbiter did not unload {key}: {resp.get('decision')}: {resp.get('reason', '')}")
-            reason = str(resp.get("reason", ""))
-            if unit_active(key) and "not resident" in reason:
-                raise RuntimeError(f"{unit_of(key)} is active but the Arbiter does not list it ({reason}); a unit "
-                                   "started outside the Arbiter is never stopped behind it: stop it by hand or "
-                                   "restart atlas-orchestrator.service (api.py startup stops unowned units)")
-            log(f"control: Arbiter unloaded {key}: {reason}")
-            return reason
-        p = run(["systemctl", "stop", unit_of(key)], timeout=STOP_TIMEOUT_S + 30)
-        if p.returncode != 0:
-            log(f"control: systemctl stop {unit_of(key)} exit {p.returncode}: {(p.stderr or p.stdout).strip()[:200]}")
-        run(["systemctl", "reset-failed", unit_of(key)])
-        return "stopped via systemctl (fallback)"
+        """Unload through the Arbiter (its rule-5 check inside). Returns the Arbiter's reason. Raises RuntimeError on
+        any answer but granted: a refusal means the engine is busy (Section 9.3: never swapped out from under a
+        session) and this script never stops a unit behind a serving Arbiter."""
+        try:
+            code, resp = self.post("/arbiter/unload", {"engine": key, "task_id": TASK_ID},
+                                   timeout=ARBITER_WAIT_S + STOP_TIMEOUT_S + 60)
+        except HttpFail as exc:
+            raise RuntimeError(f"POST /arbiter/unload {key} failed: {exc}") from exc
+        if code == 503:
+            raise RuntimeError(f"Arbiter halted after unloading {key}: HTTP 503 {short(resp)} (Section 4.2 rule "
+                               f"5: the GTT counter did not drop; restart {ORCH_UNIT}.service after looking)")
+        if code != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Arbiter refused to unload {key}: HTTP {code} {short(resp, 200)}")
+        self.last_decision = resp
+        if resp.get("decision") != "granted":
+            raise RuntimeError(f"Arbiter did not unload {key}: {resp.get('decision')}: {resp.get('reason', '')}")
+        reason = str(resp.get("reason", ""))
+        if unit_active(key) and "not resident" in reason:
+            raise RuntimeError(f"{unit_of(key)} is active but the Arbiter does not list it ({reason}); a unit "
+                               "started outside the Arbiter is never stopped behind it: stop it by hand or "
+                               f"restart {ORCH_UNIT}.service (api.py startup stops unowned units)")
+        log(f"control: Arbiter unloaded {key}: {reason}")
+        return reason
 
     # -- register (rule 1) --
     def register(self, key: str, total_bytes: int) -> str:
         """POST /arbiter/register; returns "" on success or the reason it was not registered (the caller warns)."""
-        if self.mode != "orchestrator":
-            return f"footprint not registered with the Arbiter: {self.fallback_reason}"
         try:
             code, resp = self.post("/arbiter/register", {"engine": key, "total_bytes": int(total_bytes),
                                                          "task_id": TASK_ID}, timeout=30)
@@ -942,10 +1083,8 @@ def coherence_check(port: int, model: str) -> tuple[bool, str]:
 
 
 def finalize_control(res: EngineResult, ctl: Control) -> None:
-    """Record how the engine was really controlled at save time (rule §7.4: the table must show a bypassed Arbiter)."""
+    """Record how the engine was controlled at save time (the step 4 table prints it)."""
     res.control_mode = ctl.mode
-    if ctl.mode != "orchestrator":
-        res.warn(f"loaded via systemctl fallback: {ctl.fallback_reason}")
 
 
 def credit_release(ctx: Ctx, key: str, ok: bool, secs: float, note: str) -> None:
@@ -968,30 +1107,50 @@ def unload_and_release(ctl: Control, key: str, baseline: int) -> tuple[bool, flo
         log(f"release {key}: FAIL {exc}")
         return False, 0.0, f"unload refused/failed: {exc}"
     ok, secs, note = wait_release(baseline, key)
-    if ctl.mode == "orchestrator":
-        note += f"; Arbiter: {reason}"
-    return ok, secs, note
+    return ok, secs, f"{note}; Arbiter: {reason}"
+
+
+def release_or_poll(ctl: Control, key: str, baseline: int) -> tuple[bool, float, str]:
+    """Section 4.2 rule 5, always: an engine that is resident (unit active or in the ledger) is unloaded through the
+    Arbiter and the counter polled; an engine whose unit already went away (a failed load, a server that died at 8k)
+    still gets the counter polled, because the process exit is never trusted."""
+    if unit_active(key) or key in ctl.resident_keys():
+        return unload_and_release(ctl, key, baseline)
+    ok, secs, note = wait_release(baseline, key)
+    return ok, secs, f"unit not active, counter polled anyway: {note}"
+
+
+def leak_message(ctx: Ctx, key: str, note: str) -> str:
+    return (f"{key} did not release its memory ({note}): the phase stops here, as the Arbiter halts (Section 4.2 rule "
+            f"5); recorded in {ctx.result_path(key)}. Check the GTT counter and the llama-server@ units, restart "
+            f"{ORCH_UNIT}.service, then re-run (the engine is re-tested)")
 
 
 def swap_out(ctx: Ctx, ctl: Control, previous: str | None, baseline: int) -> tuple[float, str]:
-    """Unload the previous engine (if resident) and confirm its memory came back. Returns (seconds, note)."""
+    """Unload the previous engine and confirm its memory came back, crediting the check to PREVIOUS. Returns (seconds,
+    note). A release that fails is an Infra error: no further load (rule 5)."""
     t0 = time.monotonic()
     if not previous:
         return 0.0, "no previous engine"
-    if not unit_active(previous):
-        return 0.0, f"{previous} was not resident"
-    log(f"swap: unloading {previous}")
-    ok, secs, note = unload_and_release(ctl, previous, baseline)
+    log(f"swap: releasing {previous}")
+    ok, secs, note = release_or_poll(ctl, previous, baseline)
     credit_release(ctx, previous, ok, secs, note)
     if not ok:
-        log(f"swap: {previous} did NOT release its memory; the next load may be over budget")
-    return time.monotonic() - t0, f"unloaded {previous} ({note})"
+        raise Infra(leak_message(ctx, previous, note))
+    return time.monotonic() - t0, f"released {previous} ({note})"
 
 
 def stop_and_release(ctx: Ctx, ctl: Control, key: str, baseline: int, res: EngineResult) -> None:
-    ok, secs, note = unload_and_release(ctl, key, baseline)
+    """Release KEY (unload through the Arbiter, or poll the counter when its unit is already gone) into res."""
+    ok, secs, note = release_or_poll(ctl, key, baseline)
     res.released, res.release_s, res.release_note = ok, round(secs, 1), note
     res.resident_after = unit_active(key) if not ok else False
+
+
+def halt_if_leaked(ctx: Ctx, res: EngineResult) -> None:
+    """Called after the result is saved and its records printed: a failed release stops the phase (rule 5)."""
+    if res.released is False:
+        raise Infra(leak_message(ctx, res.key, res.release_note))
 
 
 def register_footprint(ctl: Control, res: EngineResult, baseline: int) -> None:
@@ -1050,10 +1209,12 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
         return
     r, note = measure_point(port, PREFILL_LONG, "8k")
     log(f"{key}: {note}")
+    # Section 23 S6 (folded into the baseline; engines.json known_issue of nemotron-3-super names #20732): the 8k
+    # prefill test checks the server is still alive afterwards and records a WARNING with the issue number, not a hang
+    # and not a phase-blocking fail; for every other engine a server that dies at 8k is a fail (Section 21 V10 wants
+    # load, generate and swap at 8k as at 512). The document wins (CONVENTIONS.md preamble).
+    tolerated = NEMOTRON_ISSUE_ID in str(spec.get("known_issue") or "")
     if r["error"]:
-        # Conflict f: Nemotron's ~20k memory fault; any engine that dies here is caught, never hung. Section 21 V10
-        # wants load, generate and swap at 8k as at 512: a dead server here is a FAIL, not a warning (the Nemotron
-        # issue is at ~20k, not 8k).
         time.sleep(3)
         alive = unit_active(key) and health_code(port) == 200
         if not alive:
@@ -1066,11 +1227,17 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
                                   f"atlas-orchestrator restart); journal: {tail}")
             else:
                 res.crashed_at_8k = True
-                issue = NEMOTRON_ISSUE if key == "nemotron-3-super" else "server died during the 8k prefill"
-                res.prefill_8k_note = "crashed"
-                res.load_error = f"8k prefill crashed the server ({issue}); journal: {tail}"
-                if "ErrorDeviceLost" in tail_full:
-                    res.load_error += f" [{DEVICELOST_ISSUE}]"
+                lost = f" [{DEVICELOST_ISSUE}]" if "ErrorDeviceLost" in tail_full else ""
+                if tolerated:
+                    res.prefill_8k_note = f"crashed (llama.cpp issue {NEMOTRON_ISSUE_ID}): warning per Section 23 S6"
+                    res.known_issue_note = (f"8k prefill crashed the server: {NEMOTRON_ISSUE}; Section 23 S6 records "
+                                            f"a warning with the issue number, not a fail (the 512 point passed; "
+                                            f"the server was alive-checked, not hung); journal: {tail}{lost}")
+                    res.warn(res.known_issue_note)
+                    log(f"{key}: WARNING {res.known_issue_note}")
+                else:
+                    res.prefill_8k_note = "crashed"
+                    res.load_error = f"8k prefill crashed the server (died during the prefill); journal: {tail}{lost}"
         else:
             res.prefill_8k_note = f"request failed but server alive: {r['error'][:160]}"
             res.load_error = f"8k prefill request failed: {r['error'][:200]}"
@@ -1078,18 +1245,23 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
     t = r["timings"]
     res.prefill_tps_8k = round(float(t.get("prompt_per_second") or 0), 2)
     res.decode_tps_8k = round(float(t.get("predicted_per_second") or 0), 2)
+    if tolerated:
+        res.prefill_8k_note = f"{NEMOTRON_ISSUE_ID} checked, server alive"  # engines.json known_issue wording
 
 
 def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     spec = ctx.spec(key)
     ctl = Control(ctx.orch_url, ctx.admin_token)
+    pending_recover(ctx)
     baseline = read_baseline(ctx)
     res = EngineResult(key=key, arbiter_class=spec.get("arbiter_class", ""), control_mode=ctl.mode,
                        tested_at=now_iso(), baseline_deviation=str(spec.get("baseline_deviation") or ""))
     if spec.get("kv_ladder"):
         ladder_engine(ctx, ctl, key, previous, baseline, res)
         return
-    env = ctx.env(key)
+    # Step 2 measures the STAND-ALONE profile: a `coresident` override left by an interrupted step 3 would otherwise
+    # register the 2-slot / 65536 profile as the vision engine's footprint (rule 1) and print it as its row.
+    env = ctx.render(key, [], ["coresident"])
     res.kv_requested = env.get("ATLAS_KV_TYPE", spec.get("kv_class", ""))
     if env.get("ATLAS_MODEL_PRESENT") != "1":
         res.load_error = (f"ATLAS_MODEL_PRESENT=0 in {key}.env: model file {env.get('ATLAS_MODEL_FILE')} "
@@ -1110,11 +1282,11 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
         if "ErrorDeviceLost" in res.load_error:
             res.load_error += f" [{DEVICELOST_ISSUE}]"
         log(f"{key}: LOAD FAILED: {res.load_error}")
-        if unit_active(key) or key in ctl.resident_keys():
-            stop_and_release(ctx, ctl, key, baseline, res)
+        stop_and_release(ctx, ctl, key, baseline, res)  # rule 5: the counter is polled even when the unit is gone
         finalize_control(res, ctl)
         res.save(ctx)
         record("V4", "fail", f"{key}: not loaded ({res.load_error[:300]})")
+        halt_if_leaked(ctx, res)
         return
     res.load_ok = True
     res.swap_s = round(time.monotonic() - t_swap, 1)
@@ -1125,20 +1297,23 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     log(f"{key}: V4 {'PASS' if res.kv_proof_ok else 'FAIL'}: {res.kv_proof_msg}")
     record("V4", "pass" if res.kv_proof_ok else "fail", res.kv_proof_msg)
     run_measurements(ctx, res, key, port, env)
-    if not res.load_error:
+    if not res.load_error and not res.crashed_at_8k:
         register_footprint(ctl, res, baseline)
         res.resident_after = True  # the next engine's swap (or `finish`) measures this one's release
     else:
+        if res.crashed_at_8k and not res.load_error:
+            res.footprint_note = "not measured: the server died at 8k (see warnings)"
         stop_and_release(ctx, ctl, key, baseline, res)
     res.ok = (res.load_ok and res.generated and not res.load_error and not res.band_fail
-              and res.released is not False)
+              and (not res.crashed_at_8k or bool(res.known_issue_note)) and res.released is not False)
     finalize_control(res, ctl)
     res.save(ctx)
     log(f"{key}: result ok={res.ok} decode512={res.decode_tps_512} decode8k={res.decode_tps_8k} "
         f"prefill512={res.prefill_tps_512} prefill8k={res.prefill_tps_8k} warnings={res.warnings}")
+    halt_if_leaked(ctx, res)
 
 
-# --- the DeepSeek KV ladder (engines.json kv_ladder_rule; Section 4.3; R19) ------------------------------------------
+# --- the DeepSeek KV ladder (engines.json kv_ladder_rule; Section 4.3; Section 23 S2; R19) ----------------------------
 
 
 @dataclass
@@ -1157,7 +1332,7 @@ class LadderVerdict:
 
 def rung_verdict(r: dict[str, Any]) -> str:
     if r.get("coherent") and r.get("kv_proof_ok"):
-        return "coherent"
+        return "coherent" + (" (measurement failed)" if r.get("measure_error") else "")
     if r.get("coherent"):
         return "coherent but KV unproven"
     return "incoherent" if r.get("load_ok") else "load failed"
@@ -1166,18 +1341,22 @@ def rung_verdict(r: dict[str, Any]) -> str:
 def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any]], base_kv: str,
                   f16_cap: int | None, stop_reason: str, released: bool | None, release_note: str,
                   decode_512: float | None, prefill_512: float | None) -> LadderVerdict:
-    """Pure decision of the ladder (engines.json kv_ladder_rule, Section 21 V4/V22, R19):
-      * the FIRST rung that loads, prints its proof lines and answers coherently wins (winners[0]);
-      * q4_0 (the Section 4.3 setting) -> V4 pass, overrides cleared;
-      * q8_0 -> V4 pass, but the message says the Section 4.3 setting was incoherent (a baseline deviation);
-      * f16 -> V4 DEFERRED: unquantised KV is exactly the fallback V4 exists to catch; deliberate is not quantised.
-        V22 still passes with the note (R19; engines.json known_issue), ctx capped to ctx_size_f16_cap;
-      * no winner -> V4 and V22 deferred with the reason (R19 keeps the phase unblocked)."""
+    """Pure decision of the ladder (engines.json kv_ladder_rule; Section 4.3; Section 23 S2; Section 21 V4/V22; R19).
+    The ladder DESCENDS in list order f16 -> q8_0 -> q4_0 and stops at the first rung that fails to load or is
+    incoherent, so the winner is the LAST rung that loaded, printed its proof lines and answered coherently (the lowest
+    coherent rung reached, never a rung below a failure):
+      * q4_0 (the Section 4.3 target) -> V4 pass, overrides cleared (the rungs above were the path down);
+      * q8_0 -> V4 pass with the note that q4_0 was refused or incoherent (issues #25382, #26423), written to overrides;
+      * f16 only -> V4 DEFERRED (unquantised KV is exactly the fallback V4 exists to catch), kv_type=f16 and
+        ctx_size=ctx_size_f16_cap written to overrides, V22 still passes with the note (S2);
+      * no coherent rung (f16 itself fails) -> V4 and V22 deferred with the reason (R19 keeps the phase unblocked);
+      * a winner whose measurement failed (request error, death at 8k) is still the winner (a measurement failure is
+        not incoherence) but V22 records deferred with that reason (R19)."""
     summary = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in rungs)
     untried = [kv for kv in ladder if kv not in {r["kv"] for r in rungs}]
     if untried:
         summary += ", " + ", ".join(f"{kv}=not tried" for kv in untried)
-    winners = [r["kv"] for r in rungs if r.get("coherent") and r.get("kv_proof_ok")]
+    winners = [r for r in rungs if r.get("coherent") and r.get("kv_proof_ok")]
     if not winners:
         reason = stop_reason or f"no coherent rung ({summary})"
         return LadderVerdict(
@@ -1186,16 +1365,18 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
             v22_result="deferred",
             v22_msg=f"DeepSeek V4 Flash deferred without blocking the phase (R19): {reason}; ladder: {summary}",
             set_ov=[], clear_ov=["kv_type", "ctx_size"], note="overrides cleared", deviation="", summary=summary)
-    winner = winners[0]
-    before = [r for r in rungs if r["kv"] != winner and ladder.index(r["kv"]) < ladder.index(winner)]
-    detail = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in before) or "n/a"
+    wrung = winners[-1]
+    winner = str(wrung["kv"])
+    below = [r for r in rungs if ladder.index(r["kv"]) > ladder.index(winner)]
+    detail = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in below) or "not reached"
     base_rung = next((r for r in rungs if r["kv"] == base_kv), None)
     base_state = rung_verdict(base_rung) if base_rung else "not tried"
-    ok = released is not False
+    measure_error = str(wrung.get("measure_error") or "")
+    ok = released is not False and not measure_error
     perf = f"decode {decode_512} tok/s at 512, prefill {prefill_512} tok/s"
     if winner == base_kv:
         v = LadderVerdict(winner, "pass",
-                          f"{key}: {winner} applied and coherent (ladder: {summary}; baseline {base_kv} kept, "
+                          f"{key}: {winner} applied and coherent, the Section 4.3 target reached (ladder: {summary}; "
                           "overrides cleared)", "pass" if ok else "deferred", "", [], ["kv_type", "ctx_size"],
                           "baseline kept (overrides cleared)", "", summary)
     elif winner == "f16":
@@ -1205,8 +1386,8 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
         deviation = (f"KV f16 instead of Section 4.3 q4_0: no quantised rung usable on this build ({detail}; "
                      f"{DEEPSEEK_KV_ISSUES}); {note}")
         v = LadderVerdict(winner, "deferred",
-                          f"{key}: unquantised KV: Section 4.3 q4_0 and q8_0 both unusable on this build "
-                          f"({detail}; {DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
+                          f"{key}: unquantised KV: the first quantised rung below f16 failed ({detail}; "
+                          f"{DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
                           "pass" if ok else "deferred", "", set_ov, [], note, deviation, summary)
     else:
         note = f"{winner} written to overrides.json"
@@ -1215,20 +1396,29 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
         v = LadderVerdict(winner, "pass",
                           f"{key}: {winner} applied (Section 4.3 setting {base_kv} {base_state}: {detail}; "
                           f"{DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
-                          "pass" if ok else "deferred", "", [], ["ctx_size"], note, deviation, summary)
-        v.set_ov = [("kv_type", winner)]
+                          "pass" if ok else "deferred", "", [("kv_type", winner)], ["ctx_size"], note, deviation,
+                          summary)
     v.v22_msg = (f"DeepSeek V4 Flash 0731 UD-Q4_K_XL loads and generates coherently with {winner} KV ({perf}; "
                  f"{v.note})" + (f"; unquantised KV, see V4 deferred ({DEEPSEEK_KV_ISSUES})" if winner == "f16" else "")
-                 + (f"; deferred: {release_note} (R19)" if not ok else ""))
+                 + (f"; deferred: measurement failed at {winner}: {measure_error[:200]} (R19)" if measure_error else "")
+                 + (f"; deferred: {release_note} (R19)" if released is False else ""))
     return v
 
 
+LADDER_RUNG_FIELDS = ("decode_tps_512", "decode_tps_8k", "prefill_tps_512", "prefill_tps_8k", "prefill_8k_note",
+                      "crashed_at_8k", "footprint_bytes", "footprint_note", "band_fail", "band_note")
+
+
 def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseline: int, res: EngineResult) -> None:
-    """DeepSeek V4 Flash (research conflict b): the engines.json kv_ladder in list order (baseline q4_0 first, then
-    q8_0, then f16), coherence at each rung, first coherent rung wins. Section 4.3 states the ladder f16-first and
-    keeps the lowest coherent setting; both orders keep the same setting, the list order just loads the closed
-    setting first (engines.json kv_ladder_rule). A load failure records the rung and CONTINUES (rule 3 there);
-    a rung that loads but is incoherent escalates; only a rule-5 release failure ends the ladder early."""
+    """DeepSeek V4 Flash (research conflict b; engines.json kv_ladder_rule; Section 4.3; Section 23 S2): the rungs in
+    list order f16 -> q8_0 -> q4_0, DOWN from the unquantised cache towards the q4_0 target. A rung that loads, prints
+    its proof lines and answers the coherence prompt becomes the current winner and the next rung is tried; the ladder
+    stops at the first rung that fails to load or is incoherent and keeps the previous winner (the lowest coherent rung
+    reached). A coherent rung whose measurement fails (request error, death at 8k) is not incoherence: the ladder stops
+    with that rung as the winner and V22 records deferred with the reason (R19). The f16 rung is the control that
+    attributes an incoherent quantised rung to KV quantisation rather than to the build or the model. Every rung's
+    overrides are journalled (pending-overrides.json) so an interrupted ladder cannot leave an f16 profile behind; a
+    rule-5 release failure stops the phase (Infra) after the result is saved."""
     spec = ctx.spec(key)
     ladder: list[str] = list(spec["kv_ladder"])
     f16_cap = spec.get("ctx_size_f16_cap")
@@ -1239,11 +1429,12 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
     _, res.swap_note = swap_out(ctx, ctl, previous, baseline)
     swap_measured = False
     stop_reason = ""
+    pending = pending_begin(ctx, key, ["kv_type", "ctx_size"], "DeepSeek KV ladder rungs")
     for kv in ladder:
         rung: dict[str, Any] = {"kv": kv, "load_ok": False, "coherent": False, "kv_proof_ok": False, "note": ""}
         res.ladder.append(rung)
         set_ov: list[tuple[str, str]] = [("kv_type", kv)]
-        clear_ov: list[str] = []
+        clear_ov: list[str] = ["coresident"]
         if kv == "f16" and f16_cap:
             set_ov.append(("ctx_size", str(int(f16_cap))))
         else:
@@ -1262,13 +1453,12 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
             rung["note"] = f"load failed: {exc}"
             if "ErrorDeviceLost" in str(exc):
                 rung["note"] += f" [{DEVICELOST_ISSUE}]"
-            log(f"{key}: rung {kv} {rung['note']}; continuing with the next rung (kv_ladder_rule 3)")
-            if unit_active(key) or key in ctl.resident_keys():
-                stop_and_release(ctx, ctl, key, baseline, res)
-                if res.released is False:
-                    stop_reason = f"memory not released after the failed {kv} rung: {res.release_note}"
-                    break
-            continue
+            log(f"{key}: rung {kv} {rung['note']}; the ladder stops here and keeps the rung above (kv_ladder_rule 3)")
+            stop_and_release(ctx, ctl, key, baseline, res)  # rule 5: polled even when the unit never came up
+            rung["released"] = res.released
+            if res.released is False:
+                stop_reason = f"memory not released after the failed {kv} rung: {res.release_note}"
+            break
         rung["load_ok"] = True
         res.load_ok = True
         if not swap_measured:
@@ -1284,26 +1474,39 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         log(f"{key}: rung {kv} coherence {'ok' if coherent else 'FAIL'}: {detail}")
         won = coherent and ok
         if won:
+            # Per-rung measurement into res (reset first so a rung never inherits the one above), copied into the rung.
+            res.load_error, res.band_fail, res.band_note, res.crashed_at_8k, res.prefill_8k_note = "", "", "", False, ""
+            res.footprint_bytes, res.footprint_note = None, ""
             run_measurements(ctx, res, key, port, env)
-            rung.update({"decode_tps_512": res.decode_tps_512, "decode_tps_8k": res.decode_tps_8k,
-                         "prefill_tps_512": res.prefill_tps_512, "prefill_tps_8k": res.prefill_tps_8k,
-                         "prefill_8k_note": res.prefill_8k_note})
             if res.load_error:
-                rung["note"] = res.load_error
-                rung["coherent"] = False
-                won = False
-                res.load_error = ""
+                rung["measure_error"] = res.load_error  # a dead or failing server is never registered (rule 1)
             else:
                 register_footprint(ctl, res, baseline)
+            rung.update({f: getattr(res, f) for f in LADDER_RUNG_FIELDS})
         stop_and_release(ctx, ctl, key, baseline, res)
+        rung["released"] = res.released
         if res.released is False:
             stop_reason = f"memory not released after the {kv} rung: {res.release_note}"
             break
-        if won:
-            break  # kv_ladder_rule 2: the first coherent, proven rung wins
+        if not won:
+            log(f"{key}: rung {kv} {rung_verdict(rung)}; the ladder stops here and keeps the rung above "
+                "(kv_ladder_rule 3)")
+            break
+        if rung.get("measure_error"):
+            log(f"{key}: rung {kv} is coherent but its measurement failed ({rung['measure_error'][:160]}); the ladder "
+                "stops with this rung as the winner and V22 records deferred (R19)")
+            break
+        log(f"{key}: rung {kv} coherent and proven: current winner; descending (kv_ladder_rule 2)")
+    standing = next((r for r in reversed(res.ladder) if r.get("coherent") and r.get("kv_proof_ok")), {})
     v = decide_ladder(key, ladder, res.ladder, base_kv, f16_cap, stop_reason, res.released, res.release_note,
-                      res.decode_tps_512, res.prefill_tps_512)
+                      standing.get("decode_tps_512"), standing.get("prefill_tps_512"))
     ctx.render(key, v.set_ov, v.clear_ov)
+    pending_end(ctx, pending)
+    # The result's figures are the winner's (the rung that stands), not the last rung tried.
+    wrung = standing if v.winner else None
+    for f in LADDER_RUNG_FIELDS:
+        setattr(res, f, wrung.get(f) if wrung else EngineResult.__dataclass_fields__[f].default)
+    res.load_error = ""
     res.kv_applied = v.winner
     res.kv_proof_ok = v.v4_result == "pass"
     res.kv_proof_msg = v.v4_msg
@@ -1311,12 +1514,14 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
     res.v22_result, res.v22_msg = v.v22_result, v.v22_msg
     if v.deviation:
         res.baseline_deviation = (res.baseline_deviation + " | " if res.baseline_deviation else "") + v.deviation
-    res.ok = bool(v.winner) and res.released is not False and not res.band_fail
+    res.ok = (bool(v.winner) and res.released is not False and not res.band_fail
+              and not (wrung or {}).get("measure_error"))
     res.resident_after = False
     finalize_control(res, ctl)
     res.save(ctx)
     record("V4", v.v4_result, v.v4_msg)
     log(f"{key}: ladder result: {res.v22_result}: {res.v22_msg}")
+    halt_if_leaked(ctx, res)
 
 
 # --- prepare / finish / summarize / table -----------------------------------------------------------------------------
@@ -1324,23 +1529,32 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
 
 def cmd_prepare(ctx: Ctx, _args: argparse.Namespace) -> int:
     ctl = Control(ctx.orch_url, ctx.admin_token)
+    pending_recover(ctx)
+    prev_baseline = read_baseline_optional(ctx)  # an earlier run's baseline: a resident engine's release is credited
     active = [k for k in ctx.core_keys() if unit_active(k)]
-    if ctl.mode == "orchestrator":
-        ledger = ctl.resident_keys()
-        foreign = [k for k in active if k not in ledger]
-        if foreign:
-            raise Infra(f"{foreign} active but not in the Arbiter's ledger (resident: {ledger}); a unit the Arbiter "
-                        "does not own is never stopped behind it: restart atlas-orchestrator.service (its startup "
-                        "stops unowned units) or stop the unit by hand")
-        to_unload = [k for k in ctx.core_keys() if k in ledger]
-    else:
-        to_unload = active
+    ledger = ctl.resident_keys()
+    foreign = [k for k in active if k not in ledger]
+    if foreign:
+        raise Infra(f"{foreign} active but not in the Arbiter's ledger (resident: {ledger}); a unit the Arbiter "
+                    f"does not own is never stopped behind it: restart {ORCH_UNIT}.service (its startup "
+                    "stops unowned units) or stop the unit by hand")
+    to_unload = [k for k in ctx.core_keys() if k in ledger or k in active]
     for k in to_unload:
-        log(f"prepare: {k} is resident before the tests; unloading it (via {ctl.mode})")
-        try:
-            ctl.unload(k)
-        except RuntimeError as exc:
-            raise Infra(f"cannot establish the baseline: {exc}") from exc
+        res = load_result(ctx, k)
+        log(f"prepare: {k} is resident before the tests; unloading it through the Arbiter")
+        if prev_baseline is None:
+            try:
+                ctl.unload(k)
+            except RuntimeError as exc:
+                raise Infra(f"cannot establish the baseline: {exc}") from exc
+            continue
+        ok, secs, note = unload_and_release(ctl, k, prev_baseline)
+        if res is not None and res.resident_after:
+            # File-level resumability (CONVENTIONS.md §7.3): the engine passed in an interrupted run and was left
+            # resident for the next swap to measure; this IS that measurement, credited so its V10 line can pass.
+            credit_release(ctx, k, ok, secs, f"credited by prepare on a re-run (baseline of the earlier run): {note}")
+        if not ok:
+            raise Infra(f"cannot establish the baseline: {k} did not release ({note}) (Section 4.2 rule 5)")
     if to_unload:
         time.sleep(5)
     # Settle: two readings 10 s apart within tolerance, so the baseline is not taken mid-release.
@@ -1360,7 +1574,7 @@ def cmd_prepare(ctx: Ctx, _args: argparse.Namespace) -> int:
     ctx.results_dir.mkdir(parents=True, exist_ok=True)
     (ctx.results_dir / "baseline.json").write_text(json.dumps({
         "gtt_used_bytes": cur, "gtt_total_bytes": total, "measured_at": now_iso(), "control_mode": ctl.mode,
-        "fallback_reason": ctl.fallback_reason, "unloaded_first": to_unload}, indent=2) + "\n", encoding="utf-8")
+        "unloaded_first": to_unload}, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
@@ -1371,17 +1585,22 @@ def cmd_engine(ctx: Ctx, args: argparse.Namespace) -> int:
 
 def cmd_finish(ctx: Ctx, args: argparse.Namespace) -> int:
     ctl = Control(ctx.orch_url, ctx.admin_token)
+    pending_recover(ctx)
     baseline = read_baseline(ctx)
     prev = args.previous
-    if prev and unit_active(prev):
-        log(f"finish: unloading the last engine {prev}")
-        ok, secs, note = unload_and_release(ctl, prev, baseline)
+    if prev:
+        log(f"finish: releasing the last engine {prev}")
+        ok, secs, note = release_or_poll(ctl, prev, baseline)
         credit_release(ctx, prev, ok, secs, note)
+        if not ok:
+            raise Infra(leak_message(ctx, prev, note))
     for k in ctx.core_keys():
-        if unit_active(k):
-            log(f"finish: {k} still active (unexpected); unloading it")
+        if unit_active(k) or k in ctl.resident_keys():
+            log(f"finish: {k} still resident (unexpected); unloading it")
             ok, secs, note = unload_and_release(ctl, k, baseline)
             credit_release(ctx, k, ok, secs, note)
+            if not ok:
+                raise Infra(leak_message(ctx, k, note))
     return 0
 
 
@@ -1409,7 +1628,9 @@ def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
         parts.append("warn: " + " | ".join(w[:160] for w in res.warnings))
     if res.load_error:
         parts.append(f"error: {res.load_error[:200]}")
-    ok = (res.generated and not res.load_error and not res.crashed_at_8k and not res.stopped_externally
+    # A death at 8k fails the engine unless Section 23 S6 tolerates it as a warning (known_issue_note, nemotron #20732).
+    crash_fail = res.crashed_at_8k and not res.known_issue_note
+    ok = (res.generated and not res.load_error and not crash_fail and not res.stopped_externally
           and not res.band_fail and res.released is True)
     return ("pass" if ok else "fail"), "; ".join(parts)
 
@@ -1484,6 +1705,8 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
             notes.append("warn")
         if res.prefill_8k_note:
             notes.append(f"8k {res.prefill_8k_note.split(':')[0]}")
+        if res.known_issue_note:
+            notes.append(f"S6 warning {NEMOTRON_ISSUE_ID}")
         if res.load_error:
             notes.append(res.load_error[:40])
         rows.append((key, "ok" if res.load_ok else "FAIL", res.kv_applied or res.kv_requested or "-",
@@ -1552,23 +1775,25 @@ def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: d
     the way the Arbiter itself reads it: the probe engine's unit env file (phase2/engine-env.py, root) is rendered
     with a ctx_size override doubled until /internal/deep-think/plan says the standard tier no longer fits; then
     (a) the deep tier is planned and must be downgraded, (b) POST /arbiter/load of that engine at that profile must be
-    refused. The override is restored in a finally block; nothing is loaded. The Arbiter's KV model (arbiter.py)
-    scales with ctx, which is why doubling reaches over budget in a few steps."""
+    refused. The override is journalled in pending-overrides.json BEFORE the first render and restored in a finally
+    block (SIGTERM is an exception here, so `systemctl stop` runs it; a SIGKILL/power cut is repaired by
+    pending_recover() on the next invocation); nothing is loaded. The Arbiter's KV model (arbiter.py) scales with ctx,
+    which is why doubling reaches over budget in a few steps. /internal/deep-think/plan is loopback-guarded and never
+    sees the admin token (Control._hdr)."""
     key = pick_probe_key(ctx, exclude)
     spec = ctx.spec(key)
     prior_ctx = ctx.override_of(key, "ctx_size")
     base_ctx = int(prior_ctx or spec["ctx_size"])
-    plan_hdr = ctl.headers  # the admin header is harmless on /internal (loopback-only either way)
     out["v14b_probe_engine"] = key
     out["v14b_prior_ctx_override"] = prior_ctx
 
     def plan(tier: str) -> dict[str, Any]:
-        code, resp = http("POST", f"{ctl.orch_url}/internal/deep-think/plan", {"tier": tier, "task_id": TASK_ID},
-                          timeout=60, headers=plan_hdr)
+        code, resp = ctl.post("/internal/deep-think/plan", {"tier": tier, "task_id": TASK_ID}, timeout=60)
         if code != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"POST /internal/deep-think/plan {tier} answered {code}: {short(resp, 200)}")
         return resp
 
+    pending = pending_begin(ctx, key, ["ctx_size"], "V14b over-budget probe profile")
     try:
         before = plan("deep")
         out["v14b_plan_deep_before"] = before
@@ -1619,9 +1844,8 @@ def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: d
                "probe profile rendered through engine-env.py for the proof and restored")
         return ok, msg
     finally:
-        restore: list[tuple[str, str]] = [("ctx_size", str(prior_ctx))] if prior_ctx is not None else []
-        clear = [] if prior_ctx is not None else ["ctx_size"]
-        env_back = ctx.render(key, restore, clear)
+        env_back = pending_restore(ctx, pending)
+        pending_end(ctx, pending)
         log(f"coresident/V14b: {key} env restored (ctx {env_back.get('ATLAS_CTX_SIZE')}, "
             f"parallel {env_back.get('ATLAS_PARALLEL')})")
 
@@ -1630,16 +1854,20 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     text_key, vision_key = args.text, args.vision
     tspec, vspec = ctx.spec(text_key), ctx.spec(vision_key)
     ctl = Control(ctx.orch_url, ctx.admin_token)
+    pending_recover(ctx)
     baseline = read_baseline(ctx)
-    out: dict[str, Any] = {"text": text_key, "vision": vision_key, "control_mode": ctl.mode,
-                           "fallback_reason": ctl.fallback_reason, "tested_at": now_iso()}
+    out: dict[str, Any] = {"text": text_key, "vision": vision_key, "control_mode": ctl.mode, "tested_at": now_iso()}
     for k in ctx.core_keys():
-        if unit_active(k):
+        if unit_active(k) or k in ctl.resident_keys():
             log(f"coresident: {k} is resident; unloading it first")
             ok, _, note = unload_and_release(ctl, k, baseline)
             if not ok:
                 raise Infra(f"cannot start the two-residency test: {k} did not release: {note}")
     loaded: list[str] = []
+    # The vision engine's co-resident profile (parallel_coresident / ctx_size_coresident) is a TEMPORARY override:
+    # journalled before it is written, cleared in cleanup(); the orchestrator decides co-residency live.
+    pend_vision = pending_begin(ctx, vision_key, ["coresident"], "two-residency vision profile",
+                                clear_always=["coresident"])
     used_after: dict[str, int] = {}  # GTT used right after each load, so each unload has a measured release target
 
     def cleanup() -> list[str]:
@@ -1654,7 +1882,8 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
             if not ok:
                 problems.append(f"{k} did not release after the two-residency test ({note})")
         # Restore the vision engine's stand-alone rendering (8 slots); the orchestrator decides co-residency live.
-        ctx.render(vision_key, [], ["coresident"])
+        pending_restore(ctx, pend_vision)
+        pending_end(ctx, pend_vision)
         return problems
 
     def finish(v21: tuple[str, str], v14b: tuple[str, str]) -> int:
@@ -1694,15 +1923,14 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
         used_after[key] = gtt_used_bytes()
         log(f"coresident: {key} loaded in {secs:.0f}s (ctx {env['ATLAS_CTX_SIZE']}, parallel {env['ATLAS_PARALLEL']}); "
             f"GTT used {fmt_gb(used_after[key])}")
-    if ctl.mode == "orchestrator":
-        # Rule 3: the Arbiter may have evicted the text engine to fit the vision one; the ledger says.
-        ledger = ctl.resident_keys()
-        gone = [k for k in loaded if k not in ledger]
-        if gone:
-            loaded[:] = [k for k in loaded if k in ledger]
-            why = (f"the Arbiter evicted {gone} to load {vision_key} (resident now: {ledger}; last decision: "
-                   f"{short(ctl.last_decision, 200)}); the pair does not co-reside at these profiles")
-            return finish(("fail", why), ("fail", f"pair not resident; {why}"))
+    # Rule 3: the Arbiter may have evicted the text engine to fit the vision one; the ledger says.
+    ledger = ctl.resident_keys()
+    gone = [k for k in loaded if k not in ledger]
+    if gone:
+        loaded[:] = [k for k in loaded if k in ledger]
+        why = (f"the Arbiter evicted {gone} to load {vision_key} (resident now: {ledger}; last decision: "
+               f"{short(ctl.last_decision, 200)}); the pair does not co-reside at these profiles")
+        return finish(("fail", why), ("fail", f"pair not resident; {why}"))
     time.sleep(5)
     used = gtt_used_bytes()
     delta = used - baseline
@@ -1716,12 +1944,9 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
                 "residency_ok": residency_ok})
     log(f"coresident: {'OK' if residency_ok else 'OUT OF TOLERANCE'}: {mem_msg}")
 
-    if ctl.mode != "orchestrator":
-        why = (f"not provable via systemctl fallback: {ctl.fallback_reason} (only the Arbiter queues a second "
-               "generation, refuses a load or downgrades a tier)")
-        return finish(("fail", f"{mem_msg}; queueing {why}"), ("fail", f"refusal/downgrade {why}"))
-
-    # Solo timings of each engine (direct, no Arbiter) give the wall-clock reference for the concurrent run.
+    # Solo timings of each engine (direct to the llama-server port) give the wall-clock reference for the concurrent
+    # run. Nothing else generates meanwhile: the driver stops atlas-sentinel.timer, atlas-prune.timer and
+    # atlas-celery-gpu.service around steps 02/03 (Section 4.2 rule 3: one generation at a time, background work too).
     tport, vport = int(tenv["LLAMA_ARG_PORT"]), int(venv["LLAMA_ARG_PORT"])
     q_text = [{"role": "user", "content": "Write a 250-word essay about the history of lighthouses."}]
     q_vision = [{"role": "user", "content": "Describe, in about 150 words, how a suspension bridge carries its load."}]
@@ -1833,6 +2058,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--vision", required=True)
     p.set_defaults(fn=cmd_coresident)
     args = ap.parse_args(argv)
+    # `systemctl stop atlas-day1-phase3` sends SIGTERM to the whole cgroup: turn it into an exception in the main
+    # thread so every finally block (override restores, pending journal) runs before exit (CONVENTIONS.md §7.3, §7.4).
+    signal.signal(signal.SIGTERM, _on_sigterm)
     try:
         require_loopback(args.orch_url)
         ctx = Ctx(engines_path=Path(args.engines), env_dir=Path(args.env_dir), results_dir=Path(args.results_dir),
@@ -1843,6 +2071,9 @@ def main(argv: list[str] | None = None) -> int:
             + (" (admin token loaded)" if ctx.admin_token else ""))
         ctx.load_engines()
         return int(args.fn(ctx, args))
+    except Terminated as exc:
+        log(f"TERMINATED: {exc}")
+        return 143
     except Infra as exc:
         log(f"FATAL: {exc}")
         return 2

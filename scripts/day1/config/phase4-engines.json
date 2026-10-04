@@ -3,12 +3,13 @@
     "purpose": "The Phase 4 engines of ATLAS_FRAMEWORK_REVIEW.md Section 15.2 (Section 17 Phase 4; Section 21 V8, V9, V11). Read by phase4-engines.sh, phase4/lib-engine.sh (each phase4/engines/<key>.sh reads its own entry) and phase4/engines/p4common.py. Meditron-70B and the vision engine (Qwen2.5-VL-72B) are Phase 3 GGUF engines and are not listed (Section 15.2, 17 step 2).",
     "tier_rule": "green: built in step 02 in list order, a failure is recorded fail and the phase continues. yellow: attempted in step 03, a failure is recorded deferred. verify: step 04, records verify_id (V8 pointllm, V9 clay-prithvi) pass or deferred. deferred: listed for the table only, no build_script, never attempted (Section 15.2 says why).",
     "order_rule": "List order is Section 17 step 2's order of value; the driver keeps it.",
-    "hf_rule": "hf_repos[] is what the engine pulls with huggingface_hub.snapshot_download through the allowlist proxy (HF_HOME=/srv/atlas/engines/hf). gated=true repos get HF_TOKEN from /etc/atlas/secrets/hf-token.env, bind-mounted read-only into that pull container only (never an env var; public repos never see the token) and fail with the exact licence URL on 401/403 (research conflict 16); a squid 403 is reported as a proxy denial, not a licence. verified=false means the repo id, size or licence came from a search snippet; p4common.py re-reads https://huggingface.co/api/models/<repo>?blobs=true (gated, cardData.license, sha, siblings with sizes and LFS sha256) at pull time, records it in $HF_HOME/manifests/<repo>.json, verifies every LFS file's sha256 after the download, and pins the revision: `revision` when given here, else the hub sha of the first successful pull written to $HF_HOME/manifests/<repo>.pinned and used on every later run (delete it to re-pin). allow_patterns limits the pull (FLUX: skip the 24 GB single-file duplicates).",
+    "hf_rule": "hf_repos[] is what the engine pulls with huggingface_hub.snapshot_download through the allowlist proxy (HF_HOME=/srv/atlas/engines/hf; HF_ENDPOINT from atlas.env is honoured for the pull itself). gated=true repos get HF_TOKEN from /etc/atlas/secrets/hf-token.env: root reads it and stages a copy owned by the container uid (mode 400) in a private root-only tmpfs directory, bind-mounted read-only into that pull container only at /run/secrets/hf-token.env and removed after the run (never an env var; public repos never see the token; the token is sent only to huggingface.co or a *.hf.co host, rule §7.2). A gated repo whose token file is absent fails before any container starts with the token prompt and the licence URL; 401/403 from the hub fails with the exact licence URL (research conflict 16); a squid 403 is reported as a proxy denial, not a licence. verified=false means the repo id, size or licence came from a search snippet; p4common.py re-reads https://huggingface.co/api/models/<repo>?blobs=true (gated, cardData.license, sha, siblings with sizes and LFS sha256) at pull time, verifies every LFS file's sha256 after the download (and lib-engine.sh re-verifies on the host), writes refs/main in the cache so the offline GPU test resolves the default revision to the pinned snapshot (huggingface_hub 2.0.0 writes no ref for a commit-hash download), PROVES the offline resolution in-process (snapshot_download, hf_hub_download, DiffusionPipeline.download for pipelines) and prints the listing, the pin and the resolved id as tagged lines that lib-engine.sh stores root-held under $ATLAS_STATE/phase4/hf-manifests/<org>__<repo>.{json,pinned,resolved}. Revision pin: `revision` when given here, else the hub sha of the first successful pull (.pinned, used on every later run; delete it to re-pin). allow_patterns limits the pull (FLUX: skip the 24 GB single-file duplicates; the offline proof confirms diffusers does not expect them).",
     "pip_rule": "pip[] is installed into /srv/atlas/engines/venv/<key> (a --system-site-packages venv over the image's ROCm torch) under the image's /opt/atlas/constraints-rocm.txt, so no engine pin can replace the gfx1151 torch (rocm-containers.md §4 item 2, §6.6). Pins are typed only where the research gives one (rule §7.9); unpinned entries say so in research_note. Every successful install is frozen to $ATLAS_SRV/engines/manifests/<key>-freeze.txt (the audit artefact for unpinned entries).",
+    "git_rule": "git[] entries are cloned into /srv/atlas/engines/src/<dir> through the proxy. `ref` (optional) is fetched exactly (git fetch --depth 1 origin <ref>); without it the default branch HEAD is cloned and its commit recorded root-held in $ATLAS_STATE/phase4/git-pins.json, which every later re-clone fetches, so the code that runs is reproducible until the Principal deletes the pin (rule §7.9 for code, not only for weights). The sha landed is in the engine's result notes.",
     "footprint_rule": "footprint_gb_expected is Section 15.2's planning figure. The measured value is the GTT counter delta (mem_info_gtt_used) on the host while the engine's test runs, written to $ATLAS_STATE/phase4/<key>.json as footprint_mb and registered with the Arbiter in step 05.",
     "timeout_rule": "timeout_s bounds one engine's script (build + pull + test); load_timeout_s is the in-test watchdog for a hung model load (kernel 7.0 mmap/hang reports, ROCm/legacy-rocm-build #6530): a load slower than this is killed and recorded fail, never waited for.",
     "research": "rocm-containers.md (2026-09-22) §3 and §6; adjudicated conflicts 12-19.",
-    "sandbox_rule": "Every container run carries --pids-limit 4096, --memory/--memory-swap = mem_limit_gb (null -> max(16, 2 x footprint_gb_expected); GTT is not charged to the cgroup, so this bounds CPU-side memory only), --cpus = nproc - 2, --cap-drop ALL, no-new-privileges. Build/pull/clone runs have the proxy and no GPU; the GPU test run has /dev/kfd, /dev/dri, --network none and only the extra flags V11 recorded in $ATLAS_SRV/engines/v11-runflags.txt (phase4/lib-engine.sh header).",
+    "sandbox_rule": "Every container run carries --pids-limit 4096, --memory/--memory-swap = mem_limit_gb (null -> max(16, 2 x footprint_gb_expected); GTT is not charged to the cgroup, so this bounds CPU-side memory only), --cpus = nproc - 2, --cap-drop ALL, no-new-privileges, PYTHONNOUSERSITE=1, PIP_CONFIG_FILE=/dev/null, GIT_CONFIG_GLOBAL=/dev/null. Build/pull/clone runs have the proxy and no GPU and mount hf/, venv/<key>, src/, dl/<key>, <key>/, manifests/ read-write; the GPU test run has /dev/kfd, /dev/dri, --network none, mounts those read-only (plus phase4-samples/<key>, home/, miopen/ read-write) and adds only the extra flags V11 recorded root-held in $ATLAS_STATE/phase4/v11-runflags.txt (phase4/lib-engine.sh header).",
     "yellow_rule": "Section 17 step 3 'log pass or fail, never block' and CONVENTIONS §7.4 'yellow records deferred': the result file carries result=deferred AND outcome=fail (blocking=false), and the step 6 table prints deferred(fail)."
   },
   "base_image": {
@@ -21,8 +22,8 @@
     "torch": "2.13.0+rocm10.0.0",
     "torchvision": "0.28.0+rocm10.0.0",
     "diagnostic_fallback_image": "docker.io/kyuz0/amd-strix-halo-comfyui:latest",
-    "diagnostic_fallback_digest": null,
-    "note": "AMD's own gfx1151 wheels are the primary (adjudicated conflict 12; rocm-containers.md §1.1 VERIFIED index and extras, versions VERIFIED via TheRock #7839). scottt's 2025 wheel is NOT pinned. The fallback image is only run as a diagnostic when V11 fails, to separate 'our image is wrong' from 'this kernel/BIOS combination is broken' (§1.1). The fallback tag is floating (the research gives a push date, no digest; rule §7.9): diagnostic_fallback_digest is null, so the FIRST pull is UNPINNED and the driver records the pulled digest in $ATLAS_STATE/phase4/diag-image.txt and uses it on every later run; the README lists the recorded digest. The diagnostic run is hardened (atlas uid, --cap-drop ALL, no-new-privileges, pids/memory caps, read-only root)."
+    "diagnostic_fallback_digest": "sha256:384aa1fecef6a841832e0d5552949977330308d8c25e212a94f5e8dfcc061cae",
+    "note": "AMD's own gfx1151 wheels are the primary (adjudicated conflict 12; rocm-containers.md §1.1 VERIFIED index and extras, versions VERIFIED via TheRock #7839). scottt's 2025 wheel is NOT pinned. The fallback image is only run as a diagnostic when V11 fails, to separate 'our image is wrong' from 'this kernel/BIOS combination is broken' (§1.1). diagnostic_fallback_digest: VERIFIED 2026-10-04 from the Docker Hub registry API (GET /v2/kyuz0/amd-strix-halo-comfyui/manifests/latest -> Docker-Content-Digest, a single-arch manifest.v2), so the pull is pinned and nothing floating runs on the GPU (Section 16.3 item 8, rule §7.9); set it to null only to re-pin, in which case the driver records the first pulled digest in $ATLAS_STATE/phase4/diag-image.txt and uses it afterwards. The diagnostic run is hardened (atlas uid, --cap-drop ALL, no-new-privileges, pids/memory caps, read-only root, --entrypoint /opt/venv/bin/python) and mirrors V11: the default seccomp profile first, seccomp=unconfined + ipc=host once on a non-timeout failure only."
   },
   "defaults": {
     "timeout_s": 14400,
@@ -261,7 +262,8 @@
       "git": [
         {
           "url": "https://github.com/facebookresearch/sam2.git",
-          "dir": "sam2"
+          "dir": "sam2",
+          "ref": "2b90b9f5ceec907a1c18123530e92e794ad901a4"
         }
       ],
       "build_script": "phase4/engines/sam2.sh",
@@ -272,7 +274,7 @@
       "verify_id": null,
       "timeout_s": 7200,
       "licence_note": null,
-      "research_note": "rocm-containers.md §3.7: SAM2_BUILD_CUDA=0 pip install -e . VERIFIED (INSTALL.md, setup.py); only the small-hole mask post-processing is lost (Section 15.2). The 2.1 HF id is UNVERIFIED; fallback_repo is the README's VERIFIED example id. dl.fbaipublicfiles.com is not allowlisted, so the .pt fallback is not used. pip install -e . runs with --no-build-isolation (INSTALL.md): the build-system's torch>=2.5.1 would otherwise pull the CUDA wheel into a throwaway build env."
+      "research_note": "rocm-containers.md §3.7: SAM2_BUILD_CUDA=0 pip install -e . VERIFIED (INSTALL.md, setup.py); only the small-hole mask post-processing is lost (Section 15.2). The 2.1 HF id is UNVERIFIED; fallback_repo is the README's VERIFIED example id. dl.fbaipublicfiles.com is not allowlisted, so the .pt fallback is not used. pip install -e . runs with --no-build-isolation (INSTALL.md): the build-system's torch>=2.5.1 would otherwise pull the CUDA wheel into a throwaway build env. Clone pinned to the main HEAD read on 2026-10-04 (git[].ref)."
     },
     {
       "key": "stable-audio-open",
@@ -298,7 +300,7 @@
       "verify_id": null,
       "timeout_s": 7200,
       "licence_note": "Gated with a manual form on huggingface.co; accept it with the HF_TOKEN account before Phase 4 (conflict 16).",
-      "research_note": "rocm-containers.md §3.8: package VERIFIED; flash-attn is not available on ROCm gfx1151, the model must fall back to SDPA (UNVERIFIED that every module does); inference snippet UNVERIFIED-by-snippet. Fix round (rule §7.9 deviation, README): stable-audio-tools==0.0.20 declares requires-python <3.11 and pins torch==2.7.1/torchaudio==2.7.1 (VERIFIED PyPI), so stable-audio-open.sh installs it --no-deps --ignore-requires-python and its runtime deps minus torch separately; the wav is written with soundfile (torchaudio >= 2.9 needs torchcodec)."
+      "research_note": "rocm-containers.md §3.8: package VERIFIED; flash-attn is not available on ROCm gfx1151, the model must fall back to SDPA (UNVERIFIED that every module does); inference snippet UNVERIFIED-by-snippet. Fix round (rule §7.9 deviation, README): stable-audio-tools==0.0.20 declares requires-python <3.11 and pins torch==2.7.1/torchaudio==2.7.1 (VERIFIED PyPI), so stable-audio-open.sh installs it --no-deps --ignore-requires-python and then the wheel's OWN Requires-Dist set minus torch/torchaudio/setuptools (VERIFIED from the 0.0.20 wheel METADATA, 2026-10-04: alias-free-torch==0.0.6 dill einops einops-exts huggingface_hub importlib-resources==5.12.0 torchsde nnAudio PyWavelets==1.4.1 safetensors scipy sentencepiece==0.1.99 soxr tqdm transformers v-diffusion-pytorch==0.0.2 vector-quantize-pytorch==1.14.41; the `train`/`ui` extras are not installed) plus soundfile for the wav (torchaudio >= 2.9 needs torchcodec); `python -c 'import stable_audio_tools'` runs in the build so a missing module is a named build failure, not a GPU-test failure."
     },
     {
       "key": "cosyvoice2",
@@ -320,7 +322,8 @@
         {
           "url": "https://github.com/FunAudioLLM/CosyVoice.git",
           "dir": "CosyVoice",
-          "recursive": true
+          "recursive": true,
+          "ref": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc"
         }
       ],
       "build_script": "phase4/engines/cosyvoice2.sh",
@@ -331,7 +334,7 @@
       "verify_id": null,
       "timeout_s": 10800,
       "licence_note": null,
-      "research_note": "Section 15.2 says green; rocm-containers.md §3.9 says treat as yellow (requirements.txt pins torch/onnxruntime, pynini needs OpenFst). The tier stays green per the document; the script filters those pins out under the constraints file (UNVERIFIED workaround) and a failure is a recorded fail, never a block. The test passes the prompt wav PATH (VERIFIED cosyvoice/cli/cosyvoice.py) and replaces upstream load_wav (torchaudio.load -> torchcodec on >= 2.9) with a soundfile loader; soundfile is added to the venv."
+      "research_note": "Section 15.2 says green; rocm-containers.md §3.9 says treat as yellow (requirements.txt pins torch/onnxruntime, pynini needs OpenFst). The tier stays green per the document; the script filters those pins out under the constraints file (UNVERIFIED workaround) and a failure is a recorded fail, never a block. The test passes the prompt wav PATH (VERIFIED cosyvoice/cli/cosyvoice.py) and replaces upstream load_wav (torchaudio.load -> torchcodec on >= 2.9) with a soundfile loader; soundfile is added to the venv. Clone pinned to the main HEAD read on 2026-10-04 (git[].ref)."
     },
     {
       "key": "openvla",
@@ -388,17 +391,27 @@
         "rembg",
         "onnxruntime",
         "opencv-python-headless",
-        "pillow"
+        "pillow",
+        "plyfile",
+        "xatlas",
+        "pyvista",
+        "pymeshfix",
+        "igraph",
+        "tqdm",
+        "scipy",
+        "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"
       ],
       "git": [
         {
           "url": "https://github.com/microsoft/TRELLIS.git",
           "dir": "TRELLIS",
-          "recursive": true
+          "recursive": true,
+          "ref": "442aa1e1afb9014e80681d3bf604e8d728a86ee7"
         },
         {
           "url": "https://github.com/kroqueta-s/trellis-strix-halo.git",
-          "dir": "trellis-strix-halo"
+          "dir": "trellis-strix-halo",
+          "ref": "2794cbbd05c921876ebff354af5a67f447f5b7a9"
         }
       ],
       "build_script": "phase4/engines/trellis.sh",
@@ -409,7 +422,7 @@
       "verify_id": null,
       "timeout_s": 14400,
       "licence_note": null,
-      "research_note": "rocm-containers.md §3.13: upstream needs six CUDA-only packages; attempt A = upstream code + kroqueta-s pure-torch shims (gfx1151-validated on Windows only, Linux UNVERIFIED). A build or run failure records deferred with the last 20 log lines. Attempt B (TRELLIS.2 + paladx2105 ROCm 10.0 wheels) is noted, not automated: its wheel URLs are unverified. The kroqueta-s shims are one module, runners/trellis/shims.py, whose install() registers spconv/flash_attn/nvdiffrast/kaolin/open3d replacements in sys.modules before `import trellis` (VERIFIED README + docstring); trellis_test.py calls it."
+      "research_note": "rocm-containers.md §3.13: upstream needs six CUDA-only packages; attempt A = upstream code + kroqueta-s pure-torch shims (gfx1151-validated on Windows only, Linux UNVERIFIED). A build or run failure records deferred with the last 20 log lines. Attempt B (TRELLIS.2 + paladx2105 ROCm 10.0 wheels) is noted, not automated: its wheel URLs are unverified. The kroqueta-s shims are one module, runners/trellis/shims.py, whose install() registers spconv/flash_attn/nvdiffrast/kaolin/open3d replacements in sys.modules before `import trellis` (VERIFIED README + docstring); trellis_test.py calls it. Fix round 2 (VERIFIED from upstream main, 2026-10-04): trellis/representations/gaussian/gaussian_model.py imports plyfile and utils3d at module level and utils/postprocessing_utils.py imports xatlas, pyvista, pymeshfix, igraph, cv2, trimesh, so the pip list carries TRELLIS setup.sh --basic's set (xatlas pyvista pymeshfix igraph + utils3d at the commit setup.sh pins) plus plyfile; both clones are pinned to the HEAD shas read on 2026-10-04 (git[].ref). ALLOWLIST DEPENDENCY: TrellisImageTo3DPipeline.from_pretrained builds its image conditioner with torch.hub.load('facebookresearch/dinov2', ...) (trellis_image_to_3d.py line 74), whose weights come from dl.fbaipublicfiles.com, which Section 12.5 / config/allowlist.txt do not list (sam2.sh records the same decision). trellis.sh pre-fetches it with the network on (TORCH_HOME on the persisted HOME) and, when that host is denied, records deferred with that exact reason and widens nothing: adding dl.fbaipublicfiles.com is a Principal decision for the Phase 1 writer, not something this engine does."
     },
     {
       "key": "blender-cycles",
@@ -430,7 +443,7 @@
       "verify_id": null,
       "timeout_s": 7200,
       "licence_note": null,
-      "research_note": "Adjudicated conflict 18: pin 4.5 LTS (newest 4.5.x on the release index, tarball name pattern UNVERIFIED). gfx1151 HIP kernels are in the tarball since Blender commit 6363181a (VERIFIED via Bforartists #4932); whether HIP 6.x fatbins load on the ROCm 10.0 runtime is UNVERIFIED. The test renders the default cube at 64 samples with HIP, then with CPU (mandatory fallback, Section 15.2) and records which succeeded; pass needs at least the CPU render. Blender runs with --offline-mode (>= 4.2) and the --bpy step fails when bpy.app.online_access is True; each render has its own timeout under the load watchdog so the CPU fallback always runs."
+      "research_note": "Adjudicated conflict 18: pin 4.5 LTS (newest 4.5.x on the release index, tarball name pattern UNVERIFIED). gfx1151 HIP kernels are in the tarball since Blender commit 6363181a (VERIFIED via Bforartists #4932); whether HIP 6.x fatbins load on the ROCm 10.0 runtime is UNVERIFIED. The test renders the default cube at 64 samples with HIP, then with CPU (mandatory fallback, Section 15.2) and records which succeeded; pass needs at least the CPU render. Blender runs with --offline-mode (>= 4.2) and the --bpy step fails when bpy.app.online_access is True; each render has its own timeout under the load watchdog so the CPU fallback always runs. Fix round 2: the tarball is downloaded and unpacked INSIDE the container as atlas into /srv/atlas/engines/blender-cycles/ (root never extracts an archive into the atlas-writable tree: GNU tar as root keeps archive ownership and setuid bits); the sha256 is checked by root read-only against the .sha256 file from the same index, which proves transfer integrity only, not provenance (same-origin checksum; the README says so)."
     },
     {
       "key": "pointllm",
@@ -451,7 +464,8 @@
       "git": [
         {
           "url": "https://github.com/OpenRobotLab/PointLLM.git",
-          "dir": "PointLLM"
+          "dir": "PointLLM",
+          "ref": "cb72f4e6ab625ddab92f84931127e12bc326b4be"
         }
       ],
       "build_script": "phase4/engines/pointllm.sh",
@@ -462,7 +476,7 @@
       "verify_id": "V8",
       "timeout_s": 14400,
       "licence_note": "cc-by-nc-4.0 (UNVERIFIED-by-snippet): non-commercial, the same class the baseline flags for FLUX (adjudicated conflict 17; Section 16.5). Recorded for the Principal.",
-      "research_note": "rocm-containers.md §3.11: point ops are pure torch (VERIFIED), the risk is dependency rot (transformers 2023 commit, tokenizers==0.12.1 built from source with rustc, open3d unpinned). Failure records V8 deferred, as Section 17 step 4 allows. tokenizers==0.12.1 has wheels for cp36-cp310 only (VERIFIED PyPI): the sdist build needs index.crates.io, static.crates.io and crates.io in config/allowlist.txt (Phase 1 writer); pointllm.sh stops with that message when they are absent."
+      "research_note": "rocm-containers.md §3.11: point ops are pure torch (VERIFIED), the risk is dependency rot (transformers 2023 commit, tokenizers==0.12.1 built from source with rustc, open3d unpinned). Failure records V8 deferred, as Section 17 step 4 allows. tokenizers==0.12.1 has wheels for cp36-cp310 only (VERIFIED PyPI): the sdist build needs index.crates.io, static.crates.io and crates.io in config/allowlist.txt (Phase 1 writer; VERIFIED absent on 2026-10-04, so V8 is deferred by construction until they are added: edit the repository copy, then `sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist <repo>/scripts/day1/config/allowlist.txt` — no ufw reset, no reboot — then `sudo ./atlas-day1.sh phase4 --force 04`); pointllm.sh stops with that message when they are absent. Clone pinned to the master HEAD read on 2026-10-04 (git[].ref)."
     },
     {
       "key": "clay-prithvi",
@@ -496,7 +510,8 @@
       "git": [
         {
           "url": "https://github.com/Clay-foundation/model.git",
-          "dir": "clay-model"
+          "dir": "clay-model",
+          "ref": "f14e698f3c237cabf8d28dec669a362d66625381"
         }
       ],
       "build_script": "phase4/engines/clay-prithvi.sh",
@@ -507,7 +522,7 @@
       "verify_id": "V9",
       "timeout_s": 10800,
       "licence_note": null,
-      "research_note": "rocm-containers.md §3.12: Prithvi via TerraTorch is the V9 engine (registry name VERIFIED, build call UNVERIFIED-by-snippet); Clay v1.5 (quickstart VERIFIED) is attempted second. V9 passes when either encoder runs on the device; the notes say which."
+      "research_note": "rocm-containers.md §3.12: Prithvi via TerraTorch is the V9 engine (registry name VERIFIED, build call UNVERIFIED-by-snippet); Clay v1.5 (quickstart VERIFIED) is attempted second. V9 passes when either encoder runs on the device; the notes say which. Clone pinned to the main HEAD read on 2026-10-04 (git[].ref)."
     },
     {
       "key": "evo",

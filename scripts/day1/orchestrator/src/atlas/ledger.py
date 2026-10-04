@@ -440,14 +440,21 @@ class Ledger:
 
     # --- retention (10.4, D9) -----------------------------------------------------------------------------------------
 
-    def purge(self, table: str, older_than_s: float, *, now: float | None = None,
-              archive: Callable[[str, list[dict[str, Any]]], None] | None = None, vacuum: bool = False) -> int:
+    def purge(
+        self,
+        table: str,
+        older_than_s: float,
+        *,
+        now: float | None = None,
+        archive: Callable[[str, list[dict[str, Any]]], None] | None = None,
+        vacuum: bool = False,
+    ) -> int:
         """Delete the rows of `table` older than `older_than_s` seconds and return how many went.
 
-        D9 says "30 days hot, then archived": when `archive` is given it receives (table, rows) BEFORE the delete, inside
-        the same transaction, so a failing archive keeps the rows (the caller, atlas.tasks.prune, writes them under
-        /srv/cold). approvals, strikes and meta are permanent and refused with ValueError. Open tasks (queued/running)
-        are never purged whatever their age: a row that vanished mid-flight would be a lie in the ledger.
+        D9 says "30 days hot, then archived": when `archive` is given it receives (table, rows) BEFORE the delete,
+        inside the same transaction, so a failing archive keeps the rows (the caller, atlas.tasks.prune, writes them
+        under /srv/cold). approvals, strikes and meta are permanent and refused with ValueError. Open tasks (queued or
+        running) are never purged whatever their age: a row that vanished mid-flight would be a lie in the ledger.
         """
         table = self._table(table)
         if table in PERMANENT_TABLES:
@@ -459,7 +466,7 @@ class Ledger:
         where = f"{ts_col} < ?"
         params: list[Any] = [cutoff]
         if table == "tasks":
-            where += " AND status NOT IN (%s)" % ", ".join("?" for _ in _TASK_OPEN_STATUSES)
+            where += " AND status NOT IN ({})".format(", ".join("?" for _ in _TASK_OPEN_STATUSES))
             params.extend(_TASK_OPEN_STATUSES)
         with self.transaction() as cur:
             if archive is not None:

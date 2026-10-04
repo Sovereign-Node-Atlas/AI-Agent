@@ -10,11 +10,14 @@ One pulse (`atlas.tasks.sentinel_pulse`, cpu queue, enqueued hourly by atlas-sen
   4. statistics first: deviations against the last `history_window` readings and the fixed thresholds of the file;
   5. write the pulse (JSON) to SENTINEL_LOG_DIR/pulses/... and to ledger.sentinel_pulses;
   6. ONLY when a threshold tripped: enqueue `atlas.tasks.sentinel_bluf` on the gpu queue, which asks the resident
-     router model for a BLUF entry through the orchestrator (that model is outside the Arbiter's ledger, 4.1: the
-     call takes no lock but waits while a weight-bearing generation runs, atlas.api._generation_lock; never a swap
-     under an active session, 4.2 rule 6), writes the BLUF to the log, the ledger and the `sentinel` memory
-     collection, and pushes it through ntfy. Owners are carried as fields: alaric for threats, silas for markets,
-     under arthur (C12).
+     router model for a BLUF entry through the orchestrator (the call holds the orchestrator's one generation slot
+     like every generation, atlas.api.GenerationSlot, 4.2 rule 3; never a swap under an active session, rule 6) with
+     audience "principal", so the never-delegate rewrite (16.1 rule 5) runs on the text before it reaches the phone;
+     writes the BLUF to the log, the ledger and the `sentinel` memory collection (estate-bound, under Arthur, C12),
+     and pushes it through ntfy. Owners are carried as fields: alaric for threats, silas for markets, under arthur.
+     Thresholds (fix round 2): a reader resolves its limit ONCE (`th.get(key, default)`) and uses that same value in
+     the comparison and in the Anomaly, so a feeds file without a key alerts at the default instead of raising
+     KeyError into "telemetry unreadable" and losing the anomaly.
 
 No model is invoked on a quiet pulse. Nothing here calls anything but the allowlisted feeds and loopback services.
 
@@ -541,13 +544,14 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                 v = _read_loadavg()
                 ratio = v["load1"] / v["nproc"]
                 v["load1_over_nproc"] = round(ratio, 3)
-                if ratio > float(th.get("load1_over_nproc", 2.0)):
+                limit = float(th.get("load1_over_nproc", 2.0))
+                if ratio > limit:
                     anomalies.append(
                         Anomaly(
                             sid,
                             "load1_over_nproc",
                             ratio,
-                            float(th["load1_over_nproc"]),
+                            limit,
                             f"load1 {v['load1']:.1f} on {int(v['nproc'])} cpus",
                             "alaric",
                             "estate",
@@ -556,13 +560,14 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                     )
             elif sid == "memory":
                 v = _read_meminfo()
-                if v["mem_available_pct"] < float(th.get("mem_available_pct_min", 5.0)):
+                limit = float(th.get("mem_available_pct_min", 5.0))
+                if v["mem_available_pct"] < limit:
                     anomalies.append(
                         Anomaly(
                             sid,
                             "mem_available_pct",
                             v["mem_available_pct"],
-                            float(th["mem_available_pct_min"]),
+                            limit,
                             f"MemAvailable {v['mem_available_pct']:.1f}%",
                             "alaric",
                             "estate",
@@ -571,13 +576,14 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                     )
             elif sid == "gtt":
                 v = _read_gtt()
-                if v["gtt_used_pct"] > float(th.get("gtt_used_pct_max", 92.0)):
+                limit = float(th.get("gtt_used_pct_max", 92.0))
+                if v["gtt_used_pct"] > limit:
                     anomalies.append(
                         Anomaly(
                             sid,
                             "gtt_used_pct",
                             v["gtt_used_pct"],
-                            float(th["gtt_used_pct_max"]),
+                            limit,
                             f"GTT {v['gtt_used_pct']:.1f}% used",
                             "alaric",
                             "estate",
@@ -586,13 +592,14 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                     )
             elif sid == "thermal":
                 v = _read_thermal()
-                if v["temp_c_max"] > float(th.get("temp_c_max", 95.0)):
+                limit = float(th.get("temp_c_max", 95.0))
+                if v["temp_c_max"] > limit:
                     anomalies.append(
                         Anomaly(
                             sid,
                             "temp_c_max",
                             v["temp_c_max"],
-                            float(th["temp_c_max"]),
+                            limit,
                             f"hottest sensor {v['temp_c_max']:.0f} C",
                             "alaric",
                             "estate",
@@ -658,13 +665,14 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                     )
             elif sid == "backup":
                 v = _read_backup()
-                if v["snapshot_age_hours"] > float(th.get("snapshot_age_hours_max", 36)):
+                limit = float(th.get("snapshot_age_hours_max", 36))
+                if v["snapshot_age_hours"] > limit:
                     anomalies.append(
                         Anomaly(
                             sid,
                             "snapshot_age_hours",
                             v["snapshot_age_hours"],
-                            float(th["snapshot_age_hours_max"]),
+                            limit,
                             f"last AEGIS run {v['snapshot_age_hours']:.0f} h ago",
                             "alaric",
                             "estate",
@@ -673,13 +681,14 @@ def read_telemetry(sources: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict
                     )
             elif sid == "firewall":
                 v = _read_firewall()
-                if v["denied_per_hour"] > float(th.get("denied_per_hour_max", 200)):
+                limit = float(th.get("denied_per_hour_max", 200))
+                if v["denied_per_hour"] > limit:
                     anomalies.append(
                         Anomaly(
                             sid,
                             "denied_per_hour",
                             v["denied_per_hour"],
-                            float(th["denied_per_hour_max"]),
+                            limit,
                             f"{int(v['denied_per_hour'])} denied connections in the last hour",
                             "alaric",
                             "estate",
@@ -963,8 +972,15 @@ def sentinel_bluf(
     try:
         client = OrchestratorClient()
         try:
+            # audience="principal": the BLUF goes to the Principal's phone, so the never-delegate rewrite (16.1 rule 5)
+            # runs on it inside the orchestrator (fix round 2).
             text = client.generate(
-                engine, bluf_messages(anomalies, pulse_ts), max_tokens=400, temperature=0.2, task_id=self.request.id
+                engine,
+                bluf_messages(anomalies, pulse_ts),
+                max_tokens=400,
+                temperature=0.2,
+                task_id=self.request.id,
+                audience="principal",
             )
         finally:
             client.close()

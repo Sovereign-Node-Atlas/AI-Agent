@@ -38,12 +38,12 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict
 
 from atlas.config import EngineSpec
-from urllib.parse import urlsplit
 
 log = logging.getLogger("atlas.engines")
 

@@ -1,5 +1,6 @@
 """Section 16.4 / V17 with a StubDocker: the run line is the Dockerfile's (plus --pull never and the atlas gid), exit
-137 reads as killed_by_cap, a missing image or an unconfined network grant is refused, staged paths stay inside."""
+137 reads as killed_by_cap, a missing image is refused, every network grant is refused (the bridge is a DNS tunnel at
+best), staged paths and job ids stay inside SANDBOX_DIR, the operator's caps come from the environment."""
 
 from __future__ import annotations
 
@@ -8,7 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from atlas.sandbox import SandboxConfig, SandboxError, StubDocker, build_argv, run, sandbox_config_from_env
+from atlas.sandbox import (
+    SandboxConfig,
+    SandboxError,
+    StubDocker,
+    build_argv,
+    parse_memory_mb,
+    run,
+    sandbox_config_from_env,
+)
 
 
 def cfg(tmp_path: Path) -> SandboxConfig:
@@ -145,13 +154,43 @@ def test_missing_image_is_refused_before_any_run(tmp_path: Path) -> None:
     assert docker.calls == [] and not (tmp_path / "sandbox" / "noimg").exists()
 
 
-def test_network_grant_needs_the_egress_unit(tmp_path: Path) -> None:
+def test_network_grant_is_refused_whatever_the_egress_unit_says(tmp_path: Path) -> None:
+    """A bridged container reaches the proxy not at all and DNS at best, and DNS to a recursive resolver is a tunnel
+    around the allowlist (12.5): the grant buys nothing but the leak, so run() refuses it (README-contracts 'Sandbox'
+    records the atlas-sandbox bridge as the remedy). build_argv keeps the shape for that future."""
     docker = StubDocker()
-    with pytest.raises(SandboxError, match="atlas-docker-egress"):
-        run("print(1)", network=True, runner=docker, config=cfg(tmp_path), egress_active=lambda: False)
+    for active in (False, True):
+        with pytest.raises(SandboxError, match="tunnel around the allowlist"):
+            run("print(1)", network=True, runner=docker, config=cfg(tmp_path), egress_active=lambda a=active: a)
+    assert docker.calls == [] and docker.inspected_images == []
+    assert not (tmp_path / "sandbox").exists()
+    with_net = build_argv(
+        "j", "/w", ["python3"], memory_mb=512, cpus=1, timeout_s=10, network=True, config=cfg(tmp_path)
+    )
+    assert "--network" not in with_net
+
+
+@pytest.mark.parametrize("job_id", ["../x", "/abs", "a b", "x" * 65, "sb;rm", "a/b"])
+def test_job_ids_that_could_escape_or_break_the_name_are_refused(tmp_path: Path, job_id: str) -> None:
+    docker = StubDocker()
+    with pytest.raises(SandboxError, match="job id"):
+        run("print(1)", runner=docker, config=cfg(tmp_path), job_id=job_id)
     assert docker.calls == []
-    res = run("print(1)", network=True, runner=docker, config=cfg(tmp_path), egress_active=lambda: True)
-    assert res.ok and "--network" not in res.argv
+    assert not (tmp_path / "x").exists() and not (tmp_path / "sandbox" / "x").exists()
+    assert not (tmp_path / "sandbox" / "a").exists()
+
+
+def test_run_defaults_its_caps_to_the_configured_ones(tmp_path: Path) -> None:
+    """SANDBOX_MEMORY / SANDBOX_CPUS / SANDBOX_TIMEOUT_S (README-contracts) are what run() uses when the caller
+    passes nothing; the code constants are only the fallback of an unset environment."""
+    docker = StubDocker()
+    c = SandboxConfig(base_dir=str(tmp_path / "sandbox"), gid=1234, memory_mb=777, cpus=1.5, timeout_s=42)
+    res = run("print(1)", runner=docker, config=c, job_id="caps")
+    argv = list(res.argv)
+    assert argv[argv.index("--memory") + 1] == "777m" and argv[argv.index("--cpus") + 1] == "1.5"
+    assert argv[3] == "52" and "SANDBOX_TIMEOUT_S=42" in argv
+    res = run("print(1)", memory_mb=512, runner=docker, config=c, job_id="caps2")
+    assert list(res.argv)[list(res.argv).index("--memory") + 1] == "512m"
 
 
 @pytest.mark.parametrize(
@@ -171,6 +210,9 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SANDBOX_PIDS", "256")
     monkeypatch.setenv("SANDBOX_TMPFS_SIZE", "512m")
     monkeypatch.setenv("SANDBOX_FSIZE", "1073741824")
+    monkeypatch.setenv("SANDBOX_MEMORY", "2g")
+    monkeypatch.setenv("SANDBOX_CPUS", "2")
+    monkeypatch.setenv("SANDBOX_TIMEOUT_S", "300")
     c = sandbox_config_from_env()
     assert (c.image, c.base_dir, c.pids, c.tmpfs_size, c.fsize) == (
         "atlas-sandbox:py3.12",
@@ -179,7 +221,19 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "512m",
         1073741824,
     )
+    assert (c.memory_mb, c.cpus, c.timeout_s) == (2048, 2.0, 300)
     assert c.run_gid >= 0
-    monkeypatch.setenv("SANDBOX_PIDS", "lots")
-    with pytest.raises(SandboxError):
-        sandbox_config_from_env()
+    assert parse_memory_mb("512m") == 512 and parse_memory_mb("2048") == 2048 and parse_memory_mb("1G") == 1024
+    for bad in ("2 cows", "5m", ""):
+        with pytest.raises(SandboxError):
+            parse_memory_mb(bad)
+    for key, value in (
+        ("SANDBOX_PIDS", "lots"),
+        ("SANDBOX_CPUS", "two"),
+        ("SANDBOX_TIMEOUT_S", "5m"),
+        ("SANDBOX_MEMORY", "x"),
+    ):
+        monkeypatch.setenv(key, value)
+        with pytest.raises(SandboxError, match=key):
+            sandbox_config_from_env()
+        monkeypatch.delenv(key)
