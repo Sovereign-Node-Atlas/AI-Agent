@@ -7,7 +7,8 @@
 #      needs (voice-stt.md §5.2): pyannote/speaker-diarization-3.1 (config.yaml) and pyannote/segmentation-3.0
 #      (pytorch_model.bin). 401/403 = licence not accepted -> the two URLs the Principal must visit; exit 1.
 #      The bearer header is read by curl from a mode-600 file (-H @file), never placed on argv where /proc/<pid>/cmdline
-#      shows it to every local account (fix round).
+#      shows it to every local account (fix round). The token file is PARSED (awk), never sourced: CONVENTIONS §2 makes
+#      it atlas:atlas, and this script runs as root (fix round 2: no root execution of an atlas-writable file).
 #   2. A 10-second 16 kHz mono WAV is generated (two synthetic tones with a gap) and diarised once ONLINE (downloads
 #      into HF_HOME) and once with HF_HUB_OFFLINE=1 (proves the cache loads without network, Section 12.5). Both runs
 #      execute as the atlas service account (runuser) when this script runs as root, so the HF cache entries and lock
@@ -31,10 +32,13 @@ entry="${ATLAS_ENTRY:-./atlas-day1.sh}"
 [[ -x "$venv/bin/python" ]] || { echo "V6 fail: $venv/bin/python does not exist (phase2/05-voice.sh builds it)"; exit 1; }
 HF_TOKEN=""
 if [[ -r "$tokf" ]]; then
-  # shellcheck disable=SC1090  # secret file, HF_TOKEN=... (CONVENTIONS.md §2)
-  source "$tokf"
+  # Parsed, not sourced (header item 1): the file is atlas-owned per §2 and this runs as root.
+  HF_TOKEN="$(awk -F= '$1=="HF_TOKEN" {sub(/^[^=]*=/, ""); gsub(/["'"'"' \t\r]/, ""); print; exit}' "$tokf")"
 fi
 [[ -n "$HF_TOKEN" ]] || { echo "V6 fail: HF_TOKEN empty or $tokf unreadable (phase2-services.sh prompts for it)"; exit 1; }
+[[ "$HF_TOKEN" =~ ^hf_[A-Za-z0-9_]{20,}$ ]] || { echo "V6 fail: HF_TOKEN in $tokf does not look like a Hugging Face token (hf_...)"; exit 1; }
+# The child processes (runuser -> env -> python) inherit it from the environment: never an argv element.
+export HF_TOKEN
 proxy_env
 base="${HF_ENDPOINT:-https://huggingface.co}"
 
@@ -104,11 +108,12 @@ as_runtime_user() {
 
 diarise() {   # diarise PIPELINE OFFLINE(0|1) -> JSON on stdout; exit 3 = pipeline failed to load, 1 = run failed
   local pipe="$1" offline="$2"
-  # HF_TOKEN travels in the environment of the child (readable only by that uid and root), never on argv.
+  # HF_TOKEN is EXPORTED above and inherited by runuser (which keeps the caller's environment except HOME/SHELL/USER/
+  # LOGNAME without -l/-m), env and python: it is never an argument of env(1), so no /proc/<pid>/cmdline ever shows it.
   as_runtime_user env HF_HOME="$hf_home" HF_HUB_OFFLINE="$offline" HF_HUB_ENABLE_HF_TRANSFER=0 \
     HF_HUB_DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 PYANNOTE_METRICS_ENABLED=0 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
     HTTPS_PROXY="${HTTPS_PROXY:-}" HTTP_PROXY="${HTTP_PROXY:-}" NO_PROXY="${NO_PROXY:-}" \
-    OMP_NUM_THREADS="$(nproc)" HF_TOKEN="$HF_TOKEN" \
+    OMP_NUM_THREADS="$(nproc)" \
     "$venv/bin/python" - "$pipe" "$work/test16k.wav" <<'PY'
 import json, os, sys, time
 import torch

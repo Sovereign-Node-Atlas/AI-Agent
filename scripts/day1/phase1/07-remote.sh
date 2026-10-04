@@ -3,20 +3,34 @@
 # docker/wg-easy/compose.yml (admin UI published on the LAN address only), the Cloudflare dynamic-DNS updater under
 # atlas-ddns, ntfy with default-deny auth and a node token, the WireGuard bridge address added to the SSH/Cockpit/
 # xrdp bindings, and V5 (DNS matches the public IP; a handshake from mobile data within 10 minutes passes, else
-# deferred with the exact re-run command). No interactive prompt anywhere in this step (rule §7.6).
+# V5 is recorded as FAIL with the exact re-run command: the step itself completes, the gate shows the red row and
+# Phase 2 waits for `--force 07`; CONVENTIONS §6 gives V5 no deferral provision).
+#
+# THE ONE POSSIBLE PROMPT IN THIS STEP (Section 22, S11): when the Cloudflare token cannot list zones
+# (Zone:DNS:Edit only, adjudicated conflict 3) and no zone id is found beside the token in CLOUDFLARE.txt or as
+# CF_ZONE_ID in atlas.env, the Principal is asked ONCE for the 32-hex zone id (Overview page of the zone), read from
+# /dev/tty with a 5-minute timeout. No terminal or no answer in time leaves CF_ZONE_ID blank with a warning (the
+# updater then fails visibly until it is set; V5 reports the DNS mismatch; Phase 2 step 6b stops with the manual fix).
+# Non-interactive path: CF_ZONE_ID=<id> in $ATLAS_ETC/atlas.env (non-secret) before this step runs.
 #
 # CLOUDFLARE TOKEN HAND-OFF (Section 12.3, R7, V23): Phase 2 step 6b is the relocation step, but this step needs a
 # working updater NOW. So it READS the token from $CLOUDFLARE_TXT and writes $ATLAS_ETC/secrets/cloudflare.env
 # (mode 600, atlas-ddns), tightens CLOUDFLARE.txt to 600 owned by the Principal, leaves it IN PLACE, and never
-# deletes it. Step 6b verifies the env file against the API, stores CF_ZONE_ID if still blank (asking once if it
-# must), and only then shreds CLOUDFLARE.txt (V23).
+# deletes it. Step 6b verifies the env file against the API, uses the stored CF_ZONE_ID, and only then shreds
+# CLOUDFLARE.txt (V23).
 #
 # SECRETS ON DISK: WireGuard's server and peer private keys (/etc/wireguard in the container) live under
 # $ATLAS_ETC/secrets/wg-easy (root 700); ntfy's user.db (password hashes, the node token) lives under
 # /var/lib/atlas-ntfy (atlas 700). Neither is under /srv/atlas nor in restic's include set (CONVENTIONS §7.2);
-# client configs are regenerable from the admin UI and need no backup. Secrets never travel on a command line:
-# curl reads the bearer header from a file descriptor, docker exec takes NTFY_PASSWORD from --env-file, and every
-# error message is redacted before it reaches the log.
+# client configs are regenerable from the admin UI and need no backup. $ATLAS_ETC/secrets itself is root:atlas 710
+# (traverse-only for the atlas group: no listing, every file 600 owned by its one reader) because atlas-owned files
+# live inside it (ntfy.env here, hf-token.env and secrets/google later) and their owner could not open them under
+# CONVENTIONS §2's root:root 700; phase2/06c-google-oauth.sh fixes the same mode for every writer, so no re-run of
+# this step (`--force 07` for V5) regresses it. Secrets never travel on a command line: curl reads the bearer header
+# from a file descriptor, docker exec takes NTFY_PASSWORD from --env-file, and every error message is redacted before
+# it reaches the log. Dependency noted for lib/common.sh's notify (called once below): it passes the ntfy token as
+# `-H "Authorization: Bearer ..."` on curl's argv (readable in /proc/<pid>/cmdline for the life of the process); the
+# fix belongs to common.sh (`-H @<(printf ...)`), this step's own curl calls already use the fd form.
 # Facts from the platform research items 8, 9, 10, 11 (VERIFIED unless marked). Defines step_07 only.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
@@ -63,7 +77,7 @@ _wg_kernel() {
 
 _wg_easy_up() {
   local envf="$ATLAS_ETC/secrets/wg-easy.env" datadir="$ATLAS_ETC/secrets/wg-easy"
-  ensure_dir "$ATLAS_ETC/secrets" root:root 700
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710          # header: traverse-only for atlas; every writer uses this mode
   ensure_dir "$datadir" root:root 700
   _migrate_dir "$ATLAS_SRV/data/wg-easy" "$datadir"
   if [[ ! -s "$envf" ]]; then
@@ -71,7 +85,9 @@ _wg_easy_up() {
     {
       echo "# WG-Easy compose interpolation + admin credentials. WG_ADMIN_PASS is the admin password for the Principal;"
       echo "# WG_INIT_PASS/WG_INIT_ENABLED feed the container's one-time INIT_* setup and are blanked once setup ran."
-      echo "WG_ADMIN_USER=$PRINCIPAL_USER"
+      echo "# WG_ADMIN_USER is a fixed 11-character name: unattended-setup.md warns that INIT_USERNAME/INIT_PASSWORD are"
+      echo "# not complexity-checked and a short name can be refused by the login form (UNVERIFIED minimum length)."
+      echo "WG_ADMIN_USER=atlas-admin"
       echo "WG_ADMIN_PASS=$pw"
       echo "WG_INIT_ENABLED=true"
       echo "WG_INIT_PASS=$pw"
@@ -93,7 +109,7 @@ _wg_easy_up() {
   [[ -f "$dir/compose.yml" ]] || die "$dir/compose.yml is missing"
   _wg_kernel
   local compose=(docker compose --project-name atlas-wg-easy --project-directory "$dir" --env-file "$envf")
-  log "docker compose up wg-easy (ghcr.io/wg-easy/wg-easy:15; pull goes through the proxy)"
+  log "docker compose up wg-easy (ghcr.io/wg-easy/wg-easy:15.4.0; pull goes through the proxy)"
   retry 3 "${compose[@]}" up -d --quiet-pull \
     || die "docker compose up for wg-easy failed (ghcr.io and pkg-containers.githubusercontent.com must be allowlisted): $(_redact "$("${compose[@]}" logs --tail 20 2>&1 | tail -n 20)")"
   ip link show "$ATLAS_WG_BRIDGE" >/dev/null 2>&1 || die "the compose bridge $ATLAS_WG_BRIDGE does not exist after compose up (driver_opts com.docker.network.bridge.name UNVERIFIED; docker network ls)"
@@ -123,7 +139,7 @@ _wg_easy_check() {
   local wgs
   wgs="$(docker exec wg-easy wg show "$WG_IFACE" 2>&1 | head -n 3 || true)"
   grep -q "interface: $WG_IFACE" <<<"$wgs" \
-    || die "$WG_IFACE is not up inside wg-easy: the INIT_* unattended setup did not run (WG-Easy v15 UNVERIFIED detail). Open http://$LAN_IP:51821/ and finish the wizard with host $VPN_HOST port $WG_PORT, then re-run: sudo $ATLAS_ENTRY phase1 --force 07. Output: $(_redact "$wgs")"
+    || die "$WG_IFACE is not up inside wg-easy: the INIT_* unattended setup did not run (WG-Easy v15 UNVERIFIED detail), or the capability set is too tight ('Operation not permitted' in 'docker logs wg-easy': compose.yml drops every capability but NET_ADMIN/NET_RAW, UNVERIFIED for the v15 entrypoint; loosen cap_drop there and re-run). Otherwise open http://127.0.0.1:51821/ from the node and finish the wizard with host $VPN_HOST port $WG_PORT, then re-run: sudo $ATLAS_ENTRY phase1 --force 07. Output: $(_redact "$wgs")"
   log "wg-easy: $(head -n1 <<<"$wgs")"
 }
 
@@ -154,9 +170,8 @@ _cloudflare_env() {
     warn "Cloudflare token could not be verified via /user/tokens/verify (answer: $(_redact "${verify:0:120}")); continuing with the DNS record lookup"
   fi
   if [[ -z "$zone_id" ]]; then
-    # Adjudicated conflict 3, without any prompt here: the API when the token allows, else the id written beside the
-    # token in CLOUDFLARE.txt, else a non-secret CF_ZONE_ID= key in atlas.env, else blank (the updater fails visibly,
-    # V5 reports the DNS mismatch, and Phase 2 step 6b asks the Principal once).
+    # Adjudicated conflict 3 / Section 22 / S11: the API when the token allows, else the id written beside the token
+    # in CLOUDFLARE.txt, else a non-secret CF_ZONE_ID= key in atlas.env, else the ONE ask of the Principal (header).
     zone_id="$(_cf_curl "$token" "$api/zones?name=$DOMAIN&status=active" 2>/dev/null | jq -r '.result[0].id // empty' || true)"
     if [[ -n "$zone_id" ]]; then
       log "zone id for $DOMAIN resolved with GET /zones (the token carries Zone:Zone:Read)"
@@ -169,10 +184,37 @@ _cloudflare_env() {
       log "zone id taken from CF_ZONE_ID in $ATLAS_ETC/atlas.env"
     fi
     if [[ -n "$zone_id" && ! "$zone_id" =~ ^[0-9a-f]{32}$ ]]; then
-      warn "'$zone_id' is not a 32-hex zone id; leaving CF_ZONE_ID blank"
+      warn "'$zone_id' is not a 32-hex zone id; ignoring it"
       zone_id=""
     fi
-    [[ -n "$zone_id" ]] || warn "CF_ZONE_ID left blank (the token cannot list zones and no id was found): the ddns updater will fail until Phase 2 step 6b stores it; V5 will report the DNS mismatch. To fix it now: CF_ZONE_ID=<32-hex id from the dashboard Overview page> in $ATLAS_ETC/atlas.env, then --force 07."
+    if [[ -z "$zone_id" ]]; then
+      # The one ask (Section 22: "Phase 1 step 7 asks for the id once if the token cannot list zones"). The device is
+      # opened for real: under systemd-run/nohup there is no terminal and the ask is skipped with the warning below.
+      if ( : </dev/tty ) 2>/dev/null; then
+        local answer="" tries=0
+        {
+          echo
+          echo "  ==== Cloudflare zone id needed (Section 22) ===="
+          echo "  The token in $CLOUDFLARE_TXT is Zone:DNS:Edit only, so it cannot look up the zone id of $DOMAIN."
+          echo "  Cloudflare dashboard -> $DOMAIN -> Overview -> API -> Zone ID (32 hex characters). Asked once; 5 minutes."
+          echo "  (Press Enter with nothing to skip: the ddns updater then fails until CF_ZONE_ID is set in"
+          echo "   $ATLAS_ETC/secrets/cloudflare.env or $ATLAS_ETC/atlas.env and this step is re-run with --force 07.)"
+        } >/dev/tty
+        while (( tries < 3 )); do
+          answer=""
+          read -r -t 300 -p "  Zone ID: " answer </dev/tty >/dev/tty || { echo >/dev/tty; break; }
+          answer="$(tr -d '[:space:]' <<<"$answer" | tr 'A-F' 'a-f')"
+          [[ -z "$answer" ]] && break
+          if [[ "$answer" =~ ^[0-9a-f]{32}$ ]]; then zone_id="$answer"; break; fi
+          echo "  not a 32-character hex id (got ${#answer} characters); try again" >/dev/tty
+          tries=$(( tries + 1 ))
+        done
+        [[ -n "$zone_id" ]] && log "zone id for $DOMAIN entered by the Principal (stored in cloudflare.env; never asked again)"
+      else
+        warn "no terminal: cannot ask for the Cloudflare zone id (set CF_ZONE_ID in $ATLAS_ETC/atlas.env for the non-interactive path)"
+      fi
+    fi
+    [[ -n "$zone_id" ]] || warn "CF_ZONE_ID left blank (the token cannot list zones and no id was found or entered): the ddns updater will fail until it is set; V5 will report the DNS mismatch; Phase 2 step 6b stops with the manual fix. To fix it now: CF_ZONE_ID=<32-hex id from the dashboard Overview page> in $ATLAS_ETC/atlas.env, then: sudo $ATLAS_ENTRY phase1 --force 07"
   fi
   {
     echo "# Cloudflare dynamic DNS (Section 12.3; V23). Written by Phase 1 step 7, verified and finalised by Phase 2 step 6b."
@@ -236,6 +278,16 @@ YML
   retry 3 docker compose --project-name atlas-ntfy --project-directory "$dir" --env-file "$ATLAS_ETC/docker.env" up -d --quiet-pull \
     || die "docker compose up for ntfy failed: $(_redact "$(docker compose --project-name atlas-ntfy --project-directory "$dir" --env-file "$ATLAS_ETC/docker.env" logs --tail 20 2>&1 | tail -n 20)")"
   wait_http "http://127.0.0.1:8090/v1/health" 90 || die "ntfy did not become healthy on http://127.0.0.1:8090/v1/health (docker logs atlas-ntfy)"
+  # Docker's own view must agree (the Phase 2 gate reads it): the compose healthcheck runs busybox wget inside the
+  # container with the proxy off (docker/ntfy/compose.yml); start_period 40 s + interval 60 s, so allow 180 s.
+  local hs="" deadline=$(( SECONDS + 180 ))
+  while (( SECONDS < deadline )); do
+    hs="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' atlas-ntfy 2>/dev/null || echo unknown)"
+    [[ "$hs" == healthy ]] && break
+    sleep 5
+  done
+  [[ "$hs" == healthy ]] || die "docker reports atlas-ntfy health '$hs' (expected healthy): the in-container healthcheck fails although the host sees /v1/health. Check: docker inspect -f '{{json .State.Health}}' atlas-ntfy (an http_proxy leaking into the container, or a changed /v1/health body)"
+  log "ntfy: docker health=$hs"
 
   # Users and the node token via the CLI inside the container (NTFY_PASSWORD makes `user add` non-interactive;
   # UNVERIFIED output format of `token add`, so the token is parsed and the step dies if nothing token-shaped appears).
@@ -281,7 +333,11 @@ YML
 # item 9 marked this UNVERIFIED). A phone that handshakes but cannot open ntfy must not pass V5 silently.
 _ntfy_path_from_vpn() {
   local out rc=0
-  out="$(docker exec wg-easy sh -c "wget -qO- -T 5 http://$LAN_IP:8090/v1/health" 2>&1)" || rc=$?
+  # Proxy OFF for the probe (fix round, blocker): compose injects http_proxy from /root/.docker/config.json, busybox
+  # wget honours it and has no no_proxy, so the request would go to squid and be dropped by ufw (wrong interface),
+  # never to ntfy. compose.yml pins the proxy variables empty as well; `-Y off` and the blank -e are belt and braces.
+  out="$(docker exec -e http_proxy= -e HTTP_PROXY= -e https_proxy= -e HTTPS_PROXY= wg-easy \
+           sh -c "wget -Y off -qO- -T 5 http://$LAN_IP:8090/v1/health" 2>&1)" || rc=$?
   if (( rc == 127 )) || grep -qi 'not found' <<<"$out"; then
     warn "cannot probe ntfy from inside wg-easy (no wget in the image; UNVERIFIED). Check by hand from the phone: http://$LAN_IP:8090/v1/health must answer over the tunnel"
     return 0
@@ -303,24 +359,30 @@ step_07() {
   _ntfy_up
   _ntfy_path_from_vpn
 
-  local home_ip
+  local home_ip admin_user
   home_ip="$(cat /var/lib/atlas-ddns/last-ip 2>/dev/null || echo unknown)"
+  admin_user="$(awk -F= '$1=="WG_ADMIN_USER" {print $2; exit}' "$ATLAS_ETC/secrets/wg-easy.env" 2>/dev/null || echo atlas-admin)"
   cat <<MSG
 
   ==== V5: WireGuard from mobile data (up to 10 minutes; the Principal's phone) ====
   Node public IP (per the ddns updater): $home_ip     DNS record: $VPN_HOST
   If your router's WAN address is in 100.64.0.0/10 you are behind CGNAT and this cannot pass (R11).
-  1. On this LAN, open http://$LAN_IP:51821/ and log in as "$PRINCIPAL_USER" with the password in
+  1. Open the WG-Easy admin page FROM THE NODE (the UI is plain http, so the password must not cross the
+     Wi-Fi): in the RDP session's Firefox, http://127.0.0.1:51821/ ; or over SSH: ssh -L 51821:127.0.0.1:51821
+     and then http://127.0.0.1:51821/ on the PC. Log in as "$admin_user" with the password in
      $ATLAS_ETC/secrets/wg-easy.env (sudo cat it). Create a client named "phone" and show its QR code.
   2. On the phone: install the WireGuard app, scan the QR code, then TURN WI-FI OFF (mobile data only)
      and switch the tunnel on.
   3. In the phone's browser open http://$LAN_IP:8090/ (ntfy) and log in as "principal" with the
      password in $ATLAS_ETC/secrets/ntfy-principal.env; subscribe to topic "$NTFY_TOPIC".
-  This step passes as soon as a handshake from a mobile-data address is seen. If you cannot do it now,
-  V5 is recorded as deferred (non-blocking) and you re-run it later with:
+  V5 passes as soon as a handshake from a mobile-data address is seen. If none arrives in 10 minutes, V5 is
+  recorded as FAIL (CONVENTIONS §6: required, no deferral), this step still completes, and the Phase 1 gate
+  blocks Phase 2 until you re-run it (idempotent, waits again) with:
       sudo $ATLAS_ENTRY phase1 --force 07
   =================================================================================
 MSG
+  # The structural failure modes (container down, wg0 missing) already died above in _wg_easy_check, so a fail here
+  # is the timeout: recorded (rule §7.4), the step completes, the gate (step 8) shows the red row.
   run_verify V5 v05-wireguard.sh "$VPN_HOST" wg-easy "$WG_IFACE" 540 "sudo $ATLAS_ENTRY phase1 --force 07" \
-    || die "V5 failed (wg-easy container or $WG_IFACE missing; see the verify table)"
+    || warn "V5 recorded as FAIL (no handshake from mobile data in time, or see the verify table). The phase continues to the gate, which blocks Phase 2 until: sudo $ATLAS_ENTRY phase1 --force 07"
 }

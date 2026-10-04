@@ -5,7 +5,11 @@
 # Pass only when every account in GOOGLE_ACCOUNTS answered all three APIs with its own address, AND the proof ran as
 # the account that consumes the tokens at run time: when this script runs as root the helper is executed as atlas
 # (runuser), so a token atlas cannot open (a root-only /etc/atlas/secrets, CONVENTIONS §2 vs the atlas-owned google/
-# subdirectory; see phase2/06c-google-oauth.sh "SECRETS DIRECTORY TRAVERSAL") fails here, at the gate, not in Phase 3.
+# subdirectory; the agreed mode is root:atlas 750, see phase2/06c-google-oauth.sh "SECRETS DIRECTORY") fails here, at
+# the gate, not in Phase 3; the failure text names the directory's mode, owner and last change time so the step that
+# flipped it can be found. The coreutils `timeout` sits INSIDE the runuser/env chain (fix round 2: `timeout` execs its
+# argument and cannot run a shell function; placed outside it printed "failed to run command 'as_consumer'" into
+# /dev/null and every account was recorded as "no answer").
 # The inbox copy of the OAuth client JSON must be gone (step 6c shreds it after V20 first passes; §7.2: no secret
 # inside /srv/atlas).
 # Usage: v20-google.sh [TOKEN_DIR=/etc/atlas/secrets/google] [VENV=/opt/atlas/venv]
@@ -44,10 +48,12 @@ for acct in $accounts; do
   perm="$(stat -c '%a %U' "$tokf")"
   [[ "$perm" == "600 atlas" ]] || failed+=("$tag $email: token is $perm, want 600 atlas")
   if ! as_consumer test -r "$tokf"; then
-    failed+=("$tag $email: $who cannot read $tokf ($(stat -c '%A %U:%G' "$(dirname "$(dirname "$tokf")")") on $(dirname "$(dirname "$tokf")") blocks traversal; every writer must set it root:atlas 710, see phase2/06c-google-oauth.sh)")
+    secrets_dir="$(dirname "$(dirname "$tokf")")"
+    failed+=("$tag $email: $who cannot read $tokf ($(stat -c '%A %U:%G, changed %y' "$secrets_dir") on $secrets_dir blocks traversal; every writer must set it root:atlas 750 (phase2/09b-vault.sh:119 still writes 700), see phase2/06c-google-oauth.sh)")
     continue
   fi
-  out="$(timeout 240 as_consumer "$venv/bin/python" "$helper" verify --token "$tokf" --email "$email" --owner atlas 2>/dev/null || true)"
+  # runuser -> env -> timeout -> python: every link execs an external program (a shell function cannot follow timeout).
+  out="$(as_consumer timeout 240 "$venv/bin/python" "$helper" verify --token "$tokf" --email "$email" --owner atlas 2>/dev/null || true)"
   json="$(printf '%s\n' "$out" | grep -E '^\{' | tail -n1)"
   line="$(python3 -c '
 import json, sys

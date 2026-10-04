@@ -4,8 +4,9 @@
 #   (a) xrdp listens ONLY on the addresses given (ss -ltnp): any other :3389 listener is a fail; and ufw's default
 #       deny with per-interface rules (phase1/04-system.sh) is what refuses everything outside LAN/WireGuard.
 #   (b) waits up to WAIT_S for the Principal's session: an established TCP connection on 3389 plus a logind session
-#       of PRINCIPAL_USER whose service is xrdp-sesman. No session in time -> exit 2 (deferred, the gate does not
-#       block; the Principal retries with the hint), never a fail.
+#       of PRINCIPAL_USER whose service is xrdp-sesman. No session in time -> exit 1 (FAIL, fix round): CONVENTIONS §6
+#       lists V19 as Required for Phase 1 with no deferral provision and rule §7.4 records what did not pass as fail,
+#       so the gate shows a red row until the Principal re-runs with the hint (step 5b is idempotent).
 # Usage: v19-xrdp.sh PRINCIPAL_USER WAIT_S RERUN_HINT ADDR [ADDR...]
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
@@ -45,5 +46,5 @@ while (( SECONDS < deadline )); do
   fi
   sleep 5
 done
-echo "deferred: no RDP session for $user within ${wait_s}s; $bound; $hint"
-exit 2
+echo "V19 fail: no RDP session for $user within ${wait_s}s; $bound; $hint"
+exit 1

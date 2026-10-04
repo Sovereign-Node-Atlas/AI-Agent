@@ -7,6 +7,11 @@
 # LAYOUT NOTE (fix round): CONVENTIONS.md §1 line 31 lists all six services in this one file. Folding the voice
 # overlay in would mean rewriting compose.voice.yml and phase2/05-voice.sh (other writers' files), so the split stays
 # and CONVENTIONS.md §1 needs the Principal's amendment to name compose.voice.yml and docker/ntfy/compose.yml.
+# §8 AMENDMENT NEEDED (fix round 2): CONVENTIONS.md §8 lists ChromaDB 8000 and the orchestrator $ORCH_PORT under "binds
+# to loopback, LAN and WireGuard addresses only"; both are LOOPBACK ONLY here and in phase2/02-orchestrator.sh
+# (ORCH_HOST=127.0.0.1): the 1.x Rust ChromaDB server has no auth, and Open WebUI's Filter reaches the orchestrator on
+# lo. §8 should read "ChromaDB 8000 (loopback only)" and "orchestrator $ORCH_PORT (loopback only)", and
+# phase2/04-memory.sh's header "bound to loopback/LAN/WG" should read 127.0.0.1:8000 (other writers' files).
 #
 # Project name is fixed below (`name:`) so that every caller shares one project whatever its working directory:
 #   docker compose -f <this file> --env-file /etc/atlas/core.env up -d <service>
@@ -60,10 +65,18 @@ x-no-proxy: &no-proxy
 services:
   # --- Redis: Celery broker and result backend (Section 9.7). Loopback only (CONVENTIONS.md §8), password required. ---
   # /etc/atlas/secrets/redis.env (REDIS_PASSWORD=..., written by phase2/02-orchestrator.sh) is the container's env_file;
-  # the command re-enters the image's own entrypoint so redis still drops to the `redis` user (gosu) after the shell has
-  # expanded the password. UNVERIFIED: the entrypoint's name inside redis:8.10.2 (`docker-entrypoint.sh` on PATH is the
-  # official image's convention); step 02 proves it with an authenticated PING and a NOAUTH refusal from the host, and
-  # dies otherwise. An EMPTY password would silently disable auth, so the shell refuses to start without one.
+  # the command re-enters the image's own entrypoint so redis still drops to the `redis` user (gosu). The password NEVER
+  # goes on a command line (fix round 2, major: /proc/<pid>/cmdline is world-readable on the host, so `--requirepass X`
+  # would show it to every local account for the life of the server): `requirepass` is handed to redis-server as a
+  # config document on STDIN (`redis-server [options] -`: a trailing `-` reads the config from stdin, VERIFIED in redis
+  # 8.0.0 src/server.c `config_from_stdin`; stdin is parsed after the file and before the explicit options) through a
+  # shell here-document, which dash hands over on fd 0 across exec (VERIFIED with a stub: argv carries only `-`, stdin
+  # carries the line); the official image's docker-entrypoint.sh consumes no stdin (VERIFIED docker-library/redis: it
+  # only re-execs itself through gosu, then `exec "$@"`). UNVERIFIED for 8.10.2 specifically; step 02 proves the result
+  # on the node: authenticated PING via REDISCLI_AUTH, NOAUTH from the host, and the password ABSENT from the server's
+  # /proc/<pid>/cmdline, and dies otherwise.
+  # UNVERIFIED: the entrypoint's name inside redis:8.10.2 (`docker-entrypoint.sh` on PATH is the official image's
+  # convention). An EMPTY password would silently disable auth, so the shell refuses to start without one.
   redis:
     image: redis:8.10.2
     container_name: atlas-redis
@@ -74,9 +87,11 @@ services:
     command:
       - sh
       - -c
-      - >-
-        [ -n "$$REDIS_PASSWORD" ] || { echo "atlas-redis: REDIS_PASSWORD is empty (/etc/atlas/secrets/redis.env, phase2/02-orchestrator.sh)" >&2; exit 78; };
-        exec docker-entrypoint.sh redis-server --requirepass "$$REDIS_PASSWORD" --save 60 1 --appendonly yes --maxmemory 2gb --maxmemory-policy noeviction
+      - |
+        [ -n "$$REDIS_PASSWORD" ] || { echo "atlas-redis: REDIS_PASSWORD is empty (/etc/atlas/secrets/redis.env, phase2/02-orchestrator.sh)" >&2; exit 78; }
+        exec docker-entrypoint.sh redis-server --save 60 1 --appendonly yes --maxmemory 2gb --maxmemory-policy noeviction - <<EOF
+        requirepass $$REDIS_PASSWORD
+        EOF
     environment:
       <<: *no-proxy
     volumes:
@@ -85,7 +100,8 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      # REDISCLI_AUTH is redis-cli's documented environment alternative to -a: the password is on no argv (fix round 2).
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli --no-auth-warning ping | grep -q PONG"]
       interval: 30s
       timeout: 5s
       retries: 3

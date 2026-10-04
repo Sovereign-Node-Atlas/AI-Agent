@@ -43,6 +43,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 
 from atlas.config import EngineSpec
+from urllib.parse import urlsplit
 
 log = logging.getLogger("atlas.engines")
 
@@ -109,11 +110,21 @@ class RerankResult:
 class LlamaClient:
     """Synchronous client for one llama-server instance (127.0.0.1:<port>)."""
 
+    # llama-server binds loopback (CONVENTIONS.md §8 ports); only these hosts may be dialled with the proxy ignored.
+    LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+
     def __init__(self, base_url: str, *, timeout_s: float = 600.0, api_key: str | None = None,
                  transport: httpx.BaseTransport | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        # Rule §7.1: every outbound request goes through the allowlist proxy. This client sets trust_env=False (so
+        # HTTPS_PROXY is ignored), which is only legitimate for a loopback llama-server; refuse anything else BEFORE a
+        # request is built, so no module can use it to reach past the proxy at the library level (fix round).
+        parts = urlsplit(self.base_url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme != "http" or host not in self.LOOPBACK_HOSTS:
+            raise EngineError(f"LlamaClient dials loopback llama-server instances only (http://127.0.0.1:<port>, §8); "
+                              f"refusing {base_url!r}: it would bypass the allowlist proxy (rule §7.1)")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        # Local engines only: never through the allowlist proxy (trust_env=False ignores HTTPS_PROXY for 127.0.0.1).
         self._http = httpx.Client(base_url=self.base_url, timeout=timeout_s, headers=headers, trust_env=False,
                                   transport=transport)
 
@@ -278,12 +289,18 @@ class SystemdEngineController:
 
     ALLOWED = ("start", "stop", "restart")
 
-    def __init__(self, *, engines: dict[str, EngineSpec] | None = None, start_timeout_s: float = 900.0,
+    # Python's deadline must be STRICTLY longer than the unit's own (TimeoutStartSec=900, TimeoutStopSec=120 in
+    # systemd/llama-server@.service) so systemd's timeout always fires first and the exit-code path below (with the
+    # journalctl hint) is taken. Were Python's shorter, subprocess.run would try to kill a setuid sudo child owned by
+    # root, get EPERM, and report that instead of the real cause (fix round).
+    START_TIMEOUT_MARGIN_S = 60.0
+
+    def __init__(self, *, engines: dict[str, EngineSpec] | None = None, start_timeout_s: float = 960.0,
                  stop_timeout_s: float = 180.0, ready_timeout_s: float = 60.0, sudo: bool = True,
                  runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> None:
         self.engines = engines or {}
-        self.start_timeout_s = start_timeout_s  # matches TimeoutStartSec=900 in systemd/llama-server@.service
-        self.stop_timeout_s = stop_timeout_s  # TimeoutStopSec=120 plus margin
+        self.start_timeout_s = start_timeout_s  # TimeoutStartSec=900 + START_TIMEOUT_MARGIN_S
+        self.stop_timeout_s = stop_timeout_s  # TimeoutStopSec=120 + margin
         self.ready_timeout_s = ready_timeout_s
         self.sudo = sudo
         self._run = runner
@@ -308,7 +325,14 @@ class SystemdEngineController:
             proc = self._run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s,
                              check=False)
         except subprocess.TimeoutExpired as exc:
-            raise EngineControlError(f"{' '.join(cmd)} did not return within {timeout_s:.0f}s") from exc
+            raise EngineControlError(f"{' '.join(cmd)} did not return within {timeout_s:.0f}s (the unit's own "
+                                     f"TimeoutStartSec/TimeoutStopSec should have fired first; see journalctl -u "
+                                     f"{unit} -n 60)") from exc
+        except PermissionError as exc:
+            # subprocess.run's timeout path kills the child; a setuid sudo child owned by root refuses the signal.
+            raise EngineControlError(f"{' '.join(cmd)} could not be signalled ({exc}); the unit's own timeout should "
+                                     f"have fired before Python's {timeout_s:.0f}s (see journalctl -u {unit} -n 60)"
+                                     ) from exc
         except OSError as exc:
             raise EngineControlError(f"{' '.join(cmd)} could not run: {exc}") from exc
         if proc.returncode != 0:
@@ -346,17 +370,22 @@ class StubController:
     """Test double: records calls and, when given a StubProbe, moves the fake memory counter like a real load.
 
     `leak_on_stop` keeps the counter high after stop, which is how tests provoke the release-confirmation timeout
-    (Section 4.2 rule 5). `fail_start` names keys whose start raises, for the fail-loudly path.
+    (Section 4.2 rule 5). `fail_start` names keys whose start raises, for the fail-loudly path; `fail_stop` names keys
+    whose stop raises (the unit keeps running and the counter stays up), `start_error` picks the class raised by a
+    failing start (EngineError stands for wait_ready's post-start health failure).
     """
 
     def __init__(self, *, engines: dict[str, EngineSpec] | None = None, probe: Any = None,
                  footprints: dict[str, int] | None = None, leak_on_stop: bool = False,
-                 fail_start: Sequence[str] = ()) -> None:
+                 fail_start: Sequence[str] = (), fail_stop: Sequence[str] = (),
+                 start_error: type[EngineError] = EngineControlError) -> None:
         self.engines = engines or {}
         self.probe = probe
         self.footprints = dict(footprints or {})
         self.leak_on_stop = leak_on_stop
         self.fail_start = set(fail_start)
+        self.fail_stop = set(fail_stop)
+        self.start_error = start_error
         self.active: set[str] = set()
         self.calls: list[tuple[str, str]] = []
 
@@ -369,13 +398,16 @@ class StubController:
     def start(self, key: str) -> None:
         self.calls.append(("start", key))
         if key in self.fail_start:
-            raise EngineControlError(f"stub: start of {key} refused (test)")
+            raise self.start_error(f"stub: start of {key} refused (test)")
         self.active.add(key)
         if self.probe is not None:
             self.probe.used_bytes += self._bytes(key)
 
     def stop(self, key: str) -> None:
         self.calls.append(("stop", key))
+        if key in self.fail_stop:
+            raise EngineControlError(f"stub: sudo -n systemctl stop llama-server@{key} failed (exit 1): sudo: a "
+                                     "password is required (test)")
         self.active.discard(key)
         if self.probe is not None and not self.leak_on_stop:
             self.probe.used_bytes = max(0, self.probe.used_bytes - self._bytes(key))

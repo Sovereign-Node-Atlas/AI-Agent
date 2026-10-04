@@ -2,9 +2,10 @@
 # Kokoro-FastAPI (TTS, CPU), speaches (Whisper Large-v3-Turbo via faster-whisper, CPU int8) and docling-serve.
 #
 # CONTRACT (CONVENTIONS.md §1 lists these services inside docker/core/compose.yml; the core file is another writer's,
-# so they live in this overlay and are merged into the SAME compose project. The layout line of CONVENTIONS §1 should
-# add `docker/core/compose.voice.yml` with the merge command below; until then this header and the core file's header
-# are where the merge is stated):
+# so they live in this overlay and are merged into the SAME compose project. AMENDMENT requested of CONVENTIONS §1
+# (recorded here and for phase2/README-contracts.md until scripts/day1/README.md exists):
+#     docker/core/compose.voice.yml   kokoro, speaches, docling-serve overlay, merged into compose.yml by phase2/05-voice.sh
+# with the merge command
 #
 #     docker compose -f docker/core/compose.yml -f docker/core/compose.voice.yml \
 #         --env-file /etc/atlas/core.env --env-file /etc/atlas/voice.env up -d kokoro speaches docling
@@ -20,12 +21,25 @@
 #     SPEACHES_HF_HUB_OFFLINE from /etc/atlas/voice.env (written by phase2/05-voice.sh: [] / 0 ONLY during the first
 #     start that pulls the turbo model, then ["<id>"] / 1). The safe state is the default: a caller that forgets
 #     voice.env gets HF_HUB_OFFLINE=1 and no preload, never an online speaches (fix round).
-#   * Host ports (CONVENTIONS.md §8): Kokoro 8880, speaches 8881 (container 8000), docling 5001, each on loopback
-#     and the LAN address only (adjudicated conflict 4: every published Docker port is pinned to the LAN IP).
-#   * DEVIATION, stated: Section 17 places the "Docling ingestion service" in step 4; phase2/04-memory.sh installs the
-#     docling library and prefetches its models, the docling-serve container below is started by step 5 with the other
-#     CPU services of this overlay. Open WebUI reaches it from step 5 on.
-#   * Telemetry off in every container (rule §7.1): HF_HUB_DISABLE_TELEMETRY=1, DO_NOT_TRACK=1.
+#   * Host ports (CONVENTIONS.md §8): Kokoro 8880 and speaches 8881 (container 8000) on loopback and the LAN address
+#     (§8 names them as host ports; adjudicated conflict 4: every published Docker port is pinned to the LAN IP).
+#     docling 5001 is published on LOOPBACK ONLY (fix round 2): §8 does not name it, and its only consumers (Open WebUI
+#     on the host network, the orchestrator) are host processes; an unauthenticated document-conversion API gets no LAN
+#     listener for no consumer (Section 12.5). Should a LAN consumer appear, "docling-serve 5001" must first be added to
+#     the §8 port table.
+#   * DOCLING STEP OWNERSHIP (Section 17 places the "Docling ingestion service" in step 4; phase2/04-memory.sh installs
+#     the library and prefetches its models): the docling service below needs NO voice.env and NO LAN_IP, so step 4 can
+#     start it first with
+#         docker compose -f docker/core/compose.yml -f docker/core/compose.voice.yml --env-file /etc/atlas/core.env up -d docling
+#     and phase2/05-voice.sh's `up -d` is then a no-op for it. Until the 04 writer adds that line, the container is
+#     started by step 5 and Open WebUI reaches it from step 5 on (deviation stated in 05-voice.sh; a step-4 item for
+#     phase2/README-contracts.md).
+#   * Nothing outbound and nothing cloud (rule §7.1): HF_HUB_OFFLINE=1 everywhere after the first speaches start,
+#     HF_HUB_DISABLE_TELEMETRY=1, DO_NOT_TRACK=1, Kokoro's web player and voice-pack saving off, docling's remote
+#     (cloud VLM / picture-description) services and external plugins pinned OFF, not left to the image default.
+#   * Healthchecks run INSIDE the containers, into which Phase 1's /root/.docker/config.json injects HTTP(S)_PROXY with a
+#     noProxy list that covers 127.0.0.1 but not 0.0.0.0: every probe targets 127.0.0.1 and bypasses the proxy explicitly
+#     (curl --noproxy '*'; urllib with an empty ProxyHandler), so a probe can never be answered by squid.
 #
 # Images pinned per voice-stt.md §2.1, §4.1 and services-tools.md §2.3 (all VERIFIED on ghcr.io).
 
@@ -46,8 +60,10 @@ services:
       - DOWNLOAD_MODEL=false
       - DEFAULT_VOICE=af_heart
       - API_LOG_LEVEL=INFO
-      - ENABLE_WEB_PLAYER=true
-      - ALLOW_LOCAL_VOICE_SAVING=true
+      # No browser UI beside Open WebUI (Section 12.1: one interface) and no API-driven writes of new voice packs into
+      # the container: the /v1/audio/speech path Open WebUI and voice_render.py use needs neither.
+      - ENABLE_WEB_PLAYER=false
+      - ALLOW_LOCAL_VOICE_SAVING=false
       - MODEL_AUTO_UNLOAD_TIMEOUT_SECONDS=0
       - CORS_ORIGINS=["http://127.0.0.1:8880","http://${LAN_IP}:8880"]
       - HF_HUB_OFFLINE=1
@@ -55,7 +71,8 @@ services:
       - DO_NOT_TRACK=1
     healthcheck:
       # UNVERIFIED: whether curl is in the image; the interpreter that runs uvicorn (entrypoint.sh, VERIFIED) is.
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8880/health', timeout=5)\" || exit 1"]
+      # ProxyHandler({}) makes the probe independent of the injected proxy variables.
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8880/health', timeout=5)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -65,8 +82,12 @@ services:
     # voice-stt.md §4.1 (all keys VERIFIED in speaches config.py / compose.cpu.yaml). The Whisper weights (~1.6 GB) live
     # on the 8 TB volume with every other engine cache (Appendix C / Section 3.5), bind-mounted at the image's HF_HUB_CACHE
     # path; the container runs as the atlas uid/gid so the tree stays atlas:atlas (fix round: no named volume under
-    # /var/lib/docker on the OS drive). UNVERIFIED: that the image writes nothing outside HF_HUB_CACHE when its user is
-    # not the image's default `ubuntu` (uid 1000); phase2/05-voice.sh dies at the first health check if it does not start.
+    # /var/lib/docker on the OS drive). The atlas uid has no passwd entry in the image, so HOME is set explicitly
+    # (huggingface_hub derives HF_HOME from `~`, which stays the literal "~" for an unknown uid without HOME, and would
+    # then write token/assets/xet caches under a relative path in /home/ubuntu/speaches that the atlas uid cannot
+    # write): HOME=/tmp and HF_HOME=/tmp/.cache/huggingface, while HF_HUB_CACHE keeps the hub (the weights) on the bind
+    # mount. UNVERIFIED: that nothing else in the image needs a writable path; phase2/05-voice.sh dies at the first
+    # health check if it does not start.
     image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
     container_name: atlas-speaches
     restart: unless-stopped
@@ -76,6 +97,8 @@ services:
       - "127.0.0.1:8881:8000"
       - "${LAN_IP:?LAN_IP from /etc/atlas/core.env or docker.env}:8881:8000"
     environment:
+      - HOME=/tmp
+      - HF_HOME=/tmp/.cache/huggingface
       - WHISPER__INFERENCE_DEVICE=cpu
       - WHISPER__COMPUTE_TYPE=int8
       - WHISPER__CPU_THREADS=8
@@ -96,7 +119,9 @@ services:
       - ${ATLAS_SRV:-/srv/atlas}/engines/voice/speaches-hub:/home/ubuntu/.cache/huggingface/hub
       - ${ATLAS_SRV:-/srv/atlas}/engines/voice/model_aliases.json:/home/ubuntu/speaches/model_aliases.json:ro
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://0.0.0.0:8000/health"]
+      # 127.0.0.1 with --noproxy '*': 0.0.0.0 is not on the injected noProxy list and would be sent to squid, which
+      # resolves it to the host's port 8000 (ChromaDB, §8) and denies it; the container would sit at "unhealthy" for ever.
+      test: ["CMD", "curl", "--fail", "--noproxy", "*", "http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -107,15 +132,19 @@ services:
     # picture_classifier/rapidocr/easyocr models, so HF_HUB_OFFLINE=1 from the first start (Section 12.5).
     # The Python library side of Docling is installed by phase2/04-memory.sh into /opt/atlas/venv; this container is
     # the service Open WebUI calls (CONTENT_EXTRACTION_ENGINE=docling, DOCLING_SERVER_URL=http://127.0.0.1:5001).
+    # Loopback publish only (header): no LAN consumer exists and §8 has no row for 5001.
     image: ghcr.io/docling-project/docling-serve-cpu:v1.34.0
     container_name: atlas-docling
     restart: unless-stopped
     networks: [atlas]
     ports:
       - "127.0.0.1:5001:5001"
-      - "${LAN_IP:?LAN_IP from /etc/atlas/core.env or docker.env}:5001:5001"
     environment:
       - DOCLING_SERVE_ENABLE_UI=false
+      # Rule §7.1 pinned, not defaulted: no remote (cloud) VLM / picture-description calls, no plugins from outside the
+      # image, whatever a future image default or an Open WebUI request option asks for.
+      - DOCLING_SERVE_ENABLE_REMOTE_SERVICES=false
+      - DOCLING_SERVE_ALLOW_EXTERNAL_PLUGINS=false
       - DOCLING_DEVICE=cpu
       - DOCLING_NUM_THREADS=8
       - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
@@ -124,7 +153,7 @@ services:
       - DO_NOT_TRACK=1
     healthcheck:
       # UNVERIFIED: docling-serve documents no /health path; /docs is VERIFIED (services-tools.md "could not verify").
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/docs', timeout=5)\" || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:5001/docs', timeout=5)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5

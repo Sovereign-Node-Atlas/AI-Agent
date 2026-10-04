@@ -5,14 +5,26 @@
 # installer-made OS volume when it is LUKS.
 #
 # THE ONE PAUSE (rule §7.6): a single framed console block prints the recovery key, asks (only when the installer
-# encrypted the OS volume and it has no TPM2 token yet) for the OS LUKS passphrase once, and waits for WRITTEN DOWN.
-# The Principal is at the console exactly once. Everything else in this step runs unattended.
+# encrypted the OS volume and it has no TPM2 token yet) for the OS LUKS passphrase ONCE (Section 3.5 wants the OS
+# volume TPM-unlocked too; the passphrase is used for the enrolment only and never stored; this second input inside
+# the same pause is declared in the phase1-platform.sh header), and waits for WRITTEN DOWN. The screen AND the
+# terminal scrollback are cleared afterwards (ESC[3J), so the key does not linger in the SSH client's history. The
+# Principal is at the console exactly once. Everything else in this step runs unattended.
+#
+# WHAT STAYS ON THE NODE (D3, R16; fix round): the recovery key's on-node convenience copy ($ATLAS_LUKS_RECOVERY,
+# root 600) when the OS volume is encrypted, because D3 is a closed decision ("on the node and on an external USB
+# drive"; R16 "the on-node copy is convenience only"). The generated keyfile is NOT kept: it authorises the enrolments
+# and is then wiped from the LUKS header and shredded, in both OS cases, because a second full-strength unlock secret
+# on the OS drive is nothing the TPM path needs (re-enrolment after a firmware change authorises with
+# --unlock-tpm2-device=auto, UNVERIFIED flag from systemd 256, or with the recovery key; step 3's fallback open uses
+# the recovery copy). So the ways into the 8 TB volume are: the TPM at boot, the recovery key (USB + on-node copy).
 #
 # OS VOLUME NOT ENCRYPTED: Section 3.5 requires LUKS2 on the OS volume too ("nothing transient touches disk
 # unencrypted"). Step 1 already dies on an unencrypted OS volume unless ATLAS_ALLOW_UNENCRYPTED_OS=1 is set in
-# /etc/atlas/atlas.env (a recorded decision of the Principal, not a footnote). With that acknowledgement this step
-# (a) still enrols TPM2 and the recovery key, (b) then WIPES the keyfile slot and shreds the keyfile, and (c) writes NO
-# on-node recovery copy, so the unencrypted OS drive holds nothing that opens the 8 TB volume; the USB copy is the
+# /etc/atlas/atlas.env (a recorded decision of the Principal, not a footnote; the key is documented in step 1's die
+# message and in the phase1-platform.sh header, and config/atlas.env.example should carry it blank with this text).
+# Setting it ALSO waives D3's on-node copy: a plain-text recovery key on an unencrypted OS drive would defeat the data
+# volume's encryption, so with that acknowledgement this step writes NO on-node recovery copy and the USB copy is the
 # only copy (D3/R16). V2 records the deviation and the acknowledgement in its message.
 #
 # No package is installed here: cryptsetup, systemd-cryptsetup and dracut are seeded on the 26.04 Server ISO
@@ -49,12 +61,20 @@ _luks_os_mapping() {
 # _luks_os_accepted — the Principal acknowledged an unencrypted OS volume (atlas.env, see the header).
 _luks_os_accepted() { [[ "${ATLAS_ALLOW_UNENCRYPTED_OS:-0}" == "1" ]]; }
 
-# _luks_unlock_arg — how systemd-cryptenroll authorises a change: the keyfile while it exists, else the TPM.
-# UNVERIFIED: --unlock-tpm2-device= was added in systemd 256 (release notes) and is expected on 259; it is used only
-# after the keyfile slot was wiped in the accepted-unencrypted-OS case, and the call dies loudly if it is refused.
-_luks_unlock_arg() {
-  if [[ -s "$ATLAS_LUKS_KEYFILE" ]]; then printf -- '--unlock-key-file=%s\n' "$ATLAS_LUKS_KEYFILE"
-  else printf -- '--unlock-tpm2-device=auto\n'; fi
+# _luks_enroll DEVICE ARGS... — run systemd-cryptenroll ARGS DEVICE with whatever authorises a header change: the
+# keyfile while it exists; else the TPM (--unlock-tpm2-device=auto, UNVERIFIED: added in systemd 256 per the release
+# notes and expected on 259); else the recovery key ($PASSWORD is systemd-cryptenroll's documented passphrase source)
+# from the in-memory copy of this run or the on-node copy (D3). Dies with the exact way out when none works.
+_luks_enroll() {
+  local dev="$1"; shift
+  if [[ -s "$ATLAS_LUKS_KEYFILE" ]]; then
+    systemd-cryptenroll "--unlock-key-file=$ATLAS_LUKS_KEYFILE" "$@" "$dev"; return
+  fi
+  if systemd-cryptenroll --unlock-tpm2-device=auto "$@" "$dev" 2>/dev/null; then return 0; fi
+  local rec="${LUKS_RECOVERY_INMEM:-}"
+  [[ -n "$rec" || ! -s "$ATLAS_LUKS_RECOVERY" ]] || rec="$(tr -d '[:space:]' <"$ATLAS_LUKS_RECOVERY")"
+  [[ -n "$rec" ]] || die "systemd-cryptenroll $* $dev: the keyfile is gone, --unlock-tpm2-device=auto was refused (systemd $(systemctl --version | head -n1)) and no recovery copy is on the node. Run it by hand with the USB recovery key: PASSWORD='<recovery key>' systemd-cryptenroll $* $dev, then re-run: sudo $ATLAS_ENTRY phase1 --force 02"
+  PASSWORD="$rec" systemd-cryptenroll "$@" "$dev"
 }
 
 # _luks_need_tty — the pause needs a real terminal. access(2) on /dev/tty is true even without a controlling
@@ -79,7 +99,10 @@ step_02() {
   local t missing=()
   for t in cryptsetup systemd-cryptenroll systemd-cryptsetup dracut; do command -v "$t" >/dev/null || missing+=("$t"); done
   (( ${#missing[@]} == 0 )) || die "missing on this host: ${missing[*]} (expected on the 26.04 Server ISO: cryptsetup, systemd-cryptsetup, dracut). Install them from the console (apt-get install cryptsetup systemd-cryptsetup dracut) and re-run; step 2 installs nothing because the allowlist proxy does not exist before step 4 (rule §7.1)"
-  ensure_dir "$ATLAS_ETC/secrets" root:root 700
+  # root:atlas 710 (traverse-only for atlas; phase1/07-remote.sh header, phase2/06c) once the atlas group exists (step 3
+  # creates it); on the first run it is root:root 700 until step 3 widens it.
+  if getent group atlas >/dev/null 2>&1; then ensure_dir "$ATLAS_ETC/secrets" root:atlas 710
+  else ensure_dir "$ATLAS_ETC/secrets" root:root 700; fi
 
   local dev; dev="$(readlink -f "$DATA_DISK")"
   [[ -b "$dev" ]] || die "DATA_DISK $DATA_DISK does not resolve to a block device"
@@ -90,7 +113,7 @@ step_02() {
   osdev="$(_luks_os_device)"; osmap="$(_luks_os_mapping)"
   if [[ -z "$osdev" ]]; then
     _luks_os_accepted || die "the OS volume is not encrypted (Section 3.5). Reinstall with LUKS, or set ATLAS_ALLOW_UNENCRYPTED_OS=1 in $ATLAS_ETC/atlas.env to accept the deviation knowingly, then re-run"
-    os_note="OS volume UNENCRYPTED, ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 (Section 3.5 deviation): keyfile slot wiped, no on-node recovery copy, USB copy is the only copy (D3, R16)"
+    os_note="OS volume UNENCRYPTED, ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 (Section 3.5 deviation; D3 on-node copy waived): no on-node recovery copy, USB copy is the only copy (D3, R16)"
     warn "$os_note"
   elif _luks_has_token "$osdev" tpm2; then
     os_note="LUKS $osmap on $osdev, TPM2 already enrolled"
@@ -100,17 +123,15 @@ step_02() {
     log "OS volume: LUKS $osmap on $osdev without a TPM2 token: will enrol (the installer passphrase is asked once, in the pause below)"
   fi
 
-  # --- Keyfile (task: generated keyfile in $ATLAS_ETC/secrets). It authorises enrolments now and re-enrolment after
-  # a firmware change later; crypttab never references it (the TPM unlocks at boot). In the accepted-unencrypted-OS
-  # case it exists only until the enrolments are done (header). ----------------------------------------------------
+  # --- Keyfile (task: generated keyfile in $ATLAS_ETC/secrets). It authorises the enrolments of this run and exists
+  # only until they are done (header): crypttab never references it (the TPM unlocks at boot). -------------------
   local sig label=""
   sig="$(blkid -p -o value -s TYPE "$dev" 2>/dev/null || true)"
   [[ "$sig" == crypto_LUKS ]] && label="$(cryptsetup luksDump "$dev" 2>/dev/null | awk -F: '/^Label:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
   local keyfile_wiped=0
-  if [[ "$sig" == crypto_LUKS && "$label" == atlas-data && ! -s "$ATLAS_LUKS_KEYFILE" ]] && _luks_os_accepted \
-     && _luks_has_token "$dev" tpm2; then
-    keyfile_wiped=1          # earlier run of this step already wiped the keyfile slot; the TPM authorises changes
-    log "keyfile absent by design (accepted unencrypted OS); TPM2 authorises any re-enrolment"
+  if [[ "$sig" == crypto_LUKS && "$label" == atlas-data && ! -s "$ATLAS_LUKS_KEYFILE" ]] && _luks_has_token "$dev" tpm2; then
+    keyfile_wiped=1          # earlier run of this step already wiped the keyfile slot; the TPM (or recovery key) authorises changes
+    log "keyfile absent by design (wiped after enrolment); TPM2 or the recovery key authorises any re-enrolment"
   elif [[ ! -s "$ATLAS_LUKS_KEYFILE" ]]; then
     ( umask 077; head -c 64 /dev/urandom >"$ATLAS_LUKS_KEYFILE" )
     log "generated LUKS keyfile $ATLAS_LUKS_KEYFILE (root, 600)"
@@ -136,12 +157,11 @@ step_02() {
   [[ -e "/dev/disk/by-uuid/$uuid" ]] || die "/dev/disk/by-uuid/$uuid did not appear (udevadm settle; udevadm trigger --subsystem-match=block)"
 
   # --- TPM2 enrolment (PCR 7) and recovery key --------------------------------------------------------------------
-  local unlock; unlock="$(_luks_unlock_arg)"
   if _luks_has_token "$dev" tpm2; then
     log "TPM2 token already enrolled on $dev"
   else
     log "enrolling TPM2 (PCR 7) on $dev"
-    systemd-cryptenroll "$unlock" --tpm2-device=auto --tpm2-pcrs=7 "$dev" \
+    _luks_enroll "$dev" --tpm2-device=auto --tpm2-pcrs=7 \
       || die "systemd-cryptenroll --tpm2-device=auto failed on $dev (V2). Check: fTPM enabled, exactly one TPM (systemd-cryptenroll --tpm2-device=list)"
   fi
   local recovery="" show_key=0
@@ -150,13 +170,14 @@ step_02() {
   else
     if _luks_has_token "$dev" recovery; then
       warn "a recovery token exists but its confirmation (or the on-node copy) is missing: wiping it and enrolling a fresh one"
-      systemd-cryptenroll --wipe-slot=recovery "$unlock" "$dev"
+      _luks_enroll "$dev" --wipe-slot=recovery
     fi
-    recovery="$(systemd-cryptenroll "$unlock" --recovery-key "$dev" 2>/dev/null | tr -d '[:space:]')"
+    recovery="$(_luks_enroll "$dev" --recovery-key 2>/dev/null | tr -d '[:space:]')"
     [[ -n "$recovery" ]] || die "systemd-cryptenroll --recovery-key printed nothing"
+    LUKS_RECOVERY_INMEM="$recovery"       # authorises the keyfile wipe below on this run; cleared at the end of the step
     if _luks_os_accepted; then
       rm -f "$ATLAS_LUKS_RECOVERY"
-      log "recovery key enrolled; NO on-node copy (accepted unencrypted OS): the USB copy is the only copy"
+      log "recovery key enrolled; NO on-node copy (accepted unencrypted OS, D3 copy waived): the USB copy is the only copy"
     else
       ( umask 077; printf '%s\n' "$recovery" >"$ATLAS_LUKS_RECOVERY" )
       log "recovery key enrolled; on-node copy at $ATLAS_LUKS_RECOVERY (root, 600; D3 convenience copy)"
@@ -183,6 +204,7 @@ step_02() {
         echo "#"
         if _luks_os_accepted; then echo "#   There is NO copy on the node (unencrypted OS volume, accepted): the USB copy is the only copy."
         else echo "#   On-node convenience copy (root only): $ATLAS_LUKS_RECOVERY"; fi
+        echo "#   The screen and this terminal's scrollback are erased once you confirm; the key is never logged."
         echo "#"
       fi
       if (( need_os_enrol )); then
@@ -202,8 +224,9 @@ step_02() {
       done
       date -Is >"$ATLAS_LUKS_CONFIRMED"
     fi
-    clear 2>/dev/null || true
-    (( show_key )) && log "recovery key confirmed as written down (the key itself is never logged)"
+    # ESC[2J clears the screen, ESC[3J the scrollback (xterm/VTE/Windows Terminal honour it; `clear` alone does not).
+    printf '\033[2J\033[3J\033[H' >/dev/tty 2>/dev/null || true
+    (( show_key )) && log "recovery key confirmed as written down (the key itself is never logged; screen and scrollback cleared)"
     recovery=""
   fi
 
@@ -246,17 +269,22 @@ step_02() {
     log "TPM2 unlock test passed: /dev/mapper/$ATLAS_LUKS_MAPPING is open"
   fi
 
-  # --- Accepted unencrypted OS: nothing on the OS drive may open the data volume from now on (header) -----------
-  if _luks_os_accepted && [[ -s "$ATLAS_LUKS_KEYFILE" ]]; then
+  # --- The keyfile has done its job: wipe its slot and shred it (header). Authorisation for the wipe comes from the
+  # TPM or the recovery key, never from the keyfile being wiped. ---------------------------------------------------
+  if [[ -s "$ATLAS_LUKS_KEYFILE" ]]; then
     if ! { _luks_has_token "$dev" tpm2 && _luks_has_token "$dev" recovery; }; then
       die "refusing to wipe the keyfile slot: TPM2 and recovery tokens must both be enrolled first"
     fi
-    systemd-cryptenroll --wipe-slot=password --unlock-tpm2-device=auto "$dev" \
-      || die "systemd-cryptenroll --wipe-slot=password failed on $dev; the keyfile slot is still present"
+    local kf="$ATLAS_LUKS_KEYFILE"
+    ATLAS_LUKS_KEYFILE=""                 # so _luks_enroll authorises with the TPM / recovery key, not the slot being wiped
+    _luks_enroll "$dev" --wipe-slot=password \
+      || { ATLAS_LUKS_KEYFILE="$kf"; die "systemd-cryptenroll --wipe-slot=password failed on $dev; the keyfile slot is still present"; }
+    ATLAS_LUKS_KEYFILE="$kf"
     shred -u "$ATLAS_LUKS_KEYFILE"
-    rm -f "$ATLAS_LUKS_RECOVERY"
-    log "keyfile slot wiped and $ATLAS_LUKS_KEYFILE shredded; the TPM and the USB recovery key are the only ways in"
+    _luks_os_accepted && rm -f "$ATLAS_LUKS_RECOVERY"
+    log "keyfile slot wiped and $ATLAS_LUKS_KEYFILE shredded; the TPM and the recovery key$(_luks_os_accepted || printf ' (USB + on-node copy, D3)') are the only ways in"
   fi
+  LUKS_RECOVERY_INMEM=""; recovery=""
 
   # --- initramfs: dracut on 26.04 (VERIFIED); the TPM modules are added explicitly (hostonly default UNVERIFIED) --
   install -d -m 755 /etc/dracut.conf.d

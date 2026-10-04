@@ -1,5 +1,5 @@
-# /etc/systemd/system/atlas-sentinel.service — one Sentinel pulse (Section 9.3): the unit's ONLY job is to enqueue
-# the Celery task; the worker on the `cpu` queue does the fetching, the statistics-first detection and the BLUF
+# /etc/systemd/system/atlas-sentinel.service — one Sentinel pulse (Section 9.3): the unit's ONLY atlas-side job is to
+# enqueue the Celery task; the worker on the `cpu` queue does the fetching, the statistics-first detection and the BLUF
 # alert through ntfy (9.3 names a systemd timer, 9.7 makes Celery the executor; CONVENTIONS.md §8 settles both).
 # Installed by phase2/08-sentinel.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
 # Feeds: config/sentinel-feeds.json (D6), path handed over as SENTINEL_FEEDS in /etc/atlas/orchestrator.env.
@@ -8,7 +8,19 @@
 # the resulting ledger record as one JSON line (used once by step 08 to prove the ledger; not used by the timer).
 # The broker URL (with the Redis password) comes from /etc/atlas/secrets/redis.env, read by PID 1 (the file itself
 # is atlas-owned, so `atlas-admin` run by hand as atlas with `set -a; source` also works).
+#
+# Two ExecStartPre lines (fix round 2):
+#   1. as atlas: the secrets directory must be traversable and ntfy.env readable, otherwise the hourly pulse's BLUF
+#      push would fail silently at 03:00 — the unit fails instead and the journal says why (root:atlas 750 contract,
+#      phase2/02-orchestrator.sh header).
+#   2. as ROOT (`+`, failure tolerated with `-`): /usr/local/sbin/atlas-sentinel-telemetry (phase2/atlas-sentinel-
+#      telemetry.sh) writes /var/lib/atlas/telemetry/firewall.json — the counts of `[UFW BLOCK]` and `[ATLAS docker
+#      egress denied]` kernel log lines and squid TCP_DENIED lines of the last hour — into a ROOT-OWNED directory the
+#      worker can read. The atlas account is in no journal or squid log group (CONVENTIONS.md §2), so the D6 "firewall"
+#      telemetry item needs a root-side exporter; the package reads that file (sentinel-feeds.json names it) and reports
+#      "telemetry unreadable: firewall" when it is missing or stale, never a healthy zero.
 # If the orchestrator or Redis is down, the enqueue fails, this unit fails, and the journal says so: nothing silent.
+# No docker group, no sudo: this oneshot gets the full read-only treatment (16.3 item 6 enforced, not advisory).
 
 [Unit]
 Description=A.T.L.A.S. Sentinel pulse (enqueue the Celery task, Section 9.3)
@@ -23,6 +35,13 @@ WorkingDirectory=${ATLAS_OPT}/orchestrator
 EnvironmentFile=${ATLAS_ETC}/orchestrator.env
 EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
-Environment=HOME=/var/lib/atlas
+Environment=HOME=/var/lib/atlas/home
+ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env || { echo "atlas-sentinel: ${ATLAS_ETC}/secrets is not traversable by atlas or ntfy.env is unreadable (directory root:atlas 750, file atlas:atlas 600; phase2/02-orchestrator.sh header): the BLUF alert path is broken" >&2; exit 1; }'
+ExecStartPre=-+/usr/local/sbin/atlas-sentinel-telemetry
 ExecStart=${ATLAS_OPT}/venv/bin/atlas-admin enqueue sentinel
 TimeoutStartSec=120
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv -${ATLAS_OPT}/day1 ${ATLAS_ETC}

@@ -5,9 +5,9 @@
 # Order (each part idempotent):
 #   1. apt restic (0.18.1-3ubuntu1, VERIFIED resolute).
 #   2. Passphrase: $ATLAS_ETC/secrets/restic.pass (root 600), generated once and printed ONCE in a framed block on the
-#      terminal for the Principal to store off-node beside the LUKS recovery key (D3, R16). NO pause (fix round:
-#      CONVENTIONS.md §7.6 lists no pause for this step): when there is no terminal the block is not printed, the log
-#      names the on-node copy, and the phase continues; the end-of-step summary repeats the path.
+#      terminal for the Principal to store off-node beside the LUKS recovery key (D3, R16). NO pause (CONVENTIONS.md §7.6
+#      lists no pause for this step): when there is no terminal the block is not printed, the log names the on-node
+#      copy, and the phase continues; the end-of-step summary repeats the path.
 #   3. $ATLAS_ETC/restic.env (RESTIC_REPOSITORY=/srv/backups/restic on the 4 TB OS drive, RESTIC_PASSWORD_FILE,
 #      RESTIC_CACHE_DIR) and the include/exclude sets of Appendix C:
 #        include: $ATLAS_SRV/{data,workspace,sandbox}, $ATLAS_SRV/vault/cipher (the vault as-is, ciphertext; phase2/
@@ -17,28 +17,42 @@
 #                 entirely (CONVENTIONS.md §2), staging, the automount/FUSE mount points ($ATLAS_SRV/vault/open is the
 #                 gocryptfs plaintext view: root gets EACCES there while the vault is open), the throw-away test vault,
 #                 caches.
-#   4. `restic init` when the repository does not exist yet; a canary file for V13.
-#   5. /usr/local/sbin/atlas-aegis, the root helper the unit runs: `freeze` (the orchestrator's aegis-freeze task,
-#      mandatory while the orchestrator is up, skipped explicitly when it is down), `manifests`, `finish` (thaw through
-#      celery's broadcast channel, ledger row, ntfy on failure). Written here because CONVENTIONS.md §1 fixes the
-#      systemd/ list; the unit header (systemd/atlas-aegis.service) explains the sequence.
-#   6. /etc/sudoers.d/atlas-aegis: the orchestrator's manual [EXECUTE AEGIS BACKUP] trigger runs `sudo systemctl start
-#      atlas-aegis.service` (blocking) or `... start --no-block atlas-aegis.service`, and nothing else; proven with a
-#      negative test (a `stop` must be refused) and, below, by running the first backup through exactly that path.
-#   7. Units: atlas-aegis.service/.timer (nightly 02:30; freeze -> restic backup -> forget --keep-within 1d --keep-daily
-#      30 --keep-monthly 12 --prune -> thaw) and atlas-restic-check.service/.timer (quarterly restore test).
-#   8. First backup now, as the atlas account through sudo (the manual trigger's path), then run_verify V13
-#      v13-restic.sh (restore the canary to a scratch dir, sha256 compare, restic check). A V13 fail is recorded, not
-#      fatal here: the gate blocks on it.
+#      Every include path exists before the first backup (fix round 2: the Day 1 snapshot is exit 0, not exit 3):
+#      $ATLAS_SRV/vault/cipher is created here with EXACTLY phase2/09b-vault.sh's owner and mode (atlas:atlas 700; an
+#      empty directory is what `gocryptfs -init` wants), so step 9b finds its directory instead of this step depending on
+#      a later step (§7.5). The Section 11 / Appendix C wording "/srv/atlas/vault" means vault/cipher (+ vault/open as the
+#      plaintext view) in the implemented layout: README-contracts.md §3.1 records that the baseline text needs amending.
+#   4. `restic init` when the repository does not exist yet; a canary file for V13, written AS ATLAS into the atlas-owned
+#      data tree (root never writes by name under an atlas-owned directory: symlink planting).
+#   5. /usr/local/sbin/atlas-aegis from the repository file phase2/atlas-aegis.sh (install -m 755; shellcheck covers it):
+#      `freeze`, `manifests` (as atlas), `finish` (thaw, ledger row, ntfy on failure), `forget-result`.
+#   6. Units: atlas-aegis.service (freeze -> manifests -> restic backup -> finish), atlas-aegis-forget.service (restic
+#      forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune; Requires/After the backup), atlas-aegis.timer
+#      (nightly 02:30 -> the forget unit, so only the nightly timer prunes), atlas-aegis-trigger.path (the manual
+#      [EXECUTE AEGIS BACKUP] trigger: /run/atlas/aegis-request, created by the orchestrator as atlas, starts the backup
+#      unit; NO sudo), atlas-restic-check.service/.timer (quarterly restore test). A stale /etc/sudoers.d/atlas-aegis from
+#      an earlier revision is removed and a negative sudo test proves the control path is atlas-engines alone (§8).
+#   7. First backup now, through the manual trigger's path (atlas creates the request file; the path unit starts the
+#      service; the step waits for Result=success and no raised freeze flag), then run_verify V13 v13-restic.sh (restore
+#      the canary to a scratch dir, sha256 compare, restic check). A V13 fail is recorded, not fatal here: the gate
+#      blocks on it.
 #
 # Contracts: `atlas-admin enqueue aegis-freeze|aegis-thaw --wait N` and `celery -A atlas.celery_app control
-# add_consumer <queue>` (phase2/02-orchestrator.sh header; the package's freeze cancels the cpu and gpu consumers and
-# raises /run/atlas/aegis-freeze). orch_admin/ORCH_ENV/REDIS_ENV come from step 02. $ATLAS_ETC/secrets is root:atlas
-# 750 (02's header). The package's manual trigger (atlas.tasks.aegis_manual_backup) may use either sudoers line.
+# add_consumer <queue>` (phase2/02-orchestrator.sh header; the package's freeze cancels the gpu consumer and raises
+# /run/atlas/aegis-freeze). orch_write_file/orch_admin/ORCH_ENV/REDIS_ENV come from step 02. $ATLAS_ETC/secrets is
+# root:atlas 750 (02's header; adjudication item there). The package's manual trigger (atlas.tasks.aegis_manual_backup)
+# MUST create /run/atlas/aegis-request and confirm with `systemctl is-active atlas-aegis.service`, never call sudo (the
+# previous `sudo systemctl start [--no-block] atlas-aegis.service` route and its sudoers fragment are gone, fix round 2;
+# until the package follows, its sudo call fails loudly with "a password is required" and the task's notify says so).
+# File writes use orch_write_file (rust-coreutils install rejects a pipe source on re-runs; 02's header).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 }
+if ! declare -F orch_write_file >/dev/null; then
+  # shellcheck source=phase2/02-orchestrator.sh
+  source "$ATLAS_DAY1_DIR/phase2/02-orchestrator.sh"
+fi
 
 RESTIC_PASS_FILE="$ATLAS_ETC/secrets/restic.pass"
 RESTIC_PRINTED="$ATLAS_STATE/restic.pass-printed"
@@ -49,7 +63,11 @@ RESTIC_REPO="/srv/backups/restic"
 RESTIC_CACHE="/var/cache/restic"
 RESTIC_CANARY="$ATLAS_SRV/data/restic-canary.txt"
 AEGIS_HELPER=/usr/local/sbin/atlas-aegis
-AEGIS_SUDOERS=/etc/sudoers.d/atlas-aegis
+AEGIS_HELPER_SRC="$ATLAS_DAY1_DIR/phase2/atlas-aegis.sh"
+AEGIS_REQUEST=/run/atlas/aegis-request
+AEGIS_STALE_SUDOERS=/etc/sudoers.d/atlas-aegis   # earlier revision; removed here
+AEGIS_UNITS=(atlas-aegis.service atlas-aegis-forget.service atlas-restic-check.service)
+AEGIS_VERBATIM=(atlas-aegis.timer atlas-aegis-trigger.path atlas-restic-check.timer)
 
 _restic_passphrase() {
   ensure_dir "$ATLAS_ETC/secrets" root:atlas 750
@@ -91,15 +109,23 @@ _restic_files() {
   ensure_dir /srv/backups root:root 700
   ensure_dir "$RESTIC_CACHE" root:root 700
   {
-    echo "# restic environment (Section 9.5). Written by Phase 2 step 7; read by atlas-aegis.service, atlas-restic-check.service, verify/v13-restic.sh."
+    echo "# restic environment (Section 9.5). Written by Phase 2 step 7; read by atlas-aegis.service, atlas-aegis-forget.service, atlas-restic-check.service, verify/v13-restic.sh."
     echo "RESTIC_REPOSITORY=$RESTIC_REPO"
     echo "RESTIC_PASSWORD_FILE=$RESTIC_PASS_FILE"
     echo "RESTIC_CACHE_DIR=$RESTIC_CACHE"
-  } | install -m 600 -o root -g root /dev/stdin "$RESTIC_ENV_FILE"
+  } | orch_write_file 600 root:root "$RESTIC_ENV_FILE"
 
-  # Include set (Appendix C, task list). Paths that do not exist yet (memory.env before step 4, vault/cipher before
-  # step 9b, the Open WebUI dir before step 3 on a --force re-run) make restic exit 3 ("some files could not be
-  # read"); the unit accepts 3.
+  # The vault layout of phase2/09b-vault.sh (_vault_dirs: atlas:atlas 700 for root, cipher, open, test-cipher), created
+  # here with the same values so the include set is complete from the first backup (header item 3). gocryptfs -init
+  # accepts an empty existing directory; 9b's ensure_dir calls are then no-ops.
+  ensure_dir "$ATLAS_SRV/vault" atlas:atlas 700
+  ensure_dir "$ATLAS_SRV/vault/cipher" atlas:atlas 700
+  ensure_dir "$ATLAS_SRV/vault/open" atlas:atlas 700
+  ensure_dir "$ATLAS_SRV/vault/test-cipher" atlas:atlas 700
+
+  # Include set (Appendix C, task list). Every path exists at this point in Section 17 order (steps 1-4 wrote engines/,
+  # the Open WebUI dir, memory.env; /srv/cold and the data tree come from step 02; the vault dirs just above), so the
+  # Day 1 snapshot is a clean exit 0. The unit still accepts restic's exit 3 for a file that changes mid-read.
   local inc=(
     "$ATLAS_SRV/data"
     "$ATLAS_SRV/workspace"
@@ -118,10 +144,15 @@ _restic_files() {
     "$ATLAS_SRV/data/open-webui"
     "$ATLAS_STATE"
   )
+  local missing=() path
+  for path in "${inc[@]}"; do [[ -e "$path" ]] || missing+=("$path"); done
+  if (( ${#missing[@]} > 0 )); then
+    warn "include paths absent at step time (restic skips them with exit 3 until they exist; steps 1-4 and 9b create them): ${missing[*]}"
+  fi
   {
     echo "# restic --files-from: the AEGIS include set (Appendix C). One path per line; secrets are never listed (CONVENTIONS.md §2)."
     printf '%s\n' "${inc[@]}"
-  } | install -m 644 -o root -g root /dev/stdin "$RESTIC_INCLUDE"
+  } | orch_write_file 644 root:root "$RESTIC_INCLUDE"
   {
     echo "# restic --exclude-file: weights (manifests are copied into data/manifests by the unit), secrets, staging, mounts, caches."
     echo "$ATLAS_SRV/models"
@@ -139,11 +170,11 @@ _restic_files() {
     echo "**/.pytest_cache"
     echo "**/.ruff_cache"
     echo "**/*.pyc"
-  } | install -m 644 -o root -g root /dev/stdin "$RESTIC_EXCLUDE"
+  } | orch_write_file 644 root:root "$RESTIC_EXCLUDE"
   grep -qx "$ATLAS_ETC/secrets" "$RESTIC_EXCLUDE" || die "secrets exclusion missing from $RESTIC_EXCLUDE"
   grep -qx "$ATLAS_SRV/vault/open" "$RESTIC_EXCLUDE" || die "vault plaintext mount exclusion missing from $RESTIC_EXCLUDE"
   grep -qx "$ATLAS_SRV/vault/cipher" "$RESTIC_INCLUDE" || die "vault ciphertext dir missing from $RESTIC_INCLUDE (Section 9.5 Contents)"
-  log "wrote $RESTIC_ENV_FILE, $RESTIC_INCLUDE (${#inc[@]} paths), $RESTIC_EXCLUDE"
+  log "wrote $RESTIC_ENV_FILE, $RESTIC_INCLUDE (${#inc[@]} paths, ${#missing[@]} absent), $RESTIC_EXCLUDE"
 }
 
 _restic_env() {
@@ -156,209 +187,139 @@ _restic_env() {
 _restic_init() {
   _restic_env
   # UNVERIFIED by the research: `--files-from`; VERIFIED there: init, backup, forget, restore, check. Assert the flags now
-  # so the unit never fails at 02:30 for a flag that does not exist.
-  restic backup --help 2>&1 | grep -q -- '--files-from' || die "this restic ($(restic version 2>&1 | head -n1)) has no --files-from flag; atlas-aegis.service relies on it"
-  restic forget --help 2>&1 | grep -q -- '--keep-within' || die "this restic ($(restic version 2>&1 | head -n1)) has no --keep-within flag; atlas-aegis.service relies on it"
+  # so the unit never fails at 02:30 for a flag that does not exist. The help text is captured first: under pipefail a
+  # `restic --help | grep -q` dies of SIGPIPE when grep exits before restic finished writing (fix round 2).
+  local help
+  help="$(restic backup --help 2>&1 || true)"
+  grep -q -- '--files-from' <<<"$help" || die "this restic ($(restic version 2>&1 | head -n1)) has no --files-from flag; atlas-aegis.service relies on it"
+  help="$(restic forget --help 2>&1 || true)"
+  grep -q -- '--keep-within' <<<"$help" || die "this restic ($(restic version 2>&1 | head -n1)) has no --keep-within flag; atlas-aegis-forget.service relies on it"
   if restic snapshots >/dev/null 2>&1; then
     log "restic repository $RESTIC_REPO already initialised"
   else
     log "restic init $RESTIC_REPO"
     restic init >/dev/null || die "restic init failed for $RESTIC_REPO (wrong passphrase file or an unreadable repository dir?)"
   fi
-  # V13 canary: a known file whose sha256 the restore test compares.
+  # V13 canary: a known file whose sha256 the restore test compares. Written AS ATLAS (the data tree is atlas-owned;
+  # root must not create files by name under it). runuser keeps the environment, so the content travels in a variable.
   ensure_dir "$ATLAS_SRV/data" atlas:atlas 755
-  printf 'ATLAS restic canary %s %s\n' "$(date -Is)" "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" >"$RESTIC_CANARY"
-  chown atlas:atlas "$RESTIC_CANARY"; chmod 644 "$RESTIC_CANARY"
+  local text
+  text="ATLAS restic canary $(date -Is) $(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  # shellcheck disable=SC2016  # the inner sh expands $CANARY_TEXT/$CANARY_PATH from its (inherited) environment
+  CANARY_TEXT="$text" CANARY_PATH="$RESTIC_CANARY" svc_user_run /bin/sh -c 'umask 022; printf "%s\n" "$CANARY_TEXT" >"$CANARY_PATH"' \
+    || die "could not write the V13 canary $RESTIC_CANARY as atlas ($ATLAS_SRV/data must be atlas-writable)"
+  [[ -s "$RESTIC_CANARY" && ! -L "$RESTIC_CANARY" ]] || die "$RESTIC_CANARY is missing or a symlink after the write"
 }
 
-# --- the root helper the unit runs -----------------------------------------------------------------------------------------
+# --- the root helper the units run (repository file, shellcheck-clean) ------------------------------------------------
 _restic_helper() {
-  cat >"$AEGIS_HELPER.tmp" <<'HELPER'
-#!/usr/bin/env bash
-# /usr/local/sbin/atlas-aegis — written by scripts/day1/phase2/07-restic.sh (generated: CONVENTIONS.md §1 fixes the
-# systemd/ list). Run as ROOT by /etc/systemd/system/atlas-aegis.service (its header explains the sequence):
-#   freeze     with atlas-orchestrator AND atlas-celery-cpu active: `atlas-admin enqueue aegis-freeze --wait 900` as
-#              atlas MUST succeed (the queues pause, /run/atlas/aegis-freeze goes up), otherwise exit 1 and the unit
-#              fails before restic runs (Section 9.5 Freeze row; an unfrozen backup is never called a success).
-#              With either unit inactive the freeze is skipped EXPLICITLY (crash-consistent backup; the journal says so).
-#              The intent marker is written BEFORE the enqueue, so `finish` thaws even when the wait timed out after the
-#              task had already paused the queues.
-#   manifests  copy every <models|engines>/<key>/MANIFEST.json into $ATLAS_SRV/data/manifests (Appendix C).
-#   finish     ExecStopPost, always runs. Thaw goes through celery's broadcast channel — `celery control add_consumer
-#              cpu|gpu`, which a worker answers while its task queues are cancelled — never through the paused queue;
-#              then the flag comes down and the package's aegis-thaw task is enqueued (now deliverable) for its ledger
-#              row. No reply from a worker: both workers are restarted and the unit is reported FAILED. Then a ntfy
-#              push (lib/common.sh notify) whenever systemd's $SERVICE_RESULT is not "success" or the thaw fell back.
-# Environment from the unit: ATLAS_OPT, ATLAS_SRV, ATLAS_ETC, restic.env, orchestrator.env, secrets/redis.env and
-# memory.env keys; runuser keeps them, so atlas-admin and celery see the broker URL and the settings. Never exits 3
-# (the unit's SuccessExitStatus for restic).
-set -Eeuo pipefail
-: "${ATLAS_OPT:=/opt/atlas}"; : "${ATLAS_SRV:=/srv/atlas}"; : "${ATLAS_ETC:=/etc/atlas}"
-VENV="$ATLAS_OPT/venv"
-RUN_DIR=/run/atlas
-INTENT="$RUN_DIR/aegis-unit-froze"
-FLAG="${AEGIS_FREEZE_FLAG:-$RUN_DIR/aegis-freeze}"
-
-as_atlas() { runuser -u atlas -- "$@"; }
-say() { printf 'atlas-aegis %s\n' "$*"; }
-err() { printf 'atlas-aegis %s\n' "$*" >&2; }
-
-orchestrator_up() {
-  systemctl -q is-active atlas-orchestrator.service && systemctl -q is-active atlas-celery-cpu.service
-}
-
-cmd_freeze() {
-  if ! orchestrator_up; then
-    rm -f "$INTENT"
-    say "freeze skipped: atlas-orchestrator or atlas-celery-cpu is inactive; taking a crash-consistent backup (Section 9.5 Freeze row needs a running orchestrator)"
-    return 0
-  fi
-  [[ -d "$RUN_DIR" ]] || install -d -m 750 -o atlas -g atlas "$RUN_DIR"
-  date -Is >"$INTENT"
-  if ! as_atlas "$VENV/bin/atlas-admin" enqueue aegis-freeze --wait 900; then
-    err "freeze FAILED with the orchestrator up: the unit stops here (no backup of an unfrozen store is reported as success); finish thaws"
-    return 1
-  fi
-  say "freeze done: Celery cpu/gpu consumers paused, flag $FLAG raised"
-}
-
-cmd_manifests() {
-  local d="$ATLAS_SRV/data/manifests" f rel
-  mkdir -p "$d"
-  find "$ATLAS_SRV/models" "$ATLAS_SRV/engines" -mindepth 2 -maxdepth 2 -name MANIFEST.json 2>/dev/null | while read -r f; do
-    rel="${f#"$ATLAS_SRV"/}"
-    mkdir -p "$d/$(dirname "$rel")"
-    cp -f "$f" "$d/$rel"
-  done
-  say "manifests copied into $d: $(find "$d" -name MANIFEST.json 2>/dev/null | wc -l)"
-}
-
-thaw() {
-  local ok=1 q
-  for q in cpu gpu; do
-    if ! as_atlas "$VENV/bin/celery" -A atlas.celery_app control --timeout 20 add_consumer "$q" >/dev/null 2>&1; then
-      ok=0; err "thaw: 'celery control add_consumer $q' got no reply"
-    fi
-  done
-  rm -f "$FLAG"
-  if (( ok )); then
-    if as_atlas "$VENV/bin/atlas-admin" enqueue aegis-thaw --wait 120 >/dev/null; then
-      rm -f "$INTENT"
-      say "thaw done: consumers resumed on cpu and gpu, flag $FLAG removed, aegis-thaw ledger row written"
-      return 0
-    fi
-    err "thaw: consumers answered add_consumer but 'atlas-admin enqueue aegis-thaw --wait 120' failed"
-  fi
-  if systemctl restart atlas-celery-cpu.service atlas-celery-gpu.service; then
-    rm -f "$INTENT"
-    err "thaw FALLBACK: restarted atlas-celery-cpu and atlas-celery-gpu (fresh consumers, queues live); the unit is reported failed so this is seen"
-  else
-    err "thaw FAILED: workers did not resume and could not be restarted; the Celery queues may still be paused (flag $FLAG removed)"
-  fi
-  return 1
-}
-
-notify_push() {
-  local lib="$ATLAS_OPT/day1/lib/common.sh"
-  if [[ -r "$lib" ]]; then
-    # shellcheck disable=SC1090  # lib/common.sh: notify() never fails the caller; its log copy goes nowhere (/dev/null)
-    ( set +e; export ATLAS_LOG_TO_STDERR=1 ATLAS_PHASE=aegis ATLAS_LOG_FILE=/dev/null; source "$lib"; notify "$1" ) || true
-  else
-    err "notify: $lib missing; message was: $1"
-  fi
-}
-
-cmd_finish() {
-  local rc=0 result="${SERVICE_RESULT:-unknown}" status="${EXIT_STATUS:-?}"
-  if [[ -e "$INTENT" ]]; then
-    thaw || rc=1
-  else
-    say "finish: no freeze was requested by this run; nothing to thaw"
-  fi
-  [[ "$status" == 3 ]] && say "restic exit 3: some source files could not be read (names above); the snapshot exists"
-  if [[ "$result" != success || $rc -ne 0 ]]; then
-    notify_push "AEGIS backup on $(hostname) FAILED: systemd result=$result exit=$status, thaw=$([[ $rc -eq 0 ]] && echo ok || echo fallback/failed). See: journalctl -u atlas-aegis.service"
-    err "finish: result=$result exit=$status thaw_rc=$rc (ntfy pushed)"
-  else
-    say "finish: backup result=$result exit=$status, thaw ok"
-  fi
-  return "$rc"
-}
-
-case "${1:-}" in
-  freeze)    cmd_freeze ;;
-  manifests) cmd_manifests ;;
-  finish)    cmd_finish ;;
-  *) err "usage: atlas-aegis freeze|manifests|finish"; exit 2 ;;
-esac
-HELPER
-  bash -n "$AEGIS_HELPER.tmp" || { rm -f "$AEGIS_HELPER.tmp"; die "the generated $AEGIS_HELPER does not parse"; }
-  install -m 755 -o root -g root "$AEGIS_HELPER.tmp" "$AEGIS_HELPER"
-  rm -f "$AEGIS_HELPER.tmp"
+  [[ -f "$AEGIS_HELPER_SRC" ]] || die "$AEGIS_HELPER_SRC is missing (the AEGIS helper source)"
+  bash -n "$AEGIS_HELPER_SRC" || die "$AEGIS_HELPER_SRC does not parse"
+  install -m 755 -o root -g root "$AEGIS_HELPER_SRC" "$AEGIS_HELPER"
   [[ -x "$ATLAS_OPT/venv/bin/celery" && -x "$ATLAS_OPT/venv/bin/atlas-admin" ]] \
     || die "$ATLAS_OPT/venv lacks celery/atlas-admin (step 02); $AEGIS_HELPER needs both for freeze/thaw"
-  log "installed $AEGIS_HELPER (freeze | manifests | finish)"
+  "$AEGIS_HELPER" >/dev/null 2>&1 && die "$AEGIS_HELPER without a subcommand must exit non-zero"
+  log "installed $AEGIS_HELPER from $AEGIS_HELPER_SRC (freeze | manifests | finish | forget-result | notify)"
 }
 
-_restic_sudoers() {
-  local sc tmp
+# --- control path: no second sudoers fragment (CONVENTIONS.md §8) --------------------------------------------------------
+_restic_no_sudoers() {
+  local sc
+  if [[ -e "$AEGIS_STALE_SUDOERS" ]]; then
+    rm -f "$AEGIS_STALE_SUDOERS"
+    warn "removed $AEGIS_STALE_SUDOERS (earlier revision): the manual AEGIS trigger is atlas-aegis-trigger.path now; /etc/sudoers.d/atlas-engines is the only NOPASSWD grant (CONVENTIONS.md §8)"
+  fi
+  # Negative test: the atlas account must NOT be able to start or stop the backup unit through sudo (non-interactive).
   sc="$(readlink -f "$(command -v systemctl)")"
-  tmp="$(mktemp)"
-  cat >"$tmp" <<SUDO
-# atlas-aegis — written by scripts/day1/phase2/07-restic.sh. The orchestrator's manual [EXECUTE AEGIS BACKUP] trigger
-# (Section 9.5) starts the same unit the nightly timer runs, blocking or with --no-block, and nothing else.
-atlas ALL=(root) NOPASSWD: $sc start atlas-aegis.service
-atlas ALL=(root) NOPASSWD: $sc start --no-block atlas-aegis.service
-SUDO
-  if command -v visudo >/dev/null 2>&1; then
-    visudo -c -f "$tmp" >/dev/null || { rm -f "$tmp"; die "sudoers fragment failed visudo -c; not installed"; }
-  else
-    warn "visudo not found (sudo-rs without it?); installing $AEGIS_SUDOERS unchecked (the tests below prove the grant)"
+  if svc_user_run sudo -n "$sc" start --no-block atlas-aegis.service >/dev/null 2>&1; then
+    die "sudo let the atlas account run 'systemctl start --no-block atlas-aegis.service': a sudoers fragment wider than /etc/sudoers.d/atlas-engines is installed (ls /etc/sudoers.d); refusing to continue (CONVENTIONS.md §8)"
   fi
-  install -m 440 -o root -g root "$tmp" "$AEGIS_SUDOERS"
-  rm -f "$tmp"
-  # Negative test: the fragment must not widen the control path (a `stop` is refused, non-interactively).
   if svc_user_run sudo -n "$sc" stop atlas-aegis.service >/dev/null 2>&1; then
-    die "sudo let the atlas account run 'systemctl stop atlas-aegis.service': $AEGIS_SUDOERS (or another fragment) is wider than the two start lines; refusing to continue"
+    die "sudo let the atlas account run 'systemctl stop atlas-aegis.service': a sudoers fragment wider than /etc/sudoers.d/atlas-engines is installed; refusing to continue (CONVENTIONS.md §8)"
   fi
-  log "installed $AEGIS_SUDOERS (start, start --no-block; a stop is refused as atlas)"
+  log "control path: no sudo grant for atlas-aegis.service (start and stop refused as atlas); the trigger is $AEGIS_REQUEST"
 }
 
 _restic_units() {
+  local u
   export ATLAS_ETC ATLAS_OPT ATLAS_SRV
+  for u in "${AEGIS_UNITS[@]}"; do
+    [[ -f "$ATLAS_DAY1_DIR/systemd/$u" ]] || die "$ATLAS_DAY1_DIR/systemd/$u is missing"
+  done
+  for u in "${AEGIS_VERBATIM[@]}"; do
+    [[ -f "$ATLAS_DAY1_DIR/systemd/$u" ]] || die "$ATLAS_DAY1_DIR/systemd/$u is missing"
+  done
   render_template -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-aegis.service" /etc/systemd/system/atlas-aegis.service ATLAS_ETC ATLAS_OPT ATLAS_SRV
+  render_template -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-aegis-forget.service" /etc/systemd/system/atlas-aegis-forget.service ATLAS_ETC ATLAS_OPT
   render_template -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-restic-check.service" /etc/systemd/system/atlas-restic-check.service ATLAS_ETC ATLAS_OPT
-  install -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-aegis.timer" /etc/systemd/system/atlas-aegis.timer
-  install -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-restic-check.timer" /etc/systemd/system/atlas-restic-check.timer
-  grep -q -- '--keep-within 1d --keep-daily 30 --keep-monthly 12 --prune' /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service lost its retention line"
+  for u in "${AEGIS_VERBATIM[@]}"; do
+    install -m 644 "$ATLAS_DAY1_DIR/systemd/$u" "/etc/systemd/system/$u"
+  done
+  # Content checks, not mere presence (the lines the Section 9.5 contract hangs on).
+  grep -q -- '^ExecStart=/usr/bin/restic forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune' /etc/systemd/system/atlas-aegis-forget.service || die "atlas-aegis-forget.service lost its retention line"
+  grep -q '^Requires=atlas-aegis.service' /etc/systemd/system/atlas-aegis-forget.service || die "atlas-aegis-forget.service must Require atlas-aegis.service (prune only after a successful backup)"
+  grep -q '^Unit=atlas-aegis-forget.service' /etc/systemd/system/atlas-aegis.timer || die "atlas-aegis.timer must start atlas-aegis-forget.service (backup, then the nightly-only prune)"
+  grep -q 'restic forget' /etc/systemd/system/atlas-aegis.service && die "atlas-aegis.service must not prune (the manual trigger starts it; Section 16.3 item 5)"
   grep -q '^SuccessExitStatus=3' /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service lost SuccessExitStatus=3 (restic's partial-read exit code)"
+  grep -q "^ExecStartPre=/bin/rm -f $AEGIS_REQUEST" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not remove $AEGIS_REQUEST first (the path unit would re-trigger for ever)"
   grep -q "^ExecStartPre=$AEGIS_HELPER freeze" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not run '$AEGIS_HELPER freeze'"
   grep -q "^ExecStopPost=$AEGIS_HELPER finish" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not run '$AEGIS_HELPER finish' (the thaw)"
+  grep -q '^RuntimeDirectory=atlas-aegis' /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service lost RuntimeDirectory=atlas-aegis (the helper's root-owned intent marker)"
   grep -qF "EnvironmentFile=$ATLAS_ETC/secrets/redis.env" /etc/systemd/system/atlas-aegis.service || die "atlas-aegis.service does not load secrets/redis.env (the broker URL for freeze/thaw)"
+  grep -q "^PathExists=$AEGIS_REQUEST" /etc/systemd/system/atlas-aegis-trigger.path || die "atlas-aegis-trigger.path does not watch $AEGIS_REQUEST"
+  grep -q '^Unit=atlas-aegis.service' /etc/systemd/system/atlas-aegis-trigger.path || die "atlas-aegis-trigger.path does not start atlas-aegis.service"
   systemctl daemon-reload
+  systemctl reset-failed atlas-aegis.service atlas-aegis-forget.service atlas-aegis-trigger.path 2>/dev/null || true
   systemctl enable --now atlas-aegis.timer >/dev/null
   systemctl enable --now atlas-restic-check.timer >/dev/null
-  log "timers enabled: $(systemctl list-timers --no-legend atlas-aegis.timer atlas-restic-check.timer 2>/dev/null | awk '{print $NF" "$1" "$2" "$3}' | tr '\n' ';')"
+  systemctl enable --now atlas-aegis-trigger.path >/dev/null || die "systemctl enable --now atlas-aegis-trigger.path failed: $(systemctl status atlas-aegis-trigger.path --no-pager 2>&1 | tail -n 5)"
+  systemctl is-active --quiet atlas-aegis-trigger.path || die "atlas-aegis-trigger.path is not active after enable (journalctl -u atlas-aegis-trigger.path)"
+  log "timers enabled: $(systemctl list-timers --no-legend atlas-aegis.timer atlas-restic-check.timer 2>/dev/null | awk '{print $NF" "$1" "$2" "$3}' | tr '\n' ';'); trigger path active (watching $AEGIS_REQUEST)"
+}
+
+# _restic_wait_unit UNIT MAX_S — wait until UNIT is neither activating nor active; prints the final is-active state.
+_restic_wait_unit() {
+  local unit="$1" max="$2" waited=0 st
+  while :; do
+    st="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    [[ "$st" == activating || "$st" == active || "$st" == deactivating ]] || { printf '%s' "$st"; return 0; }
+    (( waited < max )) || { printf '%s' "$st"; return 1; }
+    sleep 5; waited=$(( waited + 5 ))
+  done
 }
 
 _restic_first_backup() {
-  local sc
-  sc="$(readlink -f "$(command -v systemctl)")"
-  log "first AEGIS backup through the manual trigger's path: atlas runs 'sudo systemctl start atlas-aegis.service' (freeze -> restic -> thaw; the orchestrator is up, so the freeze is mandatory)"
+  log "first AEGIS backup through the manual trigger's path: atlas creates $AEGIS_REQUEST, atlas-aegis-trigger.path starts the unit (freeze -> manifests -> restic -> thaw; the orchestrator is up, so the freeze is mandatory)"
+  [[ -d /run/atlas ]] || die "/run/atlas does not exist: atlas-orchestrator.service (RuntimeDirectory=atlas) is not running (step 02)"
   systemctl reset-failed atlas-aegis.service 2>/dev/null || true   # also resets the StartLimit counter for re-runs
-  if ! svc_user_run sudo -n "$sc" start atlas-aegis.service; then
-    journalctl -u atlas-aegis.service --no-pager -n 60 >&2 || true
-    die "the first restic backup failed (journal above: a freeze failure means the orchestrator's aegis-freeze task did not complete; a sudo refusal means $AEGIS_SUDOERS is not in effect)"
-  fi
+  local st
+  st="$(systemctl is-active atlas-aegis.service 2>/dev/null || true)"
+  [[ "$st" == activating || "$st" == active ]] && die "atlas-aegis.service is already $st (a backup is running); re-run --force 07 when it has finished"
+  # shellcheck disable=SC2016  # $1 is the inner sh's positional argument (the request path)
+  svc_user_run /bin/sh -c 'umask 077; : >"$1"' _ "$AEGIS_REQUEST" || die "the atlas account could not create $AEGIS_REQUEST (/run/atlas must be atlas:atlas 750, atlas-orchestrator.service's RuntimeDirectory)"
+  # The path unit reacts within a second or two; give it 60 s to start the service.
+  local waited=0
+  while :; do
+    st="$(systemctl is-active atlas-aegis.service 2>/dev/null || true)"
+    [[ "$st" == activating || "$st" == active || "$st" == deactivating ]] && break
+    [[ ! -e "$AEGIS_REQUEST" && "$st" == inactive ]] && break     # already finished (a very small include set)
+    (( waited < 60 )) || { journalctl -u atlas-aegis-trigger.path -u atlas-aegis.service --no-pager -n 30 >&2 || true; die "atlas-aegis-trigger.path did not start atlas-aegis.service within 60 s of $AEGIS_REQUEST appearing (unit state $st; the StartLimit may be hit: systemctl reset-failed atlas-aegis.service atlas-aegis-trigger.path)"; }
+    sleep 2; waited=$(( waited + 2 ))
+  done
+  st="$(_restic_wait_unit atlas-aegis.service 7200)" || die "atlas-aegis.service is still $st after 2 h; the first backup did not finish (journalctl -u atlas-aegis.service)"
   local result
   result="$(systemctl show -p Result --value atlas-aegis.service 2>/dev/null || true)"
-  [[ "$result" == success ]] || die "atlas-aegis.service finished with Result=$result (journalctl -u atlas-aegis.service)"
+  if [[ "$result" != success ]]; then
+    journalctl -u atlas-aegis.service --no-pager -n 60 >&2 || true
+    die "atlas-aegis.service finished with Result=$result (journal above: a freeze failure means the orchestrator's aegis-freeze task did not complete)"
+  fi
+  [[ -e "$AEGIS_REQUEST" ]] && die "$AEGIS_REQUEST still exists after the run: the unit's first ExecStartPre did not remove it (the path unit would loop)"
   [[ -e /run/atlas/aegis-freeze ]] && die "the freeze flag /run/atlas/aegis-freeze is still raised after the backup: the thaw did not complete (journalctl -u atlas-aegis.service)"
   _restic_env
   local n
   n="$(restic snapshots --json 2>/dev/null | python3 -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
   (( n >= 1 )) || die "no snapshot in $RESTIC_REPO after the first backup"
-  log "first backup done: $n snapshot(s) in $RESTIC_REPO ($(du -sh "$RESTIC_REPO" 2>/dev/null | cut -f1)); freeze/thaw completed through the orchestrator"
+  log "first backup done through the trigger path: $n snapshot(s) in $RESTIC_REPO ($(du -sh "$RESTIC_REPO" 2>/dev/null | cut -f1)); freeze/thaw completed through the orchestrator"
 }
 
 step_07() {
@@ -367,8 +328,8 @@ step_07() {
   _restic_files
   _restic_init
   _restic_helper
-  _restic_sudoers
   _restic_units
+  _restic_no_sudoers
   _restic_first_backup
   run_verify V13 v13-restic.sh "$RESTIC_CANARY" \
     || warn "V13 recorded as fail: the restore test did not verify by checksum; the Phase 2 gate will block until it passes"
@@ -379,10 +340,12 @@ step_07() {
   Repository:       $RESTIC_REPO (4 TB OS drive; Section 9.5)
   Passphrase:       on-node copy $RESTIC_PASS_FILE (root only, never backed up). Store a copy on the off-node USB
                     drive with the LUKS recovery key (D3, R16) — printed once above when a terminal was present.
-  Nightly:          atlas-aegis.timer 02:30 (freeze -> restic -> keep-within 1d / 30 daily / 12 monthly -> thaw)
-  Manual trigger:   [EXECUTE AEGIS BACKUP] -> sudo systemctl start atlas-aegis.service (two starts per 6 h)
+  Nightly:          atlas-aegis.timer 02:30 -> atlas-aegis-forget.service (backup: freeze -> restic -> thaw; then
+                    forget --keep-within 1d / 30 daily / 12 monthly --prune; only the nightly run prunes)
+  Manual trigger:   [EXECUTE AEGIS BACKUP] -> the orchestrator creates $AEGIS_REQUEST (no sudo);
+                    atlas-aegis-trigger.path starts the backup (two starts per 6 h)
   Restore test:     atlas-restic-check.timer quarterly; V13 recorded now.
   ======================
 MSG
-  log "step 07 done: nightly atlas-aegis.timer (02:30, keep-within 1d, 30 daily / 12 monthly), quarterly atlas-restic-check.timer; passphrase on-node copy $RESTIC_PASS_FILE"
+  log "step 07 done: nightly atlas-aegis.timer (02:30; backup then keep-within 1d, 30 daily / 12 monthly), manual trigger $AEGIS_REQUEST, quarterly atlas-restic-check.timer; passphrase on-node copy $RESTIC_PASS_FILE"
 }

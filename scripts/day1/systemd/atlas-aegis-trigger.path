@@ -1,0 +1,18 @@
+# /etc/systemd/system/atlas-aegis-trigger.path — the manual `[EXECUTE AEGIS BACKUP]` trigger (Section 9.5) without sudo
+# (fix round 2: CONVENTIONS.md §8 names /etc/sudoers.d/atlas-engines as the ONLY NOPASSWD grant of the atlas account).
+# The orchestrator's atlas.tasks.aegis_manual_backup creates the empty file /run/atlas/aegis-request (as atlas; /run/atlas
+# is atlas-orchestrator.service's RuntimeDirectory) and PID 1 starts atlas-aegis.service, whose first ExecStartPre
+# removes the request. The service's StartLimitBurst (2 per 6 h) bounds abuse; when it is hit this path unit fails with
+# unit-start-limit-hit and is re-armed with `systemctl reset-failed atlas-aegis.service atlas-aegis-trigger.path &&
+# systemctl start atlas-aegis-trigger.path`. Installed verbatim and enabled by phase2/07-restic.sh, which also proves
+# the path works by taking the Day 1 first backup through it.
+[Unit]
+Description=Manual AEGIS backup trigger: /run/atlas/aegis-request starts atlas-aegis.service (Section 9.5)
+After=atlas-orchestrator.service
+
+[Path]
+PathExists=/run/atlas/aegis-request
+Unit=atlas-aegis.service
+
+[Install]
+WantedBy=multi-user.target

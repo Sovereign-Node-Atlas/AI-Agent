@@ -9,7 +9,14 @@
 #   2. Credentials: $ATLAS_ETC/secrets/smb.cred (root 600; mount.cifs `credentials=` file with username=, password=,
 #      domain= lines, VERIFIED format) must be PRE-STAGED by the Principal. This step never reads a terminal (fix round:
 #      CONVENTIONS.md §7.6 sanctions no prompt in step 9); when the file is missing it dies at once with the exact
-#      command that creates it, and step 02 already warned about it at the start of the phase.
+#      command that creates it, and step 02 already warned about it at the start of the phase. The creation command reads
+#      the password from the terminal (read -rsp), never from a command line: a password typed as an argument lands in
+#      the shell history and in /proc/<pid>/cmdline (§7.2 "never echoed"; fix round 2).
+#      REQUIREMENT FOR THE PRINCIPAL'S CHECKLIST (fix round 2; README.md "what to have ready" and Section 22 are other
+#      writers' files and must gain this line): "before Phase 2, create /etc/atlas/secrets/smb.cred with the Windows
+#      account that can read and write WINDOWS_SHARE" plus the command below; without it the unattended phase stops at
+#      step 9 on the first run (§7.6 sanctions no prompt here; the HF-token prompt at the phase start is the sanctioned
+#      pause and could carry these credentials too — phase2-services.sh's writer's call).
 #   3. systemd/srv-atlas-winpc.mount + .automount rendered and installed under the systemd-escaped name of
 #      $ATLAS_SRV/winpc; ONLY the .automount is enabled (research 4.12): the share mounts on first access and is
 #      released after TimeoutIdleSec=600 (the unit-file form of x-systemd.idle-timeout).
@@ -18,7 +25,8 @@
 #      fatal with the mount unit's journal and the exact re-run command: a share that cannot be listed must not be pretended.
 #
 # Facts: cifs-utils 2:7.4-1ubuntu0.26.04.3 (VERIFIED); vers=3.1.1 / noserverino spellings UNVERIFIED on the page read
-# (the listing test is the proof). Contract this file defines: the share is at $ATLAS_SRV/winpc for the orchestrator's
+# (the listing test is the proof). The mount carries nosuid,nodev,noexec (fix round 2: the PC is a non-trusted source,
+# Section 12.4, and the service account holds the docker group; the write test below is unaffected). Contract this file defines: the share is at $ATLAS_SRV/winpc for the orchestrator's
 # tools (WINPC_MOUNT in /etc/atlas/orchestrator.env). $ATLAS_ETC/secrets is root:atlas 750 (phase2/02 header); smb.cred
 # stays root:root 600 (mount.cifs runs as root).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
@@ -33,7 +41,7 @@ WINPC_MOUNT_UNIT=""
 _winpc_credentials() {
   ensure_dir "$ATLAS_ETC/secrets" root:atlas 750
   if [[ ! -s "$WINPC_CRED" ]]; then
-    die "$WINPC_CRED is missing. Create it (the Windows account that can read and write $WINDOWS_SHARE), then re-run: sudo bash -c 'umask 077; printf \"username=%s\\npassword=%s\\ndomain=%s\\n\" \"<windows user>\" \"<password>\" \"WORKGROUP\" > $WINPC_CRED; chown root:root $WINPC_CRED; chmod 600 $WINPC_CRED' && sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2"
+    die "$WINPC_CRED is missing. Create it (the Windows account that can read and write $WINDOWS_SHARE; the password is read from the terminal, never typed on a command line), then re-run: sudo bash -c 'umask 077; read -rp \"Windows user: \" u; read -rsp \"Windows password: \" p; echo; printf \"username=%s\\npassword=%s\\ndomain=WORKGROUP\\n\" \"\$u\" \"\$p\" > $WINPC_CRED; chown root:root $WINPC_CRED; chmod 600 $WINPC_CRED' && sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2"
   fi
   if ! grep -q '^username=.\+' "$WINPC_CRED" || ! grep -q '^password=.\+' "$WINPC_CRED"; then
     die "$WINPC_CRED lacks a username= or password= line (mount.cifs credentials format: username=, password=, domain=)"
@@ -52,6 +60,7 @@ _winpc_units() {
   render_template -m 644 "$ATLAS_DAY1_DIR/systemd/srv-atlas-winpc.mount" "/etc/systemd/system/$mount_unit" WINDOWS_SHARE ATLAS_SRV ATLAS_ETC ATLAS_UID ATLAS_GID
   render_template -m 644 "$ATLAS_DAY1_DIR/systemd/srv-atlas-winpc.automount" "/etc/systemd/system/$automount_unit" ATLAS_SRV
   grep -qF "What=$WINDOWS_SHARE" "/etc/systemd/system/$mount_unit" || die "rendered $mount_unit lost What=$WINDOWS_SHARE"
+  grep -qE '^Options=.*,nosuid,nodev,noexec' "/etc/systemd/system/$mount_unit" || die "rendered $mount_unit lost nosuid,nodev,noexec (Section 12.4: the PC is a non-trusted source)"
   systemctl daemon-reload
   # Never enable the .mount (it would mount at boot and hold the PC); the automount owns it (research 4.12).
   systemctl disable "$mount_unit" >/dev/null 2>&1 || true

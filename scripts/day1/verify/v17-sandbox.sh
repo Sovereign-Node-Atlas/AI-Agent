@@ -16,7 +16,8 @@
 #      The image's entrypoint (coreutils `timeout -s KILL`) must SIGKILL it at the deadline (exit 137 within a few
 #      seconds of 5 s) and the container must be gone afterwards, so a program that ignores the host-side signal has
 #      no way to outlive its time bound. The host-side GNU timeout is only the backstop and must not be what fired.
-# The exit codes and the elapsed seconds of both runs are printed, with the image id (python:3.12-slim is unpinned).
+# The exit codes and the elapsed seconds of both runs are printed, with the image id and the base image the Dockerfile
+# pinned by digest (label org.atlas.sandbox.base; fix round 2, rule §7.9).
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -33,7 +34,8 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
 fi
 image_id="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null | cut -c8-19 || true)"
 image_ver="$(docker image inspect -f '{{index .Config.Labels "org.atlas.sandbox.version"}}' "$image" 2>/dev/null || true)"
-[[ "$image_ver" == 2 ]] || { echo "V17 fail: $image carries label org.atlas.sandbox.version='${image_ver:-none}', expected 2 (the in-container timeout entrypoint); rebuild: docker build -t $image $ATLAS_DAY1_DIR/docker/sandbox"; exit 1; }
+[[ "$image_ver" == 3 ]] || { echo "V17 fail: $image carries label org.atlas.sandbox.version='${image_ver:-none}', expected 3 (digest-pinned base + the in-container timeout entrypoint); rebuild: docker rmi $image; docker build -t $image $ATLAS_DAY1_DIR/docker/sandbox (phase2/10-gate.sh does this)"; exit 1; }
+image_base="$(docker image inspect -f '{{index .Config.Labels "org.atlas.sandbox.base"}}' "$image" 2>/dev/null || true)"
 
 meminfo() { awk -v k="$1" '$1 == k ":" { print $2; exit }' /proc/meminfo; }   # kB
 load1() { cut -d' ' -f1 /proc/loadavg; }
@@ -52,7 +54,7 @@ errf="$(mktemp)"
 trap 'rm -f "$errf"; docker rm -f "$name" "$name2" >/dev/null 2>&1 || true' EXIT
 
 # The run line of docker/sandbox/Dockerfile minus the job mount (nothing to mount here).
-run_flags=(--init --cpus=1 --pids-limit=64 --network none --read-only
+run_flags=(--init --pull never --cpus=1 --pids-limit=64 --network none --read-only
   --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=64m" --ulimit fsize=1048576
   --cap-drop ALL --security-opt no-new-privileges --user 65534:65534)
 
@@ -141,5 +143,5 @@ if awk -v e="$elapsed2" -v t="$in_limit" 'BEGIN { exit (e < t + 10) ? 0 : 1 }'; 
   exit 1
 fi
 
-echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); SIGTERM-ignoring job killed by the in-container timeout: exit 137 after ${elapsed2}s (limit ${in_limit}s), container gone; $host (Δload1 $load_delta)$llama_note; image $image ${image_id:-?} (base python:3.12-slim unpinned)"
+echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); SIGTERM-ignoring job killed by the in-container timeout: exit 137 after ${elapsed2}s (limit ${in_limit}s), container gone; $host (Δload1 $load_delta)$llama_note; image $image ${image_id:-?} (base ${image_base:-unlabelled})"
 exit 0

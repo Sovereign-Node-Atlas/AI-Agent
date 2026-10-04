@@ -7,8 +7,12 @@
 #   grep TCP_DENIED /var/log/squid/access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head
 # then add it here (in the repository copy) and reload the proxy WITHOUT re-running step 4:
 #   sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt
-# (copies the file over /opt/atlas/day1/config/allowlist.txt, re-renders, `systemctl reload squid`; no ufw reset,
+# (copies the file over /opt/atlas/day1/config/allowlist.txt, re-renders squid AND the host DNS forwarder (dnsmasq:
+# the host resolves only the names listed here plus the node's own DOMAIN, Section 12.5), reloads both; no ufw reset,
 # no dist-upgrade, no reboot). `--force 04` is NOT the way: it resets ufw, repeats the update and ends in a reboot.
+# The render REFUSES (dies) when this file names a host from the "NEVER listed" group below or a wildcard that would
+# re-admit one (".googleapis.com", ".google.com", ".ubuntu.com", ".amazonaws.com", ".azure.com"), and logs the sha256
+# of the rendered list so any later change is visible in the phase log (Section 16.3 item 6).
 #
 # NOT outbound (never listed): ntfy at http://127.0.0.1:8090 and http://<LAN_IP>:8090 is loopback/LAN; every
 # llama-server, Redis, ChromaDB, Kokoro, Whisper, Open WebUI and orchestrator port is loopback/LAN; WireGuard is
@@ -20,13 +24,14 @@
 # --- Ubuntu package mirrors (apt via Acquire::https::Proxy). Named hosts, NOT ".ubuntu.com": the wildcard would also
 # admit motd.ubuntu.com (motd-news/apt-news beacons), daisy/errors.ubuntu.com (apport uploads) and the report/metrics
 # hosts; phase1/04-system.sh disables those senders as well (rule §7.1). ".archive.ubuntu.com" covers the country
-# mirror the installer may have chosen (au.archive.ubuntu.com ...). No Launchpad/PPA host: Section 16.3 item 8 keeps
-# PPAs out; if a script ever needs one, it names that one host here. keyserver.ubuntu.com is not used by any script.
-archive.ubuntu.com
+# mirror the installer may have chosen (au.archive.ubuntu.com ...) AND archive.ubuntu.com itself (squid's dstdomain
+# treats the dotted form as "the domain and every subdomain"; a separate bare entry would only earn a "covered by"
+# warning in cache.log on every parse). No Launchpad/PPA host: Section 16.3 item 8 keeps PPAs out; if a script ever
+# needs one, it names that one host here. keyserver.ubuntu.com is not used by any script. Not listed either:
+# esm.ubuntu.com (the Ubuntu Pro timers are disabled in step 4 and no ESM source is attached) and changelogs.ubuntu.com
+# (only the release-upgrade beacon used it; step 4 sets Prompt=never and no script runs `apt changelog`).
 .archive.ubuntu.com
 security.ubuntu.com
-esm.ubuntu.com
-changelogs.ubuntu.com
 
 # --- Mozilla apt repository: Firefox as a .deb, never the snap stub (adjudicated conflict 5) -------------------------
 packages.mozilla.org
@@ -68,6 +73,10 @@ huggingface.co
 .hf.co
 
 # --- Build-time tool downloads named by the services research (Phase 2 step 6) ---------------------------------------
+# dl.google.com is a generic Google download host (Chrome, Earth and Drive installers and their update pings live
+# there too); the ONLY path the scripts fetch from it is the Android command-line tools zip for the build farm:
+#   https://dl.google.com/android/repository/commandlinetools-linux-*.zip      (Phase 2 step 6, docker/buildfarm)
+# so a TCP_DENIED-free access.log line for this host that is not that path is something to look at.
 dl.google.com
 services.gradle.org
 plugins.gradle.org
@@ -104,8 +113,17 @@ identity.xero.com
 login.xero.com
 
 # --- Wix (REST API host, account manager, and the static hosts the browser path loads for site design) ---------------
+# Named hosts, never ".wix.com": that wildcard would also admit frog.wix.com, Wix's BI/telemetry collector that every
+# Wix page and the editor post usage events to (rule §7.1). UNVERIFIED beyond the API host: the account manager and
+# editor hosts are the well-known ones; if a Phase 2 run shows further TCP_DENIED *.wix.com hosts, add them here BY
+# NAME (and never frog.wix.com).
 www.wixapis.com
-.wix.com
+www.wix.com
+manage.wix.com
+users.wix.com
+editor.wix.com
+static.wix.com
+dev.wix.com
 # UNVERIFIED: static asset hosts Wix pages load; needed only for the Playwright/UI-TARS browser path
 .wixstatic.com
 .parastorage.com

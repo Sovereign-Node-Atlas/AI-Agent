@@ -3,6 +3,17 @@
 # NTFY_AUTH_DIR). ntfy lives here, not in docker/core/compose.yml, because Section 17 brings it up in Phase 1 (step 7):
 # project "atlas-ntfy", container "atlas-ntfy", host ports 127.0.0.1:8090 and ${LAN_IP}:8090; core must not declare a
 # second one. Auth is default-deny; the node token is /etc/atlas/secrets/ntfy.env (NTFY_TOKEN=...).
+#
+# Proxy (fix round, major): /root/.docker/config.json (step 6) makes compose inject http_proxy=http://172.17.0.1:3128
+# into every container started as root; binwiederhier/ntfy is FROM alpine, so its healthcheck's busybox wget honours
+# http_proxy and ignores no_proxy, and the probe to localhost would go to squid (not allowlisted -> 403 -> the
+# container is permanently "unhealthy" and the Phase 2 gate refuses it). ntfy needs no egress at all, so the proxy
+# variables are pinned EMPTY (service environment overrides the injected ones) AND the probe runs with `wget -Y off`
+# (busybox: proxy off). Step 7 waits for `docker inspect` to report healthy before it continues.
+#
+# Hardening: every capability dropped (Docker sets net.ipv4.ip_unprivileged_port_start=0 in the container namespace,
+# so the atlas uid binds :80 without NET_BIND_SERVICE), no-new-privileges, read-only root filesystem with a tmpfs /tmp;
+# the three bind mounts are the only writable paths.
 services:
   ntfy:
     image: binwiederhier/ntfy:v2.28.0
@@ -10,6 +21,11 @@ services:
     command: ["serve"]
     environment:
       - TZ=${TZ}
+      # No proxy for this container (header).
+      - http_proxy=
+      - https_proxy=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
     user: "${ATLAS_UID}:${ATLAS_GID}"
     volumes:
       - ${NTFY_DATA_DIR}/etc:/etc/ntfy          # server.yml (/srv/atlas/data/ntfy, backed up)
@@ -21,10 +37,17 @@ services:
       - "${LAN_IP}:8090:80"
       - "127.0.0.1:8090:80"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --tries=1 http://localhost:80/v1/health -O - | grep -Eo '\"healthy\"\\s*:\\s*true' || exit 1"]
+      test: ["CMD-SHELL", "wget -Y off -q --tries=1 http://localhost:80/v1/health -O - | grep -Eo '\"healthy\"\\s*:\\s*true' || exit 1"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 40s
     restart: unless-stopped
     init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

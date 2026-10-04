@@ -1,22 +1,38 @@
-# docker/wg-easy/compose.yml — WG-Easy (Section 12.2; Phase 1 step 7). Image pinned per the platform research (item 8).
+# docker/wg-easy/compose.yml — WG-Easy (Section 12.2; Phase 1 step 7). Image pinned to the exact release (rule §7.9):
+# ghcr.io/wg-easy/wg-easy:15.4.0, the latest stable 15.x on 2026-10-04 (VERIFIED on the GitHub releases page and the
+# ghcr package page, which lists the tags 15, 15.4 and 15.4.0 for that release). The floating "15" tag is not used:
+# a 15.x point release would otherwise change the image under this step, whose INIT_* unattended setup is itself an
+# UNVERIFIED detail.
 #
 # Every ${VAR} is interpolated by `docker compose --env-file /etc/atlas/secrets/wg-easy.env` (written by
 # phase1/07-remote.sh, mode 600 root). The INIT_* variables perform WG-Easy v15's unattended first-run setup and are
-# ignored on every later start (docs: unattended-setup.md). Step 7 sets WG_INIT_ENABLED=false and blanks WG_INIT_PASS
-# in the env file once wg0 is up and recreates the container, so the admin password never stays in the container's
-# environment (docker inspect / config.v2.json are readable by every docker-group member); it lives only in the env file.
+# ignored on every later start (docs: unattended-setup.md, which also warns that the initial username and password are
+# not complexity-checked and a short one may be refused at the login form: step 7 uses the 11-character admin name
+# "atlas-admin" and a 24-character password). Step 7 sets WG_INIT_ENABLED=false and blanks WG_INIT_PASS in the env
+# file once wg0 is up and recreates the container, so the admin password never stays in the container's environment
+# (docker inspect / config.v2.json are readable by every docker-group member); it lives only in the env file.
 #
 # Network design (adjudicated conflict 4): wg0 lives INSIDE this container. VPN clients reach the host masqueraded
 # as the container address 10.42.42.42 on the bridge br-atlas-wg, so "bound to LAN and WireGuard" for host services
 # means ufw rules on ${LAN_IFACE} and on br-atlas-wg (10.42.42.0/24). The admin UI (51821) is published on the LAN
 # address only, because Docker's published ports bypass ufw; UDP 51820 is published on every address by design.
+# INSECURE=true means the admin password crosses the LAN Wi-Fi in clear on a login from the Windows PC: step 7's V5
+# instructions therefore have the first login made from the node itself (the RDP session, http://127.0.0.1:51821) or
+# over the VPN.
 #
-# Capabilities: NET_ADMIN only. The host loads the wireguard module itself (step 7: modprobe + modules-load.d and a
-# functional `ip link add type wireguard` proof), so the internet-facing container never gets SYS_MODULE or a
-# /lib/modules mount.
+# Proxy: the host's /root/.docker/config.json (step 6) injects http_proxy/https_proxy into every container compose
+# starts as root. wg-easy needs no egress (DISABLE_VERSION_CHECK=true) and its busybox wget (used by step 7 to probe
+# the ntfy path from the VPN side) ignores no_proxy, so the proxy variables are pinned EMPTY here (service environment
+# overrides the CLI's injected proxies); step 7 additionally runs the probe with `wget -Y off`.
+#
+# Capabilities: everything dropped, NET_ADMIN (wg-quick, ip, netlink iptables) and NET_RAW (legacy iptables talks to
+# the kernel over a raw socket) added back; no-new-privileges. The host loads the wireguard module itself (step 7:
+# modprobe + modules-load.d and a functional `ip link add type wireguard` proof), so the internet-facing container
+# never gets SYS_MODULE or a /lib/modules mount. UNVERIFIED that the v15 entrypoint needs nothing beyond these two;
+# step 7's _wg_easy_check dies naming `docker logs wg-easy` and this cap_drop when wg0 is not up.
 services:
   wg-easy:
-    image: ghcr.io/wg-easy/wg-easy:15
+    image: ghcr.io/wg-easy/wg-easy:15.4.0
     container_name: wg-easy
     environment:
       - INSECURE=true                # http only; the UI is reachable from LAN/VPN only (published on ${LAN_IP})
@@ -32,6 +48,11 @@ services:
       - INIT_IPV6_CIDR=fdcc:ad94:bacf:61a4::/112
       - INIT_ALLOWED_IPS=${WG_CIDR},${LAN_CIDR},10.42.42.0/24
       - TZ=${TZ}
+      # No proxy for this container (header): it has no egress and busybox wget has no no_proxy.
+      - http_proxy=
+      - https_proxy=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
     networks:
       wg:
         ipv4_address: 10.42.42.42
@@ -44,8 +65,13 @@ services:
       - "${LAN_IP}:51821:51821/tcp"
       - "127.0.0.1:51821:51821/tcp"
     restart: unless-stopped
+    cap_drop:
+      - ALL
     cap_add:
       - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.src_valid_mark=1

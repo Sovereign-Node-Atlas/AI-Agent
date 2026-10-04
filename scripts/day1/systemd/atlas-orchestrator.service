@@ -11,24 +11,34 @@
 #
 # Control path (CONVENTIONS.md §8): the process runs as `atlas` and starts/stops engines with `sudo systemctl
 # start|stop|restart llama-server@<key>` under /etc/sudoers.d/atlas-engines, so NoNewPrivileges must stay off here.
+# That fragment is the ONLY sudoers grant of the atlas account (fix round 2): the AEGIS manual trigger is a path unit
+# (atlas-aegis-trigger.path, phase2/07-restic.sh), not a second fragment.
 # Every outbound request of the integrations goes through the allowlist proxy: proxy.env is loaded last so HTTPS_PROXY
 # is set for the Google/Xero/feed clients (rule §7.1).
+#
+# HOME is the atlas account's home /var/lib/atlas/home (phase1/03-mounts.sh; /var/lib/atlas itself stays root:root 755
+# so the service can never replace the Day 1 state under it). The docker client reads its proxy config from
+# $HOME/.docker/config.json (phase1/06-docker.sh writes it there), so a wrong HOME would start every sandbox and Phase 4
+# container without the proxy (fix round 2, major).
 #
 # DOCKER GROUP == HOST ROOT (recorded, fix round; phase1/06-docker.sh header states the same decision): the sandbox
 # (16.4) and the Phase 4 containers are `docker run` calls from this account, and CONVENTIONS.md §2 puts `atlas` in the
 # docker group for that. Any docker-group member can `docker run --privileged -v /:/host`, so for a process that has
 # been compromised (a prompt-injected task that reaches a shell) every hardening line below, the exact sudoers
-# fragments and the outbound allowlist are advisory, not enforced. The baseline (CONVENTIONS.md §2) fixes the group
+# fragment and the outbound allowlist are advisory, not enforced. The baseline (CONVENTIONS.md §2) fixes the group
 # membership, so it stays; the alternatives (a root-owned `atlas-sandbox-run <job-dir>` helper under sudoers, or a
 # docker-socket proxy limited to containers/create with the sandbox HostConfig) are a Principal decision that also
 # changes the package's run line (docker/sandbox/Dockerfile header) and phase1/06-docker.sh.
 #
-# Self-modification (Section 16.3 items 6 and 8, fix round): the package tree, the venv, the day1 copy and /etc are
-# read-only for this process (ReadOnlyPaths= plus ProtectSystem=full); the engine env files under /etc/atlas/engines are
-# read-only too — a change to an engine's flags is a proposal the Principal applies through the phase scripts, never a
-# write from here. ProtectSystem=strict was NOT chosen: it would also make /run read-only, which sudo-rs (its
-# timestamp directory) and the docker client may need (UNVERIFIED either way; a control path that breaks at 02:30 is
-# worse than one explicit read-only list).
+# Self-modification and the Principal's reserved trees (Section 16.3 items 5, 6 and 8, fix round 2): the package tree,
+# the venv, the day1 copy and /etc are read-only for this process (ReadOnlyPaths= plus ProtectSystem=full), and so are
+# the weights ($ATLAS_SRV/models), the Phase 4 engines ($ATLAS_SRV/engines) and the vault ciphertext
+# ($ATLAS_SRV/vault/cipher, written only by atlas-vault.service): a change to an engine's flags or a new model is a
+# proposal the Principal applies through the phase scripts, never a write from here. Paths that may not exist yet
+# (the day1 copy before atlas-day1.sh ran, vault/cipher before step 9b) carry the `-` prefix so the unit still starts.
+# ProtectSystem=strict was NOT chosen: it would also make /run read-only, which sudo-rs (its timestamp directory) and
+# the docker client may need (UNVERIFIED either way; a control path that breaks at 02:30 is worse than one explicit
+# read-only list). ReadWritePaths= below therefore only matters if strict is ever adopted; it names the state dirs.
 
 [Unit]
 Description=A.T.L.A.S. orchestrator (Engine Arbiter, router, approval gate, ledger)
@@ -49,7 +59,7 @@ EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 Environment=PYTHONUNBUFFERED=1
-Environment=HOME=/var/lib/atlas
+Environment=HOME=/var/lib/atlas/home
 # Redis is a container (docker/core/compose.yml, restart: unless-stopped); wait for the loopback port rather than
 # crash-loop on the first boot. /dev/tcp is a bash feature, hence /bin/bash. The loop is 180 s; TimeoutStartSec is
 # longer so its own message, not a systemd kill, is what the journal shows when Redis never comes.
@@ -61,11 +71,10 @@ TimeoutStartSec=300
 TimeoutStopSec=60
 KillMode=mixed
 LimitNOFILE=65536
-# Only paths the service must write; everything else read-only (weights are read by llama-server, not here).
 ProtectSystem=full
 PrivateTmp=true
-ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv ${ATLAS_OPT}/day1 ${ATLAS_ETC}
-ReadWritePaths=${ATLAS_SRV} /var/lib/atlas -/srv/cold -/run/atlas
+ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv -${ATLAS_OPT}/day1 ${ATLAS_ETC} -${ATLAS_SRV}/models -${ATLAS_SRV}/engines -${ATLAS_SRV}/vault/cipher
+ReadWritePaths=/var/lib/atlas -/srv/cold -/run/atlas
 RuntimeDirectory=atlas
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes

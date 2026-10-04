@@ -8,12 +8,21 @@
 # visibility_timeout longer than the longest task, both set in the app, not here. The broker/result URLs (with the
 # Redis password) come from /etc/atlas/secrets/redis.env, read by PID 1.
 #
+# Secrets the WORKER itself opens at run time (fix round 2, blocker): the Sentinel BLUF push reads NTFY_TOKEN_FILE
+# (/etc/atlas/secrets/ntfy.env) and, on the gpu worker, the D9 retention task reads OPENWEBUI_ADMIN_TOKEN_FILE. Both
+# files are atlas:atlas 600 inside /etc/atlas/secrets, which must be root:atlas 750 (phase2/02-orchestrator.sh header,
+# adjudication item). The first ExecStartPre runs AS ATLAS and fails the unit when the directory cannot be traversed or
+# the token files cannot be read, so a writer that tightens the directory to 700 (phase2/09b-vault.sh today) is seen in
+# the journal at the next start, not as a silent nightly failure of the alert path (§7.4).
+# HOME is the account's home /var/lib/atlas/home (phase1/03-mounts.sh): the docker client's proxy config is there.
+#
 # DOCKER GROUP == HOST ROOT (recorded, fix round): this worker runs the AEGIS sandbox (`docker run`, 16.4) and
 # processes untrusted content (RSS feeds, documents, web pages); a parser RCE or prompt injection that reaches a
 # shell here has host root through the docker socket (`docker run --privileged -v /:/host`). CONVENTIONS.md §2 fixes the
-# group membership, so the read-only paths, the sudoers fragments and the allowlist below are advisory for a
+# group membership, so the read-only paths, the sudoers fragment and the allowlist below are advisory for a
 # compromised worker; the alternatives are recorded in atlas-orchestrator.service's header.
-# Self-modification (16.3 items 6 and 8): package, venv, day1 copy and /etc read-only; see atlas-orchestrator.service.
+# Self-modification and reserved trees (16.3 items 5, 6 and 8): package, venv, day1 copy, /etc, weights, engines and
+# the vault ciphertext are read-only; see atlas-orchestrator.service.
 
 [Unit]
 Description=A.T.L.A.S. Celery worker (cpu queue)
@@ -31,7 +40,8 @@ EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
 EnvironmentFile=-${ATLAS_ETC}/proxy.env
 Environment=PYTHONUNBUFFERED=1
-Environment=HOME=/var/lib/atlas
+Environment=HOME=/var/lib/atlas/home
+ExecStartPre=/bin/sh -c 'test -x ${ATLAS_ETC}/secrets && test -r ${ATLAS_ETC}/secrets/ntfy.env && { test ! -e ${ATLAS_ETC}/secrets/openwebui-admin.token || test -r ${ATLAS_ETC}/secrets/openwebui-admin.token; } || { echo "atlas-celery-cpu: ${ATLAS_ETC}/secrets is not traversable by atlas, or ntfy.env / openwebui-admin.token are unreadable (directory must be root:atlas 750, files atlas:atlas 600; phase2/02-orchestrator.sh header)" >&2; exit 1; }'
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null && exit 0; sleep 2; done; echo "atlas-celery-cpu: redis not reachable on 127.0.0.1:6379" >&2; exit 1'
 ExecStart=${ATLAS_OPT}/venv/bin/celery -A atlas.celery_app worker -Q cpu -n cpu@%H --loglevel=INFO --concurrency=${CELERY_CPU_CONCURRENCY} --max-tasks-per-child=50
 Restart=always
@@ -43,8 +53,8 @@ TimeoutStopSec=300
 LimitNOFILE=65536
 ProtectSystem=full
 PrivateTmp=true
-ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv ${ATLAS_OPT}/day1 ${ATLAS_ETC}
-ReadWritePaths=${ATLAS_SRV} /var/lib/atlas -/srv/cold -/run/atlas
+ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv -${ATLAS_OPT}/day1 ${ATLAS_ETC} -${ATLAS_SRV}/models -${ATLAS_SRV}/engines -${ATLAS_SRV}/vault/cipher
+ReadWritePaths=/var/lib/atlas -/srv/cold -/run/atlas
 
 [Install]
 WantedBy=multi-user.target

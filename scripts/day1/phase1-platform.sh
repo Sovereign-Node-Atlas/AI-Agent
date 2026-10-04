@@ -20,9 +20,21 @@
 # refuses to go past step 4 until it has happened. --no-reboot is accepted here only: atlas-day1.sh's option parser
 # does not pass it through, so use the direct path above for that case.
 #
-# Interactive moments (rule §7.6): the recovery-key pause in step 2 (and, only if the installer encrypted the OS
-# volume, its passphrase once, just before). Steps 5b and 7 WAIT up to 10 minutes each for the Principal's RDP
-# session and phone handshake but never block: a timeout records deferred and the gate treats deferred as passed.
+# Interactive moments (rule §7.6 names the recovery-key pause; the two further inputs below are declared here, in
+# the step headers and in the README):
+#   * step 2: the recovery key is printed once and the step waits for "WRITTEN DOWN"; in the SAME pause, when the
+#     installer encrypted the OS volume and it has no TPM2 token yet, the OS LUKS passphrase is asked ONCE so the TPM
+#     can unlock the OS at boot (Section 3.5; used for the enrolment only, never stored);
+#   * step 7: when the Cloudflare token cannot list zones and no zone id is found (CLOUDFLARE.txt, CF_ZONE_ID in
+#     atlas.env), the zone id is asked ONCE from the terminal with a 5-minute timeout (Section 22, S11); no terminal
+#     or no answer leaves it blank with a warning. Non-interactive path: CF_ZONE_ID=<32 hex> in /etc/atlas/atlas.env.
+# Waits that are not prompts: steps 5b and 7 WAIT up to 10 minutes each for the Principal's RDP session and phone
+# handshake. A timeout records V19/V5 as FAIL (CONVENTIONS §6 lists both as required with no deferral), the step
+# still completes, and the Phase 1 gate blocks Phase 2 until `--force 05b` / `--force 07` re-runs the wait.
+# Recorded setting with a Section 3.5 consequence: ATLAS_ALLOW_UNENCRYPTED_OS=1 in /etc/atlas/atlas.env accepts an
+# unencrypted OS volume (step 1 otherwise stops); it also waives D3's on-node recovery-key copy (a plain-text key on
+# an unencrypted drive would defeat the data volume's encryption), so the USB copy is then the only copy. The key is
+# documented here and in steps 1/2; config/atlas.env.example should list it blank with the same text.
 
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"

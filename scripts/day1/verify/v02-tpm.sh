@@ -4,7 +4,7 @@
 #   Checks: /dev/tpmrm0 exists; systemd-cryptenroll --tpm2-device=list sees it; the LUKS2 header of LUKS_DEVICE
 #   carries a systemd-tpm2 token bound to PCR 7 (adjudicated conflict 1); the mapping MAPPING_NAME is active (which,
 #   after the Phase 1 reboot, proves the TPM unlocked it without a keyboard). OS_LUKS_DEVICE, when given, must carry
-#   a systemd-tpm2 token too. Exit 0 pass, 1 fail. Must run as root (cryptsetup luksDump).
+#   a systemd-tpm2 token bound to PCR 7 as well (S9). Exit 0 pass, 1 fail. Must run as root (cryptsetup luksDump).
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -44,6 +44,11 @@ boot="$(cut -d- -f1 /proc/sys/kernel/random/boot_id)"
 os_msg="OS volume: ${osnote:-not checked}"
 if [[ -n "$osdev" && "$osdev" != "-" ]]; then
   os_tok="$(token_check "$osdev")" || { echo "V2 fail on OS volume $osdev: $os_tok"; exit 1; }
+  # S9 fixes --tpm2-pcrs=7 for every enrolment V2 proves: an OS token from an earlier manual enrolment with another
+  # mask (or none) must not pass unnoticed any more than the data volume's would.
+  if [[ "$os_tok" != *"pcrs=7"* && "$os_tok" != *"pcrs=unknown"* ]]; then
+    echo "V2 fail: OS volume enrolment is not bound to PCR 7 ($os_tok on $osdev; re-enrol: systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 $osdev)"; exit 1
+  fi
   os_msg="OS volume $osdev: $os_tok"
 elif [[ "$osdev" == "-" && "$osnote" != *ACCEPTED* ]]; then
   # The caller established that "/" is not on LUKS. Section 3.5 requires LUKS2 on the OS volume too, so this is a

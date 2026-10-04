@@ -30,6 +30,12 @@ Group=atlas
 SupplementaryGroups=render video
 EnvironmentFile=${ATLAS_ETC}/engines/%i.env
 Environment=LLAMA_ARG_HOST=127.0.0.1
+# No proxy for the engine (fix round 2): phase1/04-system.sh installs HTTP_PROXY/HTTPS_PROXY/NO_PROXY as the manager's
+# DefaultEnvironment for every unit, which would hand the engine (built with an HTTPS client, LLAMA_OPENSSL=ON) a working
+# route to every allowlisted host through squid on 127.0.0.1:3128, inside IPAddressAllow=localhost. The engine has no
+# legitimate outbound need (Section 16.3 item 8); a unit Environment= overrides DefaultEnvironment, so blank them here
+# and tell every client library not to look for one (NO_PROXY=*).
+Environment=HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= NO_PROXY=* no_proxy=*
 # RADV writes its shader cache under $XDG_CACHE_HOME; the atlas system user has no usable HOME.
 CacheDirectory=atlas-llama
 Environment=XDG_CACHE_HOME=/var/cache/atlas-llama
@@ -37,7 +43,8 @@ WorkingDirectory=${ATLAS_SRV}/models
 # $ARGS is split at whitespace by systemd with quotes respected and then removed, which is why engine-env.py refuses
 # tokens with spaces or quotes; JSON-valued options (chat template kwargs) travel as LLAMA_ARG_* variables in the env file.
 ExecStart=/usr/local/bin/llama-server $ARGS
-ExecStartPost=/bin/sh -c 'until curl -sf -o /dev/null "http://127.0.0.1:${LLAMA_ARG_PORT}/health"; do sleep 2; done'
+# --noproxy '*': the readiness poll must reach 127.0.0.1 directly whatever the environment says (never via squid).
+ExecStartPost=/bin/sh -c 'until curl -sf --noproxy "*" -o /dev/null "http://127.0.0.1:${LLAMA_ARG_PORT}/health"; do sleep 2; done'
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=900
@@ -60,11 +67,27 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# Fix round 2: the settings that cost nothing for a Vulkan engine and close real escape classes for a process whose uid
+# (atlas) is in the docker group, i.e. root-equivalent on this host (phase2/04-memory.sh header). The docker socket is
+# reachable by the uid but not by this process: InaccessiblePaths masks it (`-`: no failure when the path is absent;
+# both spellings, /run and the /var/run symlink). Slot and shader-cache files are created 0600 (UMask).
+CapabilityBoundingSet=
+RestrictNamespaces=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ProtectProc=invisible
+UMask=0077
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock
 # Network confinement by kernel BPF, independent of ufw and of the proxy variables: the engine (built with an HTTPS
 # client, LLAMA_OPENSSL=ON per conflict 10) may only talk on loopback, where the orchestrator and ExecStartPost reach it.
+# AF_UNIX stays: UNVERIFIED whether Mesa's device enumeration or the RADV cache needs a local socket, and removing it is
+# a change to test on the node (llama-server --list-devices under the unit) before it lands here, not in a template.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
-IPAddressAllow=localhost
+IPAddressAllow=127.0.0.1/32 ::1/128
 
 [Install]
 WantedBy=multi-user.target

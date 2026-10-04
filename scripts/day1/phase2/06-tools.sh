@@ -12,25 +12,56 @@
 # comes from LBNL-ETA (research conflict 1); OpenStudio/EnergyPlus from NatLabRockies (research conflict 2); MCP4IFC is
 # YELLOW (research conflict 5: attempted, logged, never blocks; the WARN summary at the end of the step names its status).
 #
-# WHO RUNS WHAT (fix round):
+# WHO RUNS WHAT (fix round 2):
 #   * Root installs packages and extracts tarballs; every archive is unpacked with --no-same-owner --no-same-permissions,
 #     then chowned root:root and chmodded u=rwX,go=rX, and `find ! -user root` must be empty before the tree is put in
 #     place (an upstream archive carrying uid 1000 would otherwise hand the Principal's login user write access to
 #     binaries root runs through /etc/profile.d and /usr/local/bin).
+#   * /opt/atlas/venv (the orchestrator venv) is root:atlas, group/other WITHOUT write (the invariant steps 02 and 04
+#     establish for Section 16.3 item 6: the atlas account never owns the interpreter or the site-packages it runs,
+#     and root never executes an atlas-writable file). It is re-asserted here BEFORE root runs pip or any import from
+#     it (a venv an earlier revision chowned to atlas is re-owned first) and again at the end of the step. ifcopenshell,
+#     ifcmcp and playwright import from it read-only; the browser tree ($ATLAS_OPT/playwright) is root a+rX.
 #   * Blender extensions and preferences are PER USER (~/.config/blender/4.5). Every `blender -b` that installs, enables
 #     or imports Bonsai/MCP4IFC runs as the atlas account (the orchestrator's identity, CONVENTIONS §8) with its own
-#     HOME, and always with --offline-mode (extensions.blender.org is allowlisted only for the one-time Bonsai download;
-#     Section 12.1 "update checks disabled"). tools.env records BLENDER_ARGS and BLENDER_USER_CONFIG for the orchestrator.
-#   * MCP4IFC is unpinned upstream research code: it is checked out at MCP4IFC_COMMIT (a fixed 40-hex pin), and its
-#     `uv sync` and install scripts run as atlas under $ATLAS_OPT/tools, never as root.
+#     HOME, always with --offline-mode (extensions.blender.org is allowlisted only for the one-time Bonsai download;
+#     Section 12.1 "update checks disabled") and ALWAYS with --python-exit-code 1: without it Blender exits 0 after a
+#     Python exception (creator_args: the exit code on a Python error is 0 unless set), so every probe would be a false
+#     positive. Probes are positive as well (a printed marker is grepped), so a wrong default can never pass again.
+#     tools.env records BLENDER_ARGS and BLENDER_USER_CONFIG for the orchestrator.
+#   * MCP4IFC is unpinned upstream research code: it is checked out at MCP4IFC_COMMIT (a fixed 40-hex pin). Its git
+#     operations, `uv sync` and install scripts run as atlas under $ATLAS_OPT/tools while the checkout is atlas-owned,
+#     and the checkout plus its .venv are re-owned root:atlas go-w once that work is done (the orchestrator spawns the
+#     server from it read-only; the next run hands it back to atlas for the duration of the git/uv work only).
 #   * Downloads are transient and go to /var/cache/atlas/downloads on the OS drive (never $ATLAS_STATE, which restic
 #     backs up, and never $ATLAS_SRV, the atlas-owned data volume); sha256 pins where known, the rest recorded.
-#   * The buildfarm image runs as a non-root build user and the only run line is the capped one in its header; atlas is
-#     in the docker group, which is root-equivalent on the host (any -v path, --privileged, --pid host), so the
-#     orchestrator must construct the docker run line itself from tools.env, accept only a job directory under
-#     BUILDFARM_WORK_ROOT as the single -v source, never pass user-supplied flags, and keep the caps below.
-#   * PRINCIPAL DISCLOSURE (Section 16.3 item 2): building the buildfarm image accepts the Android SDK licence terms
-#     (https://developer.android.com/studio/terms) on the Principal's behalf; printed before the build, README item.
+#   * The buildfarm image runs as a non-root build user and THE run line is executed by a ROOT-OWNED WRAPPER,
+#     /usr/local/sbin/atlas-buildfarm-run JOBDIR CMD..., written by this step: it reads the BUILDFARM_* keys from
+#     tools.env itself, accepts only a job directory whose realpath is under BUILDFARM_WORK_ROOT, interprets no other
+#     argument, names the container buildfarm-<basename JOBDIR>, runs it with --init, and on the host timeout (exit
+#     124/137) kills the container by name (a `timeout` around the docker client alone bounds the client, not the
+#     build). /etc/sudoers.d/atlas-buildfarm grants atlas exactly that wrapper (visudo-checked, like atlas-engines), so
+#     the orchestrator never needs the docker socket for builds; the Phase 1 writer can then drop atlas from the docker
+#     group (recorded for phase2/README-contracts.md; CONVENTIONS §8 should list this fragment beside atlas-engines and
+#     atlas-vault). The smoke run goes through the wrapper via `sudo -n` as atlas, so the whole path is proven.
+#   * ANDROID SDK LICENCE (Section 16.3 item 2: terms are accepted by the Principal, never by a script on their behalf):
+#     the image build runs `sdkmanager --licenses` ONLY when BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes is set in
+#     /etc/atlas/atlas.env (the Principal reads https://developer.android.com/studio/terms and sets the key; no pause,
+#     CONVENTIONS §7.6). Otherwise the image is not built, BUILDFARM_STATUS=licence-not-accepted goes into tools.env,
+#     the step-06 summary WARNs with the one-line fix, and the orchestrator must treat the build tool as unavailable.
+#     The Dockerfile refuses to run sdkmanager without the matching build arg. config/atlas.env.example should gain
+#     the key with the URL in its comment (another writer's file; recorded for README-contracts.md).
+#   * APT DRIFT: the Dockerfile pins openjdk/mingw; when the archive has moved on it installs the current versions and
+#     writes what it installed to /opt/buildfarm/versions.txt. This step reads that file after the build, WARNs on
+#     drift and records BUILDFARM_JDK_VERSION / BUILDFARM_MINGW_VERSION / BUILDFARM_APT_DRIFT in tools.env, so the
+#     drift is visible after the build, not only in a scrolled-away build log (§7.9).
+#
+# UNPINNED / PINNED HERE (rule §7.9; scripts/day1/README.md does not exist yet, so the disclosure lives here and is
+# repeated for phase2/README-contracts.md): uv is pinned (UV_PIN, shared with phase2/05-voice.sh); the Blender 4.5.N
+# PATCH is chosen from the live release listing (download.blender.org was blocked in research and in this round, so no
+# sha256 can be typed here) and the choice is recorded LOUDLY (log line + BLENDER_VERSION + BLENDER_TARBALL_SHA256 in
+# tools.env; the published blender-4.5.N.sha256 is verified when present); the Bonsai version comes from the extensions
+# API for the installed Blender (BONSAI_VERSION recorded). Everything else is pinned or sha256-fixed.
 #
 # Contracts relied on from other writers (CONVENTIONS.md §1):
 #   * /opt/atlas/venv ($ATLAS_OPT/venv) is the orchestrator venv (step 02; step 04 creates it when absent, and so does
@@ -42,12 +73,18 @@
 #   * $ATLAS_ETC/docker.env (Phase 1 step 6): CONTAINER_HTTP_PROXY / CONTAINER_HTTPS_PROXY, ATLAS_UID, ATLAS_GID.
 #   * $ATLAS_OPT/python (phase2/05-voice.sh, step 5 before 6): the uv-managed CPython 3.11 MCP4IFC's venv is built on.
 #   * /var/cache/atlas (phase2/04-memory.sh): the cache root for pip/uv/downloads.
+#   * /etc/atlas/atlas.env (load_env exports every key): BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE (see above).
 # Contract this file defines for others:
-#   * $ATLAS_ETC/tools.env (root:atlas 640): BLENDER_BIN, BLENDER_VERSION, BLENDER_ARGS, BLENDER_USER_CONFIG,
-#     BONSAI_VERSION, RADIANCE_BIN, RAYPATH, ENERGYPLUS_BIN, OPENSTUDIO_BIN, KICAD_CLI, PLAYWRIGHT_BROWSERS_PATH,
-#     TOOLS_VENV, IFCMCP_BIN, MCP4IFC_DIR, MCP4IFC_COMMIT, MCP4IFC_STATUS, MCP4IFC_PYTHON, MCP4IFC_ADDON_ZIP,
-#     BUILDFARM_IMAGE, BUILDFARM_MEMORY, BUILDFARM_CPUS, BUILDFARM_PIDS, BUILDFARM_TMPFS_SIZE, BUILDFARM_TIMEOUT_S,
-#     BUILDFARM_UID, BUILDFARM_GID, BUILDFARM_WORK_ROOT. Sourceable KEY=VALUE lines.
+#   * $ATLAS_ETC/tools.env (root:atlas 640): BLENDER_BIN, BLENDER_VERSION, BLENDER_TARBALL_SHA256, BLENDER_ARGS,
+#     BLENDER_USER_CONFIG, BONSAI_VERSION, RADIANCE_BIN, RAYPATH, ENERGYPLUS_BIN, OPENSTUDIO_BIN, KICAD_CLI,
+#     PLAYWRIGHT_BROWSERS_PATH, TOOLS_VENV, IFCMCP_BIN, MCP4IFC_DIR, MCP4IFC_COMMIT, MCP4IFC_STATUS, MCP4IFC_PYTHON,
+#     MCP4IFC_ADDON_ZIP, BUILDFARM_STATUS (built | licence-not-accepted), BUILDFARM_RUN (the wrapper), BUILDFARM_IMAGE,
+#     BUILDFARM_MEMORY, BUILDFARM_CPUS, BUILDFARM_PIDS, BUILDFARM_TMPFS_SIZE, BUILDFARM_TIMEOUT_S, BUILDFARM_UID,
+#     BUILDFARM_GID, BUILDFARM_WORK_ROOT, BUILDFARM_JDK_VERSION, BUILDFARM_MINGW_VERSION, BUILDFARM_APT_DRIFT,
+#     UV_VERSION. Sourceable KEY=VALUE lines.
+#   * /usr/local/sbin/atlas-buildfarm-run JOBDIR CMD... (root 755) and /etc/sudoers.d/atlas-buildfarm: the orchestrator
+#     runs builds as `sudo -n /usr/local/sbin/atlas-buildfarm-run $BUILDFARM_WORK_ROOT/<job> gradle assembleRelease`;
+#     exit status is the container's (124/137 = killed at BUILDFARM_TIMEOUT_S), 64 = refused argument.
 
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
@@ -57,9 +94,13 @@
 IFCOPENSHELL_PIN="ifcopenshell==0.8.5"             # services-tools.md §4.1 VERIFIED (py314 manylinux wheel exists)
 IFCMCP_PIN="ifcopenshell-mcp[mcp]==0.8.5"          # §4.1 VERIFIED (PyPI 2026-04-01)
 PLAYWRIGHT_PIN="playwright==1.63.0"                # §4.7 VERIFIED (ubuntu26.04-x64 dependency map at v1.63.0)
+UV_PIN="0.12.23"                                   # PyPI release current on 2026-10-04 (VERIFIED); same pin as 05-voice.sh
 BLENDER_SERIES="4.5"                               # adjudicated conflict 18: 4.5 LTS
 BLENDER_RELEASE_URL="https://download.blender.org/release/Blender4.5/"
-BLENDER_ARGS="--offline-mode"                      # every headless call, one flag (quoted as one word below); Blender 4.2+ (UNVERIFIED on 4.5: the version call dies if rejected)
+# Every headless call: offline (Blender 4.2+; UNVERIFIED on 4.5: the version call dies if rejected) AND a non-zero exit
+# on a Python exception (`--python-exit-code <code>`, "zero disables" per `blender --help`; the default IS zero).
+BLENDER_HEADLESS=(-b --offline-mode --python-exit-code 1)
+BLENDER_ARGS="--offline-mode --python-exit-code 1"  # the same flags for the orchestrator (tools.env), as one string
 BONSAI_API_URL="https://extensions.blender.org/api/v1/extensions/"   # UNVERIFIED API (site blocked during research)
 RADIANCE_URL="https://github.com/LBNL-ETA/Radiance/releases/download/rad6R0P2/Radiance_c1700d56_Linux.zip"   # §4.4 VERIFIED
 ENERGYPLUS_URL="https://github.com/NatLabRockies/EnergyPlus/releases/download/v26.1.0/EnergyPlus-26.1.0-6f2e40d102-Linux-Ubuntu24.04-x86_64.tar.gz"   # §4.5 VERIFIED
@@ -78,11 +119,17 @@ MCP4IFC_REPO="https://github.com/Show2Instruct/ifc-bonsai-mcp"   # §4.3 VERIFIE
 MCP4IFC_COMMIT="62154932f99d8bff8494c51ddb0b16840fac8fec"
 MCP4IFC_PYTHON_SERIES="3.11"                       # README: Python 3.10+; the managed 3.11 of step 5 is reused
 BUILDFARM_IMAGE="atlas-buildfarm:1"
+BUILDFARM_IMAGE_REVISION="3"                       # org.atlas.buildfarm.version label of docker/buildfarm/Dockerfile
 BUILDFARM_MEMORY="8g"                              # Section 16.4-style caps for the buildfarm run line (header)
 BUILDFARM_CPUS="4"
 BUILDFARM_PIDS="1024"
 BUILDFARM_TMPFS_SIZE="2g"
 BUILDFARM_TIMEOUT_S="3600"
+BUILDFARM_JDK_PIN="21.0.12.1+1-1~26.04.4"         # services-tools.md §4.8 VERIFIED (packages.ubuntu.com/resolute)
+BUILDFARM_MINGW_PIN="13.2.0-6ubuntu1+26.1"         # §4.8 VERIFIED (gcc/g++-mingw-w64-x86-64)
+BUILDFARM_WRAPPER="/usr/local/sbin/atlas-buildfarm-run"
+BUILDFARM_SUDOERS="/etc/sudoers.d/atlas-buildfarm"
+ANDROID_TERMS_URL="https://developer.android.com/studio/terms"
 TOOLS_CACHE_DIR="/var/cache/atlas"
 
 TOOLS_VENV=""
@@ -92,6 +139,7 @@ TOOLS_UV=""
 TOOLS_ATLAS_HOME=""
 TOOLS_ATLAS_UID=""
 TOOLS_ATLAS_GID=""
+BUILDFARM_STATUS="not-attempted"
 
 _tools_paths() {
   TOOLS_VENV="$ATLAS_OPT/venv"
@@ -164,8 +212,20 @@ _tools_root_only() {
   local dir="$1" stray
   chown -R root:root "$dir"
   chmod -R u=rwX,go=rX "$dir"
-  stray="$(find "$dir" ! -user root -o -perm /o+w 2>/dev/null | head -n 3 || true)"
+  # Symlinks are excluded from the mode test (their own mode is always 0777; chmod -R never changes them, chown -R
+  # re-owns the link itself and never follows it outside the tree).
+  stray="$(find "$dir" ! -type l \( ! -user root -o -perm /o+w \) 2>/dev/null | head -n 3 || true)"
   [[ -z "$stray" ]] || die "$dir still has non-root or world-writable entries after the fix: $(tr '\n' ' ' <<<"$stray")"
+}
+
+# _tools_venv_harden — the step-02/04 invariant for /opt/atlas/venv: root:atlas, no group/other write, asserted. Called
+# before root executes anything from the venv and again at the end of the step (Section 16.3 items 5 and 6).
+_tools_venv_harden() {
+  local stray
+  chown -R root:atlas "$TOOLS_VENV"
+  chmod -R go-w "$TOOLS_VENV"
+  stray="$(find "$TOOLS_VENV" ! -type l \( ! -user root -o -perm /022 \) 2>/dev/null | head -n 3 || true)"
+  [[ -z "$stray" ]] || die "$TOOLS_VENV still has non-root or group/world-writable entries after the fix (Section 16.3 item 6): $(tr '\n' ' ' <<<"$stray")"
 }
 
 _tools_apt() {
@@ -181,6 +241,8 @@ _tools_venv() {
     mkdir -p "$ATLAS_OPT"
     python3 -m venv "$TOOLS_VENV" || die "python3 -m venv $TOOLS_VENV failed"
   fi
+  # Re-own BEFORE the first execution: a venv an earlier revision chowned to atlas must never run as root.
+  _tools_venv_harden
   [[ -x "$TOOLS_VENV/bin/pip" ]] || "$TOOLS_VENV/bin/python" -m ensurepip --upgrade || die "$TOOLS_VENV has no pip"
 }
 
@@ -189,6 +251,7 @@ _tools_pip() {
   ensure_dir "$TOOLS_CACHE_DIR/pip" root:root 755
   export PIP_CACHE_DIR="$TOOLS_CACHE_DIR/pip" PIP_DISABLE_PIP_VERSION_CHECK=1
   retry 3 "$TOOLS_VENV/bin/python" -m pip install --quiet "$@"
+  _tools_venv_harden     # new site-packages files take the invariant immediately
 }
 
 # --- 1. IfcOpenShell + IfcMCP -------------------------------------------------------------------------------------------
@@ -208,17 +271,27 @@ _tools_ifcopenshell() {
 }
 
 # --- 2. Blender 4.5 LTS tarball + Bonsai ---------------------------------------------------------------------------------
-# _tools_blender_version BIN -> the first line of `blender -b --offline-mode --version` (capture first, then cut: a
-# `| head -n1` pipeline would SIGPIPE Blender's later output and turn success into 141 under pipefail).
+# _tools_blender_version BIN -> the first line of `blender -b --offline-mode --python-exit-code 1 --version` (capture
+# first, then cut: a `| head -n1` pipeline would SIGPIPE Blender's later output and turn success into 141 under pipefail).
 _tools_blender_version() {
   local out
-  out="$("$1" -b "$BLENDER_ARGS" --version 2>&1)" || return 1
+  out="$("$1" "${BLENDER_HEADLESS[@]}" --version 2>&1)" || return 1
   printf '%s\n' "${out%%$'\n'*}"
 }
 
-# _tools_blender_atlas ARGS... — a headless Blender run as atlas (per-user extensions and preferences), offline.
+# _tools_blender_atlas ARGS... — a headless Blender run as atlas (per-user extensions and preferences), offline, and
+# failing (exit 1) on any Python exception.
 _tools_blender_atlas() {
-  _tools_as_atlas /opt/blender/blender -b "$BLENDER_ARGS" "$@"
+  _tools_as_atlas /opt/blender/blender "${BLENDER_HEADLESS[@]}" "$@"
+}
+
+# _tools_blender_probe EXPR MARKER — run EXPR as atlas; succeeds only when Blender exits 0 AND MARKER was printed
+# (positive proof: a wrong --python-exit-code default alone can never produce a false pass). Output in TOOLS_PROBE_OUT.
+TOOLS_PROBE_OUT=""
+_tools_blender_probe() {
+  local expr="$1" marker="$2"
+  TOOLS_PROBE_OUT="$(_tools_blender_atlas --python-expr "$expr" 2>&1)" || return 1
+  grep -q -- "$marker" <<<"$TOOLS_PROBE_OUT"
 }
 
 _tools_blender() {
@@ -227,13 +300,18 @@ _tools_blender() {
     log "Blender already installed: $line"
   else
     proxy_env
-    # UNVERIFIED: the exact 4.5.x patch level (download.blender.org was blocked during research). The release directory
-    # listing is parsed for the highest blender-4.5.N-linux-x64.tar.xz, and its blender-4.5.N.sha256 file is used.
-    local listing file ver
+    # UNVERIFIED: the exact 4.5.x patch level (download.blender.org was blocked during research and in the fix rounds,
+    # so no sha256 can be typed here). The release directory listing is parsed for the highest
+    # blender-4.5.N-linux-x64.tar.xz, its published blender-4.5.N.sha256 is used when present, and the choice is
+    # recorded loudly (log + tools.env). §7.9 disclosure in the header.
+    local listing matches file ver
     listing="$(curl -fsSL --max-time 60 "$BLENDER_RELEASE_URL")" || die "could not list $BLENDER_RELEASE_URL (download.blender.org allowlisted?)"
-    file="$(grep -oE "blender-$BLENDER_SERIES\.[0-9]+-linux-x64\.tar\.xz" <<<"$listing" | sort -t. -k3,3n | uniq | tail -n1)"
+    # grep exits 1 on no match: captured with `|| true` so the die below (not the ERR trap) names the problem.
+    matches="$(grep -oE "blender-$BLENDER_SERIES\.[0-9]+-linux-x64\.tar\.xz" <<<"$listing" || true)"
+    file="$(sort -t. -k3,3n <<<"$matches" | uniq | tail -n1 || true)"
     [[ -n "$file" ]] || die "no blender-$BLENDER_SERIES.N-linux-x64.tar.xz in $BLENDER_RELEASE_URL (layout changed?)"
     ver="$(sed -E 's/^blender-([0-9.]+)-linux-x64\.tar\.xz$/\1/' <<<"$file")"
+    warn "blender: UNPINNED patch level (rule §7.9, see header): the listing's newest 4.5 build is $ver; recorded in $TOOLS_ENV_FILE as BLENDER_VERSION / BLENDER_TARBALL_SHA256"
     local sha="none" shafile="$TOOLS_STAGING/blender-$ver.sha256"
     if curl -fsSL --max-time 60 -o "$shafile" "${BLENDER_RELEASE_URL}blender-$ver.sha256" 2>/dev/null; then
       sha="$(awk -v f="$file" '$2==f || $2=="*"f {print $1; exit}' "$shafile")"
@@ -242,13 +320,14 @@ _tools_blender() {
       warn "no blender-$ver.sha256 beside the tarball (UNVERIFIED layout); the computed hash will be recorded"
     fi
     _tools_dl "$BLENDER_RELEASE_URL$file" "$TOOLS_STAGING/$file" "$sha"
+    _tools_kv BLENDER_TARBALL_SHA256 "$(sha256sum "$TOOLS_STAGING/$file" | cut -d' ' -f1)"
     log "installing Blender $ver into /opt/blender (root-owned, read-only for everyone else)"
     _tools_extract_tar "$TOOLS_STAGING/$file" /opt/blender.new
     rm -rf /opt/blender && mv /opt/blender.new /opt/blender
   fi
   ln -sfn "$bin" /usr/local/bin/blender
   _tools_root_only /opt/blender
-  line="$(_tools_blender_version "$bin")" || die "blender -b $BLENDER_ARGS --version failed (is --offline-mode accepted by this Blender?)"
+  line="$(_tools_blender_version "$bin")" || die "blender ${BLENDER_HEADLESS[*]} --version failed (are --offline-mode and --python-exit-code accepted by this Blender?)"
   [[ "$line" == "Blender $BLENDER_SERIES."* ]] || die "unexpected Blender version line: $line"
   log "smoke blender --version: $line"
   _tools_kv BLENDER_BIN "$bin"
@@ -256,19 +335,19 @@ _tools_blender() {
   _tools_kv BLENDER_ARGS "$BLENDER_ARGS"
   _tools_kv BLENDER_USER_CONFIG "$TOOLS_ATLAS_HOME/.config/blender"
   # The atlas account owns its Blender config; the online-access preference is saved off once (UNVERIFIED attribute
-  # name on 4.5, warn-only: --offline-mode on every call is the enforced control).
+  # name on 4.5, warn-only: --offline-mode on every call is the enforced control). Positive probe: exit 0 AND marker.
   ensure_dir "$TOOLS_ATLAS_HOME/.config" atlas:atlas 700
-  if _tools_blender_atlas --python-expr 'import bpy; bpy.context.preferences.system.use_online_access = False; bpy.ops.wm.save_userpref()' >/dev/null 2>&1; then
+  if _tools_blender_probe 'import bpy; bpy.context.preferences.system.use_online_access = False; bpy.ops.wm.save_userpref(); print("PREF_OK")' PREF_OK; then
     log "blender: use_online_access=False saved in $TOOLS_ATLAS_HOME/.config/blender (atlas)"
   else
-    warn "blender: could not save use_online_access=False for atlas (UNVERIFIED preference name); every call passes $BLENDER_ARGS regardless"
+    warn "blender: could not save use_online_access=False for atlas (UNVERIFIED preference name): ${TOOLS_PROBE_OUT: -200}; every call passes $BLENDER_ARGS regardless"
   fi
 }
 
 _tools_bonsai() {
   local bin="/opt/blender/blender" bver
   bver="$(_tools_blender_version "$bin" | awk '{print $2}')"
-  if _tools_blender_atlas --python-expr 'import bonsai, bonsai.tool' >/dev/null 2>&1; then
+  if _tools_blender_probe 'import bonsai, bonsai.tool; print("BONSAI_OK")' BONSAI_OK; then
     log "Bonsai already importable in Blender $bver for atlas"
   else
     proxy_env
@@ -314,16 +393,15 @@ PY
     repo="$(grep -oE '\buser_default\b' <<<"$repos" | head -n1 || true)"
     [[ -n "$repo" ]] || repo="$(grep -oE '^[A-Za-z0-9_]+' <<<"$repos" | head -n1 || true)"
     [[ -n "$repo" ]] || die "could not read a repository id from 'blender --command extension repo-list' (as atlas): $repos"
+    warn "bonsai: version ${ver:-?} chosen by the extensions API for Blender $bver (UNPINNED, rule §7.9, see header); recorded as BONSAI_VERSION"
     log "installing Bonsai ${ver:-?} into Blender repo '$repo' for atlas (offline install-file)"
     _tools_blender_atlas --command extension install-file "$TOOLS_STAGING/bonsai-linux-x64.zip" --repo "$repo" --enable \
       || die "blender --command extension install-file failed for Bonsai as atlas (is the zip the linux-x64 build for Blender $bver?)"
     _tools_kv BONSAI_VERSION "${ver:-manual}"
   fi
-  local out
-  out="$(_tools_blender_atlas --python-expr 'import bonsai, bonsai.tool, ifcopenshell; print("BONSAI_OK", ifcopenshell.version)' 2>&1)" \
-    || die "Bonsai does not import inside Blender $bver as atlas after the install: ${out: -300}"
-  out="$(grep -m1 BONSAI_OK <<<"$out")" || die "no BONSAI_OK line from Blender $bver (as atlas): ${out: -300}"
-  log "smoke bonsai (inside Blender $bver, as atlas): $out"
+  _tools_blender_probe 'import bonsai, bonsai.tool, ifcopenshell; print("BONSAI_OK", ifcopenshell.version)' BONSAI_OK \
+    || die "Bonsai does not import inside Blender $bver as atlas after the install (no BONSAI_OK line): ${TOOLS_PROBE_OUT: -300}"
+  log "smoke bonsai (inside Blender $bver, as atlas): $(grep -m1 BONSAI_OK <<<"$TOOLS_PROBE_OUT")"
 }
 
 # --- 3. MCP4IFC ---------------------------------------------------------------------------------------------------------
@@ -331,29 +409,52 @@ _tools_uv() {
   local bv="$ATLAS_OPT/venv-uv"
   if [[ ! -x "$bv/bin/uv" ]]; then
     python3 -m venv "$bv" || die "python3 -m venv $bv failed"
+  fi
+  # Pinned (rule §7.9; the same UV_PIN as phase2/05-voice.sh, which normally brings the shared venv to it first).
+  if [[ "$("$bv/bin/uv" --version 2>/dev/null | awk '{print $2}')" != "$UV_PIN" ]]; then
     proxy_env
-    # UNVERIFIED: uv version — no pin in the research; installed unpinned from PyPI (shared with phase2/05-voice.sh).
-    retry 3 "$bv/bin/python" -m pip install --quiet --disable-pip-version-check uv || die "pip install uv failed"
+    log "venv-uv: installing uv==$UV_PIN into $bv (was: $("$bv/bin/uv" --version 2>/dev/null || echo none))"
+    retry 3 "$bv/bin/python" -m pip install --quiet --disable-pip-version-check "uv==$UV_PIN" || die "pip install uv==$UV_PIN failed"
+    [[ "$("$bv/bin/uv" --version 2>/dev/null | awk '{print $2}')" == "$UV_PIN" ]] || die "uv in $bv is not $UV_PIN after the install"
   fi
   TOOLS_UV="$bv/bin/uv"
   chmod -R a+rX "$bv"
+  _tools_kv UV_VERSION "$UV_PIN"
   ensure_dir "$TOOLS_CACHE_DIR/uv-atlas" atlas:atlas 755      # uv cache for the runs made as atlas
 }
 
 MCP4IFC_STATUS="not-attempted"
 
+# _tools_mcp4ifc_harden DIR — once the atlas-side git/uv work is done: root:atlas, no group/other write (the orchestrator
+# spawns the server from it read-only, Section 16.3 item 6). The next run hands it back to atlas for the git/uv work.
+_tools_mcp4ifc_harden() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  chown -R root:atlas "$dir"
+  chmod -R go-w "$dir"
+  chown root:root "$ATLAS_OPT/tools"; chmod 755 "$ATLAS_OPT/tools"
+  log "MCP4IFC: $dir re-owned root:atlas, read-only for atlas"
+}
+
 _tools_mcp4ifc() {
+  local dir="$ATLAS_OPT/tools/ifc-bonsai-mcp"
+  _tools_mcp4ifc_work "$dir"
+  _tools_mcp4ifc_harden "$dir"
+}
+
+_tools_mcp4ifc_work() {
   # Research conflict 5: MCP4IFC is real (Show2Instruct/ifc-bonsai-mcp) but is a research artefact bound to a live
   # Blender + Bonsai GUI session; treated as YELLOW: attempted, logged plainly, never blocks the phase (the WARN summary
   # at the end of step_06 repeats MCP4IFC_STATUS). The headless official IfcMCP (installed above) delivers LLM-driven
-  # IFC editing regardless. Everything below runs as atlas on the pinned commit.
-  local dir="$ATLAS_OPT/tools/ifc-bonsai-mcp"
+  # IFC editing regardless. Everything below runs as atlas on the pinned commit, in an atlas-owned checkout for the
+  # duration of this function only (the caller re-owns it root:atlas afterwards).
+  local dir="$1"
   _tools_uv
   proxy_env
+  # Atlas needs to create the clone on the first run and to write .venv/.git on every run: hand the tree to atlas now.
   ensure_dir "$ATLAS_OPT/tools" atlas:atlas 755
-  # A clone left root-owned by an earlier run of this step is handed to atlas once (git refuses "dubious ownership").
   if [[ -d "$dir" && "$(stat -c %U "$dir")" != atlas ]]; then
-    warn "MCP4IFC: $dir is owned by $(stat -c %U "$dir"); chowning to atlas (everything below runs as atlas)"
+    log "MCP4IFC: $dir is owned by $(stat -c %U "$dir"); handing it to atlas for the git/uv work (re-owned root:atlas afterwards)"
     chown -R atlas:atlas "$dir"
   fi
   if [[ ! -d "$dir/.git" ]]; then
@@ -396,13 +497,13 @@ _tools_mcp4ifc() {
   if [[ -s "$dir/blender_addon.zip" ]]; then
     _tools_kv MCP4IFC_ADDON_ZIP "$dir/blender_addon.zip"
     # UNVERIFIED: the add-on module name; derived from the zip's top-level directory, enabled headlessly AS ATLAS
-    # (per-user preferences), warn-only.
+    # (per-user preferences), warn-only. Positive probe (exit 0 and marker), so a raised addon_enable is reported.
     local mod
     mod="$(unzip -Z1 "$dir/blender_addon.zip" | head -n1 | cut -d/ -f1)"
-    if _tools_blender_atlas --python-expr "import bpy; bpy.ops.preferences.addon_install(filepath='$dir/blender_addon.zip', overwrite=True); bpy.ops.preferences.addon_enable(module='$mod'); bpy.ops.wm.save_userpref()" >/dev/null 2>&1; then
+    if _tools_blender_probe "import bpy; bpy.ops.preferences.addon_install(filepath='$dir/blender_addon.zip', overwrite=True); bpy.ops.preferences.addon_enable(module='$mod'); bpy.ops.wm.save_userpref(); print('ADDON_OK')" ADDON_OK; then
       log "MCP4IFC: Blender add-on '$mod' installed and enabled for atlas"
     else
-      warn "MCP4IFC (yellow): add-on '$mod' could not be enabled headlessly for atlas; enable $dir/blender_addon.zip once in Blender's preferences (XFCE session, as atlas)"
+      warn "MCP4IFC (yellow): add-on '$mod' could not be enabled headlessly for atlas: ${TOOLS_PROBE_OUT: -200}; enable $dir/blender_addon.zip once in Blender's preferences (XFCE session, as atlas)"
     fi
   fi
   MCP4IFC_STATUS="installed"; _tools_kv MCP4IFC_STATUS "$MCP4IFC_STATUS"
@@ -436,9 +537,11 @@ _tools_radiance() {
     rm -rf /opt/radiance && mv /opt/radiance.new /opt/radiance
   fi
   _tools_root_only /opt/radiance
-  # Only after ownership is root: this PATH line reaches every login shell, root included.
+  # Only after ownership is root: this PATH line reaches every login shell, root included. APPENDED, not prepended:
+  # Radiance ships ~200 generically named tools (total, cnt, lam, histo, ...) that must not shadow system commands for
+  # root or the Principal; the orchestrator uses RADIANCE_BIN from tools.env explicitly.
   cat >/etc/profile.d/radiance.sh <<'EOT'
-export PATH=/opt/radiance/bin:$PATH RAYPATH=/opt/radiance/lib
+export PATH=$PATH:/opt/radiance/bin RAYPATH=/opt/radiance/lib
 EOT
   local out
   out="$(RAYPATH=/opt/radiance/lib "$bin" -version 2>&1)" || die "rtrace -version failed: ${out: -300}"
@@ -523,6 +626,7 @@ _tools_playwright() {
   export PLAYWRIGHT_BROWSERS_PATH="$browsers"
   mkdir -p "$browsers"
   # `playwright install --with-deps chromium` = install-deps (apt, root) + install (browser download); VERIFIED docs.
+  # Both run as root out of the ROOT-OWNED venv (hardened above): no atlas-writable file is executed by root.
   retry 2 "$TOOLS_VENV/bin/playwright" install-deps chromium || die "playwright install-deps chromium failed (apt through the proxy)"
   if ! compgen -G "$browsers/chromium-*" >/dev/null; then
     # UNVERIFIED: the browser CDN host names (cdn.playwright.dev / playwright.azureedge.net in config/allowlist.txt).
@@ -547,50 +651,77 @@ PY
 }
 
 # --- 8. Build container ------------------------------------------------------------------------------------------------------
-# _tools_buildfarm_run WORKDIR CMD... — THE run line (docker/buildfarm/Dockerfile header): capped, unprivileged, no
-# network, read-only root, one bind mount. The orchestrator builds the same line from tools.env.
-_tools_buildfarm_run() {
-  local work="$1"; shift
-  timeout -k 5 600 docker run --rm --network none \
-    --memory "$BUILDFARM_MEMORY" --memory-swap "$BUILDFARM_MEMORY" --cpus "$BUILDFARM_CPUS" --pids-limit "$BUILDFARM_PIDS" \
-    --cap-drop ALL --security-opt no-new-privileges --user "$TOOLS_ATLAS_UID:$TOOLS_ATLAS_GID" \
-    --read-only --tmpfs "/tmp:rw,size=$BUILDFARM_TMPFS_SIZE" -v "$work:/work:rw" -w /work "$BUILDFARM_IMAGE" "$@"
+# _tools_buildfarm_wrapper — writes THE run line as a root-owned program and the sudoers line that lets atlas call it
+# (header: WHO RUNS WHAT). The wrapper reads BUILDFARM_* from tools.env (root:atlas 640, written before it is called).
+_tools_buildfarm_wrapper() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'EOT'
+#!/usr/bin/env bash
+# /usr/local/sbin/atlas-buildfarm-run JOBDIR CMD... — written by phase2/06-tools.sh (Day 1 step 6). THE buildfarm run
+# line (docker/buildfarm/Dockerfile header): capped, unprivileged, no network, read-only root, one bind mount, bounded
+# in time INSIDE docker (the container is killed by name when the host timeout fires). Called by the orchestrator as
+# `sudo -n atlas-buildfarm-run $BUILDFARM_WORK_ROOT/<job> gradle assembleRelease` (/etc/sudoers.d/atlas-buildfarm).
+# JOBDIR must resolve under BUILDFARM_WORK_ROOT; no other argument is interpreted; CMD... is passed to the container
+# verbatim. Exit: the container's status; 124/137 after the timeout; 64 for a refused argument.
+set -Eeuo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENVF="${ATLAS_TOOLS_ENV:-/etc/atlas/tools.env}"
+usage() { echo "usage: atlas-buildfarm-run JOBDIR CMD..." >&2; exit 64; }
+(( $# >= 2 )) || usage
+jobdir="$1"; shift
+kv() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$ENVF"; }
+[[ -r "$ENVF" ]] || { echo "atlas-buildfarm-run: $ENVF is not readable" >&2; exit 64; }
+root="$(kv BUILDFARM_WORK_ROOT)"; image="$(kv BUILDFARM_IMAGE)"; mem="$(kv BUILDFARM_MEMORY)"; cpus="$(kv BUILDFARM_CPUS)"
+pids="$(kv BUILDFARM_PIDS)"; tmpfs="$(kv BUILDFARM_TMPFS_SIZE)"; tmo="$(kv BUILDFARM_TIMEOUT_S)"; uid="$(kv BUILDFARM_UID)"; gid="$(kv BUILDFARM_GID)"
+for v in root image mem cpus pids tmpfs tmo uid gid; do
+  [[ -n "${!v}" ]] || { echo "atlas-buildfarm-run: BUILDFARM_${v^^} missing in $ENVF" >&2; exit 64; }
+done
+[[ "$(kv BUILDFARM_STATUS)" == built ]] || { echo "atlas-buildfarm-run: BUILDFARM_STATUS is '$(kv BUILDFARM_STATUS)', not built (Android SDK licence not accepted? see /etc/atlas/tools.env)" >&2; exit 64; }
+[[ "$tmo" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || { echo "atlas-buildfarm-run: non-numeric BUILDFARM_TIMEOUT_S/UID/GID" >&2; exit 64; }
+real="$(realpath -e -- "$jobdir" 2>/dev/null || true)"
+rootreal="$(realpath -e -- "$root" 2>/dev/null || true)"
+[[ -n "$real" && -n "$rootreal" && -d "$real" && "$real" == "$rootreal"/* ]] \
+  || { echo "atlas-buildfarm-run: JOBDIR must be an existing directory under $root (got '$jobdir')" >&2; exit 64; }
+base="$(basename -- "$real")"
+[[ "$base" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "atlas-buildfarm-run: job directory name '$base' is not [A-Za-z0-9._-]+" >&2; exit 64; }
+name="buildfarm-$base"
+docker rm -f "$name" >/dev/null 2>&1 || true
+rc=0
+timeout -k 5 "$tmo" docker run --rm --init --name "$name" --network none \
+  --memory "$mem" --memory-swap "$mem" --cpus "$cpus" --pids-limit "$pids" \
+  --cap-drop ALL --security-opt no-new-privileges --user "$uid:$gid" \
+  --read-only --tmpfs "/tmp:rw,size=$tmpfs" -v "$real:/work:rw" -w /work "$image" "$@" || rc=$?
+if (( rc == 124 || rc == 137 )); then
+  # The host timeout stopped the CLIENT; the build may still be running: kill the container itself (Section 16.4 cap).
+  docker kill "$name" >/dev/null 2>&1 || true
+  echo "atlas-buildfarm-run: $name killed after ${tmo}s (BUILDFARM_TIMEOUT_S)" >&2
+fi
+docker rm -f "$name" >/dev/null 2>&1 || true
+exit "$rc"
+EOT
+  bash -n "$tmp" || { rm -f "$tmp"; die "the generated $BUILDFARM_WRAPPER does not parse"; }
+  install -m 755 -o root -g root "$tmp" "$BUILDFARM_WRAPPER"
+  rm -f "$tmp"
+  # sudoers: exactly the wrapper, nothing else (sudo-rs, plain syntax, visudo-checked like /etc/sudoers.d/atlas-engines).
+  tmp="$(mktemp)"
+  printf '# Written by phase2/06-tools.sh: the orchestrator (atlas) runs buildfarm jobs through the root-owned wrapper only.\natlas ALL=(root) NOPASSWD: %s\n' "$BUILDFARM_WRAPPER" >"$tmp"
+  visudo -c -f "$tmp" >/dev/null || { rm -f "$tmp"; die "sudoers fragment for $BUILDFARM_WRAPPER failed visudo -c; not installed"; }
+  install -m 440 -o root -g root "$tmp" "$BUILDFARM_SUDOERS"
+  rm -f "$tmp"
+  # A syntax error in any sudoers.d file makes sudo refuse EVERY command: atlas must still be able to list its grants.
+  svc_user_run sudo -n -l >/dev/null 2>&1 || die "'sudo -n -l' fails as atlas after installing $BUILDFARM_SUDOERS (sudo-rs parse error?); remove the fragment and re-run"
+  log "buildfarm: wrapper $BUILDFARM_WRAPPER and $BUILDFARM_SUDOERS installed (atlas -> exactly that program)"
 }
 
-_tools_buildfarm() {
-  command -v docker >/dev/null || die "docker is not installed (Phase 1 step 6)"
-  local ctx="$ATLAS_DAY1_DIR/docker/buildfarm"
-  [[ -f "$ctx/Dockerfile" ]] || die "$ctx/Dockerfile is missing"
-  if [[ "$(docker image inspect -f '{{index .Config.Labels "org.atlas.buildfarm.version"}}' "$BUILDFARM_IMAGE" 2>/dev/null)" == "2" ]]; then
-    log "$BUILDFARM_IMAGE already built"
-  else
-    local hp="" sp=""
-    hp="$(awk -F= '$1=="CONTAINER_HTTP_PROXY" {print $2; exit}' "$ATLAS_ETC/docker.env" 2>/dev/null || true)"
-    sp="$(awk -F= '$1=="CONTAINER_HTTPS_PROXY" {print $2; exit}' "$ATLAS_ETC/docker.env" 2>/dev/null || true)"
-    [[ -n "$sp" ]] || die "CONTAINER_HTTPS_PROXY is empty in $ATLAS_ETC/docker.env (Phase 1 step 6): the image build (apt, Gradle, sdkmanager) cannot reach the allowlist proxy"
-    echo
-    echo "  NOTE (Section 16.3 item 2): building $BUILDFARM_IMAGE runs 'sdkmanager --licenses' and accepts the Android SDK"
-    echo "  licence terms on your behalf. The text is at https://developer.android.com/studio/terms."
-    echo
-    log "docker build $BUILDFARM_IMAGE (Gradle 9.7.1, cmdline-tools 15859902, NDK r30, MinGW-w64; ~2 GB of downloads through the proxy; build user $TOOLS_ATLAS_UID:$TOOLS_ATLAS_GID)"
-    docker build --pull -t "$BUILDFARM_IMAGE" \
-      --build-arg "http_proxy=$hp" --build-arg "https_proxy=$sp" --build-arg "HTTP_PROXY=$hp" --build-arg "HTTPS_PROXY=$sp" \
-      --build-arg "no_proxy=localhost,127.0.0.1" --build-arg "NO_PROXY=localhost,127.0.0.1" \
-      --build-arg "ATLAS_UID=$TOOLS_ATLAS_UID" --build-arg "ATLAS_GID=$TOOLS_ATLAS_GID" \
-      "$ctx" || die "docker build of $BUILDFARM_IMAGE failed (dl.google.com / services.gradle.org allowlisted? sdkmanager ids are UNVERIFIED build args)"
-  fi
-  # Smoke runs under the real run line: a throw-away work dir owned by the build uid.
-  local work out
-  work="$(mktemp -d "$TOOLS_CACHE_DIR/buildfarm-smoke.XXXXXX")"
-  chown "$TOOLS_ATLAS_UID:$TOOLS_ATLAS_GID" "$work"
-  out="$(_tools_buildfarm_run "$work" gradle --version 2>&1)" || { rm -rf "$work"; die "docker run $BUILDFARM_IMAGE gradle --version failed under the capped run line: ${out: -400}"; }
-  out="$(grep -m1 -E '^Gradle ' <<<"$out")" || { rm -rf "$work"; die "no 'Gradle <version>' line from the buildfarm smoke run"; }
-  log "smoke docker run buildfarm gradle --version: $out"
-  out="$(_tools_buildfarm_run "$work" x86_64-w64-mingw32-gcc --version 2>&1)" || { rm -rf "$work"; die "x86_64-w64-mingw32-gcc --version failed inside $BUILDFARM_IMAGE: ${out: -400}"; }
-  out="${out%%$'\n'*}"
-  log "smoke buildfarm mingw: $out"
-  rm -rf "$work"
-  ensure_dir "$ATLAS_SRV/workspace" atlas:atlas 755
+# _tools_buildfarm_licence -> 0 when the Principal set BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes in atlas.env.
+_tools_buildfarm_licence() {
+  local v="${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}"
+  [[ -n "$v" ]] || v="$(awk -F= '$1=="BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE" {gsub(/"/, "", $2); print $2; exit}' "$ATLAS_ETC/atlas.env" 2>/dev/null || true)"
+  [[ "$v" == yes ]]
+}
+
+_tools_buildfarm_kv_caps() {
   _tools_kv BUILDFARM_IMAGE "$BUILDFARM_IMAGE"
   _tools_kv BUILDFARM_MEMORY "$BUILDFARM_MEMORY"
   _tools_kv BUILDFARM_CPUS "$BUILDFARM_CPUS"
@@ -600,6 +731,72 @@ _tools_buildfarm() {
   _tools_kv BUILDFARM_UID "$TOOLS_ATLAS_UID"
   _tools_kv BUILDFARM_GID "$TOOLS_ATLAS_GID"
   _tools_kv BUILDFARM_WORK_ROOT "$ATLAS_SRV/workspace"
+  _tools_kv BUILDFARM_RUN "$BUILDFARM_WRAPPER"
+}
+
+_tools_buildfarm() {
+  command -v docker >/dev/null || die "docker is not installed (Phase 1 step 6)"
+  local ctx="$ATLAS_DAY1_DIR/docker/buildfarm"
+  [[ -f "$ctx/Dockerfile" ]] || die "$ctx/Dockerfile is missing"
+  ensure_dir "$ATLAS_SRV/workspace" atlas:atlas 755
+  _tools_buildfarm_kv_caps
+  if ! _tools_buildfarm_licence; then
+    # Section 16.3 item 2: accepting the Android SDK terms is the Principal's act, expressed as a setting (§7.6: no pause).
+    BUILDFARM_STATUS="licence-not-accepted"; _tools_kv BUILDFARM_STATUS "$BUILDFARM_STATUS"
+    warn "buildfarm: NOT built. The image build runs 'sdkmanager --licenses', which accepts the Android SDK licence terms ($ANDROID_TERMS_URL); Section 16.3 item 2 reserves that for you. Read the terms, then once: sudo bash -c 'echo BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes >> $ATLAS_ETC/atlas.env' && sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06"
+    _tools_buildfarm_wrapper     # installed anyway: it refuses to run while BUILDFARM_STATUS is not 'built'
+    return 0
+  fi
+  if [[ "$(docker image inspect -f '{{index .Config.Labels "org.atlas.buildfarm.version"}}' "$BUILDFARM_IMAGE" 2>/dev/null)" == "$BUILDFARM_IMAGE_REVISION" ]]; then
+    log "$BUILDFARM_IMAGE already built (revision $BUILDFARM_IMAGE_REVISION)"
+  else
+    local hp="" sp=""
+    hp="$(awk -F= '$1=="CONTAINER_HTTP_PROXY" {print $2; exit}' "$ATLAS_ETC/docker.env" 2>/dev/null || true)"
+    sp="$(awk -F= '$1=="CONTAINER_HTTPS_PROXY" {print $2; exit}' "$ATLAS_ETC/docker.env" 2>/dev/null || true)"
+    [[ -n "$sp" ]] || die "CONTAINER_HTTPS_PROXY is empty in $ATLAS_ETC/docker.env (Phase 1 step 6): the image build (apt, Gradle, sdkmanager) cannot reach the allowlist proxy"
+    log "buildfarm: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes is set in $ATLAS_ETC/atlas.env (Section 16.3 item 2: the Principal accepted $ANDROID_TERMS_URL); sdkmanager --licenses runs with that build arg"
+    log "docker build $BUILDFARM_IMAGE (Gradle 9.7.1, cmdline-tools 15859902, NDK r30, MinGW-w64; ~2 GB of downloads through the proxy; build user $TOOLS_ATLAS_UID:$TOOLS_ATLAS_GID)"
+    docker build --pull -t "$BUILDFARM_IMAGE" \
+      --build-arg "http_proxy=$hp" --build-arg "https_proxy=$sp" --build-arg "HTTP_PROXY=$hp" --build-arg "HTTPS_PROXY=$sp" \
+      --build-arg "no_proxy=localhost,127.0.0.1" --build-arg "NO_PROXY=localhost,127.0.0.1" \
+      --build-arg "ATLAS_UID=$TOOLS_ATLAS_UID" --build-arg "ATLAS_GID=$TOOLS_ATLAS_GID" \
+      --build-arg "ACCEPT_ANDROID_SDK_LICENCE=yes" \
+      "$ctx" || die "docker build of $BUILDFARM_IMAGE failed (dl.google.com / services.gradle.org allowlisted? sdkmanager ids are UNVERIFIED build args)"
+  fi
+  BUILDFARM_STATUS="built"; _tools_kv BUILDFARM_STATUS "$BUILDFARM_STATUS"
+  _tools_buildfarm_wrapper
+  # Smoke runs under THE run line, through the wrapper, through sudo, AS ATLAS (the orchestrator's path end to end):
+  # a throw-away job directory under BUILDFARM_WORK_ROOT owned by the build uid.
+  local work out
+  work="$(mktemp -d "$ATLAS_SRV/workspace/.buildfarm-smoke.XXXXXX")"
+  chown "$TOOLS_ATLAS_UID:$TOOLS_ATLAS_GID" "$work"
+  out="$(svc_user_run sudo -n "$BUILDFARM_WRAPPER" "$work" gradle --version 2>&1)" || { rm -rf "$work"; die "sudo -n $BUILDFARM_WRAPPER <job> gradle --version failed as atlas under the capped run line: ${out: -400}"; }
+  out="$(grep -m1 -E '^Gradle ' <<<"$out")" || { rm -rf "$work"; die "no 'Gradle <version>' line from the buildfarm smoke run"; }
+  log "smoke buildfarm (as atlas, via sudo -n $BUILDFARM_WRAPPER) gradle --version: $out"
+  out="$(svc_user_run sudo -n "$BUILDFARM_WRAPPER" "$work" x86_64-w64-mingw32-gcc --version 2>&1)" || { rm -rf "$work"; die "x86_64-w64-mingw32-gcc --version failed inside $BUILDFARM_IMAGE: ${out: -400}"; }
+  out="${out%%$'\n'*}"
+  log "smoke buildfarm mingw: $out"
+  # The wrapper must refuse a job directory outside BUILDFARM_WORK_ROOT (exit 64), whoever calls it.
+  if svc_user_run sudo -n "$BUILDFARM_WRAPPER" /tmp true >/dev/null 2>&1; then
+    rm -rf "$work"; die "$BUILDFARM_WRAPPER accepted a job directory outside $ATLAS_SRV/workspace: the -v boundary is broken"
+  fi
+  log "smoke buildfarm: a job directory outside BUILDFARM_WORK_ROOT is refused by the wrapper"
+  # APT DRIFT (§7.9): what the image actually installed versus the research pins (header).
+  out="$(svc_user_run sudo -n "$BUILDFARM_WRAPPER" "$work" cat /opt/buildfarm/versions.txt 2>&1)" || { rm -rf "$work"; die "no /opt/buildfarm/versions.txt in $BUILDFARM_IMAGE (the Dockerfile writes it): ${out: -300}"; }
+  rm -rf "$work"
+  local jdk mingw drift
+  jdk="$(awk '$1=="openjdk-21-jdk-headless" {print $2; exit}' <<<"$out")"
+  mingw="$(awk '$1=="gcc-mingw-w64-x86-64" {print $2; exit}' <<<"$out")"
+  drift="$(awk -F= '$1=="drift" {print $2; exit}' <<<"$out")"
+  [[ -n "$jdk" && -n "$mingw" ]] || die "versions.txt in $BUILDFARM_IMAGE lacks the openjdk/mingw lines: $(tr '\n' ' ' <<<"$out")"
+  _tools_kv BUILDFARM_JDK_VERSION "$jdk"
+  _tools_kv BUILDFARM_MINGW_VERSION "$mingw"
+  _tools_kv BUILDFARM_APT_DRIFT "${drift:-unknown}"
+  if [[ "$jdk" != "$BUILDFARM_JDK_PIN" || "$mingw" != "$BUILDFARM_MINGW_PIN" || "$drift" == yes ]]; then
+    warn "buildfarm: APT VERSION DRIFT (§7.9): image has openjdk-21-jdk-headless $jdk (pin $BUILDFARM_JDK_PIN), gcc-mingw-w64-x86-64 $mingw (pin $BUILDFARM_MINGW_PIN); recorded as BUILDFARM_JDK_VERSION/BUILDFARM_MINGW_VERSION/BUILDFARM_APT_DRIFT in $TOOLS_ENV_FILE; update the pins in docker/buildfarm/Dockerfile deliberately"
+  else
+    log "buildfarm: apt versions match the research pins (openjdk $jdk, mingw $mingw)"
+  fi
 }
 
 # --- 9. Docling (installed by step 04) ------------------------------------------------------------------------------------------
@@ -613,7 +810,8 @@ step_06() {
   _tools_paths
   ensure_dir "$TOOLS_CACHE_DIR" root:root 755
   ensure_dir "$TOOLS_STAGING" root:root 755
-  [[ -e "$TOOLS_ENV_FILE" ]] || : >"$TOOLS_ENV_FILE"
+  # Created with its final mode (root:atlas 640): a die anywhere in the step never leaves it world-readable.
+  [[ -e "$TOOLS_ENV_FILE" ]] || install -m 640 -o root -g atlas /dev/null "$TOOLS_ENV_FILE"
   _tools_apt
   _tools_venv
   _tools_ifcopenshell
@@ -628,10 +826,13 @@ step_06() {
   _tools_buildfarm
   _tools_docling_assert
   chown root:atlas "$TOOLS_ENV_FILE"; chmod 640 "$TOOLS_ENV_FILE"
-  chown -R atlas:atlas "$TOOLS_VENV" 2>/dev/null || true
+  _tools_venv_harden     # Section 16.3 item 6: root:atlas, no group/other write, asserted (the step-02/04 invariant)
   if [[ "$MCP4IFC_STATUS" != installed ]]; then
     warn "SUMMARY step 06: MCP4IFC_STATUS=$MCP4IFC_STATUS (yellow, research conflict 5): the Section 15.1 row is served by IfcMCP ($TOOLS_VENV/bin/ifcmcp) until the Principal decides; recorded in $TOOLS_ENV_FILE for the gate table"
   fi
-  log "step 06 done: Section 15.1 tools installed; paths in $TOOLS_ENV_FILE (MCP4IFC_STATUS=$MCP4IFC_STATUS)"
-  notify "Phase 2 step 6 done: IfcOpenShell, Bonsai, MCP4IFC ($MCP4IFC_STATUS), Radiance, EnergyPlus, OpenStudio, KiCad, Playwright, buildfarm"
+  if [[ "$BUILDFARM_STATUS" != built ]]; then
+    warn "SUMMARY step 06: BUILDFARM_STATUS=$BUILDFARM_STATUS: the build container is not available until you accept the Android SDK terms ($ANDROID_TERMS_URL) by setting BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes in $ATLAS_ETC/atlas.env and re-running: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06"
+  fi
+  log "step 06 done: Section 15.1 tools installed; paths in $TOOLS_ENV_FILE (MCP4IFC_STATUS=$MCP4IFC_STATUS, BUILDFARM_STATUS=$BUILDFARM_STATUS)"
+  notify "Phase 2 step 6 done: IfcOpenShell, Bonsai, MCP4IFC ($MCP4IFC_STATUS), Radiance, EnergyPlus, OpenStudio, KiCad, Playwright, buildfarm ($BUILDFARM_STATUS)"
 }

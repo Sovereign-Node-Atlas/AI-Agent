@@ -2,6 +2,10 @@
 # verify/v10a-router-resident.sh — V10, the Phase 2 half (Section 21): "Eleanor's resident 4B router model is verified
 # separately at the Phase 2 gate". Sends one chat completion to llama-server@router-qwen3.5-4b and passes on a non-empty
 # reply. Contract (CONVENTIONS.md §5): exit 0 pass / 1 fail / 2 deferred / 3 info; exactly one stdout line; no prompts.
+# Recording: the callers (phase2/04-memory.sh _mem_check_residents and phase2/10-gate.sh _gate_v10_half) record this
+# script's verdict and line as `V10 info`, never under an id "V10a" (CONVENTIONS §4 declares halves only for V3 and
+# V14; tools/fill-workbook.py has no row for V10a). The Phase 3 gate's V10 record supersedes it as the latest per id.
+# The file name keeps the "v10a" prefix only so it sorts beside the other verify scripts as the Phase 2 half of V10.
 
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/common.sh

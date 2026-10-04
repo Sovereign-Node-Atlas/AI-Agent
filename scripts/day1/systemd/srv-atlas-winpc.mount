@@ -9,6 +9,9 @@
 # Options (services research 4.12, mount.cifs VERIFIED: credentials=, uid=, gid=, file_mode=, dir_mode=, iocharset=,
 # vers=): vers=3.1.1 is the current Windows dialect (value string UNVERIFIED on the page read; step 09 proves it with a
 # directory listing and fails loudly otherwise). _netdev orders the mount after the network.
+# nosuid,nodev,noexec (fix round 2): the PC is a non-trusted source (Section 12.4) and the mount is writable for the
+# docker-group service account, so nothing placed on the share can be executed from the mount, present a device node
+# or carry a setuid bit. Step 09's touch/rm write test is unaffected.
 
 [Unit]
 Description=Windows PC share ${WINDOWS_SHARE} (on demand, Section 12.4)
@@ -19,5 +22,5 @@ Wants=network-online.target
 What=${WINDOWS_SHARE}
 Where=${ATLAS_SRV}/winpc
 Type=cifs
-Options=credentials=${ATLAS_ETC}/secrets/smb.cred,vers=3.1.1,uid=${ATLAS_UID},gid=${ATLAS_GID},file_mode=0660,dir_mode=0770,iocharset=utf8,_netdev,noserverino
+Options=credentials=${ATLAS_ETC}/secrets/smb.cred,vers=3.1.1,uid=${ATLAS_UID},gid=${ATLAS_GID},file_mode=0660,dir_mode=0770,iocharset=utf8,_netdev,noserverino,nosuid,nodev,noexec
 TimeoutSec=30

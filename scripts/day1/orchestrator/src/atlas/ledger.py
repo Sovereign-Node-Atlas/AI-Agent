@@ -13,21 +13,30 @@ One file, ATLAS_DB_PATH (/srv/atlas/data/orchestrator/atlas.sqlite3, phase2/02-o
 Helpers are deliberately small: insert/update/get/list per table plus `record_json` (one JSON line for
 `atlas-admin enqueue --wait`, contract in phase2/02-orchestrator.sh). Thread-safe through one connection and a lock;
 WAL mode so the API and the Celery workers can read while one writes.
+
+Retention (Section 10.4, D9 closed): operational logs 30 days hot then archived, Sentinel logs 12 months, scars
+permanent. RETENTION_S states the window per table and `purge()` / `purge_expired()` apply it, handing the expired rows
+to an archive callback first; approvals and strikes are never purged (the scar record of 9.4 is permanent, the approval
+trail is the audit of 16.2). The 72-hour prune task (atlas.tasks.prune, another writer) is the intended caller.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("atlas.ledger")
 
 SCHEMA_VERSION = 1
 
@@ -144,6 +153,16 @@ DIR_MODE = 0o750
 FILE_MODE = 0o640
 _UMASK = 0o027
 APPROVAL_STATUSES: frozenset[str] = frozenset({"held", "approved", "rejected", "auto-sent", "sent"})
+DAY_S = 86400.0
+# D9 windows, in seconds: 30 days hot for operational logs, 12 months for Sentinel. Tables absent here are permanent.
+RETENTION_S: dict[str, float] = {
+    "arbiter_decisions": 30 * DAY_S,  # 4.2 rule 9: every decision of every request
+    "routing_decisions": 30 * DAY_S,  # 7.2 rule 5
+    "tasks": 30 * DAY_S,  # the per-task rows of 9.7 are an operational log once the task is over
+    "sentinel_pulses": 365 * DAY_S,  # 10.4: Sentinel logs 12 months
+}
+PERMANENT_TABLES: frozenset[str] = frozenset({"approvals", "strikes", "meta"})
+_TASK_OPEN_STATUSES: tuple[str, ...] = ("queued", "running")
 
 
 def new_task_id() -> str:
@@ -161,10 +180,13 @@ class Ledger:
         self.path = str(path)
         self._lock = threading.RLock()
         on_disk = self.path != ":memory:"
-        if on_disk:
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
-        old_umask = os.umask(_UMASK)  # the main file, -wal and -shm are born 0640 (sqlite creates them lazily)
+        # The umask is tightened BEFORE the directories are made: mkdir(parents=True) applies `mode` to the leaf only
+        # and creates the intermediate parents at 0777 & ~umask, so every level of `--db a/b/c/atlas.sqlite3` is born
+        # 750, and the main file, -wal and -shm (sqlite creates them lazily) are born 0640.
+        old_umask = os.umask(_UMASK)
         try:
+            if on_disk:
+                Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
             self._conn = sqlite3.connect(self.path, timeout=timeout_s, check_same_thread=False, isolation_level=None)
             self._conn.row_factory = sqlite3.Row
             if on_disk:
@@ -172,10 +194,19 @@ class Ledger:
         finally:
             os.umask(old_umask)
         if on_disk:
-            try:
-                os.chmod(self.path, FILE_MODE)  # a pre-existing file created under a looser umask
-            except OSError:
-                pass  # not ours (another owner): the mode is that owner's business, the rows are still readable
+            # A pre-existing database created under a looser umask (and its side files, which inherit its mode).
+            for side in ("", "-wal", "-shm"):
+                p = self.path + side
+                if not os.path.exists(p):
+                    continue
+                try:
+                    if stat.S_IMODE(os.stat(p).st_mode) != FILE_MODE:
+                        os.chmod(p, FILE_MODE)
+                except OSError as exc:
+                    st = os.stat(p)
+                    log.warning("%s is owned by uid %d with mode %o and could not be tightened to %o: %s (rule §7.4: "
+                                "the ledger holds sensitive-tier data; fix the owner or the mode)", p, st.st_uid,
+                                stat.S_IMODE(st.st_mode), FILE_MODE, exc)
         self._conn.execute("PRAGMA foreign_keys=ON")
 
     # --- lifecycle ---------------------------------------------------------------------------------------------------
@@ -406,6 +437,55 @@ class Ledger:
 
     def list_sentinel_pulses(self, limit: int = 100) -> list[dict[str, Any]]:
         return self.query("SELECT * FROM sentinel_pulses ORDER BY id DESC LIMIT ?", (limit,))
+
+    # --- retention (10.4, D9) -----------------------------------------------------------------------------------------
+
+    def purge(self, table: str, older_than_s: float, *, now: float | None = None,
+              archive: Callable[[str, list[dict[str, Any]]], None] | None = None, vacuum: bool = False) -> int:
+        """Delete the rows of `table` older than `older_than_s` seconds and return how many went.
+
+        D9 says "30 days hot, then archived": when `archive` is given it receives (table, rows) BEFORE the delete, inside
+        the same transaction, so a failing archive keeps the rows (the caller, atlas.tasks.prune, writes them under
+        /srv/cold). approvals, strikes and meta are permanent and refused with ValueError. Open tasks (queued/running)
+        are never purged whatever their age: a row that vanished mid-flight would be a lie in the ledger.
+        """
+        table = self._table(table)
+        if table in PERMANENT_TABLES:
+            raise ValueError(f"table {table!r} is permanent (approvals: 16.2 audit; strikes: 9.4 scars); never purged")
+        if older_than_s <= 0:
+            raise ValueError(f"older_than_s must be positive, got {older_than_s!r}")
+        ts_col = "created_at" if table == "tasks" else "ts"
+        cutoff = (time.time() if now is None else now) - older_than_s
+        where = f"{ts_col} < ?"
+        params: list[Any] = [cutoff]
+        if table == "tasks":
+            where += " AND status NOT IN (%s)" % ", ".join("?" for _ in _TASK_OPEN_STATUSES)
+            params.extend(_TASK_OPEN_STATUSES)
+        with self.transaction() as cur:
+            if archive is not None:
+                cur.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY {ts_col}", params)
+                rows = [dict(r) for r in cur.fetchall()]
+                if not rows:
+                    return 0
+                archive(table, rows)
+            cur.execute(f"DELETE FROM {table} WHERE {where}", params)
+            deleted = int(cur.rowcount or 0)
+        if vacuum and deleted:
+            with self._lock:
+                self._conn.execute("VACUUM")
+        return deleted
+
+    def purge_expired(self, *, now: float | None = None,
+                      archive: Callable[[str, list[dict[str, Any]]], None] | None = None,
+                      vacuum: bool = False) -> dict[str, int]:
+        """Apply RETENTION_S to every table that has a window; {table: rows deleted}. The 72-hour prune calls this."""
+        out: dict[str, int] = {}
+        for table, window in RETENTION_S.items():
+            out[table] = self.purge(table, window, now=now, archive=archive)
+        if vacuum and any(out.values()):
+            with self._lock:
+                self._conn.execute("VACUUM")
+        return out
 
 
 def open_ledger(path: str | Path | None = None) -> Ledger:

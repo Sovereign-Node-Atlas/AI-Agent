@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # phase1/05-postboot.sh — Phase 1 step 5 (Sections 3.3, 17, 21): after the reboot, prove that the kernel accepted the
-# GRUB parameters and that the GTT pool matches them (V3a: /proc/cmdline, sysfs, 196608 MiB with tolerance), that
+# GRUB parameters (all three of Section 3.3, lockup_timeout included) and that the GTT pool matches them (V3a:
+# /proc/cmdline, the live module parameters, 196608 MiB with tolerance), that
 # vulkaninfo shows the GPU as RADV GFX1151, that /tmp is tmpfs and swap is off, and that the TPM unlocked the data
 # volume without a keyboard (V2 re-recorded post-reboot). The llama-cli half of V3 belongs to the Phase 2 gate.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
@@ -42,6 +43,6 @@ step_05() {
   if dmesg 2>/dev/null | grep -q 'gttsize via module parameter is deprecated'; then
     log "dmesg: amdgpu.gttsize deprecation warning present (expected on kernel 7.x; ttm.pages_limit is the parameter of record)"
   fi
-  run_verify V3a v03a-gtt.sh 196608 || die "V3a failed: the kernel parameters or the GTT pool do not match (see the verify table; cat /proc/cmdline; dmesg | grep -i gtt)"
+  run_verify V3a v03a-gtt.sh 196608 || die "V3a failed: the kernel parameters (gttsize, ttm.pages_limit, lockup_timeout), the GTT pool or the RADV device string do not match (see the verify table; cat /proc/cmdline; cat /sys/module/amdgpu/parameters/lockup_timeout; dmesg | grep -i gtt)"
   log "step 5 complete: GTT pool $(gpu_gtt_total_mb) MiB, vulkaninfo sees RADV GFX1151"
 }

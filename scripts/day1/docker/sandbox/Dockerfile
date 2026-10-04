@@ -2,15 +2,22 @@
 # quota, no network unless the task's tier grants it, and a timeout". Built by phase2/10-gate.sh as
 # atlas-sandbox:py3.12; proven by verify/v17-sandbox.sh (a memory bomb dies with exit 137 under --memory=512m and the
 # host does not notice; a SIGTERM-ignoring script is still gone when the in-container timeout expires). The
-# orchestrator's run line (SANDBOX_* keys in /etc/atlas/orchestrator.env, README-contracts.md "Sandbox"):
+# orchestrator's run line (SANDBOX_* keys in /etc/atlas/orchestrator.env, README-contracts.md "Sandbox"; the gate owns
+# the build only because no Section 17 step does, recorded in README-contracts.md §3):
 #
-#   timeout -k 5 $((SANDBOX_TIMEOUT_S + 10)) docker run --rm --init --name sb-<job> \
+#   timeout -k 5 $((SANDBOX_TIMEOUT_S + 10)) docker run --rm --init --pull never --name sb-<job> \
 #     --network none --memory $SANDBOX_MEMORY --memory-swap $SANDBOX_MEMORY --cpus $SANDBOX_CPUS \
 #     --pids-limit $SANDBOX_PIDS --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=$SANDBOX_TMPFS_SIZE \
-#     --ulimit fsize=$SANDBOX_FSIZE --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 \
+#     --ulimit fsize=$SANDBOX_FSIZE --cap-drop ALL --security-opt no-new-privileges --user 65534:<atlas gid> \
 #     -e SANDBOX_TIMEOUT_S=$SANDBOX_TIMEOUT_S \
 #     -v $SANDBOX_DIR/<job>:/work:rw -w /work atlas-sandbox:py3.12 python3 /work/main.py
 #   docker rm -f sb-<job>   (always, afterwards: the client may have been killed while the container lived on)
+#
+# This is the line orchestrator/src/atlas/sandbox.py build_argv() produces (fix round 2: the three copies — this header,
+# README-contracts.md §1 and the package — now agree). `--pull never`: an unqualified name that is not present locally
+# would otherwise be resolved to docker.io/library/atlas-sandbox:py3.12 and pulled. `--user 65534:<atlas gid>`: the job
+# directory is created setgid group atlas (0o2770) and staged files 0o640, so the nobody-uid process reads and writes
+# /work through the group bit and nothing else of atlas's.
 #
 # Two timeouts, on purpose (fix round). GNU timeout on the host only signals the docker CLIENT; a sandboxed program
 # that does `signal.signal(SIGTERM, SIG_IGN)` survives the proxied SIGTERM and the follow-up SIGKILL hits the client
@@ -20,8 +27,12 @@
 # elapsed time, as the package already does). The host-side timeout is a backstop 10 s later for a hung daemon;
 # --init makes docker-init PID 1 so signals and zombies are handled and the wrapper is an ordinary process.
 # --ulimit fsize bounds every file a job writes (SANDBOX_FSIZE, default 1 GiB); /tmp is a bounded, noexec tmpfs.
-# UNVERIFIED: no per-job cap on the total size of $SANDBOX_DIR/<job> exists here (a project quota on the 8 TB volume
-# would be the durable one, a Principal decision); the package removes the job directory after collecting outputs.
+# UNVERIFIED / OPEN: no per-job cap on the TOTAL size of $SANDBOX_DIR/<job> exists here, and the bind mount carries no
+# nosuid/nodev of its own, so a job may fill the 8 TB volume with many 1 GiB files. Two durable fixes, both a decision
+# outside this file because they change the package's staging (README-contracts.md §3): an XFS project quota on
+# $SANDBOX_DIR, or a bounded `--mount type=tmpfs,dst=/work,tmpfs-size=$SANDBOX_WORK_SIZE` charged to the job's memory
+# cgroup with `docker cp` in and out instead of the bind mount. Until then the package removes the job directory after
+# collecting outputs.
 #
 # DOCKER SOCKET == HOST ROOT (recorded, fix round; the same decision is in systemd/atlas-orchestrator.service and
 # phase1/06-docker.sh): the account that runs this line, `atlas`, is in the docker group (CONVENTIONS.md §2), and a
@@ -39,14 +50,19 @@
 # layer over this, not the guard. A tier that grants network replaces `--network none`; the container is then still
 # confined to the allowlist proxy by the DOCKER-USER rules of atlas-docker-egress.service (README-contracts.md).
 #
-# UNVERIFIED: no digest pin for python:3.12-slim — the research names no python image tag, so the floating minor tag
-# is used and the build is skipped once the image exists (rule §7.3); phase2/10-gate.sh logs the RepoDigest it
-# resolved to, so the next revision can pin `FROM python:3.12-slim@sha256:...`; re-pull deliberately with
-# `docker build --pull`. README-contracts.md §3 lists this as an unpinned item (rule §7.9).
-FROM python:3.12-slim
+# Base image pin (rule §7.9; fix round 2). UNVERIFIED: the research names no python image tag or digest, so the digest
+# below is the multi-arch index that Docker Hub served for python:3.12-slim on 2026-10-04, resolved by this file's
+# writer (GET registry-1.docker.io/v2/library/python/manifests/3.12-slim, Accept: OCI index), not a research pin. A
+# digest pin is strictly safer than the floating tag (the image the caps were proven on is the image that runs), and a
+# build from a digest Docker Hub no longer serves fails loudly in phase2/10-gate.sh (V17 fail), never silently floats.
+# To re-pin: `docker pull python:3.12-slim && docker image inspect python:3.12-slim --format '{{index .RepoDigests 0}}'`
+# on the node, paste the digest here, bump org.atlas.sandbox.version (the gate and v17-sandbox.sh check it) and the
+# "Unpinned" section of README-contracts.md. The gate skips the build once the labelled image exists (rule §7.3).
+FROM python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
 
-LABEL org.atlas.sandbox.version="2" \
-      org.atlas.sandbox.section="16.4"
+LABEL org.atlas.sandbox.version="3" \
+      org.atlas.sandbox.section="16.4" \
+      org.atlas.sandbox.base="python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

@@ -1,0 +1,27 @@
+# /etc/systemd/system/atlas-aegis-forget.service — the D9 retention of the AEGIS repository (Section 9.5 "30 nightly,
+# 12 monthly"): `restic forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune`. --keep-within 1d is the
+# floor: a second snapshot on the same day never deletes that day's earlier one (Section 16.3 item 5).
+# Installed by phase2/07-restic.sh through render_template (ATLAS_ETC, ATLAS_OPT substituted).
+# Requires= + After= atlas-aegis.service: the nightly timer (atlas-aegis.timer, Unit= THIS service) starts the backup
+# first and prunes only when it succeeded (a failed dependency stops this unit from starting). The manual trigger
+# (atlas-aegis-trigger.path) starts atlas-aegis.service alone, so the orchestrator can add snapshots but can never
+# initiate the deletion of backups (fix round 2). ExecStopPost pushes a ntfy alert when the prune failed.
+
+[Unit]
+Description=AEGIS retention: restic forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune (D9, nightly)
+Requires=atlas-aegis.service
+After=atlas-aegis.service
+RequiresMountsFor=/srv/backups
+Documentation=file:${ATLAS_ETC}/restic.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=${ATLAS_ETC}/restic.env
+EnvironmentFile=${ATLAS_ETC}/orchestrator.env
+Environment=ATLAS_ETC=${ATLAS_ETC} ATLAS_OPT=${ATLAS_OPT}
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/bin/restic forget --keep-within 1d --keep-daily 30 --keep-monthly 12 --prune
+ExecStopPost=/usr/local/sbin/atlas-aegis forget-result
+TimeoutStartSec=4h

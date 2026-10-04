@@ -1,13 +1,15 @@
 # /etc/systemd/system/atlas-aegis.timer — AEGIS nightly at 02:30 local time (Section 9.5 "Nightly automatic").
-# Installed verbatim by phase2/07-restic.sh. Persistent=true runs a missed night at the next boot.
+# Installed verbatim by phase2/07-restic.sh. Persistent=true runs a missed night at the next boot. The unit started is
+# atlas-aegis-forget.service, which Requires= and runs After= atlas-aegis.service: backup first, then the D9 retention
+# prune — only the nightly timer ever prunes (fix round 2; the manual trigger starts the backup unit alone).
 [Unit]
-Description=Run the AEGIS restic backup nightly
+Description=Run the AEGIS restic backup and retention nightly
 
 [Timer]
 OnCalendar=*-*-* 02:30:00
 RandomizedDelaySec=10min
 Persistent=true
-Unit=atlas-aegis.service
+Unit=atlas-aegis-forget.service
 
 [Install]
 WantedBy=timers.target

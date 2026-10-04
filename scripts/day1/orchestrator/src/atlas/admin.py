@@ -21,12 +21,13 @@ import argparse
 import importlib
 import json
 import logging
+import re
 import sqlite3
 import sys
 from collections.abc import Sequence
 from typing import Any
 
-from atlas.arbiter import GIB, ArbiterError, SysfsMemoryProbe
+from atlas.arbiter import GIB, MAX_RESIDENT, ArbiterError, SysfsMemoryProbe
 from atlas.config import ConfigError, EngineSpec, Settings, load_engines
 from atlas.engines import EngineControlError, SystemdEngineController
 from atlas.ledger import Ledger, new_task_id
@@ -35,6 +36,13 @@ log = logging.getLogger("atlas.admin")
 
 # Celery task names (contract with atlas.tasks / atlas.celery_app, NOT stated in CONVENTIONS.md: the task writer
 # registers these names; the queue comes from the app's task_routes (chat_retention -> gpu, the rest -> cpu default).
+#
+# CONTRACT for the task writer (atlas/tasks/__init__.py should state the same): a task's return value and the message
+# of any exception it raises are printed by `enqueue --wait` to stdout — the systemd journal for atlas-sentinel,
+# atlas-prune and atlas-aegis.service — and stored in the ledger's tasks row (result_json / error). They MUST NOT carry
+# tokens, URLs with embedded credentials, or the contents of any file under /etc/atlas/secrets (rule §7.2). This side
+# masks `scheme://user:pass@host` credentials in every Celery/kombu error it records (_redact), nothing more: a secret
+# a task returns on purpose cannot be recognised here.
 ENQUEUE_TASKS: dict[str, str] = {
     "sentinel": "atlas.tasks.sentinel_pulse",
     "prune": "atlas.tasks.prune_sweep",
@@ -42,6 +50,13 @@ ENQUEUE_TASKS: dict[str, str] = {
     "aegis-thaw": "atlas.tasks.aegis_thaw",
     "chat-retention": "atlas.tasks.chat_retention",
 }
+# `redis://:hunter2@127.0.0.1:6379/0` -> `redis://:***@127.0.0.1:6379/0` (the user part, if any, is kept).
+_URL_CREDENTIALS = re.compile(r"://([^/@:\s]*):([^@/\s]*)@")
+
+
+def _redact(text: str) -> str:
+    """Mask the password of any `scheme://user:pass@host` in an error message before it reaches a log or the ledger."""
+    return _URL_CREDENTIALS.sub(r"://\1:***@", text)
 
 
 def _fail(msg: str, code: int = 1) -> int:
@@ -131,7 +146,7 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     print("engine units:")
     for key, state in out["engines"].items():
         print(f"  {key:<26} {state}")
-    print(f"weight-bearing units active: {', '.join(s.key for s in active) or 'none'} (limit {2})")
+    print(f"weight-bearing units active: {', '.join(s.key for s in active) or 'none'} (limit {MAX_RESIDENT})")
     print(f"last {len(out['decisions'])} ledger decisions:")
     for d in out["decisions"]:
         print(f"  #{d['id']} {d['action']:<10} {d['decision']:<8} {d['engine'] or '-':<26} task={d['task_id'] or '-'} "
@@ -192,9 +207,10 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     try:
         result = app.send_task(name, task_id=task_id, **opts)
     except Exception as exc:
-        ledger.update_task(task_id, status="failed", error=f"enqueue failed: {exc}")
+        reason = _redact(str(exc))  # kombu names the broker URL, credentials included, in its errors
+        ledger.update_task(task_id, status="failed", error=f"enqueue failed: {reason}")
         ledger.close()
-        return _fail(f"could not enqueue {name}: {exc}")
+        return _fail(f"could not enqueue {name}: {reason}")
     if args.wait is None:
         print(f"enqueued {args.task} as {name} task_id={task_id} queue={effective}")
         ledger.close()
@@ -202,17 +218,18 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     try:
         result.get(timeout=args.wait, propagate=False)
     except Exception as exc:
-        ledger.update_task(task_id, error=f"wait: {exc}")
+        reason = _redact(str(exc))
+        ledger.update_task(task_id, error=f"wait: {reason}")
         print(ledger.record_json("tasks", task_id))
         ledger.close()
-        return _fail(f"{args.task} did not finish within {args.wait}s: {exc}")
+        return _fail(f"{args.task} did not finish within {args.wait}s: {reason}")
     state = str(result.state)
     row = ledger.get_task(task_id)
     if row is not None and row.get("status") in ("queued", "running"):
         # The task writer updates the row; when it did not, record Celery's own outcome so the line is honest.
         ledger.update_task(task_id, status="done" if state == "SUCCESS" else "failed",
                            result=result.result if state == "SUCCESS" else None,
-                           error=None if state == "SUCCESS" else str(result.result))
+                           error=None if state == "SUCCESS" else _redact(str(result.result)))
     print(ledger.record_json("tasks", task_id))
     ledger.close()
     return 0 if state == "SUCCESS" else 1

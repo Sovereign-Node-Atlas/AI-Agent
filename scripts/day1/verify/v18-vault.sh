@@ -12,7 +12,9 @@
 #
 # Steps (every one fails loudly, nothing is skipped):
 #   1. The vault must be locked; the helper, unit, memory.env (CHROMA_URL, CHROMA_COLLECTIONS), the orchestrator's
-#      /health and atlas-admin exist.
+#      /health and atlas-admin exist. If orchestrator.env names ORCH_ADMIN_TOKEN_FILE (api.py: /vault/* are admin
+#      routes), the token is read from that root-readable file and sent as X-Atlas-Token through a curl config file
+#      (never argv); without one the routes accept loopback callers, which this script is.
 #   2. `atlas-vault override` (root) writes the one-shot override (idle 20 s, cipher dir CIPHER_DIR) into the root-only
 #      /run/atlas-vault, then the vault is opened BY THE BUTTON: POST /vault/open on the orchestrator with the
 #      passphrase in the JSON body (built by python from stdin, never argv), which pipes it into `sudo -n atlas-vault
@@ -20,17 +22,24 @@
 #      and the override file gone, gocryptfs's cmdline carrying exactly CIPHER_DIR and -idle 20s (the override was
 #      honoured), `sudo -n atlas-vault status` as atlas == open, GET /vault/status == "open" (a mount invisible inside
 #      the orchestrator's mount namespace would fail here).
-#   3. A marker phrase is written to a file in the vault as atlas.
+#   3. A marker phrase is written to a file in the vault as atlas, under `.atlas-selftest/` (phase2/09b-vault.sh uses
+#      the same directory: the ONLY path Day 1 automation touches inside a vault, Section 16.3 rule 5).
 #   4. `atlas-admin vault-session-test --file <that file>` (contract: reads the file inside a vault-tagged session,
-#      then attempts a memory write through the normal path, synchronously; exit 0; one JSON line) as atlas. When the
-#      installed atlas-admin does not accept --file (README-contracts.md §3 item 4), `python -m atlas.vault
-#      session-test --file` is the fallback and the evidence says so. The marker file is then deleted (the Principal's
-#      real vault must not accumulate test litter; Section 16.3 rule 5).
+#      then attempts a memory write through the normal path, synchronously; exit 0; one JSON line) as atlas, with the
+#      telemetry opt-outs exported whatever the env files say (rule §7.1). Should the installed atlas-admin not accept
+#      --file, `python -m atlas.vault session-test --file` is the fallback and the evidence says so. The marker file
+#      is then deleted (the Principal's real vault must not accumulate test litter).
 #   5. Wait past the idle window: the mount must be gone and the unit inactive within 120 s (gocryptfs checks idleness
 #      on a timer, so the unmount lands between 1x and 2x the -idle value); GET /vault/status == "locked".
 #   6. Every ChromaDB collection is queried for the marker phrase (where_document $contains; a paging scan is the
 #      fallback when the server refuses that filter) and the LightRAG working dir is grepped: PASS only when the
 #      phrase is absent everywhere AND the six Section 10.1 collections all exist.
+#
+# NO RAW RESPONSE BODY IS EVER PRINTED (fix round 2, major): this script's one stdout line lands in verify.jsonl (644
+# under a 755 state dir) and the phase log, and 09b runs it with the Principal's passphrase. FastAPI's default 422 body
+# echoes the request `input` (the passphrase); any drift in VaultOpenRequest would have put it there. _redact below
+# parses JSON, drops every `input` key recursively and keeps a short allowlist of keys; non-JSON bodies print as their
+# byte count only, and the literal passphrase is replaced wherever text is kept.
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -47,6 +56,7 @@ set +a
 : "${VAULT_PASS_FILE:=/run/atlas-vault/pass}" "${VAULT_OVERRIDE_FILE:=/run/atlas-vault/override.env}"
 IDLE=20s
 IDLE_WAIT_S=120
+SELFTEST_SUBDIR=".atlas-selftest"   # must equal VAULT_SELFTEST_SUBDIR in phase2/09b-vault.sh
 
 # --- passphrase source and cipher dir -------------------------------------------------------------------------------------
 pass=""
@@ -66,6 +76,50 @@ else
   [[ "$cipher" == "$VAULT_CIPHER_DIR" ]] && { echo "V18 fail: the real vault needs the Principal's passphrase on stdin; nothing arrived"; exit 1; }
 fi
 [[ -f "$cipher/gocryptfs.conf" ]] || { echo "V18 fail: $cipher/gocryptfs.conf missing: not an initialised vault (step 9b)"; exit 1; }
+
+# _redact MODE TEXT — MODE json: parse, drop `input` everywhere, keep an allowlist of keys, else "(non-JSON body, N
+# bytes)"; MODE text: keep the text (one line) with the literal passphrase and passphrase-looking fields replaced. Both
+# cut to 250 characters. The passphrase reaches python through the environment, never argv.
+_redact() {
+  local mode="$1" text="$2"
+  V18_PASS="$pass" V18_MODE="$mode" python3 -c '
+import json
+import os
+import re
+import sys
+
+raw = sys.stdin.read()
+secret = os.environ.get("V18_PASS", "")
+mode = os.environ.get("V18_MODE", "json")
+KEEP = {"detail", "msg", "message", "state", "ok", "loc", "type", "read", "chars", "vault_tagged",
+        "memory_write_attempted", "memory_write_suppressed", "error"}
+
+
+def hide(s):
+    s = s.replace(secret, "[redacted]") if secret else s
+    return re.sub(r"(?i)(passphrase[\"\x27 ]*[:=][\"\x27 ]*)[^\"\x27,}\s]+", r"\1[redacted]", s)
+
+
+def scrub(o):
+    if isinstance(o, dict):
+        return {k: scrub(v) for k, v in o.items() if k != "input" and k in KEEP}
+    if isinstance(o, list):
+        return [scrub(x) for x in o]
+    if isinstance(o, str):
+        return hide(o)
+    return o
+
+
+try:
+    out = json.dumps(scrub(json.loads(raw)), separators=(",", ":"))
+except ValueError:
+    if mode == "text":
+        out = " ".join(hide(raw).split())
+    else:
+        out = f"(non-JSON body, {len(raw.encode())} bytes)"
+print(out[:250])
+' <<<"$text" 2>/dev/null || echo "(unparseable body suppressed)"
+}
 
 # --- preconditions ----------------------------------------------------------------------------------------------------
 is_mounted() { awk -v m="$VAULT_MOUNT_DIR" '$5 == m { f = 1 } END { exit !f }' /proc/self/mountinfo; }
@@ -93,29 +147,61 @@ orch_dir="$ATLAS_OPT/orchestrator"
 orch_port="$(awk -F= '$1=="ORCH_PORT" {print $2; exit}' "$orch_env" 2>/dev/null || true)"
 [[ "$orch_port" =~ ^[0-9]+$ ]] || orch_port=8800
 orch_base="http://127.0.0.1:$orch_port"
+
+# Admin routes (api.py): with ORCH_ADMIN_TOKEN_FILE configured, /vault/* need X-Atlas-Token; the header goes through a
+# curl config file (600, shredded by cleanup), never argv. Without a token file the routes accept loopback callers.
+curl_cfg=""
+token_file="$(awk -F= '$1=="ORCH_ADMIN_TOKEN_FILE" {print $2; exit}' "$orch_env" 2>/dev/null || true)"
+token_file="${token_file%\"}"; token_file="${token_file#\"}"
+auth_note="loopback (no ORCH_ADMIN_TOKEN_FILE)"
+if [[ -n "$token_file" ]]; then
+  [[ -r "$token_file" ]] || { echo "V18 fail: ORCH_ADMIN_TOKEN_FILE=$token_file is set in $orch_env but is not readable; the button (POST /vault/open) needs X-Atlas-Token"; exit 1; }
+  tok="$(sed -nE 's/^ORCH_ADMIN_TOKEN=//p' "$token_file" | head -n1)"
+  [[ -n "$tok" ]] || tok="$(head -n1 "$token_file")"
+  tok="${tok%\"}"; tok="${tok#\"}"
+  [[ -n "$tok" ]] || { echo "V18 fail: $token_file holds no token (ORCH_ADMIN_TOKEN=... or the bare token)"; exit 1; }
+  curl_cfg="$(mktemp)"
+  chmod 600 "$curl_cfg"
+  printf 'header = "X-Atlas-Token: %s"\n' "$tok" >"$curl_cfg"
+  tok=""
+  auth_note="X-Atlas-Token from $token_file"
+fi
+curl_admin() { if [[ -n "$curl_cfg" ]]; then curl -K "$curl_cfg" "$@"; else curl "$@"; fi; }
+
 hb="$(curl -s --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' "$CHROMA_URL/api/v2/heartbeat" || true)"
 [[ "$hb" == 200 ]] || { echo "V18 fail: ChromaDB heartbeat at $CHROMA_URL/api/v2/heartbeat answered HTTP ${hb:-none}"; exit 1; }
 oh="$(curl -s --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' "$orch_base/health" || true)"
 [[ "$oh" == 200 ]] || { echo "V18 fail: the orchestrator's $orch_base/health answered HTTP ${oh:-none}; the button (POST /vault/open) cannot be exercised (systemctl status atlas-orchestrator)"; exit 1; }
 
 orch_vault_status() {
-  curl -s --noproxy '*' --max-time 10 "$orch_base/vault/status" 2>/dev/null \
-    | python3 -c 'import json, sys
+  local resp code body
+  resp="$(curl_admin -s --noproxy '*' --max-time 10 -w '\n%{http_code}' "$orch_base/vault/status" 2>/dev/null || true)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  case "$code" in
+    200) python3 -c 'import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
     print("unparseable"); sys.exit(0)
-print(d.get("state") or d.get("status") or "missing-state")' 2>/dev/null || echo "no-answer"
+print(d.get("state") or d.get("status") or "missing-state")' <<<"$body" 2>/dev/null || echo "no-answer" ;;
+    401|403) echo "auth-$code" ;;
+    "") echo "no-answer" ;;
+    *) echo "http-$code" ;;
+  esac
 }
 
 mfile=""
+mdir="$VAULT_MOUNT_DIR/$SELFTEST_SUBDIR"
 # shellcheck disable=SC2329  # invoked through the EXIT trap below
 cleanup() {
-  # Never leave the marker, the vault open, an override or a passfile behind, whatever happened above.
+  # Never leave the marker, the vault open, an override, a passfile or the token config behind, whatever happened above.
   if [[ -n "$mfile" ]] && is_mounted; then runuser -u atlas -- rm -f "$mfile" 2>/dev/null || true; fi
+  if is_mounted; then runuser -u atlas -- rmdir "$mdir" 2>/dev/null || true; fi
   if is_mounted || systemctl is-active --quiet "$VAULT_UNIT"; then "$VAULT_HELPER" lock >/dev/null 2>&1 || true; fi
   rm -f "$VAULT_OVERRIDE_FILE" 2>/dev/null || true
   if [[ -e "$VAULT_PASS_FILE" && ! -L "$VAULT_PASS_FILE" ]]; then shred -u "$VAULT_PASS_FILE" 2>/dev/null || rm -f "$VAULT_PASS_FILE"; fi
+  if [[ -n "$curl_cfg" && -f "$curl_cfg" ]]; then shred -u "$curl_cfg" 2>/dev/null || rm -f "$curl_cfg"; fi
   pass=""
   return 0
 }
@@ -125,22 +211,26 @@ trap cleanup EXIT
 # The one-shot override (root-only directory; the helper refuses an idle longer than VAULT_IDLE or a cipher dir that is
 # not an initialised vault) applies to the next open, which the orchestrator performs through sudo -n like the button.
 if ! out="$(VAULT_IDLE_OVERRIDE="$IDLE" VAULT_CIPHER_OVERRIDE="$cipher" "$VAULT_HELPER" override 2>&1)"; then
-  echo "V18 fail: 'atlas-vault override' (idle $IDLE, cipher $cipher) refused: $(tr '\n' ' ' <<<"$out" | cut -c1-250)"; exit 1
+  echo "V18 fail: 'atlas-vault override' (idle $IDLE, cipher $cipher) refused: $(_redact text "$out")"; exit 1
 fi
-[[ -s "$VAULT_OVERRIDE_FILE" ]] || { echo "V18 fail: $VAULT_OVERRIDE_FILE did not appear after 'atlas-vault override' (helper printed '$out')"; exit 1; }
+[[ -s "$VAULT_OVERRIDE_FILE" ]] || { echo "V18 fail: $VAULT_OVERRIDE_FILE did not appear after 'atlas-vault override' (helper printed '$(_redact text "$out")')"; exit 1; }
 t_open="$(date +%s)"
 # The passphrase goes from this process's memory to python's stdin to curl's stdin: never an argument anywhere.
 resp="$(printf '%s' "$pass" \
   | python3 -c 'import json, sys; print(json.dumps({"passphrase": sys.stdin.read().rstrip("\n")}))' \
-  | curl -s --noproxy '*' --max-time 200 -X POST -H 'Content-Type: application/json' --data-binary @- \
+  | curl_admin -s --noproxy '*' --max-time 200 -X POST -H 'Content-Type: application/json' --data-binary @- \
       -w '\n%{http_code}' "$orch_base/vault/open" 2>&1 || true)"
 code="${resp##*$'\n'}"
 body="${resp%$'\n'*}"
-if [[ "$code" != 200 ]]; then
-  echo "V18 fail: POST /vault/open (the button) answered HTTP ${code:-none} for the $mode cipher dir: $(tr '\n' ' ' <<<"$body" | cut -c1-250) (journalctl -u $VAULT_UNIT -n 8; a 403 = the helper refused the passphrase, gocryptfs exit 12)"; exit 1
+redacted="$(_redact json "$body")"
+if [[ "$code" == 401 ]] || { [[ "$code" == 403 ]] && [[ "$redacted" == *[Xx]-[Aa]tlas-[Tt]oken* ]]; }; then
+  echo "V18 fail: POST /vault/open answered HTTP $code: admin authentication failed (auth: $auth_note; api.py requires X-Atlas-Token when ORCH_ADMIN_TOKEN_FILE is set in $orch_env): $redacted"; exit 1
 fi
-if ! python3 -c 'import json, sys; d = json.loads(sys.argv[1]); sys.exit(0 if d.get("ok") and d.get("state") == "open" else 1)' "$body" 2>/dev/null; then
-  echo "V18 fail: POST /vault/open answered 200 but not {ok: true, state: open}: ${body:0:250}"; exit 1
+if [[ "$code" != 200 ]]; then
+  echo "V18 fail: POST /vault/open (the button) answered HTTP ${code:-none} for the $mode cipher dir: $redacted (journalctl -u $VAULT_UNIT -n 8; a 403 without an X-Atlas-Token detail = the helper refused the passphrase, gocryptfs exit 12)"; exit 1
+fi
+if ! python3 -c 'import json, sys; d = json.load(sys.stdin); sys.exit(0 if d.get("ok") and d.get("state") == "open" else 1)' <<<"$body" 2>/dev/null; then
+  echo "V18 fail: POST /vault/open answered 200 but not {ok: true, state: open}: $redacted"; exit 1
 fi
 is_mounted || { echo "V18 fail: the button answered open but $VAULT_MOUNT_DIR is not mounted on the host"; exit 1; }
 systemctl is-active --quiet "$VAULT_UNIT" || { echo "V18 fail: mounted but $VAULT_UNIT is not active (the mount did not come from the unit)"; exit 1; }
@@ -151,44 +241,53 @@ main_pid="$(systemctl show -p MainPID --value "$VAULT_UNIT" 2>/dev/null || true)
 gcmd="$(tr '\0' ' ' <"/proc/${main_pid:-0}/cmdline" 2>/dev/null || true)"
 [[ "$gcmd" == *"-idle $IDLE "* ]] || { echo "V18 fail: the unit did not apply the idle override ($IDLE): gocryptfs cmdline '$gcmd'"; exit 1; }
 [[ "$gcmd" == *" $cipher $VAULT_MOUNT_DIR"* ]] || { echo "V18 fail: the unit mounted a different cipher dir than $cipher: gocryptfs cmdline '$gcmd'"; exit 1; }
-# The button path once more from the shell: user atlas -> sudo-rs -> the helper (NOPASSWD fragment /etc/sudoers.d/atlas-vault).
+# The button path once more from the shell: user atlas -> sudo-rs -> the helper (NOPASSWD fragment /etc/sudoers.d/atlas-vault;
+# the package's VaultController runs `status` through sudo -n too, so the fragment keeps that verb).
 sudo_st="$(runuser -u atlas -- sudo -n "$VAULT_HELPER" status 2>&1 || true)"
 [[ "$sudo_st" == open ]] || { echo "V18 fail: as atlas, 'sudo -n $VAULT_HELPER status' answered '${sudo_st:0:120}' instead of 'open' (sudo-rs and /etc/sudoers.d/atlas-vault)"; exit 1; }
 # The orchestrator's own view (its unit runs with ProtectSystem=; the host mount must have propagated into it).
 orch_open="$(orch_vault_status)"
-[[ "$orch_open" == open ]] || { echo "V18 fail: GET /vault/status on the orchestrator says '$orch_open' while the host shows the vault mounted (the mount is invisible inside atlas-orchestrator's mount namespace)"; exit 1; }
+case "$orch_open" in
+  open) ;;
+  auth-*) echo "V18 fail: GET /vault/status answered HTTP ${orch_open#auth-}: admin authentication (auth: $auth_note)"; exit 1 ;;
+  *) echo "V18 fail: GET /vault/status on the orchestrator says '$orch_open' while the host shows the vault mounted (the mount is invisible inside atlas-orchestrator's mount namespace)"; exit 1 ;;
+esac
 
-# --- 3. marker file, written as atlas (the mount owner) -----------------------------------------------------------------
+# --- 3. marker file, written as atlas (the mount owner) under the self-test directory ------------------------------------
 marker="ATLAS-V18-VAULT-MARKER-$(date +%s)-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n') vermilion lighthouse"
-mfile="$VAULT_MOUNT_DIR/v18-marker-$(date +%s).txt"
+runuser -u atlas -- mkdir -p "$mdir" || { echo "V18 fail: could not create $mdir as atlas"; exit 1; }
+mfile="$mdir/v18-marker-$(date +%s).txt"
 # shellcheck disable=SC2016  # $1/$2 are expanded by the inner bash, on purpose
 runuser -u atlas -- bash -c 'printf "Top secret note for the vault test: %s\n" "$1" >"$2"' _ "$marker" "$mfile" \
   || { echo "V18 fail: could not write $mfile as atlas"; exit 1; }
 
 # --- 4. the orchestrator reads it in a vault-tagged session and tries to remember it ----------------------------------------
-# README-contracts.md §1 states `atlas-admin vault-session-test --file PATH`; the installed admin.py (§3 item 4) may
-# still lack --file. Probe its help text and fall back to the module entry that does accept it.
+# README-contracts.md §1 states `atlas-admin vault-session-test --file PATH` (admin.py implements it). The help text is
+# probed so an older installed copy falls back to the module entry that accepts --file, and the evidence says which ran.
 admin_via="atlas-admin"
 if ! "$admin" vault-session-test --help 2>/dev/null | grep -q -- '--file'; then
-  admin_via="python -m atlas.vault (atlas-admin lacks --file; README-contracts.md §3 item 4)"
+  admin_via="python -m atlas.vault (the installed atlas-admin lacks --file)"
   admin_exec="exec '$venv_py' -m atlas.vault session-test --file '$mfile'"
 else
   admin_exec="exec '$admin' vault-session-test --file '$mfile'"
 fi
-admin_cmd="set -a; source '$orch_env'; source '$mem_env'; source '$vault_env'; set +a; cd '$orch_dir'; $admin_exec"
+# Telemetry opt-outs exported AFTER the env files so none of them can re-enable a beacon (rule §7.1).
+telemetry_off="export HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_OFFLINE=1 DO_NOT_TRACK=1 ANONYMIZED_TELEMETRY=False CHROMA_TELEMETRY_ENABLED=false PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1"
+admin_cmd="set -a; source '$orch_env'; source '$mem_env'; source '$vault_env'; set +a; $telemetry_off; cd '$orch_dir'; $admin_exec"
 rc=0
 admin_out="$(timeout 300 runuser -u atlas -- /bin/bash -c "$admin_cmd" 2>&1)" || rc=$?
 if (( rc != 0 )); then
-  echo "V18 fail: vault-session-test --file $mfile via $admin_via exited $rc (contract in phase2/README-contracts.md): $(tr '\n' ' ' <<<"$admin_out" | cut -c1-250)"; exit 1
+  echo "V18 fail: vault-session-test --file $mfile via $admin_via exited $rc (contract in phase2/README-contracts.md): $(_redact text "$admin_out")"; exit 1
 fi
 admin_json="$(grep -E '^\{' <<<"$admin_out" | tail -n1 || true)"
-[[ -n "$admin_json" ]] || { echo "V18 fail: vault-session-test printed no JSON line (contract: exactly one): ${admin_out:0:200}"; exit 1; }
-if ! python3 -c 'import json, sys; d = json.loads(sys.argv[1]); sys.exit(0 if d.get("read") else 1)' "$admin_json" 2>/dev/null; then
-  echo "V18 fail: vault-session-test reports it did not read the file: ${admin_json:0:200}"; exit 1
+[[ -n "$admin_json" ]] || { echo "V18 fail: vault-session-test printed no JSON line (contract: exactly one): $(_redact text "$admin_out")"; exit 1; }
+if ! python3 -c 'import json, sys; d = json.load(sys.stdin); sys.exit(0 if d.get("read") else 1)' <<<"$admin_json" 2>/dev/null; then
+  echo "V18 fail: vault-session-test reports it did not read the file: $(_redact json "$admin_json")"; exit 1
 fi
 # The test litter goes now (before the idle window starts counting); the session test must not hold the file open.
 runuser -u atlas -- rm -f "$mfile" || { echo "V18 fail: could not remove $mfile as atlas"; exit 1; }
 mfile=""
+runuser -u atlas -- rmdir "$mdir" 2>/dev/null || true
 
 # --- 5. idle lock -----------------------------------------------------------------------------------------------------------
 waited=0
@@ -284,5 +383,5 @@ if [[ -n "$LIGHTRAG_WORKING_DIR" && -d "$LIGHTRAG_WORKING_DIR" ]]; then
   fi
   graph_note="absent from the graph store ($LIGHTRAG_WORKING_DIR)"
 fi
-echo "vault ($mode cipher dir) opened by the button (POST /vault/open -> sudo -n atlas-vault -> $VAULT_UNIT; override honoured; sudo status and GET /vault/status open), marker read by vault-session-test via $admin_via and removed, auto-locked after ${locked_after}s with -idle $IDLE (/vault/status locked); marker $detail; $graph_note"
+echo "vault ($mode cipher dir) opened by the button (POST /vault/open, auth $auth_note -> sudo -n atlas-vault -> $VAULT_UNIT; override honoured; sudo status and GET /vault/status open), marker under $SELFTEST_SUBDIR/ read by vault-session-test via $admin_via and removed, auto-locked after ${locked_after}s with -idle $IDLE (/vault/status locked); marker $detail; $graph_note"
 exit 0

@@ -82,15 +82,16 @@ step_01() {
     die "pre-flight: DATA_DISK $data_dev carries signature '${sig:-partitions}' that is not this script's atlas-data LUKS volume; refusing to touch it. Wipe it deliberately (wipefs -a) only if you are certain, then re-run."
   fi
   # Section 3.5 requires LUKS2 on the OS volume too. An unencrypted OS volume is a recorded decision, never a
-  # footnote: it stops here unless ATLAS_ALLOW_UNENCRYPTED_OS=1 is set in atlas.env (step 2 then wipes the keyfile
-  # slot and keeps no recovery copy on the node; V2 records the acknowledgement). Checked on "/" itself, not on any
-  # crypt mapping (an already-open atlas-data mapping must not count).
+  # footnote: it stops here unless ATLAS_ALLOW_UNENCRYPTED_OS=1 is set in atlas.env (documented in the
+  # phase1-platform.sh header; config/atlas.env.example should carry it blank). The same key waives D3's on-node
+  # recovery-key copy (step 2 keeps none on an unencrypted drive; the USB copy is the only copy) and V2 records the
+  # acknowledgement. Checked on "/" itself, not on any crypt mapping (an already-open atlas-data mapping must not count).
   if lsblk -sno TYPE "$root_src" 2>/dev/null | grep -qx crypt; then
     log "OS volume: LUKS present (installer choice, Section 3.5)"
   elif [[ "${ATLAS_ALLOW_UNENCRYPTED_OS:-0}" == "1" ]]; then
-    warn "OS volume: NOT encrypted; deviation from Section 3.5 ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 in $ATLAS_ETC/atlas.env (step 2 leaves nothing on the OS drive that opens the data volume)"
+    warn "OS volume: NOT encrypted; deviation from Section 3.5 ACCEPTED by ATLAS_ALLOW_UNENCRYPTED_OS=1 in $ATLAS_ETC/atlas.env (step 2 leaves nothing on the OS drive that opens the data volume: no on-node recovery copy, D3 waived by the same key)"
   else
-    die "pre-flight: the OS volume is NOT encrypted, but Section 3.5 requires LUKS2 on both volumes ('nothing transient touches disk unencrypted'). Either reinstall Ubuntu Server with the encrypted-LVM option, or, to accept the deviation knowingly, add ATLAS_ALLOW_UNENCRYPTED_OS=1 to $ATLAS_ETC/atlas.env and re-run: sudo $ATLAS_ENTRY phase1"
+    die "pre-flight: the OS volume is NOT encrypted, but Section 3.5 requires LUKS2 on both volumes ('nothing transient touches disk unencrypted'). Either reinstall Ubuntu Server with the encrypted-LVM option, or, to accept the deviation knowingly, add ATLAS_ALLOW_UNENCRYPTED_OS=1 to $ATLAS_ETC/atlas.env (this also waives D3's on-node recovery-key copy: the USB copy becomes the only copy) and re-run: sudo $ATLAS_ENTRY phase1"
   fi
   # SSH, Cockpit and xrdp bind to LAN_IP itself (Section 3.6). A DHCP lease that later changes would leave them on
   # the stale address (console-only recovery), so a dynamic address is flagged for a router reservation.

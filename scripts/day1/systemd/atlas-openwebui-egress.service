@@ -1,0 +1,21 @@
+# /etc/systemd/system/atlas-openwebui-egress.service — keeps the Open WebUI egress fence applied (Section 12.1; V12
+# proves the rule for 120 s, this enforces it for ever). Installed verbatim by phase2/03-openwebui.sh; the helper
+# /usr/local/sbin/atlas-openwebui-egress is the repository file phase2/atlas-openwebui-egress.sh (its header explains
+# the chain). `watch` applies the chain for the container's current cgroup, polls every second until the running
+# container has been fenced once, then re-checks every 10 s and re-applies when the container was recreated (new
+# cgroup path) or the OUTPUT jump disappeared (`ufw reload` flushes OUTPUT). Requires=docker.service: dockerd restores
+# `restart: unless-stopped` containers while it starts, so by the time this unit runs the container exists and the
+# first apply fences it at once (residual window: the fork/exec of the helper after docker.service is active).
+[Unit]
+Description=Egress fence for the atlas-openwebui container (Section 12.1, V12 made permanent)
+Requires=docker.service
+After=docker.service atlas-docker-egress.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/atlas-openwebui-egress watch atlas-openwebui
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

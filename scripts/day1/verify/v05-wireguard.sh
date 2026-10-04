@@ -7,8 +7,12 @@
 # Usage: v05-wireguard.sh VPN_HOST [CONTAINER=wg-easy] [WG_IFACE=wg0] [WAIT_S=540] [RERUN_HINT]
 #   WG_IFACE is the interface name inside the container ($WG_IFACE from atlas.env, CONVENTIONS §3); wg0 is only the
 #   default when called by hand.
-# Exit 0 pass (carrier handshake seen), 2 deferred (no carrier handshake within WAIT_S: the Principal can retry with
-# RERUN_HINT), 1 fail (container/interface missing). Never prompts. Runs under run_verify's 660 s cap.
+# Exit 0 pass (carrier handshake seen), 1 fail: container/interface missing OR no carrier handshake within WAIT_S.
+# A timeout is a FAIL, not a deferral (fix round): CONVENTIONS §6 lists V5 as Required for Phase 1 with no deferral
+# provision and rule §7.4 records a verification that did not pass as fail; Section 21 V5 is "confirm the node is
+# reachable from mobile data before relying on it". The gate then shows a red row and Phase 2 is blocked until the
+# Principal re-runs with RERUN_HINT (nothing is lost: step 7 is idempotent). Never prompts. Runs under run_verify's
+# 660 s cap.
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -62,5 +66,5 @@ while (( SECONDS < deadline )); do
   done < <(docker exec "$ctr" wg show "$wgif" latest-handshakes 2>/dev/null || true)
   sleep 10
 done
-echo "deferred: no WireGuard handshake from a mobile-data address within ${wait_s}s (last: $last); $dns_state; published=${published:-?}; $hint"
-exit 2
+echo "V5 fail: no WireGuard handshake from a mobile-data address within ${wait_s}s (last: $last); $dns_state; published=${published:-?}; $hint"
+exit 1

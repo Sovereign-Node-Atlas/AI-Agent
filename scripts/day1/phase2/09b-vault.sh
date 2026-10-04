@@ -9,8 +9,10 @@
 #
 # What it does, in order (each part idempotent):
 #   0. If the vault is open (a --force re-run), lock it first: chmod/chown on a live FUSE mount root is refused.
-#   1. apt gocryptfs 2.6.1-1 (= upstream v2.6.1, services-tools.md §4.11 VERIFIED) and fuse3 (fusermount3 is the
-#      setuid helper an unprivileged mount needs).
+#   1. apt gocryptfs 2.6.1-1 (= upstream v2.6.1, services-tools.md §4.11 VERIFIED; the installed upstream version is
+#      compared against that pin and the step dies on a mismatch, rule §7.9, with ATLAS_GOCRYPTFS_VERSION_OK=1 as the
+#      documented override once the man-page facts below are re-verified) and fuse3 (fusermount3 is the setuid helper
+#      an unprivileged mount needs).
 #   2. Layout under $ATLAS_SRV/vault (atlas:atlas 700): cipher/ (the real vault: the gocryptfs container Appendix C
 #      backs up "as ciphertext"; phase2/07-restic.sh includes exactly this path), open/ (the plaintext mount point,
 #      excluded from restic by 07 and, belt and braces, by this step), test-cipher/ (a second, throw-away cipher dir with
@@ -21,32 +23,60 @@
 #                                             orchestrator.env so the service sees them; restarted once when changed)
 #        /usr/local/bin/atlas-vault           open|lock|status (+ init, override, wait-mounted, cleanup): the passphrase
 #                                             arrives on STDIN, never as an argument, never in a log
-#        /run/atlas-vault/ (root:root 755)    the ONLY transient home of the passphrase (pass, root:atlas 640, tmpfs,
+#        /run/atlas-vault/ (root:root 755)    the ONLY transient home of the passphrase (pass, root:root 600, tmpfs,
 #                                             shredded the moment the mount is up) and of override.env (root:root 644,
 #                                             written by root verification runs only). Root-owned so the sudoers-granted
 #                                             helper never operates by name inside a directory atlas can write
 #                                             (symlink planting = root escalation; fix round). Never /run/atlas.
+#                                             Fix round 2: the passfile is root:root 600, NOT group-readable, so no
+#                                             other process running as or with group atlas (celery, llama-server) can
+#                                             read the Principal's passphrase in the window before the mount. gocryptfs
+#                                             (user atlas) gets it through STDIN: systemd opens the file as root
+#                                             (StandardInput=file:) and gocryptfs reads `-passfile /dev/stdin`; init
+#                                             uses the same fd trick through a root shell redirection. UNVERIFIED:
+#                                             that gocryptfs accepts /dev/stdin as -passfile — the man page says "file",
+#                                             process substitution is the commonly documented use; the mechanics proof
+#                                             in part 5 exercises exactly this path, so a wrong assumption dies HERE.
+#                                             This tmpfs file is the declared exception to CONVENTIONS §7.2 "secrets
+#                                             only under /etc/atlas/secrets/" (README-contracts.md §1, §3).
 #        /etc/systemd/system/atlas-vault.service   gocryptfs -fg -idle ${VAULT_IDLE} as user atlas, in the HOST mount
 #                                             namespace (a mount made inside the orchestrator's own sandboxed unit
 #                                             would be invisible to every other process); its hooks run with full
 #                                             privileges (`+`) because only root may touch /run/atlas-vault.
-#        /etc/sudoers.d/atlas-vault           atlas may run exactly: atlas-vault open | lock | status
+#        /etc/sudoers.d/atlas-vault           atlas may run exactly: atlas-vault open | lock | status. `status` needs no
+#                                             root (it reads /proc/self/mountinfo) but stays in the fragment because
+#                                             the package's VaultController._argv() runs every verb through `sudo -n`
+#                                             (orchestrator/src/atlas/vault.py); removing it would make the package's
+#                                             status() log a helper error on every locked check. CONVENTIONS §8 must
+#                                             list this fragment beside atlas-engines (README-contracts.md §3).
 #      The orchestrator's POST /vault/open therefore pipes the passphrase into `sudo -n /usr/local/bin/atlas-vault open`.
-#   4. THE INTERACTIVE PAUSE OF THIS STEP (declared, fix round: CONVENTIONS.md §7.6 lists three pauses and must gain
-#      this one; README-contracts.md §1 states it): the Principal types the passphrase (read -s from /dev/tty, twice on
-#      first initialisation, once on a re-run) and, on first initialisation, confirms the gocryptfs master key is
-#      written down (the only recovery for a forgotten passphrase, D3). The passphrase lives in this process's memory
-#      only, is piped to the helper, never appears in argv, in a file that survives, or in any log. WITHOUT A TERMINAL
-#      (a Routine, ssh without -t, a pipe) the step does NOT die: the real vault's initialisation is deferred, logged,
-#      flagged in $ATLAS_STATE/vault-init-pending, the gate warns with the exact command, and the button reports "not
-#      initialised" (exit 2) until `sudo <entry> phase2 --force 09b` is run from a console. Everything else completes.
+#   4. REAL-VAULT INITIALISATION IS OPT-IN (fix round 2). CONVENTIONS.md §7.6 lists exactly three interactive pauses and
+#      says everything else runs unattended, so a plain `sudo ./atlas-day1.sh phase2` never stops here: by default the
+#      real vault is left uninitialised (flag $ATLAS_STATE/vault-init-pending, warned, pushed by ntfy), the test vault is
+#      initialised and proven, and the gate runs V18 on it and prints the exact command. The Principal initialises the
+#      real vault from a console with
+#          sudo env ATLAS_VAULT_INIT=1 ./atlas-day1.sh phase2 --force 09b
+#      (`env` because sudo-rs's handling of `sudo VAR=value cmd` is UNVERIFIED; the entry script re-execs with `exec`,
+#      so the variable reaches this step). Only then does the step read the passphrase (read -s from /dev/tty, twice on
+#      first initialisation, once on a re-run) and, on first initialisation, wait for the gocryptfs master key to be
+#      confirmed written down (the only recovery for a forgotten passphrase, D3). ATLAS_VAULT_INIT=1 without a terminal
+#      dies with that message (an opt-in that cannot be honoured must not be skipped silently). The passphrase lives in
+#      this process's memory only, is piped to the helper, never appears in argv, in a file that survives, or in any log.
+#      A driver that exports ATLAS_FORCED_STEPS (contract requested in README-contracts.md §3; common.sh does not yet)
+#      containing `09b` is honoured like ATLAS_VAULT_INIT=1 when a terminal is present.
 #   5. Mechanics proof from the shell through the REAL button path (user atlas -> sudo-rs -> atlas-vault open ->
-#      systemd unit): mount, write a file as atlas, read it back, confirm the cipher dir holds neither the plaintext
-#      name nor the plaintext content, delete it, lock, confirm the mount is gone. On the real vault when the
-#      passphrase was typed, on the test vault otherwise (an override file, root-written, points the unit there).
+#      systemd unit): mount, write a file as atlas under $VAULT_MOUNT_DIR/.atlas-selftest/ (the ONLY path Day 1
+#      automation ever touches inside a vault; v18 uses it too), read it back, confirm the cipher dir holds neither the
+#      plaintext name nor the plaintext content, delete it, lock, confirm the mount is gone. On the real vault when the
+#      passphrase was typed, on the test vault otherwise (an override file, root-written, points the unit there). Any
+#      failure after the open removes the file and locks the vault before dying (nothing stays mounted or littered).
 #   6. run_verify V18 with the Principal's passphrase piped in (the real cipher dir; the test itself opens through
 #      POST /vault/open and uses a 20 s idle). A fail is recorded, not fatal here: the Phase 2 gate blocks on it. The
 #      gate keeps a real-mode pass and otherwise runs V18 unattended on the test cipher dir.
+#
+# Secrets directory (fix round 2, blocker): $ATLAS_ETC/secrets is root:atlas 710 (traverse-only for atlas), the mode
+# phase2/06c-google-oauth.sh fixes for every writer; this step's earlier `root:root 700` removed atlas's traversal and
+# broke V20 and the hf/ntfy/redis env files. CONVENTIONS §2's row (root:root 700) must read root:atlas 710 (README §3).
 #
 # Facts typed from services-tools.md §4.11 (VERIFIED man page): `gocryptfs -init [OPTIONS] CIPHERDIR`, mount
 # `gocryptfs [OPTIONS] CIPHERDIR MOUNTPOINT`, `-idle duration` ("500s or 2h45m"; a process with open files or its
@@ -102,13 +132,27 @@ _vault_lock_if_open() {
   return 0
 }
 
+VAULT_GOCRYPTFS_PIN="2.6.1-1"        # services-tools.md §4.11 VERIFIED: the Ubuntu 26.04 archive package (upstream v2.6.1)
+
 _vault_apt() {
   apt_install gocryptfs fuse3
-  local ver
+  local ver pkgver upstream
   ver="$(gocryptfs -version 2>/dev/null | head -n1 || true)"
-  [[ -n "$ver" ]] || die "gocryptfs -version printed nothing after apt_install (package gocryptfs 2.6.1-1 expected)"
+  [[ -n "$ver" ]] || die "gocryptfs -version printed nothing after apt_install (package gocryptfs $VAULT_GOCRYPTFS_PIN expected)"
   command -v fusermount3 >/dev/null || die "fusermount3 missing (package fuse3): unprivileged FUSE mounts cannot work"
-  log "gocryptfs: $ver"
+  # Rule §7.9: the research gives a pin, so the installed version is held to it. The archive cannot be told to install an
+  # older version, so this is a check, not a selection: a different upstream version means the man-page facts this step
+  # types (exit codes 12/10/6, -idle, -passfile, -fg, -q, -nosyslog) must be re-verified before the override is used.
+  pkgver="$(dpkg-query -W -f='${Version}' gocryptfs 2>/dev/null || true)"
+  upstream="${pkgver%%-*}"; upstream="${upstream#*:}"
+  if [[ "$upstream" != "${VAULT_GOCRYPTFS_PIN%%-*}" ]]; then
+    if [[ "${ATLAS_GOCRYPTFS_VERSION_OK:-0}" == 1 ]]; then
+      warn "gocryptfs $pkgver installed; the VERIFIED pin is $VAULT_GOCRYPTFS_PIN (services-tools.md §4.11); continuing because ATLAS_GOCRYPTFS_VERSION_OK=1"
+    else
+      die "gocryptfs $pkgver installed but the VERIFIED pin is $VAULT_GOCRYPTFS_PIN (services-tools.md §4.11; rule §7.9). Re-verify the man-page facts in this file's header against the installed version, then re-run with: sudo env ATLAS_GOCRYPTFS_VERSION_OK=1 ${ATLAS_ENTRY:-./atlas-day1.sh} phase2"
+    fi
+  fi
+  log "gocryptfs: $ver (package $pkgver; pin $VAULT_GOCRYPTFS_PIN)"
 }
 
 _vault_dirs() {
@@ -116,7 +160,8 @@ _vault_dirs() {
   ensure_dir "$VAULT_CIPHER_DIR" atlas:atlas 700
   ensure_dir "$VAULT_MOUNT_DIR" atlas:atlas 700
   ensure_dir "$VAULT_TEST_CIPHER_DIR" atlas:atlas 700
-  ensure_dir "$ATLAS_ETC/secrets" root:root 700
+  # root:atlas 710 (header: SECRETS DIRECTORY): atlas traverses to its own files, lists nothing; identical to 06c.
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710
   # The runtime dir is root-owned on tmpfs (/run): the helper re-creates it on every open; fail now if /run is not tmpfs.
   local fst
   fst="$(findmnt -n -o FSTYPE --target /run 2>/dev/null || true)"
@@ -192,9 +237,11 @@ _vault_helper() {
 #   VAULT_IDLE_OVERRIDE=<dur>     e.g. 20s; may only SHORTEN VAULT_IDLE (15m), never lengthen or disable it
 # A written override applies to ONE open (wait-mounted removes it) and expires after 600 s unused, so a crashed
 # verification run can never redirect the Principal's next button press. The passphrase is never an argument,
-# never logged, and lives on tmpfs (VAULT_PASS_FILE, root:atlas 640) only between the button press and the mount;
-# wait-mounted and cleanup shred it. Everything under VAULT_RUN_DIR is created with mktemp + rename, symlinks refused:
-# root never follows a name into a directory another account could write.
+# never logged, and lives on tmpfs (VAULT_PASS_FILE, root:root 600: no atlas process can read it) only between the
+# button press and the mount; wait-mounted and cleanup shred it. gocryptfs (user atlas) receives it on STDIN: systemd
+# opens the file as root (StandardInput=file: in atlas-vault.service) and gocryptfs reads `-passfile /dev/stdin`; init
+# does the same through a root shell redirection. Everything under VAULT_RUN_DIR is created with mktemp + rename,
+# symlinks refused: root never follows a name into a directory another account could write.
 set -Eeuo pipefail
 ENV_FILE=/etc/atlas/vault.env
 [[ -r "$ENV_FILE" ]] || { echo "atlas-vault: $ENV_FILE missing (scripts/day1/phase2/09b-vault.sh writes it)" >&2; exit 2; }
@@ -241,8 +288,9 @@ shred_pass() {
   shred -u "$VAULT_PASS_FILE" 2>/dev/null || rm -f "$VAULT_PASS_FILE"
 }
 
-# read_pass — one line from stdin into the tmpfs passfile (root:atlas 640: gocryptfs runs as atlas and reads it through
-# the group; atlas cannot unlink or replace it). -s keeps a terminal from echoing; -t bounds a caller that forgot to pipe.
+# read_pass — one line from stdin into the tmpfs passfile (root:root 600: nothing running as atlas can read, unlink or
+# replace it; gocryptfs gets the content on fd 0 from root). -s keeps a terminal from echoing; -t bounds a caller that
+# forgot to pipe.
 read_pass() {
   local p=""
   IFS= read -r -s -t 120 p || true
@@ -250,7 +298,7 @@ read_pass() {
   [[ -n "$p" ]] || { printf 'atlas-vault: no passphrase arrived on stdin within 120 s (pipe it: printf "%%s\\n" "$pass" | atlas-vault %s)\n' "$1" >&2; exit 2; }
   run_dir
   shred_pass
-  printf '%s\n' "$p" | write_run_file "$VAULT_PASS_FILE" "root:$VAULT_USER" 640
+  printf '%s\n' "$p" | write_run_file "$VAULT_PASS_FILE" root:root 600
   p=""
 }
 
@@ -325,7 +373,7 @@ do_open() {
   idle="$(override_value VAULT_IDLE)"; idle="${idle:-$VAULT_IDLE}"
   if [[ ! -f "$cipher/gocryptfs.conf" ]]; then
     rm -f "$VAULT_OVERRIDE_FILE"
-    echo "atlas-vault open: $cipher/gocryptfs.conf missing: the vault is not initialised (run from a console: sudo ./atlas-day1.sh phase2 --force 09b)" >&2
+    echo "atlas-vault open: $cipher/gocryptfs.conf missing: the vault is not initialised (run from a console: sudo env ATLAS_VAULT_INIT=1 ./atlas-day1.sh phase2 --force 09b)" >&2
     exit 2
   fi
   read_pass open
@@ -389,8 +437,9 @@ do_init() {
   [[ -d "$cipher" ]] || { echo "atlas-vault init: $cipher does not exist" >&2; exit 2; }
   read_pass init
   local out rc=0
-  # No -q: gocryptfs prints the master key on init and the caller must be able to show it once (D3).
-  out="$(runuser -u "$VAULT_USER" -- gocryptfs -init -passfile "$VAULT_PASS_FILE" "$cipher" 2>&1)" || rc=$?
+  # No -q: gocryptfs prints the master key on init and the caller must be able to show it once (D3). The root:root 600
+  # passfile is opened by THIS root shell and handed to gocryptfs (user atlas) as fd 0; -passfile /dev/stdin reads it.
+  out="$(runuser -u "$VAULT_USER" -- gocryptfs -init -passfile /dev/stdin "$cipher" <"$VAULT_PASS_FILE" 2>&1)" || rc=$?
   shred_pass
   if (( rc != 0 )) || [[ ! -f "$cipher/gocryptfs.conf" ]]; then
     echo "atlas-vault init: gocryptfs -init failed (exit $rc; 6 = cipher dir not empty, 22 = empty passphrase): $out" >&2
@@ -434,18 +483,21 @@ HELPER
 _vault_unit() {
   local tmp
   tmp="$(mktemp)"
-  # ${VAULT_*} below are systemd substitutions from the EnvironmentFiles and stay literal (escaped in this heredoc).
+  # ${VAULT_*} in Exec lines below are systemd substitutions from the EnvironmentFiles and stay literal (escaped in this
+  # heredoc); Description= gets no substitution from systemd, so the idle is rendered now (fix round 2).
   cat >"$tmp" <<UNIT
 # /etc/systemd/system/atlas-vault.service — the open vault (Section 11, D13). Written by scripts/day1/phase2/09b-vault.sh.
 # Started ONLY by /usr/local/bin/atlas-vault open (the interface button path), never at boot: gocryptfs runs in the
-# foreground as user atlas in the host mount namespace, auto-unmounts after \${VAULT_IDLE} idle and then exits, so
-# "systemctl is-active atlas-vault" mirrors the vault state. The passfile is tmpfs (root:atlas 640, in the root-only
-# $VAULT_RUN_DIR) and is shredded by wait-mounted, which runs with full privileges (the '+' prefix) because atlas may
-# not touch that directory. The override file (root-written, verification runs only) may shorten the idle or point
-# at the test vault for ONE open; vault.env is loaded first so its VAULT_IDLE is the default the override shortens.
+# foreground as user atlas in the host mount namespace, auto-unmounts after $VAULT_IDLE idle (VAULT_IDLE, or a shorter
+# one-shot override) and then exits, so "systemctl is-active atlas-vault" mirrors the vault state. The passfile is tmpfs
+# (root:root 600, in the root-only $VAULT_RUN_DIR): systemd opens it as root and hands it to gocryptfs as STDIN
+# (StandardInput=file:), gocryptfs reads it with -passfile /dev/stdin, and wait-mounted shreds it the moment the mount is
+# up (full privileges, the '+' prefix, because atlas may not touch that directory). No process running as atlas can ever
+# read the file. The override file (root-written, verification runs only) may shorten the idle or point at the test
+# vault for ONE open; vault.env is loaded first so its VAULT_IDLE is the default the override shortens.
 # NoNewPrivileges must stay off: an unprivileged FUSE mount goes through the setuid fusermount3.
 [Unit]
-Description=A.T.L.A.S. vault (gocryptfs plaintext view, auto-locks after \${VAULT_IDLE} idle)
+Description=A.T.L.A.S. vault (gocryptfs plaintext view, auto-locks after $VAULT_IDLE idle)
 Documentation=file:$VAULT_ENV_FILE
 ConditionPathExists=$VAULT_PASS_FILE
 
@@ -455,7 +507,8 @@ User=atlas
 Group=atlas
 EnvironmentFile=$VAULT_ENV_FILE
 EnvironmentFile=-$VAULT_OVERRIDE_FILE
-ExecStart=/usr/bin/gocryptfs -fg -q -nosyslog -idle \${VAULT_IDLE} -passfile $VAULT_PASS_FILE \${VAULT_CIPHER_DIR} \${VAULT_MOUNT_DIR}
+StandardInput=file:$VAULT_PASS_FILE
+ExecStart=/usr/bin/gocryptfs -fg -q -nosyslog -idle \${VAULT_IDLE} -passfile /dev/stdin \${VAULT_CIPHER_DIR} \${VAULT_MOUNT_DIR}
 ExecStartPost=+$VAULT_HELPER wait-mounted
 ExecStopPost=-+$VAULT_HELPER cleanup
 Restart=no
@@ -478,8 +531,10 @@ _vault_sudoers() {
   local tmp
   tmp="$(mktemp)"
   cat >"$tmp" <<SUDO
-# atlas-vault — written by scripts/day1/phase2/09b-vault.sh (Section 11). The orchestrator's /vault/open and
-# /vault/lock endpoints run exactly these, with the passphrase on stdin. Nothing else is permitted.
+# atlas-vault — written by scripts/day1/phase2/09b-vault.sh (Section 11). The orchestrator's /vault/open, /vault/lock
+# and /vault/status run exactly these (atlas.vault.VaultController runs every verb through sudo -n), with the
+# passphrase on stdin. 'status' needs no privilege but is listed so the package's status() never logs a sudo error.
+# Nothing else is permitted.
 atlas ALL=(root) NOPASSWD: $VAULT_HELPER open
 atlas ALL=(root) NOPASSWD: $VAULT_HELPER lock
 atlas ALL=(root) NOPASSWD: $VAULT_HELPER status
@@ -500,6 +555,14 @@ SUDO
 
 _vault_has_tty() { [[ -r /dev/tty && -w /dev/tty ]] && { : </dev/tty; } 2>/dev/null; }
 
+# _vault_init_requested — the Principal asked for the real vault's initialisation in this run (header part 4):
+# ATLAS_VAULT_INIT=1 in the environment, or a driver that exports ATLAS_FORCED_STEPS naming 09b (contract requested).
+_vault_init_requested() {
+  [[ "${ATLAS_VAULT_INIT:-0}" == 1 ]] && return 0
+  [[ " ${ATLAS_FORCED_STEPS:-} " == *" 09b "* ]] && return 0
+  return 1
+}
+
 # _vault_tty_pass VAR PROMPT — read a hidden line from the terminal into VAR (never echoed, never logged).
 _vault_tty_pass() {
   local prompt="$2"
@@ -519,7 +582,7 @@ _vault_prompt() {
   else
     _vault_tty_pass p1 "New vault passphrase (input hidden): "
     _vault_tty_pass p2 "Repeat it: "
-    [[ "$p1" == "$p2" ]] || die "the two passphrases differ; nothing written, re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2"
+    [[ "$p1" == "$p2" ]] || die "the two passphrases differ; nothing written, re-run: sudo env ATLAS_VAULT_INIT=1 ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 09b"
   fi
   (( ${#p1} >= 8 )) || die "the vault passphrase must be at least 8 characters; nothing written, re-run"
   VAULT_PASS="$p1"
@@ -568,55 +631,80 @@ _vault_init_test() {
   log "test vault initialised at $VAULT_TEST_CIPHER_DIR"
 }
 
+VAULT_SELFTEST_SUBDIR=".atlas-selftest"   # the ONLY path Day 1 automation touches inside a vault (here and verify/v18-vault.sh)
+
+# _vault_mech_abort MSG — a failure after the open: remove the self-test file as atlas, lock, then die. `die` exits
+# through no RETURN trap, so every check after the open goes through this instead (nothing stays mounted or littered).
+_vault_mech_abort() {
+  local msg="$1"
+  if [[ -n "${VAULT_MECH_FILE:-}" ]] && vault_is_mounted "$VAULT_MOUNT_DIR"; then
+    runuser -u atlas -- rm -f "$VAULT_MECH_FILE" 2>/dev/null || true
+    runuser -u atlas -- rmdir "$VAULT_MOUNT_DIR/$VAULT_SELFTEST_SUBDIR" 2>/dev/null || true
+  fi
+  if vault_is_mounted "$VAULT_MOUNT_DIR" || systemctl is-active --quiet "$VAULT_UNIT" 2>/dev/null; then
+    "$VAULT_HELPER" lock >/dev/null 2>&1 || true
+  fi
+  die "$msg"
+}
+
 # _vault_mechanics CIPHER_DIR PASS_SOURCE — the mechanics through the real button path: atlas -> sudo-rs -> atlas-vault
 # open -> unit. PASS_SOURCE is "real" (VAULT_PASS in memory) or a file (the test passphrase). For the test vault a
 # root-written override file points the ONE next open at it (the same mechanism verify/v18-vault.sh uses).
 _vault_mechanics() {
   local cipher="$1" src="$2" name content st
-  name=".atlas-vault-mechanics-$(date +%s)"
+  name="$VAULT_SELFTEST_SUBDIR/mechanics-$(date +%s)"
   content="ATLAS vault mechanics check $(date -Is) $(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  VAULT_MECH_FILE=""
   _vault_lock_if_open
   if [[ "$cipher" != "$VAULT_CIPHER_DIR" ]]; then
     VAULT_CIPHER_OVERRIDE="$cipher" "$VAULT_HELPER" override >/dev/null || die "atlas-vault override for $cipher failed"
     [[ -s "$VAULT_OVERRIDE_FILE" ]] || die "$VAULT_OVERRIDE_FILE did not appear after 'atlas-vault override'"
   fi
   if [[ "$src" == real ]]; then
+    # The captured output never reaches the log (§7.2): sudo-rs's pty relaying of a piped stdin on a tty session is
+    # UNVERIFIED, and an echoed passphrase would otherwise land in $st on a wrong-passphrase attempt. Journal instead.
     st="$(printf '%s\n' "$VAULT_PASS" | runuser -u atlas -- sudo -n "$VAULT_HELPER" open 2>&1)" \
-      || die "the button path failed: 'sudo -n $VAULT_HELPER open' as atlas with the passphrase on stdin -> $st"
+      || die "the button path failed for the real vault ('sudo -n $VAULT_HELPER open' as atlas, passphrase on stdin; wrong passphrase = gocryptfs exit 12); see: journalctl -u $VAULT_UNIT -n 8"
+    st="${st//"$VAULT_PASS"/[redacted]}"
   else
     st="$(runuser -u atlas -- sudo -n "$VAULT_HELPER" open <"$src" 2>&1)" \
       || die "the button path failed on the test vault: 'sudo -n $VAULT_HELPER open' as atlas -> $st"
   fi
-  vault_is_mounted "$VAULT_MOUNT_DIR" || die "atlas-vault open printed '$st' but $VAULT_MOUNT_DIR is not mounted"
-  systemctl is-active --quiet "$VAULT_UNIT" || die "$VAULT_MOUNT_DIR is mounted but $VAULT_UNIT is not active (the mount did not come from the unit)"
-  [[ ! -e "$VAULT_PASS_FILE" ]] || die "$VAULT_PASS_FILE still exists after the mount (wait-mounted must shred it)"
-  [[ ! -e "$VAULT_OVERRIDE_FILE" ]] || die "$VAULT_OVERRIDE_FILE survived the mount (wait-mounted must remove the one-shot override)"
+  vault_is_mounted "$VAULT_MOUNT_DIR" || _vault_mech_abort "atlas-vault open printed '$st' but $VAULT_MOUNT_DIR is not mounted"
+  systemctl is-active --quiet "$VAULT_UNIT" || _vault_mech_abort "$VAULT_MOUNT_DIR is mounted but $VAULT_UNIT is not active (the mount did not come from the unit)"
+  [[ ! -e "$VAULT_PASS_FILE" ]] || _vault_mech_abort "$VAULT_PASS_FILE still exists after the mount (wait-mounted must shred it)"
+  [[ ! -e "$VAULT_OVERRIDE_FILE" ]] || _vault_mech_abort "$VAULT_OVERRIDE_FILE survived the mount (wait-mounted must remove the one-shot override)"
   # The unit must have mounted the cipher dir we meant (the override was honoured, or the default applied).
   local pid cmd
   pid="$(systemctl show -p MainPID --value "$VAULT_UNIT" 2>/dev/null || true)"
   cmd="$(tr '\0' ' ' <"/proc/${pid:-0}/cmdline" 2>/dev/null || true)"
-  [[ "$cmd" == *" $cipher $VAULT_MOUNT_DIR"* ]] || die "$VAULT_UNIT mounted a different cipher dir than intended ($cipher): gocryptfs cmdline '$cmd'"
-  # Write and read back as atlas (the mount owner; root is denied by the FUSE kernel driver, which is the design).
+  [[ "$cmd" == *" $cipher $VAULT_MOUNT_DIR"* ]] || _vault_mech_abort "$VAULT_UNIT mounted a different cipher dir than intended ($cipher): gocryptfs cmdline '$cmd'"
+  # Write and read back as atlas (the mount owner; root is denied by the FUSE kernel driver, which is the design), under
+  # the self-test directory only (Section 16.3 rule 5: the Principal's vault is otherwise never written by automation).
+  VAULT_MECH_FILE="$VAULT_MOUNT_DIR/$name"
+  runuser -u atlas -- mkdir -p "$VAULT_MOUNT_DIR/$VAULT_SELFTEST_SUBDIR" || _vault_mech_abort "could not create $VAULT_MOUNT_DIR/$VAULT_SELFTEST_SUBDIR as atlas"
   # shellcheck disable=SC2016  # $1/$2 are expanded by the inner bash, on purpose (content never touches argv parsing here)
-  runuser -u atlas -- bash -c 'printf "%s\n" "$1" >"$2"' _ "$content" "$VAULT_MOUNT_DIR/$name" \
-    || die "could not write $VAULT_MOUNT_DIR/$name as atlas"
+  runuser -u atlas -- bash -c 'printf "%s\n" "$1" >"$2"' _ "$content" "$VAULT_MECH_FILE" \
+    || _vault_mech_abort "could not write $VAULT_MECH_FILE as atlas"
   local back
-  back="$(runuser -u atlas -- cat "$VAULT_MOUNT_DIR/$name")"
-  [[ "$back" == "$content" ]] || die "read-back mismatch in the open vault"
+  back="$(runuser -u atlas -- cat "$VAULT_MECH_FILE" 2>/dev/null || true)"
+  [[ "$back" == "$content" ]] || _vault_mech_abort "read-back mismatch in the open vault"
   # Ciphertext only on disk: neither the plaintext name nor the plaintext content may appear in the cipher dir.
-  [[ ! -e "$cipher/$name" ]] || die "the plaintext file name appears in the cipher dir (names are not encrypted?)"
+  [[ ! -e "$cipher/$name" && ! -e "$cipher/$VAULT_SELFTEST_SUBDIR" ]] || _vault_mech_abort "the plaintext file name appears in the cipher dir (names are not encrypted?)"
   if grep -rqF -- "$content" "$cipher"; then
-    die "the plaintext content appears in $cipher (content not encrypted?)"
+    _vault_mech_abort "the plaintext content appears in $cipher (content not encrypted?)"
   fi
   local nfiles
   nfiles="$(find "$cipher" -type f | wc -l)"
-  (( nfiles >= 3 )) || die "expected gocryptfs.conf, gocryptfs.diriv and one encrypted file in $cipher, found $nfiles files"
-  runuser -u atlas -- rm -f "$VAULT_MOUNT_DIR/$name"
-  st="$(runuser -u atlas -- sudo -n "$VAULT_HELPER" lock 2>&1)" || die "'sudo -n $VAULT_HELPER lock' as atlas failed: $st"
-  if vault_is_mounted "$VAULT_MOUNT_DIR"; then die "vault still mounted after lock"; fi
-  if systemctl is-active --quiet "$VAULT_UNIT"; then die "$VAULT_UNIT still active after lock"; fi
+  (( nfiles >= 3 )) || _vault_mech_abort "expected gocryptfs.conf, gocryptfs.diriv and one encrypted file in $cipher, found $nfiles files"
+  runuser -u atlas -- rm -f "$VAULT_MECH_FILE" || _vault_mech_abort "could not remove $VAULT_MECH_FILE as atlas"
+  runuser -u atlas -- rmdir "$VAULT_MOUNT_DIR/$VAULT_SELFTEST_SUBDIR" 2>/dev/null || true   # kept only if v18 litter is inside
+  VAULT_MECH_FILE=""
+  st="$(runuser -u atlas -- sudo -n "$VAULT_HELPER" lock 2>&1)" || _vault_mech_abort "'sudo -n $VAULT_HELPER lock' as atlas failed: $st"
+  if vault_is_mounted "$VAULT_MOUNT_DIR"; then _vault_mech_abort "vault still mounted after lock"; fi
+  if systemctl is-active --quiet "$VAULT_UNIT"; then _vault_mech_abort "$VAULT_UNIT still active after lock"; fi
   [[ -z "$(ls -A "$VAULT_MOUNT_DIR")" ]] || die "$VAULT_MOUNT_DIR is not empty while locked (something wrote into the mount point)"
-  log "mechanics on $cipher: open (atlas -> sudo-rs -> atlas-vault -> $VAULT_UNIT), write+read as atlas, ciphertext-only on disk ($nfiles files), lock: all confirmed"
+  log "mechanics on $cipher: open (atlas -> sudo-rs -> atlas-vault -> $VAULT_UNIT), write+read as atlas under $VAULT_SELFTEST_SUBDIR/, ciphertext-only on disk ($nfiles files), lock: all confirmed"
 }
 
 _vault_restart_orchestrator() {
@@ -643,7 +731,10 @@ step_09b() {
   _vault_restart_orchestrator
   _vault_init_test
   VAULT_PASS=""
-  if _vault_has_tty; then
+  local init_cmd="sudo env ATLAS_VAULT_INIT=1 ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 09b"
+  if _vault_init_requested; then
+    # The opt-in (header part 4): the Principal asked for the real vault now. An opt-in that cannot be honoured dies.
+    _vault_has_tty || die "ATLAS_VAULT_INIT=1 but no terminal is available to type the vault passphrase; run from a console: $init_cmd"
     _vault_prompt
     _vault_init_real
     rm -f "$VAULT_PENDING_FLAG"
@@ -654,15 +745,16 @@ step_09b() {
       warn "V18 recorded as fail (see verify.jsonl); the Phase 2 gate will block until it passes"
     fi
   elif [[ -f "$VAULT_CIPHER_DIR/gocryptfs.conf" ]]; then
-    log "no terminal: the real vault is already initialised; its passphrase was not asked for. Mechanics proven on the test vault; the gate runs V18 on it"
+    log "unattended (default): the real vault is already initialised; its passphrase was not asked for. Mechanics proven on the test vault; the gate runs V18 on it. To re-prove the real vault: $init_cmd"
     rm -f "$VAULT_PENDING_FLAG"
     _vault_mechanics "$VAULT_TEST_CIPHER_DIR" "$VAULT_TEST_PASS_FILE"
   else
-    # Section 11 / CONVENTIONS §7.6: the passphrase pause needs a console. Deferred loudly, never silently, never fatal
-    # for an unattended run: the button answers "not initialised" (exit 2) until this is done from a console.
+    # CONVENTIONS §7.6: this phase has exactly three interactive pauses and this step is not one of them, so the default
+    # run never prompts. Deferred loudly, never silently, never fatal: the button answers "not initialised" (exit 2)
+    # until the Principal runs the opt-in command from a console.
     date -Is >"$VAULT_PENDING_FLAG"
-    warn "NO TERMINAL: the real vault at $VAULT_CIPHER_DIR is NOT initialised (its passphrase must be typed on a console). Deferred; flag $VAULT_PENDING_FLAG. Run from a console: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 09b"
-    notify "Phase 2 step 9b: vault initialisation deferred (no terminal). Run from a console: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 09b"
+    warn "UNATTENDED (default): the real vault at $VAULT_CIPHER_DIR is NOT initialised (its passphrase must be typed on a console). Deferred; flag $VAULT_PENDING_FLAG. From a console: $init_cmd"
+    notify "Phase 2 step 9b: real vault initialisation deferred (opt-in). From a console: $init_cmd"
     _vault_mechanics "$VAULT_TEST_CIPHER_DIR" "$VAULT_TEST_PASS_FILE"
   fi
   VAULT_PASS=""

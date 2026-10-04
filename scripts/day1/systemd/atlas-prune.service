@@ -3,6 +3,12 @@
 # (9.4) and permanent facts untouched. Installed by phase2/08-sentinel.sh through render_template (ATLAS_ETC,
 # ATLAS_OPT substituted). Contract with the `atlas` package: `atlas-admin enqueue prune` (see atlas-sentinel.service).
 # The broker URL (with the Redis password) comes from /etc/atlas/secrets/redis.env, read by PID 1.
+#
+# Cadence (fix round 2): atlas-prune.timer fires DAILY at 03:10 and ExecCondition= lets the sweep run only when the
+# stamp /var/lib/atlas-prune/last (touched by ExecStartPost after a successful enqueue) is older than 71 hours (find
+# -mmin +4259), so the true cadence is >= 71 h, survives reboots (Persistent=true + the stamp) and never drifts at
+# month ends the way a day-of-month calendar did. ExecCondition exit 1 is "skipped", not a failure.
+# No docker group, no sudo: full read-only treatment (16.3 item 6 enforced, not advisory). HOME is the account's home.
 
 [Unit]
 Description=A.T.L.A.S. 72-hour semantic pruning sweep (enqueue the Celery task, Section 9.6)
@@ -17,6 +23,16 @@ WorkingDirectory=${ATLAS_OPT}/orchestrator
 EnvironmentFile=${ATLAS_ETC}/orchestrator.env
 EnvironmentFile=${ATLAS_ETC}/secrets/redis.env
 EnvironmentFile=-${ATLAS_ETC}/memory.env
-Environment=HOME=/var/lib/atlas
+Environment=HOME=/var/lib/atlas/home
+StateDirectory=atlas-prune
+StateDirectoryMode=0750
+# $$ is systemd's literal dollar: the shell, not systemd, expands the command substitution.
+ExecCondition=/bin/sh -c '[ ! -e /var/lib/atlas-prune/last ] || [ -n "$$(find /var/lib/atlas-prune/last -mmin +4259)" ]'
 ExecStart=${ATLAS_OPT}/venv/bin/atlas-admin enqueue prune
+ExecStartPost=/bin/touch /var/lib/atlas-prune/last
 TimeoutStartSec=120
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv -${ATLAS_OPT}/day1 ${ATLAS_ETC}

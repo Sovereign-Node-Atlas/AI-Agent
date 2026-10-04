@@ -7,3 +7,12 @@ __pycache__/
 .venv/
 build/
 dist/
+# a ledger or local secrets made inside the package tree hold Principal data (rule §7.2: never in git);
+# tests/fixtures/config/atlas.env is tracked on purpose (invented placeholder names, matches none of these)
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+.env
+*.local.env
+secrets/

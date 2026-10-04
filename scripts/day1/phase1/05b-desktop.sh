@@ -2,7 +2,8 @@
 # phase1/05b-desktop.sh — Phase 1 step 5b (Sections 3.1, 3.6, 17, 21 V19; R21; Appendix B): XFCE and xrdp bound to
 # the LAN address now (the WireGuard bridge address is added by step 7), no display manager and no autologin,
 # Firefox as a .deb from Mozilla's apt repository (adjudicated conflict 5), then V19: (a) xrdp listens only on the
-# bound addresses, (b) wait up to 10 minutes for the Principal's RDP session; no session -> deferred, not failed.
+# bound addresses, (b) wait up to 10 minutes for the Principal's RDP session; no session -> V19 recorded as FAIL
+# (CONVENTIONS §6: required, no deferral), the step still completes and the gate blocks Phase 2 until `--force 05b`.
 # Facts from the platform research item 4 (package names VERIFIED; the Mozilla repo recipe is UNVERIFIED and fails
 # loudly if it does not hold). Defines step_05b and the helper phase1_xrdp_bind (re-used by step 7).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
@@ -44,9 +45,15 @@ CONF
 # _firefox_policies — enterprise policy written BEFORE the install so the first launch already runs with telemetry,
 # Normandy studies, app-update checks, captive-portal probes, DoH and extension updates OFF (rule §7.1 wants
 # telemetry disabled in the component, not merely denied by squid; DoH would route the Principal's DNS to a resolver
-# the allowlist does not name). /etc/firefox/policies/policies.json is the documented Linux system path (VERIFIED,
-# mozilla/policy-templates README); UNVERIFIED that Mozilla's own .deb reads it rather than only its install
-# directory, so the same file is also placed at /usr/lib/firefox/distribution/policies.json (the .deb's directory).
+# the allowlist does not name). Also off in the component (fix round): the periodic Mozilla/Google services that are
+# not telemetry but still call home at every start (Safe Browsing list updates, Remote Settings-driven suggestions,
+# Push, sponsored top sites / Firefox Suggest, add-on recommendations, the OpenH264/GMP plugin fetch, search
+# suggestions), so they stop instead of being denied and logged by squid at every launch. Policy names VERIFIED
+# against mozilla/policy-templates (Preferences is restricted to the browser./dom./extensions./media. prefixes used
+# here; toolkit.telemetry.* is not allowed there and is covered by DisableTelemetry).
+# /etc/firefox/policies/policies.json is the documented Linux system path (VERIFIED, mozilla/policy-templates
+# README); UNVERIFIED that Mozilla's own .deb reads it rather than only its install directory, so the same file is
+# also placed at /usr/lib/firefox/distribution/policies.json (the .deb's directory).
 _firefox_policies() {
   local d
   for d in /etc/firefox/policies /usr/lib/firefox/distribution; do
@@ -67,13 +74,28 @@ _firefox_policies() {
     "Proxy": { "Mode": "system", "Locked": true },
     "ExtensionUpdate": false,
     "OverrideFirstRunPage": "",
-    "OverridePostUpdatePage": ""
+    "OverridePostUpdatePage": "",
+    "SearchSuggestEnabled": false,
+    "FirefoxSuggest": { "WebSuggestions": false, "SponsoredSuggestions": false, "ImproveSuggest": false, "Locked": true },
+    "UserMessaging": { "WhatsNew": false, "ExtensionRecommendations": false, "FeatureRecommendations": false,
+                       "UrlbarInterventions": false, "SkipOnboarding": true, "MoreFromMozilla": false, "Locked": true },
+    "NewTabPage": false,
+    "Homepage": { "URL": "about:blank", "StartPage": "none", "Locked": true },
+    "Preferences": {
+      "browser.safebrowsing.malware.enabled":              { "Value": false, "Status": "locked" },
+      "browser.safebrowsing.phishing.enabled":             { "Value": false, "Status": "locked" },
+      "browser.safebrowsing.downloads.remote.enabled":     { "Value": false, "Status": "locked" },
+      "browser.newtabpage.activity-stream.feeds.topsites": { "Value": false, "Status": "locked" },
+      "dom.push.enabled":                                  { "Value": false, "Status": "locked" },
+      "extensions.getAddons.cache.enabled":                { "Value": false, "Status": "locked" },
+      "media.gmp-manager.updateEnabled":                   { "Value": false, "Status": "locked" }
+    }
   }
 }
 JSON
     chmod 644 "$d/policies.json"
   done
-  log "Firefox enterprise policy written (telemetry, studies, updates, captive portal, DoH off; proxy = system)"
+  log "Firefox enterprise policy written (telemetry, studies, updates, captive portal, DoH, Safe Browsing, Push, suggestions, GMP fetch off; proxy = system)"
 }
 
 _firefox_deb() {
@@ -148,11 +170,14 @@ step_05b() {
   1. On the Windows PC open "Remote Desktop Connection" (mstsc) and connect to:  $LAN_IP
   2. Accept the certificate warning (self-signed), pick session "Xorg", log in as user "$PRINCIPAL_USER"
      with your Ubuntu password. An XFCE desktop with Firefox should appear.
-  Nothing else to do here; this step passes as soon as the session shows up. If you cannot test now, wait it out:
-  V19 is recorded as deferred (non-blocking) and you can re-run it later with:
+  Nothing else to do here; V19 passes as soon as the session shows up. If no session appears in 10 minutes,
+  V19 is recorded as FAIL (CONVENTIONS §6: required, no deferral), this step still completes, and the Phase 1
+  gate blocks Phase 2 until you re-run it (idempotent, waits again) with:
       sudo $ATLAS_ENTRY phase1 --force 05b
   ===============================================================================
 MSG
+  # phase1_xrdp_bind already died if xrdp is down or not bound as intended, so a fail here is the timeout: recorded
+  # (rule §7.4), the step completes, the gate (step 8) shows the red row.
   run_verify V19 v19-xrdp.sh "$PRINCIPAL_USER" 570 "sudo $ATLAS_ENTRY phase1 --force 05b" "${addrs[@]}" \
-    || die "V19 failed: xrdp is not listening only on the bound addresses (see the verify table)"
+    || warn "V19 recorded as FAIL (no RDP session in time, or see the verify table). The phase continues to the gate, which blocks Phase 2 until: sudo $ATLAS_ENTRY phase1 --force 05b"
 }

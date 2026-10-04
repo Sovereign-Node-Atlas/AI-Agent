@@ -1,0 +1,44 @@
+{
+  "_meta": {
+    "purpose": "Test copy of config/phase4-engines.json (Section 15.2; CONVENTIONS.md §1): four rows, one per tier, with the fields atlas.config.load_phase4_engines reads (key, name, tier, footprint_gb_expected, verify_id, licence_note). Keys and planning figures are the real file's; everything else is trimmed.",
+    "footprint_rule": "footprint_gb_expected is Section 15.2's planning figure; the measured value is registered with the Arbiter in Phase 4 step 05 (POST /arbiter/register)."
+  },
+  "engines": [
+    {
+      "key": "flux1-dev",
+      "name": "FLUX.1-dev",
+      "job": "Image generation, architectural visualisation",
+      "tier": "green",
+      "footprint_gb_expected": 24,
+      "verify_id": null,
+      "licence_note": "Non-commercial licence accepted by the Principal (Section 15.5). Accept it on huggingface.co with the HF_TOKEN account before Phase 4 (conflict 16)."
+    },
+    {
+      "key": "trellis",
+      "name": "TRELLIS",
+      "job": "Image to 3D",
+      "tier": "yellow",
+      "footprint_gb_expected": 12,
+      "verify_id": null,
+      "licence_note": null
+    },
+    {
+      "key": "pointllm",
+      "name": "PointLLM",
+      "job": "Point-cloud reasoning (V8)",
+      "tier": "verify",
+      "footprint_gb_expected": 16,
+      "verify_id": "V8",
+      "licence_note": "cc-by-nc-4.0 (UNVERIFIED), non-commercial; adjudicated conflict 17."
+    },
+    {
+      "key": "evo",
+      "name": "Evo 2",
+      "job": "Genomic foundation model",
+      "tier": "deferred",
+      "footprint_gb_expected": null,
+      "verify_id": null,
+      "licence_note": null
+    }
+  ]
+}

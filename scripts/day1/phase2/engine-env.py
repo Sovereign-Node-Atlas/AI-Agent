@@ -5,7 +5,7 @@ Output: $ATLAS_ETC/engines/<key>.env (root:atlas 640), consumed by systemd/llama
 EnvironmentFile= and by the Phase 3 driver (sourceable KEY='value' lines). Each file carries:
 
     ATLAS_ENGINE, ATLAS_MODE, ATLAS_KV_TYPE, ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_N_KEEP, ATLAS_MODEL_FILE,
-    ATLAS_MODEL_PRESENT (1/0), ATLAS_KV_PROOF_LINES, LLAMA_ARG_HOST, LLAMA_ARG_PORT, ARGS
+    ATLAS_MODEL_PATTERN, ATLAS_MODEL_PRESENT (1/0), ATLAS_KV_PROOF_LINES, LLAMA_ARG_HOST, LLAMA_ARG_PORT, ARGS
 
 ARGS is the complete llama-server command line (the unit runs `llama-server $ARGS`). systemd splits an unquoted $ARGS
 at whitespace with quotes respected and then REMOVED (systemd.service(5), "Command lines"), so a JSON token such as
@@ -27,8 +27,15 @@ names slot files per engine); the directory is created only when installing, nev
 
 Hardening (fix round): engines.json is root-owned, but one edit there must not be able to rebind an engine to 0.0.0.0,
 make llama-server (built with an HTTPS client) pull a model by itself outside hf_download's manifest and hash path
-(Section 16.3 item 8), or move --slot-save-path. The env map therefore refuses the LLAMA_ARG_* names in RESERVED_ENV
-and extra_args refuses the flags in RESERVED_FLAGS; both lists are mirrored in engines.json _meta.
+(Section 16.3 item 8), move --slot-save-path, offload tensors to a remote host (--rpc: off-node inference, the one thing
+Section 1 forbids outright), load a second model, a LoRA, a control vector or a template file from an arbitrary path,
+serve a directory over HTTP (--path) or write a log file somewhere of its choosing. The env map therefore refuses the
+LLAMA_ARG_* names in RESERVED_ENV and extra_args refuses the flags in RESERVED_FLAGS; both lists are mirrored in
+engines.json _meta (extra_args_rule, env_rule).
+
+A model file that is not present yet is rendered with ATLAS_MODEL_PRESENT=0, ATLAS_MODEL_FILE set to the directory plus
+the FIRST pattern (systemd does not glob, so the unit fails with llama.cpp's own "failed to load model") and
+ATLAS_MODEL_PATTERN='<the full model_file_pattern>' so the Phase 3 driver's diagnostic can print what it tried.
 
 Usage:
     engine-env.py [--engines FILE] [--out DIR] [--models-dir DIR] [--slots-dir DIR] [--port-base N]
@@ -55,6 +62,11 @@ RESERVED_ENV = {
     "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_MODEL", "LLAMA_ARG_MMPROJ", "LLAMA_ARG_HF_REPO", "LLAMA_ARG_HF_FILE",
     "LLAMA_ARG_HF_TOKEN", "LLAMA_ARG_MODEL_URL", "LLAMA_ARG_API_KEY", "LLAMA_ARG_SLOT_SAVE_PATH",
     "LLAMA_ARG_SSL_KEY_FILE", "LLAMA_ARG_SSL_CERT_FILE", "LLAMA_ARG_WEBUI", "LLAMA_ARG_ALIAS",
+    # Fix round 2: file-loading and network-path options (docstring). UNVERIFIED against common/arg.cpp at v0.4.1:
+    # the names follow llama.cpp's LLAMA_ARG_<FLAG> convention; refusing a name the server never reads costs nothing.
+    "LLAMA_ARG_RPC", "LLAMA_ARG_MODEL_DRAFT", "LLAMA_ARG_MODELS_DIR", "LLAMA_ARG_MODELS_PRESET",
+    "LLAMA_ARG_STATIC_PATH", "LLAMA_ARG_LORA", "LLAMA_ARG_CONTROL_VECTOR", "LLAMA_ARG_CHAT_TEMPLATE_FILE",
+    "LLAMA_ARG_LOG_FILE",
 }
 # The same options as command-line flags; never accepted from engines.json "extra_args" (also matched as --flag=value).
 RESERVED_FLAGS = {
@@ -62,6 +74,9 @@ RESERVED_FLAGS = {
     "--hf-repo-draft", "-hff", "--hf-file", "-hfv", "-hfrv", "--hf-repo-v", "-hffv", "--hf-file-v", "--hf-token",
     "--api-key", "--api-key-file", "--slot-save-path", "--mmproj", "--mmproj-url", "--ssl-key-file", "--ssl-cert-file",
     "--webui", "--no-webui", "--alias", "-a", "--api-prefix",
+    # Fix round 2 (docstring): remote offload, second models, router mode, static files, adapters, template, log file.
+    "--rpc", "-md", "--model-draft", "--models-dir", "--models-preset", "--path", "--lora", "--lora-scaled",
+    "--control-vector", "--control-vector-scaled", "--control-vector-layer-range", "--chat-template-file", "--log-file",
 }
 
 
@@ -128,7 +143,8 @@ def check_extra_flag(token: str, key: str) -> str:
     """Refuse reserved flags in extra_args, in both `--flag value` and `--flag=value` spellings."""
     flag = token.split("=", 1)[0] if token.startswith("-") else token
     if flag in RESERVED_FLAGS:
-        die(f"{key}: extra_args may not carry {token!r} (bind, model source, slot path, key or UI flag; see docstring)")
+        die(f"{key}: extra_args may not carry {token!r} (bind, model source, remote offload, file-loading, slot path, "
+            "key or UI flag; see docstring)")
     return token
 
 
@@ -213,8 +229,11 @@ def render(eng: dict[str, Any], ov: dict[str, Any], opts: argparse.Namespace, in
     args, meta = build_args(eng, ov, model_path, mmproj_path, slots_dir, port)
     if meta["mode"] in CHAT_MODES and opts.mkdirs and not opts.print_key:
         # --slot-save-path refuses a missing directory (arg.cpp "not a directory", VERIFIED). Never in --print mode.
+        # 0750: slot files are KV snapshots of the Principal's conversations, so no world traverse (fix round 2;
+        # the unit's UMask=0077 makes the files themselves 0600).
         slots_dir.mkdir(parents=True, exist_ok=True)
         try:
+            os.chmod(slots_dir, 0o750)
             shutil.chown(slots_dir, "atlas", "atlas")
         except (LookupError, PermissionError):
             pass
@@ -232,6 +251,7 @@ def render(eng: dict[str, Any], ov: dict[str, Any], opts: argparse.Namespace, in
         f"ATLAS_KV_PROOF_LINES={int(eng.get('kv_proof_lines', 0))}",
         f"ATLAS_FOOTPRINT_GB={eng.get('footprint_gb', 0)}",
         f"ATLAS_MODEL_FILE={sh_quote(str(model_path))}",
+        f"ATLAS_MODEL_PATTERN={sh_quote(patterns)}",
         f"ATLAS_MODEL_PRESENT={1 if present else 0}",
         "LLAMA_ARG_HOST=127.0.0.1",
         f"LLAMA_ARG_PORT={port}",
@@ -324,8 +344,11 @@ def main() -> int:
         if install(path, content):
             changed += 1
         if "ATLAS_MODEL_PRESENT=0" in content:
+            pattern = eng.get("model_file_pattern") or "(derived from files[])"
             print(f"engine-env.py: {eng['key']}: model file not present yet under {opts.models_dir}/{eng['key']} "
-                  f"(expected after Phase 3); unit will refuse to start until it is", file=sys.stderr)
+                  f"(no file matching {pattern!r}; expected after Phase 3; ATLAS_MODEL_FILE holds the first pattern "
+                  "literally and ATLAS_MODEL_PATTERN the full pattern); unit will refuse to start until it is",
+                  file=sys.stderr)
     if not opts.print_key:
         print(f"engine-env.py: rendered {len(wanted)} env file(s) into {opts.out} ({changed} changed)")
     return 0

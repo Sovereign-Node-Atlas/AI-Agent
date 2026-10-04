@@ -12,8 +12,9 @@
 #      /usr/local/bin. The build is skipped when dist/ATLAS_BUILD already names the pinned commit (rule §7.3).
 #   5. llama-server --list-devices must show the Vulkan0 device, also when run as the atlas user (render/video groups).
 #   6. systemd/llama-server@.service installed (render_template), /etc/sudoers.d/atlas-engines written (CONVENTIONS §8:
-#      one explicit line per engine key and verb, 30 lines, no wildcard), $ATLAS_ETC/engines/<key>.env rendered for all
-#      ten keys by phase2/engine-env.py, the slot directory created.
+#      one explicit line per engine key and verb, 30 lines, no wildcard; proven to parse by `sudo -n -l` as atlas, with
+#      visudo -c first when it exists), $ATLAS_ETC/engines/<key>.env rendered for all ten keys by phase2/engine-env.py,
+#      the slot directory created (atlas:atlas 750).
 #   7. V3b recorded (llama-cli --list-devices >= 160000 MiB); a fail is recorded, not fatal here: the gate decides.
 #
 # TODO (Section 3.4, optional, NOT Day 1): a ROCm 7.2.2 container build of llama.cpp for tuned prefill
@@ -152,7 +153,10 @@ _llama_device_check() {
   grep -q 'Vulkan0:' <<<"$out" \
     || die "llama-server --list-devices shows no Vulkan0 device. Output: $(tr '\n' ' ' <<<"$out")"
   log "devices (root): $(grep -m1 'Vulkan0:' <<<"$out" | sed 's/^[[:space:]]*//')"
-  out="$(timeout 120 svc_user_run /usr/local/bin/llama-server --list-devices 2>&1 || true)"
+  # timeout goes INSIDE the runuser call: the external `timeout` binary execvp()s its argument and cannot see a bash
+  # function, so `timeout 120 svc_user_run ...` always failed with "failed to run command 'svc_user_run'" (fix round 2,
+  # blocker). svc_user_run is `runuser -u atlas -- "$@"`, so timeout now execs llama-server as atlas.
+  out="$(svc_user_run timeout 120 /usr/local/bin/llama-server --list-devices 2>&1 || true)"
   grep -q 'Vulkan0:' <<<"$out" \
     || die "the atlas user cannot see the Vulkan device (is atlas in the render and video groups? Phase 1 step 6). Output: $(tr '\n' ' ' <<<"$out")"
   log "devices (atlas): $(grep -m1 'Vulkan0:' <<<"$out" | sed 's/^[[:space:]]*//')"
@@ -201,17 +205,47 @@ _llama_sudoers() {
   if command -v visudo >/dev/null 2>&1; then
     visudo -c -f "$tmp" >/dev/null || { rm -f "$tmp"; die "sudoers fragment failed visudo -c; not installed"; }
   else
-    warn "visudo not found (sudo-rs without it?); installing $frag unchecked"
+    warn "visudo not found (sudo-rs without it? UNVERIFIED); installing $frag and proving it by sudo's own parse below"
   fi
+  # Keep the previous fragment so a failed proof can restore it (empty file when there was none: `install` of an empty
+  # sudoers fragment is a valid no-op policy).
+  local prev
+  prev="$(mktemp)"
+  [[ -f "$frag" ]] && cp -p "$frag" "$prev"
   install -m 440 -o root -g root "$tmp" "$frag"
   rm -f "$tmp"
+  # Implementation-independent proof that the policy still parses with the fragment in place (fix round 2): a syntax
+  # error in any sudoers.d file makes sudo refuse EVERY command, so `sudo -n -l` as atlas must exit 0 (sudo(8): list the
+  # caller's own privileges; needs no password with NOPASSWD lines). On failure the previous fragment is restored and the
+  # step stops; a usage error (sudo-rs without -l, UNVERIFIED) is logged and the proof is left to step 04, which can
+  # also prove the policy by executing the granted command.
+  local lst rc=0
+  lst="$(svc_user_run sudo -n -l 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    if grep -qiE 'usage:|unknown option|invalid option|unrecognized|unexpected argument' <<<"$lst"; then
+      warn "sudo -l is not supported by this sudo (${lst//$'\n'/ }); the fragment's parse is proven in step 04 by running the granted command"
+    else
+      install -m 440 -o root -g root "$prev" "$frag"
+      rm -f "$prev"
+      die "sudo refuses to list atlas's privileges after installing $frag (exit $rc: ${lst//$'\n'/ }); the fragment does not parse under this sudo, previous state restored"
+    fi
+  elif ! grep -q 'llama-server@router-qwen3.5-4b' <<<"$lst"; then
+    rm -f "$prev"
+    die "sudo -l as atlas lists no llama-server@router-qwen3.5-4b line: $frag is not being read (includedir? sudo-rs?)"
+  else
+    log "sudo -l as atlas lists the engine commands ($frag in force)"
+  fi
+  rm -f "$prev"
   log "installed $frag ($(( ${#keys[@]} * 3 )) explicit command lines, no wildcard)"
 }
 
 _llama_engine_envs() {
   ensure_dir "$ATLAS_ETC/engines" root:atlas 750
   ensure_dir "$ATLAS_SRV/data" atlas:atlas 755
-  ensure_dir "$ATLAS_SRV/data/slots" atlas:atlas 755   # Appendix B: --slot-save-path /srv/atlas/data/slots, one dir for all
+  # Appendix B: --slot-save-path /srv/atlas/data/slots, one dir for all. 750, not 755 (fix round 2): slot files are KV
+  # snapshots of the Principal's conversations; the unit's UMask=0077 makes the files 0600 and the directory keeps every
+  # other local account (atlas-ddns, future service users) from traversing it. engine-env.py applies the same mode.
+  ensure_dir "$ATLAS_SRV/data/slots" atlas:atlas 750
   ensure_dir "$ATLAS_SRV/models" atlas:atlas 755
   # The seven large engines render with ATLAS_MODEL_PRESENT=0 until Phase 3 pulls them (stderr notes are expected).
   python3 "$ATLAS_DAY1_DIR/phase2/engine-env.py" \

@@ -18,8 +18,11 @@
 #      a 32-hex id written beside the token in $CLOUDFLARE_TXT is used; otherwise the step STOPS with the one-line
 #      manual fix (set CF_ZONE_ID in the env file, re-run). No prompt (adjudicated conflict 3 says "stores it", §7.6
 #      says everything but the three pauses runs unattended);
-#   4. `shred -u $CLOUDFLARE_TXT`;
-#   5. V23 recorded through verify/v23-cloudflare-token.sh, which re-checks all of the above and that CLOUDFLARE.txt
+#   4. the FINALISED file is read back from disk and GET /user/tokens/verify is repeated with the token read from it
+#      (fix round 2: §7.2 words the order as "after the new file is written and a read-back test of the API succeeds";
+#      the first verification read the pre-finalisation file, so it alone did not meet the literal order);
+#   5. `shred -u $CLOUDFLARE_TXT`;
+#   6. V23 recorded through verify/v23-cloudflare-token.sh, which re-checks all of the above and that CLOUDFLARE.txt
 #      no longer exists anywhere under the Principal's home.
 #
 # Facts from platform.md item 10 (VERIFIED from the OpenAPI schema: Bearer auth, GET /zones needs Zone Zone Read,
@@ -215,6 +218,10 @@ step_06b() {
   _cf_zone_id
   _cf_read_back
   _cf_write_env
+  # §7.2 order, literally: the read-back test of the API runs against the token read from the file just written, and
+  # only then does the plain-text source go.
+  _cf_read_env
+  _cf_verify_token
   _cf_shred
   run_verify V23 v23-cloudflare-token.sh "$PRINCIPAL_USER" "$CLOUDFLARE_TXT" \
     || die "V23 failed after the relocation (see the verify table)"

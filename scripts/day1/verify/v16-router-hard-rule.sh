@@ -23,7 +23,7 @@ py="$ATLAS_OPT/venv/bin/python"
 pkg="$ATLAS_OPT/orchestrator"
 [[ -f "$pkg/tests/$TEST" ]] || pkg="$ATLAS_DAY1_DIR/orchestrator"
 [[ -f "$pkg/tests/$TEST" ]] || { echo "$ID fail: tests/$TEST not found under $ATLAS_OPT/orchestrator or $ATLAS_DAY1_DIR/orchestrator (contract: orchestrator/tests/$TEST)"; exit 1; }
-"$py" -m pytest --version >/dev/null 2>&1 || { echo "$ID fail: pytest is not installed in $ATLAS_OPT/venv (phase2/10-gate.sh installs the package's [dev] extra; by hand: $ATLAS_OPT/venv/bin/pip install -e '$ATLAS_OPT/orchestrator[dev]')"; exit 1; }
+"$py" -m pytest --version >/dev/null 2>&1 || { echo "$ID fail: pytest is not installed in $ATLAS_OPT/venv (pyproject.toml declares pytest>=8 as a runtime dependency; the gate installs nothing): re-run Phase 2 step 2: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 02"; exit 1; }
 
 if [[ -r "$ATLAS_ETC/orchestrator.env" ]]; then
   set -a
@@ -31,6 +31,10 @@ if [[ -r "$ATLAS_ETC/orchestrator.env" ]]; then
   source "$ATLAS_ETC/orchestrator.env"
   set +a
 fi
+# Rule §7.1, unconditionally and AFTER the optional source (the env file must not be able to re-enable them): the package
+# imports chromadb (posthog) and huggingface_hub at import time; without these the mirrored-tree fallback would attempt
+# telemetry beacons that only the egress firewall then stops. HF_HUB_OFFLINE: the tests never download anything.
+export HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_OFFLINE=1 DO_NOT_TRACK=1 ANONYMIZED_TELEMETRY=False CHROMA_TELEMETRY_ENABLED=false PIP_DISABLE_PIP_VERSION_CHECK=1
 export PYTHONDONTWRITEBYTECODE=1
 # No -q here: pyproject.toml already sets addopts = "-q"; a second -q makes pytest -qq, which prints no "N passed" line.
 cmd=("$py" -m pytest -p no:cacheprovider "tests/$TEST")

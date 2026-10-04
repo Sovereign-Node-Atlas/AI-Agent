@@ -7,7 +7,8 @@
 #   CF_ZONE_NAME     e.g. sovereign-node.link
 #   CF_ZONE_ID       the zone id; REQUIRED in practice because a Zone:DNS:Edit-only token cannot list zones
 #                    (adjudicated conflict 3; GET /zones needs Zone:Zone:Read). When blank, GET /zones is attempted once.
-#   CF_RECORD_NAME   e.g. vpn.sovereign-node.link (must be a DNS-only A record: WireGuard is UDP, never proxied)
+#   CF_RECORD_NAME   e.g. vpn.sovereign-node.link (must be a DNS-only A record: WireGuard is UDP, never proxied; a
+#                    proxied record makes the run fail with the dashboard instruction, it is never un-proxied here)
 #   HTTPS_PROXY      from /etc/atlas/proxy.env: every request goes through the allowlist proxy (§7.1)
 #   DDNS_FORCE=1     ignore the cached last-ip and talk to the API even when the public IP is unchanged
 # State: $STATE_DIRECTORY/last-ip (systemd StateDirectory=atlas-ddns -> /var/lib/atlas-ddns), read by verify/v05-wireguard.sh.
@@ -62,18 +63,22 @@ if [[ -z "$zone_id" ]]; then
   [[ -n "$zone_id" ]] || fail "CF_ZONE_ID is blank and GET /zones failed: the token has no Zone:Zone:Read. Put CF_ZONE_ID=<zone id from the Cloudflare dashboard Overview page> in /etc/atlas/secrets/cloudflare.env"
 fi
 
-# 3. The A record, then PATCH only the content (partial update; PUT would replace the whole record).
+# 3. The A record, then PATCH only the content (partial update; PUT would replace the whole record). The updater is
+#    scoped to the ADDRESS (Section 12.2 "updated only on change"): an orange-clouded (proxied) record is a Cloudflare
+#    SETTING, and settings changes are the Principal's (Section 13: DNS for this zone is sensitive-tier; 16.3 item 4),
+#    so a proxied record is reported and left alone, never flipped here. WireGuard is UDP: the record must be DNS-only.
 rec="$(curl -fsS -m 20 "${auth[@]}" "$API/zones/$zone_id/dns_records?type=A&name=$CF_RECORD_NAME")" \
   || fail "GET dns_records failed for $CF_RECORD_NAME (token scope, zone id, or proxy)"
 rid="$(jq -r '.result[0].id // empty' <<<"$rec")"
 cur="$(jq -r '.result[0].content // empty' <<<"$rec")"
 proxied="$(jq -r '.result[0].proxied // empty' <<<"$rec")"
 [[ -n "$rid" ]] || fail "A record $CF_RECORD_NAME does not exist in zone $CF_ZONE_NAME: create it once in the dashboard (DNS only, grey cloud)"
-if [[ "$cur" != "$ip" || "$proxied" == "true" ]]; then
+[[ "$proxied" != "true" ]] || fail "A record $CF_RECORD_NAME is proxied (orange cloud): WireGuard needs a DNS-only record. Set it to DNS only (grey cloud) in the Cloudflare dashboard (a setting change, yours to make: Section 16.3 item 4); this updater changes the address only"
+if [[ "$cur" != "$ip" ]]; then
   curl -fsS -m 20 -X PATCH "${auth[@]}" "$API/zones/$zone_id/dns_records/$rid" \
-       --data "{\"content\":\"$ip\",\"proxied\":false}" | jq -e '.success == true' >/dev/null \
+       --data "{\"content\":\"$ip\"}" | jq -e '.success == true' >/dev/null \
     || fail "PATCH dns_records/$rid failed (token needs Zone:DNS:Edit on $CF_ZONE_NAME)"
-  logger -t atlas-ddns "updated $CF_RECORD_NAME: ${cur:-none} -> $ip (proxied=false)" 2>/dev/null || true
+  logger -t atlas-ddns "updated $CF_RECORD_NAME: ${cur:-none} -> $ip" 2>/dev/null || true
   echo "atlas-ddns: updated $CF_RECORD_NAME: ${cur:-none} -> $ip"
 fi
 mkdir -p "$STATE_DIR"

@@ -5,7 +5,7 @@ Two sources, kept apart on purpose:
     ATLAS_DB_PATH, ATLAS_ENGINES_ENV_DIR, LLAMA_PORT_BASE, FAMILY_NAMES, ...), plus /etc/atlas/atlas.env (§3) when
     readable;
   * the config directory (default /opt/atlas/day1/config, overridable with ATLAS_CONFIG_DIR, or CONFIG_DIR for tests):
-    engines.json, router-rules.json, task-forces.json, personas/*.md, domains/cards/*.md.
+    engines.json, phase4-engines.json, router-rules.json, task-forces.json, personas/*.md, domains/cards/*.md.
 
 Loaders validate what the orchestrator depends on and ignore unknown keys (config/README.md: "Unknown keys must be
 ignored by the loader; these are informational").
@@ -53,7 +53,13 @@ ARBITER_CLASSES: frozenset[str] = frozenset({"core", "apex", "vision", "crossche
 # (The Arbiter's KV_CLASS_FACTOR still knows f16 for projections passed explicitly, e.g. the DeepSeek KV ladder.)
 KV_CLASSES: frozenset[str] = frozenset({"q8_0", "q4_0", "none"})
 LLM_MODES: frozenset[str] = frozenset({"chat", "vision"})
+# config/phase4-engines.json entries (Section 15.2) carry this mode and the Arbiter class `phase4` (§8): containers,
+# never llama-server units, so the Arbiter records their measured footprint (Phase 4 step 5) and refuses to load them.
+PHASE4_MODE = "phase4"
+PHASE4_TIERS: frozenset[str] = frozenset({"green", "yellow", "verify", "deferred"})
 HEMISPHERES: tuple[str, ...] = ("corporate", "estate")
+# A task force or a domain card may serve both halves (Section 8.3 TF_OMEGA, 8.2 domain 24); a persona never does.
+CARD_HEMISPHERES: tuple[str, ...] = (*HEMISPHERES, "both")
 TIERS: tuple[str, ...] = ("routine", "standard", "sensitive")
 FAMILY_NAMES_PLACEHOLDER = "FAMILY_NAMES_PLACEHOLDER"
 # Settings.extra carries these keys and nothing else (orchestrator.env keys per phase2/02-orchestrator.sh; no secrets:
@@ -168,7 +174,7 @@ class EngineSpec(BaseModel):
     key: str
     display_name: str = ""
     role: str = ""
-    mode: str = "chat"  # chat | vision | embedding | reranking
+    mode: str = "chat"  # chat | vision | embedding | reranking | phase4 (config/phase4-engines.json entries)
     arbiter_class: str
     kv_class: str = "none"
     exclusive: bool = False
@@ -233,9 +239,20 @@ class EngineSpec(BaseModel):
         return self.arbiter_class == "apex" or self.exclusive
 
     @property
+    def is_phase4(self) -> bool:
+        """A Phase 4 container engine (Section 15.2): registered with the Arbiter, never loaded by it."""
+        return self.arbiter_class == "phase4"
+
+    @property
     def footprint_bytes(self) -> int:
-        """Weights, in bytes, from the Section 4.1/5.1 GB figure (decimal GB as the document counts them)."""
-        return int(self.footprint_gb * 1_000_000_000)
+        """Weights, in bytes, reading the Section 4.1/5.1 `footprint_gb` figure as GiB (binary).
+
+        The budget side is binary throughout (sysfs mem_info_gtt_* bytes, amdgpu.gttsize in MiB, the 170 GiB budget),
+        and the document's figures are GGUF file sizes whose unit it does not state. Reading them as GiB is the upper
+        bound (7.4 % above decimal GB), which is the right side for the hard pre-flight of Section 4.3 (the OOM backstop
+        errs high); the measured footprint (Arbiter.register_measured / confirm_loaded) replaces it once known.
+        """
+        return int(self.footprint_gb * 1024**3)
 
     @property
     def systemd_unit(self) -> str:
@@ -342,6 +359,28 @@ class TaskForce(BaseModel):
     engine: str | None = None  # TF_OMEGA only: the Apex engine
     trigger: str | None = None  # TF_OMEGA only: "principal-only"
 
+    @field_validator("default_tier")
+    @classmethod
+    def _tier_known(cls, v: str) -> str:
+        # CONVENTIONS.md §8 tiers are lowercase keys; 8.3's "Sensitive" must be caught here, not at dispatch (rule §7.4).
+        if v not in TIERS:
+            raise ValueError(f"default_tier {v!r} is not one of {TIERS} (CONVENTIONS.md §8)")
+        return v
+
+    @field_validator("hemisphere")
+    @classmethod
+    def _hemisphere_known(cls, v: str) -> str:
+        if v and v not in CARD_HEMISPHERES:
+            raise ValueError(f"hemisphere {v!r} is not one of {CARD_HEMISPHERES} (CONVENTIONS.md §8)")
+        return v
+
+
+def owner_persona_key(owner: str) -> str:
+    """task-forces.json names owners and relays by persona name ("Gideon", "Arthur, tagged to 14"); the persona key is
+    the lowercased first word (CONVENTIONS.md §8 persona keys)."""
+    first = re.split(r"[\s,;]+", owner.strip(), maxsplit=1)[0] if owner.strip() else ""
+    return first.lower()
+
 
 def load_task_forces(cfg_dir: Path | None = None, max_cards: int = 3) -> dict[str, TaskForce]:
     cfg_dir = cfg_dir or config_dir()
@@ -388,6 +427,13 @@ class Persona(BaseModel):
     body: str = ""
     extra: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("speaks_externally_tier")
+    @classmethod
+    def _tier_known(cls, v: str) -> str:
+        if v not in TIERS:
+            raise ValueError(f"speaks_externally_tier {v!r} is not one of {TIERS} (CONVENTIONS.md §8)")
+        return v
+
 
 def load_personas(cfg_dir: Path | None = None, engines: dict[str, EngineSpec] | None = None) -> dict[str, Persona]:
     cfg_dir = cfg_dir or config_dir()
@@ -422,12 +468,14 @@ def load_personas(cfg_dir: Path | None = None, engines: dict[str, EngineSpec] | 
 # --- domains/cards/NN-slug.md -----------------------------------------------------------------------------------------
 
 # "# NN. Name  (Hemisphere, Owner, Tier X)" — CONVENTIONS.md §8 "Domain cards": the triple is comma-separated and the
-# owner drops 8.2's inner comma ("Eleanor with Silas", "Arthur — tagged to 14"). Cards that still carry the 8.2 inner
-# comma ("Alaric, with Silas") or a pipe-separated triple ("(Corporate | Valerie, with Silas | Tier A)") are accepted,
-# NORMALISED to the §8 owner spelling and reported with a warning naming the file, so the loader never silently
-# blesses a non-conforming card (raised with the cards writer: 07, 11, 26, 28, 32, 35). The name may carry its own
-# parenthetical ("(incl. ...)") and the triple may nest one ("phrasing softened (Section 18 C9)"), so the split point
-# is the LAST run of two or more spaces before an opening parenthesis, not a regex over parentheses.
+# owner drops 8.2's inner comma ("Eleanor with Silas", "Arthur — tagged to 14"). parse_card_heading() still READS a
+# card that carries the 8.2 inner comma ("Alaric, with Silas") or a pipe-separated triple ("(Corporate | Valerie, with
+# Silas | Tier A)"), normalising the owner to the §8 spelling, so a tool can report what the card should say; but
+# load_domain_cards() (and so load_config and the Phase 2 gate) REFUSES a tree with such a card, listing every file
+# with the H1 it expects (rule §7.4: a §8 name that disagrees across files is a config error, not a warning). Fix
+# round: the real tree had six of them (07, 11, 26, 28, 32, 35), raised with the cards writer. The name may carry its
+# own parenthetical ("(incl. ...)") and the triple may nest one ("phrasing softened (Section 18 C9)"), so the split
+# point is the LAST run of two or more spaces before an opening parenthesis, not a regex over parentheses.
 _CARD_H1 = re.compile(r"^#\s+(\d{2})\.\s+(.*\S)\s*$")
 _CARD_SEP = re.compile(r"\s{2,}\(")
 _OWNER_INNER_COMMA = re.compile(r"^([A-Z][a-z]+), (with |and |tagged )")
@@ -438,7 +486,7 @@ class DomainCard(BaseModel):
     number: int
     slug: str
     name: str
-    hemisphere: str
+    hemisphere: str  # the §8 key: corporate | estate | both (the H1 spells it capitalised)
     owner: str
     tier: str  # "A" | "B" | "C"
     text: str  # the whole card, injected verbatim (Section 8.4 rule 1)
@@ -450,8 +498,12 @@ class DomainCard(BaseModel):
         return self.tier == "C"
 
 
-def parse_card_heading(line: str, *, source: str = "") -> tuple[int, str, str, str, str]:
-    """(number, name, hemisphere, owner, tier) from a card H1; the owner is returned in the §8 spelling."""
+def parse_card_heading(line: str, *, source: str = "", strict: bool = False) -> tuple[int, str, str, str, str]:
+    """(number, name, hemisphere, owner, tier) from a card H1; the owner is returned in the §8 spelling.
+
+    A non-§8 triple (pipes, or an owner with 8.2's inner comma) is normalised and logged with the H1 the card should
+    carry; with strict=True it raises ConfigError with that message instead (what load_domain_cards does).
+    """
     m = _CARD_H1.match(line.strip())
     seps = list(_CARD_SEP.finditer(m.group(2))) if m else []
     if not m or not seps or not m.group(2).endswith(")"):
@@ -467,9 +519,12 @@ def parse_card_heading(line: str, *, source: str = "") -> tuple[int, str, str, s
     raw_owner = ", ".join(parts[1:-1])
     owner = _OWNER_INNER_COMMA.sub(r"\1 \2", raw_owner)
     if piped or owner != raw_owner:
-        log.warning("%s: H1 triple is not in the CONVENTIONS.md §8 form (%s); owner read as %r — the card should say "
-                    "'(%s, %s, %s)'", where, "pipe-separated" if piped else "owner carries 8.2's inner comma", owner,
-                    hemisphere, owner, tier)
+        why = "pipe-separated" if piped else "owner carries 8.2's inner comma"
+        msg = (f"{where}: H1 triple is not in the CONVENTIONS.md §8 form ({why}); owner read as {owner!r} — the card "
+               f"should say '({hemisphere}, {owner}, {tier})'")
+        if strict:
+            raise ConfigError(msg)
+        log.warning("%s", msg)
     tm = re.fullmatch(r"Tier\s+([ABC])", tier)
     if not tm:
         raise ConfigError(f"{where}: tier field {tier!r} is not 'Tier A|B|C'")
@@ -482,17 +537,74 @@ def load_domain_cards(cfg_dir: Path | None = None) -> dict[int, DomainCard]:
     if not cdir.is_dir():
         raise ConfigError(f"{cdir} does not exist")
     out: dict[int, DomainCard] = {}
+    non_conforming: list[str] = []
     for path in sorted(cdir.glob("*.md")):
         text = path.read_text(encoding="utf-8")
         first = next((ln for ln in text.splitlines() if ln.strip()), "")
-        number, name, hemisphere, owner, tier = parse_card_heading(first, source=str(path))
+        try:
+            number, name, hemisphere, owner, tier = parse_card_heading(first, source=str(path), strict=True)
+        except ConfigError as exc:
+            if "not in the CONVENTIONS.md §8 form" not in str(exc):
+                raise
+            non_conforming.append(str(exc))  # keep going: one message names every offending card
+            number, name, hemisphere, owner, tier = parse_card_heading(first, source=str(path))
         m = re.match(r"^(\d{2})-(.+)$", path.stem)
         if not m or int(m.group(1)) != number:
             raise ConfigError(f"{path}: file number does not match its H1 number {number}")
         if number in out:
             raise ConfigError(f"{path}: duplicate domain number {number}")
-        out[number] = DomainCard(number=number, slug=m.group(2), name=name, hemisphere=hemisphere, owner=owner,
+        key = hemisphere.strip().lower()
+        if key not in CARD_HEMISPHERES:
+            raise ConfigError(f"{path}: hemisphere {hemisphere!r} is not one of {CARD_HEMISPHERES} (CONVENTIONS.md §8)")
+        out[number] = DomainCard(number=number, slug=m.group(2), name=name, hemisphere=key, owner=owner,
                                  tier=tier, text=text, path=str(path))
+    if non_conforming:
+        raise ConfigError(f"{len(non_conforming)} domain card(s) do not carry the CONVENTIONS.md §8 H1 triple "
+                          "(Hemisphere, Owner, Tier X):\n  " + "\n  ".join(non_conforming))
+    return out
+
+
+# --- phase4-engines.json ----------------------------------------------------------------------------------------------
+
+
+def load_phase4_engines(cfg_dir: Path | None = None) -> dict[str, EngineSpec]:
+    """config/phase4-engines.json -> {key: EngineSpec} with arbiter_class `phase4` (CONVENTIONS.md §8, Section 15.2).
+
+    These are container engines (phase4/engines/<key>.sh), not llama-server units: no port, no KV cache, a nominal
+    ctx. The Arbiter knows them so Phase 4 step 5's POST /arbiter/register records their measured footprint under a
+    known key (4.2 rule 1) and so request_load() on one of them is refused with a reason instead of raising
+    UnknownEngine. `footprint_gb` is the planning figure footprint_gb_expected (0 for the deferred rows, which have
+    none); the measurement from the driver replaces it. Fields the loader does not name are ignored (config/README.md).
+    """
+    cfg_dir = cfg_dir or config_dir()
+    path = cfg_dir / "phase4-engines.json"
+    data = _read_json(path)
+    entries = data.get("engines") if isinstance(data, dict) else data
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError(f"{path}: no engines[] list")
+    out: dict[str, EngineSpec] = {}
+    for index, raw in enumerate(entries, start=1):
+        if not isinstance(raw, dict) or not raw.get("key"):
+            raise ConfigError(f"{path}: engine #{index} has no key")
+        tier = raw.get("tier")
+        if tier not in PHASE4_TIERS:
+            raise ConfigError(f"{path}: engine {raw['key']!r}: tier {tier!r} is not one of {sorted(PHASE4_TIERS)}")
+        expected = raw.get("footprint_gb_expected")
+        if expected is None and tier != "deferred":
+            raise ConfigError(f"{path}: engine {raw['key']!r}: footprint_gb_expected missing (tier {tier})")
+        try:
+            spec = EngineSpec.model_validate({
+                "key": raw["key"], "display_name": raw.get("name", ""), "role": raw.get("job", ""),
+                "mode": PHASE4_MODE, "arbiter_class": "phase4", "kv_class": "none",
+                "footprint_gb": float(expected or 0), "ctx_size": 0, "parallel": 1,
+                "licence": raw.get("licence_note") or "", "notes": raw.get("research_note") or "",
+                "index": index, "port": 0,
+            })
+        except (ValueError, TypeError) as exc:
+            raise ConfigError(f"{path}: engine {raw.get('key')!r}: {exc}") from exc
+        if spec.key in out:
+            raise ConfigError(f"{path}: duplicate engine key {spec.key!r}")
+        out[spec.key] = spec
     return out
 
 
@@ -502,17 +614,25 @@ def load_domain_cards(cfg_dir: Path | None = None) -> dict[int, DomainCard]:
 @dataclass
 class AtlasConfig:
     settings: Settings
-    engines: dict[str, EngineSpec]
+    engines: dict[str, EngineSpec]  # the llama-server engines (engines.json): units, ports, the sudoers fragment
     router_rules: RouterRules
     task_forces: dict[str, TaskForce]
     personas: dict[str, Persona]
     domain_cards: dict[int, DomainCard]
+    # Kept apart from `engines` on purpose: nothing may build a llama-server@<key> unit or a sudo line from a Phase 4
+    # key. The Arbiter merges both maps (arbiter.build_arbiter) so it knows every weight-bearing process (4.2 rule 1).
+    phase4_engines: dict[str, EngineSpec] = field(default_factory=dict)
 
     def engine(self, key: str) -> EngineSpec:
         try:
             return self.engines[key]
         except KeyError as exc:
             raise ConfigError(f"unknown engine key {key!r} (CONVENTIONS.md §8)") from exc
+
+    @property
+    def all_engines(self) -> dict[str, EngineSpec]:
+        """engines.json first, then the Phase 4 entries: what the Arbiter's ledger may hold."""
+        return {**self.engines, **self.phase4_engines}
 
 
 def load_config(settings: Settings | None = None) -> AtlasConfig:
@@ -531,14 +651,27 @@ def load_config(settings: Settings | None = None) -> AtlasConfig:
     task_forces = load_task_forces(cfg, rules.max_domain_cards)
     personas = load_personas(cfg, engines)
     cards = load_domain_cards(cfg)
+    phase4 = load_phase4_engines(cfg)
+    clash = sorted(set(phase4) & set(engines))
+    if clash:
+        raise ConfigError(f"phase4-engines.json reuses engines.json keys {clash} (CONVENTIONS.md §8 names must agree)")
     for tf in task_forces.values():
         for ref in tf.domain_cards:
             if ref.domain not in cards:
                 raise ConfigError(f"task-forces.json: {tf.code} names domain {ref.domain}, which has no card")
+            if cards[ref.domain].is_tier_c:
+                # Section 8.4 rule 4: Tier C loads only on an explicit match; a preset would load it on every dispatch.
+                raise ConfigError(f"task-forces.json: {tf.code} names Tier C domain {ref.domain}; 8.4 rule 4 forbids "
+                                  "speculative Tier C loads (config/README.md: domain_cards never names a Tier C card)")
+        for role, names in (("owners", tf.owners), ("relay", tf.relay)):
+            for owner in names:
+                if owner_persona_key(owner) not in personas:
+                    raise ConfigError(f"task-forces.json: {tf.code} {role} entry {owner!r} is not a persona "
+                                      f"({sorted(personas)}; CONVENTIONS.md §8 persona keys)")
         if tf.engine is not None and tf.engine not in engines:
             raise ConfigError(f"task-forces.json: {tf.code} names unknown engine {tf.engine!r}")
     return AtlasConfig(settings=settings, engines=engines, router_rules=rules, task_forces=task_forces,
-                       personas=personas, domain_cards=cards)
+                       personas=personas, domain_cards=cards, phase4_engines=phase4)
 
 
 def _read_json(path: Path) -> Any:

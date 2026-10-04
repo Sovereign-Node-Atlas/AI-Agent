@@ -1,31 +1,42 @@
 # /etc/squid/squid.conf — A.T.L.A.S. outbound allowlist proxy (Section 12.5; CONVENTIONS.md §7.1).
-# Rendered by phase1/04-system.sh from config/squid.conf.tmpl; Ubuntu's original is kept as squid.conf.dist.
-# Ubuntu's stock file has "http_access allow localhost" BEFORE its conf.d include, which would let every local
-# client through unfiltered (platform research item 6), so the whole file is replaced rather than extended.
+# Rendered by phase1/04-system.sh (_squid_render) from config/squid.conf.tmpl; Ubuntu's original is kept as
+# squid.conf.dist. Ubuntu's stock file has "http_access allow localhost" BEFORE its conf.d include, which would let
+# every local client through unfiltered (platform research item 6), so the whole file is replaced rather than extended.
 #
 # No SSL bump: the allow/deny decision is made on the CONNECT host:443 line, which carries the hostname in clear.
 #
-# Binding: CONVENTIONS §8 says "squid 3128 (loopback only)"; rule §7.1 makes every container go through this proxy,
-# and a container reaches the host only at its bridge gateway (172.17.0.1 on docker0, 172.x.0.1 on each compose
-# bridge, which Docker allocates when the project first starts, i.e. after this file is rendered in step 4). Squid
-# cannot bind an address that does not exist yet, so the port is opened on every address and the fence is layered:
-#   * ufw (phase1/04-system.sh): `deny in on <LAN_IFACE> to any port 3128` comes BEFORE the allows, so a LAN that
-#     itself sits in 172.16.0.0/12 is refused; then `allow in on docker0` and `allow in from 172.16.0.0/12`;
-#     the WireGuard bridge (10.42.42.0/24) is not admitted at all (VPN clients never use the node as a proxy);
-#   * the "clients" acl below admits loopback and ${SQUID_CLIENT_NETS} (the Docker bridge ranges) and denies the rest.
-# "Loopback only" therefore reads "loopback plus the Docker bridge gateways", which is what §7.1 requires.
+# Binding (CONVENTIONS §8 "squid 3128 (loopback only)"): 127.0.0.1 always. Containers must also use this proxy
+# (rule §7.1) and reach the host only at a bridge gateway address, so step 6 re-renders this file once dockerd has
+# created docker0 and adds exactly one more listener, ${SQUID_EXTRA_PORTS} = "http_port <docker0 gateway>:3128"
+# (172.17.0.1 unless Docker had to pick another range; read back from /etc/atlas/docker.env DOCKER_GW on every later
+# render). Containers on compose bridges reach that address too: it is a local address of the host, whatever
+# interface the packet arrives on. net.ipv4.ip_nonlocal_bind=1 (sysctl.d/90-atlas-squid.conf, step 6) lets squid bind
+# it at boot before docker0 exists. The LAN address and the WireGuard bridge gateway are never bound: VPN clients
+# must never use the node as an outbound proxy. Second fence: ufw admits 3128 only on docker0 and from
+# 172.16.0.0/12 (never on the LAN interface) and the "clients" acl below admits loopback and ${SQUID_CLIENT_NETS}.
+#
+# IP-literal destinations are refused outright and dstdomain runs with -n (fix round, blocker): without -n, squid
+# resolves the PTR of an IP-literal destination (CONNECT 203.0.113.5:443) and matches the returned NAME against the
+# list, so anyone owning an address whose PTR says "github.com" would walk through the allowlist. With -n there is
+# no reverse lookup at all, and the ip_literal acl denies every dotted-quad or IPv6 destination before the allow
+# line. Behaviour VERIFIED against a live squid during the fix round: CONNECT 1.1.1.1:443, GET http://1.1.1.1/ and
+# CONNECT [2606:4700:4700::1111]:443 are TCP_DENIED/403; an allowlisted name tunnels; `squid -k parse` is clean.
+# phase1/04-system.sh (_proxy_selftest) proves the same on the node at every step-4 run.
 
-http_port 3128
+http_port 127.0.0.1:3128
+${SQUID_EXTRA_PORTS}
 
 acl SSL_ports port 443
 acl Safe_ports port 80
 acl Safe_ports port 443
-acl allowed dstdomain "${SQUID_ALLOWLIST}"
+acl allowed dstdomain -n "${SQUID_ALLOWLIST}"
+acl ip_literal dstdom_regex -n ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ^\[ ^[0-9a-fA-F]*:[0-9a-fA-F:]*$
 acl clients src 127.0.0.1/32 ::1/128 ${SQUID_CLIENT_NETS}
 
 http_access deny !Safe_ports
 http_access deny CONNECT !SSL_ports
 http_access deny manager
+http_access deny ip_literal
 http_access allow clients allowed
 http_access deny all
 

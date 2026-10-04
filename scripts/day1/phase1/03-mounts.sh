@@ -12,13 +12,21 @@ step_03() {
   local mapping="${ATLAS_LUKS_MAPPING:-atlas-data}" mdev="/dev/mapper/${ATLAS_LUKS_MAPPING:-atlas-data}"
   local dev; dev="$(readlink -f "$DATA_DISK")"
 
-  # --- Make sure the volume is open (TPM first, keyfile as the explicit fallback) ------------------------------
+  # --- Make sure the volume is open (TPM first; the on-node recovery copy (D3) or a still-present keyfile as the
+  # explicit fallback; step 2 wipes the keyfile once the tokens are enrolled) --------------------------------------
   if ! cryptsetup status "$mapping" >/dev/null 2>&1; then
     local uuid; uuid="$(cryptsetup luksUUID "$dev")"
     if ! systemd-cryptsetup attach "$mapping" "/dev/disk/by-uuid/$uuid" none tpm2-device=auto 2>/dev/null; then
-      warn "TPM2 attach failed; opening $dev with the keyfile instead (V2 is re-checked after the reboot in step 5)"
-      cryptsetup open --key-file "${ATLAS_LUKS_KEYFILE:-$ATLAS_ETC/secrets/luks-data.key}" "$dev" "$mapping" \
-        || die "cannot open $dev with the TPM or the keyfile"
+      local kf="${ATLAS_LUKS_KEYFILE:-$ATLAS_ETC/secrets/luks-data.key}" rf="${ATLAS_LUKS_RECOVERY:-$ATLAS_ETC/secrets/luks-data.recovery}"
+      warn "TPM2 attach failed; opening $dev with the recovery copy / keyfile instead (V2 is re-checked after the reboot in step 5)"
+      if [[ -s "$rf" ]]; then
+        tr -d '[:space:]' <"$rf" | cryptsetup open --key-file=- "$dev" "$mapping" \
+          || die "cannot open $dev with the TPM or the on-node recovery copy $rf"
+      elif [[ -s "$kf" ]]; then
+        cryptsetup open --key-file "$kf" "$dev" "$mapping" || die "cannot open $dev with the TPM or the keyfile $kf"
+      else
+        die "cannot open $dev: the TPM refused and there is no on-node recovery copy (accepted unencrypted OS). Open it with the USB recovery key: cryptsetup open $dev $mapping, then re-run: sudo $ATLAS_ENTRY phase1"
+      fi
     fi
   fi
   [[ -b "$mdev" ]] || die "$mdev is not a block device"
@@ -39,7 +47,9 @@ step_03() {
 
   # --- fstab + mount (systemd.mount options VERIFIED: nofail, x-systemd.device-timeout) -------------------------
   local fs_uuid; fs_uuid="$(blkid -o value -s UUID "$mdev")"
-  local fstab_line="UUID=$fs_uuid $ATLAS_SRV ext4 defaults,noatime,nofail,x-systemd.device-timeout=30s 0 2"
+  # nosuid,nodev (fix round): untrusted output lands here (workspace, sandbox, staging/inbox, model pulls), so a dropped
+  # setuid binary or device node must be inert; not noexec, engines and venvs under engines/ must run. Same pair /tmp has.
+  local fstab_line="UUID=$fs_uuid $ATLAS_SRV ext4 defaults,noatime,nosuid,nodev,nofail,x-systemd.device-timeout=30s 0 2"
   if grep -qE "^[^#]*[[:space:]]${ATLAS_SRV}[[:space:]]" /etc/fstab; then
     sed -i -E "s|^[^#]*[[:space:]]${ATLAS_SRV}[[:space:]].*\$|$fstab_line|" /etc/fstab
   else
@@ -49,9 +59,13 @@ step_03() {
   systemctl daemon-reload
   if ! findmnt -n "$ATLAS_SRV" >/dev/null; then
     mount "$ATLAS_SRV" || die "mount $ATLAS_SRV failed (fstab line: $fstab_line)"
+  else
+    mount -o remount "$ATLAS_SRV" || die "mount -o remount $ATLAS_SRV failed (fstab line: $fstab_line)"   # picks up nosuid,nodev on a re-run
   fi
   [[ "$(findmnt -n -o SOURCE "$ATLAS_SRV")" == "$mdev" ]] || die "$ATLAS_SRV is mounted from $(findmnt -n -o SOURCE "$ATLAS_SRV"), not $mdev"
-  log "mounted $ATLAS_SRV from $mdev ($(findmnt -n -o SIZE,AVAIL "$ATLAS_SRV"))"
+  local mopts; mopts="$(findmnt -n -o OPTIONS "$ATLAS_SRV")"
+  [[ "$mopts" == *nosuid* && "$mopts" == *nodev* ]] || die "$ATLAS_SRV is mounted without nosuid,nodev ($mopts)"
+  log "mounted $ATLAS_SRV from $mdev ($(findmnt -n -o SIZE,AVAIL "$ATLAS_SRV"); $mopts)"
 
   # --- Service accounts (CONVENTIONS.md §2): atlas (render, video; docker is added in step 6), atlas-ddns ---------
   # The account's home is /var/lib/atlas/home, NOT /var/lib/atlas: the parent of $ATLAS_STATE (/var/lib/atlas/day1:
@@ -77,7 +91,8 @@ step_03() {
   id -u "$PRINCIPAL_USER" >/dev/null 2>&1 || die "PRINCIPAL_USER=$PRINCIPAL_USER does not exist"
   # load_env installed atlas.env as root:root because the atlas group did not exist yet (§2 says root:atlas 640).
   chown root:atlas "$ATLAS_ETC/atlas.env"; chmod 640 "$ATLAS_ETC/atlas.env"
-  ensure_dir "$ATLAS_ETC/secrets" root:root 700
+  # root:atlas 710 (traverse-only for atlas; phase1/07-remote.sh header, phase2/06c): atlas-owned files live inside.
+  ensure_dir "$ATLAS_ETC/secrets" root:atlas 710
   ensure_dir "$ATLAS_ETC/secrets/google" atlas:atlas 700
 
   # --- Directory tree (Section 3.5, Appendix C, CONVENTIONS.md §2) ---------------------------------------------

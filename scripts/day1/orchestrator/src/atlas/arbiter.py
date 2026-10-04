@@ -14,7 +14,9 @@ Rule map (the numbers are Section 4.2's):
   5  Release confirmation: after a stop the GTT counter is polled until it drops within `release_tolerance_bytes`
      of the expected value; `ReleaseTimeout` is raised loudly after `release_timeout_s`.
   6  Never preempt mid-generation: an eviction whose victim is generating makes the request "queued".
-  7  Apex exclusivity: loading deepseek-v4-flash unloads everything else first; nothing else loads while it is resident.
+  7  Apex exclusivity: loading deepseek-v4-flash unloads everything else first, and nothing co-resides with it: a later
+     request for another engine evicts the Apex engine when it is idle (rule 5 path) or queues while it generates
+     (rule 6). Residency is exclusive; it is not permanent (Section 6.3: gpt-oss-120b carries most of the day).
   8  `plan_deep_think(tier)` pre-requests the full footprint and downgrades deep -> standard -> quick when it does
      not fit.
   9  Every decision is logged (structured line) and written to ledger.arbiter_decisions with the task id.
@@ -22,6 +24,19 @@ Rule map (the numbers are Section 4.2's):
 Budget (Section 4.1): budget = GTT total - resident set, where the resident set is what the counter shows before any
 engine is loaded (Ubuntu, XFCE, Docker, Open WebUI, the three resident small models, Kokoro/Whisper/PyAnnote, ...),
 measured at startup by `measure_resident_set()` (V3 makes this ~170 GB).
+
+Phase 4 engines (Section 15.2, CONVENTIONS.md §8 class `phase4`). build_arbiter() merges config/phase4-engines.json into
+the Arbiter's engine map so Phase 4 step 5 (POST /arbiter/register) records each container engine's measured footprint
+under a known key (rule 1); they run in their own containers, so request_load() on one is REFUSED with that reason.
+A registration for a key in neither file is accepted as a `phase4` spec built from the request (the driver measured
+something real) and logged as such; a key that is not a bare unit-style name is still UnknownEngine.
+
+Failure paths (fix round). A controller start that raises — EngineControlError from systemctl, or the parent
+EngineError from the post-start /health check — releases the reservation and clears `_busy`; a catch-all does the same
+for anything else, so a placeholder can never wedge the Arbiter. A controller stop that raises leaves the victim
+resident and SERVING again (unloading cleared, an error row in the ledger, the exception re-raised): the unit may well
+still be active, and the next request_unload/request_load can retry once the cause (the sudoers fragment, a hung unit)
+is fixed.
 
 What the projection follows (fix round). `systemctl start llama-server@<key>` runs the flags of
 $ATLAS_ENGINES_ENV_DIR/<key>.env (ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_KV_TYPE, ATLAS_CORESIDENT), rendered by
@@ -56,8 +71,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from atlas.config import EngineSpec, parse_env_file
-from atlas.engines import EngineControlError, EngineController
+from atlas.config import PHASE4_MODE, EngineSpec, parse_env_file
+from atlas.engines import UNIT_KEY_RE, EngineController, EngineError
 from atlas.ledger import Ledger
 
 log = logging.getLogger("atlas.arbiter")
@@ -186,6 +201,7 @@ class Footprint:
     parallel: int
     kv_class: str
     measured: bool = False
+    coresident: bool = False  # the profile this footprint was projected for (engines.json coresident, or the unit's)
 
     @property
     def total_bytes(self) -> int:
@@ -408,13 +424,20 @@ class Arbiter:
         except KeyError as exc:
             raise UnknownEngine(f"unknown engine {key!r} (CONVENTIONS.md §8 keys)") from exc
 
-    def _footprint(self, spec: EngineSpec, ctx: int, parallel: int, kv_class: str) -> Footprint:
+    def _footprint(self, spec: EngineSpec, ctx: int, parallel: int, kv_class: str, *,
+                   coresident: bool = False) -> Footprint:
         if spec.is_resident:
             return Footprint(0, 0, ctx, parallel, kv_class)
+        if spec.is_phase4:
+            # Containers (Section 15.2): weights only, the measurement when the driver registered one.
+            if spec.key in self.measured:
+                return Footprint(self.measured[spec.key], 0, 0, 1, "none", measured=True)
+            return Footprint(spec.footprint_bytes, 0, 0, 1, "none")
         if spec.key in self.measured and (ctx, parallel, kv_class) == (spec.ctx_size, spec.parallel, spec.kv_class):
-            return Footprint(self.measured[spec.key], 0, ctx, parallel, kv_class, measured=True)
+            return Footprint(self.measured[spec.key], 0, ctx, parallel, kv_class, measured=True,
+                             coresident=coresident)
         return Footprint(spec.footprint_bytes, kv_estimate_bytes(spec, ctx, parallel, kv_class), ctx, parallel,
-                         kv_class)
+                         kv_class, coresident=coresident)
 
     def projected_footprint(self, key: str, ctx: int | None = None, parallel: int | None = None,
                             kv_class: str | None = None, *, coresident: bool = False) -> Footprint:
@@ -425,12 +448,12 @@ class Arbiter:
             ctx = spec.ctx_size_coresident if coresident and spec.ctx_size_coresident else spec.ctx_size
         if parallel is None:
             parallel = spec.parallel_coresident if coresident and spec.parallel_coresident else spec.parallel
-        return self._footprint(spec, ctx, parallel, kv_class or spec.kv_class)
+        return self._footprint(spec, ctx, parallel, kv_class or spec.kv_class, coresident=coresident)
 
     def unit_profile(self, key: str) -> UnitProfile | None:
         """<engines_env_dir>/<key>.env as phase2/engine-env.py rendered it, or None (no dir, or not rendered yet)."""
         spec = self.spec(key)
-        if self.engines_env_dir is None or spec.is_resident:
+        if self.engines_env_dir is None or spec.is_resident or spec.is_phase4:
             return None
         profile = read_unit_profile(Path(self.engines_env_dir) / f"{key}.env")
         if profile is None and key not in self._warned_no_env:
@@ -444,19 +467,36 @@ class Arbiter:
         profile = self.unit_profile(key)
         if profile is None:
             return None
-        return self._footprint(self.spec(key), profile.ctx, profile.parallel, profile.kv_type), profile
+        return (self._footprint(self.spec(key), profile.ctx, profile.parallel, profile.kv_type,
+                                coresident=profile.coresident), profile)
 
     def register_measured(self, key: str, total_bytes: int, *, task_id: str | None = None) -> None:
-        """Phase 3 step 2 / Phase 4 step 5: replace the estimate with the measured footprint (rule 1)."""
+        """Phase 3 step 2 / Phase 4 step 5: replace the estimate with the measured footprint (rule 1).
+
+        A key in neither engines.json nor phase4-engines.json is accepted as a Phase 4 container engine (class
+        `phase4`, footprint = the measurement) when it is a bare unit-style name: the driver measured a real process
+        and the ledger must reflect it (4.2 rule 1), so the answer is a logged WARNING, not a 404. Anything else is
+        UnknownEngine.
+        """
+        if int(total_bytes) < 0:
+            raise ArbiterError(f"cannot register {key!r}: total_bytes {total_bytes} is negative")
         with self._cv:
             if key not in self.engines:
-                raise UnknownEngine(f"cannot register {key!r}: not in engines.json")
+                if not UNIT_KEY_RE.fullmatch(key):
+                    raise UnknownEngine(f"cannot register {key!r}: not an engine key ([A-Za-z0-9._-]+; CONVENTIONS.md §8)")
+                self.engines[key] = EngineSpec(key=key, mode=PHASE4_MODE, arbiter_class="phase4", kv_class="none",
+                                               footprint_gb=int(total_bytes) / GIB, ctx_size=0, parallel=1,
+                                               notes="created from a POST /arbiter/register; not in "
+                                                     "config/phase4-engines.json")
+                log.warning("arbiter engine=%s registered as class phase4 from the request: it is in neither "
+                            "engines.json nor phase4-engines.json (add it there so the key is documented)", key)
             self.measured[key] = int(total_bytes)
             res = self.resident.get(key)
             if res is not None:
                 res.measured_bytes = int(total_bytes)
             self._log("measure", key, Decision.GRANTED, task_id, int(total_bytes),
-                      reason=f"measured footprint {total_bytes / GIB:.2f} GiB recorded")
+                      reason=f"measured footprint {total_bytes / GIB:.2f} GiB recorded "
+                             f"(class {self.engines[key].arbiter_class})")
 
     def confirm_loaded(self, key: str, *, task_id: str | None = None) -> int:
         """After a real load: measure the counter delta and record it as the engine's footprint."""
@@ -506,6 +546,14 @@ class Arbiter:
                    coresident: bool | None, kv_class: str | None) -> LoadDecision | _LoadPlan:
         """Under the lock: decide, and when the answer is a load, reserve it (placeholder + victims + _busy)."""
         spec = self.spec(key)
+        if spec.is_phase4:
+            # Section 15.2: a container engine run by phase4/engines/<key>.sh, not a llama-server unit; the Arbiter
+            # holds its measured footprint (step 5) and nothing else. Loading it here would build a unit that does not
+            # exist, so the answer is a reason, never a systemctl call.
+            return self._decide(Decision.REFUSED, key, task_id, self._footprint(spec, 0, 1, "none").total_bytes,
+                                "Phase 4 container engine (class phase4): run by its own container (Section 15.2), "
+                                "registered with the Arbiter for its footprint only; not loadable as a llama-server "
+                                "unit")
         if spec.is_resident:
             # Resident small models are started by systemd at boot and never counted (Section 4.1, 5.3).
             if self._busy:
@@ -525,13 +573,15 @@ class Arbiter:
                                     f"unload of {key} in progress; retry when it has released")
             fp0 = res.footprint
             mismatch = [f"{name} {want!r} != resident {have!r}" for name, want, have in (
-                ("ctx", ctx, fp0.ctx), ("parallel", parallel, fp0.parallel), ("kv_class", kv_class, fp0.kv_class),
+                ("coresident", coresident, fp0.coresident), ("ctx", ctx, fp0.ctx), ("parallel", parallel, fp0.parallel),
+                ("kv_class", kv_class, fp0.kv_class),
             ) if want is not None and want != have]
             if mismatch:
                 # A swap is free only at the profile that is running; a different one needs an unload first.
                 return self._decide(Decision.REFUSED, key, task_id, fp0.total_bytes,
-                                    f"resident at ctx {fp0.ctx} x {fp0.parallel} slots, kv {fp0.kv_class}; requested "
-                                    f"{', '.join(mismatch)}: request_unload() first")
+                                    f"resident at ctx {fp0.ctx} x {fp0.parallel} slots, kv {fp0.kv_class}, "
+                                    f"coresident {fp0.coresident}; requested {', '.join(mismatch)}: request_unload() "
+                                    "first")
             res.last_used = self._clock()
             return self._decide(Decision.GRANTED, key, task_id, res.footprint.total_bytes,
                                 "already resident (swap is free)")
@@ -560,11 +610,8 @@ class Arbiter:
             return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
                                 f"projected {fp.total_gib:.1f} GiB exceeds the engine budget {budget / GIB:.1f} GiB "
                                 "(Section 4.2 rule 2)" + (f"; unit runs {profile.describe()}" if profile else ""))
-        apex_resident = [k for k, r in self.resident.items() if r.spec.is_apex]
-        if apex_resident and not spec.is_apex:
-            return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
-                                f"Apex engine {apex_resident[0]} is resident and exclusive (Section 4.2 rule 7)")
-        # 2. Evictions, planned against that footprint (rule 3, LRU; rule 6 says queued when a victim generates).
+        # 2. Evictions, planned against that footprint (rule 3, LRU; rule 7 puts a resident Apex engine first; rule 6
+        #    says queued when a victim generates).
         victims = self._plan_evictions(spec, fp)
         if victims is None:
             return self._decide(Decision.QUEUED, key, task_id, fp.total_bytes,
@@ -602,21 +649,38 @@ class Arbiter:
             return self._decide(Decision.GRANTED, key, task_id, 0, "resident small model; not budgeted (Section 4.1)")
         try:
             for victim in plan.victims:
-                self._stop_and_confirm(victim, task_id, reason=f"evicted for {key}")
+                why = f"evicted for {key}"
+                if self.engines[victim].is_apex:
+                    why += " (Section 4.2 rule 7: the Apex engine is exclusive while resident, so it leaves when idle)"
+                self._stop_and_confirm(victim, task_id, reason=why)
             used_before = self.probe.gtt_used_bytes()
             self.controller.start(key)
         except ReleaseTimeout:
             with self._cv:
                 self.resident.pop(key, None)  # nothing was started; the reservation is void
+                self._release_victims(plan.victims)
                 self._busy = None
                 self._cv.notify_all()
             raise
-        except EngineControlError as exc:
+        except EngineError as exc:
+            # EngineControlError (systemctl failed) or the parent EngineError (the post-start /health check in
+            # SystemdEngineController.start): either way nothing is serving and the reservation must go (fix round).
             with self._cv:
                 self.resident.pop(key, None)
+                self._release_victims(plan.victims)
                 self._busy = None
                 self._cv.notify_all()
                 self._decide(Decision.ERROR, key, task_id, plan.footprint.total_bytes, f"start failed: {exc}")
+            raise
+        except BaseException as exc:
+            # Anything else (a bug, KeyboardInterrupt in a test): the placeholder must never wedge the Arbiter.
+            with self._cv:
+                self.resident.pop(key, None)
+                self._release_victims(plan.victims)
+                self._busy = None
+                self._cv.notify_all()
+                self._decide(Decision.ERROR, key, task_id, plan.footprint.total_bytes,
+                             f"load aborted: {type(exc).__name__}: {exc}")
             raise
         # What the counter actually grew by is what rule 5 must see come back after the stop.
         observed = max(0, self.probe.gtt_used_bytes() - used_before)
@@ -643,11 +707,15 @@ class Arbiter:
         if spec.is_apex:
             victims = list(self.resident)  # rule 7: everything else leaves first
         else:
-            victims = []
-            free = self.free_bytes
-            count = len(self.resident)
-            # LRU first (Section 6.3 groups work by engine; the least recently used is the cheapest to lose).
+            # Rule 7, second half: nothing co-resides with the Apex engine, so a resident one is the first victim of
+            # any other load (idle -> evicted here through rule 5; generating -> None below, rule 6).
+            victims = [k for k, r in self.resident.items() if r.spec.is_apex]
+            free = self.free_bytes + sum(self.resident[k].charged_bytes for k in victims)
+            count = len(self.resident) - len(victims)
+            # LRU next (Section 6.3 groups work by engine; the least recently used is the cheapest to lose).
             for k, _r in sorted(self.resident.items(), key=lambda kv: kv[1].last_used):
+                if k in victims:
+                    continue
                 if count < MAX_RESIDENT and free >= fp.total_bytes:
                     break
                 victims.append(k)
@@ -656,6 +724,14 @@ class Arbiter:
         if any(self._is_generating(v) for v in victims):
             return None
         return victims
+
+    def _release_victims(self, victims: Sequence[str]) -> None:
+        """Under the lock: victims still resident after a failed load are serving again (their stop never happened,
+        or _stop_and_confirm already said why it failed)."""
+        for v in victims:
+            res = self.resident.get(v)
+            if res is not None and res.unloading:
+                res.unloading = False
 
     def _is_generating(self, key: str) -> bool:
         return self._gen_holder is not None and self._gen_engine == key
@@ -693,7 +769,19 @@ class Arbiter:
         with self._cv:
             res = self.resident[key]
         before = self.probe.gtt_used_bytes()
-        self.controller.stop(key)
+        try:
+            self.controller.stop(key)
+        except EngineError as exc:
+            # The stop did not happen (sudoers fragment missing, systemctl timed out, ...): the engine is still
+            # resident and, as far as the Arbiter can tell, still serving. Say so, give it back, and let the caller
+            # retry once the cause is fixed — never leave it flagged `unloading` for the life of the process.
+            with self._cv:
+                res.unloading = False
+                self._decide(Decision.ERROR, key, task_id, res.charged_bytes,
+                             f"stop failed; {key} stays resident and serving (check `systemctl is-active "
+                             f"llama-server@{key}`): {exc}", action="unload")
+                self._cv.notify_all()
+            raise
         # Rule 5: trust the counter, not the process exit. The engine's share is the delta observed at its load (or the
         # measurement when one replaced it); the counter must fall back by that much, within the tolerance.
         share = res.measured_bytes if res.measured_bytes is not None else res.observed_bytes
@@ -850,6 +938,11 @@ class Arbiter:
                      "loading": r.loading, "unloading": r.unloading}
                     for r in self.resident.values()
                 ],
+                "measured": [
+                    {"engine": k, "class": self.engines[k].arbiter_class if k in self.engines else None,
+                     "measured_bytes": n}
+                    for k, n in self.measured.items()
+                ],
                 "busy": self._busy,
                 "generating": None if gen is None else {"engine": gen[0], "task_id": gen[1]},
                 "generation_queue": list(self._gen_queue),
@@ -884,16 +977,28 @@ class Arbiter:
 
 
 def build_arbiter(engines: dict[str, EngineSpec], *, ledger: Ledger | None = None,
-                  engines_env_dir: Path | None = None, **kw: Any) -> Arbiter:
+                  engines_env_dir: Path | None = None, phase4_engines: dict[str, EngineSpec] | None = None,
+                  **kw: Any) -> Arbiter:
     """The production wiring: sysfs probe, the systemd controller (CONVENTIONS.md §8) and the unit env files
-    (Settings.engines_env_dir = ATLAS_ENGINES_ENV_DIR, phase2/02-orchestrator.sh) the projection follows."""
-    from atlas.config import Settings
+    (Settings.engines_env_dir = ATLAS_ENGINES_ENV_DIR, phase2/02-orchestrator.sh) the projection follows.
+
+    `engines` is engines.json (the llama-server units; it is all the controller may ever start or stop). The Phase 4
+    engines (config/phase4-engines.json in Settings.config_dir unless given) are merged into the Arbiter's map ONLY,
+    so Phase 4 step 5 registers under known keys (rule 1) and no sudo line is ever built from a container key.
+    """
+    from atlas.config import ConfigError, Settings, load_phase4_engines
     from atlas.engines import SystemdEngineController
 
+    settings = Settings.from_env()
     if engines_env_dir is None:
-        engines_env_dir = Settings.from_env().engines_env_dir
-    return Arbiter(engines, SystemdEngineController(engines=engines), SysfsMemoryProbe(), ledger=ledger,
-                   engines_env_dir=engines_env_dir, **kw)
+        engines_env_dir = settings.engines_env_dir
+    if phase4_engines is None:
+        phase4_engines = load_phase4_engines(settings.config_dir)  # ConfigError when absent: the tree is incomplete
+    clash = sorted(set(phase4_engines) & set(engines))
+    if clash:
+        raise ConfigError(f"phase4-engines.json reuses engines.json keys {clash} (CONVENTIONS.md §8 names must agree)")
+    return Arbiter({**engines, **phase4_engines}, SystemdEngineController(engines=engines), SysfsMemoryProbe(),
+                   ledger=ledger, engines_env_dir=engines_env_dir, **kw)
 
 
 __all__ = [

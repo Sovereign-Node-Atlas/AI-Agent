@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# phase1/08-gate.sh — Phase 1 step 8 (Section 17, CONVENTIONS.md §6): the gate table. Required V2, V3a, V5, V19
-# (deferred never blocks); V1 recorded only. Writes $ATLAS_STATE/done/phase1.gate on PASS so Phase 2 may start.
+# phase1/08-gate.sh — Phase 1 step 8 (Section 17, CONVENTIONS.md §6): the gate table. Required V2, V3a, V5, V19; V1
+# recorded only. Nothing in Phase 1 is deferrable: a V5/V19 wait that timed out is recorded as fail (red row) and the
+# Principal re-runs `--force 07` / `--force 05b`. Writes $ATLAS_STATE/done/phase1.gate on PASS so Phase 2 may start.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
