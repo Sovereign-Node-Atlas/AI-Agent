@@ -83,6 +83,22 @@ rocm.nightlies.amd.com
 # --- Hugging Face hub and its LFS/CDN hosts (model pulls, Phases 2-4) ------------------------------------------------
 huggingface.co
 .hf.co
+# TWO HOSTS BELOW ARE ADDITIONS TO THE SECTION 12.5 ENUMERATION, PENDING THE PRINCIPAL (fix round 6). 12.5 names one
+# model-pull vendor (Hugging Face) and "package mirrors during builds"; neither host is literally either, and Section
+# 16.3 item 6 / rule §7.1 make the allowlist the Principal's to approve. A Section 23 row recording both (precedent: S13
+# recorded packages.mozilla.org) is REQUESTED of the document's editor; the hosts stay because removing them degrades
+# two deliverables honestly but materially (phase4/engines/trellis.sh checks this file first and defers TRELLIS without
+# the Meta CDN; phase2/04-memory.sh defers LightRAG indexing without a tiktoken table), and the scripts that use them
+# fail loudly, never silently, if the Principal strikes them instead.
+# Meta's public weight CDN: Phase 4 engines sam2 (the .pt weight fallback, phase4/engines/sam2.sh) and trellis (the
+# DINOv2 image conditioner torch.hub.load('facebookresearch/dinov2') fetches from this host and nowhere else,
+# phase4/engines/trellis.sh; the script checks this file before any request). A model pull from a second vendor's CDN.
+dl.fbaipublicfiles.com
+# tiktoken's cl100k_base BPE table for LightRAG (Phase 2 step 4, phase2/04-memory.sh): ONE public 1.7 MB file, fetched
+# once when neither the vendored copy (config/tiktoken/, not committable from the review sandbox: HTTP 403) nor the
+# inbox copy is present, sha256-pinned in the step. The fix-round-3 position (offline delivery only) is what the
+# Principal returns to by striking this line: the step then defers and prints the inbox remedy.
+openaipublic.blob.core.windows.net
 
 # --- Build-time tool downloads named by the services research (Phase 2 step 6) ---------------------------------------
 # dl.google.com is a generic Google download host (Chrome, Earth and Drive installers and their update pings live
@@ -99,9 +115,13 @@ download.blender.org
 # this host for extension updates, so the Phase 2 writer starts Blender with --offline-mode (contract note; the
 # allowlist cannot be gated per step, it is one file rendered once).
 extensions.blender.org
-# UNVERIFIED: Playwright browser CDN host names (services research 4.7)
+# Playwright's browser download (Phase 2 step 6, phase2/06-tools.sh `playwright install chromium`; Section 12.5
+# "package mirrors during builds" clause). VERIFIED 2026-10-04 in playwright v1.63.0
+# packages/playwright-core/src/server/registry/index.ts (PLAYWRIGHT_CDN_MIRRORS): cdn.playwright.dev first,
+# playwright.download.prss.microsoft.com as the mirror. playwright.azureedge.net (the earlier UNVERIFIED entry) is
+# retired at that version and was replaced here so an outage of the first host never falls through to a denied mirror.
 cdn.playwright.dev
-playwright.azureedge.net
+playwright.download.prss.microsoft.com
 
 # --- Cloudflare (dynamic DNS, R7): the API, and www.cloudflare.com/cdn-cgi/trace for the node's public IP. No
 # third-party echo services (api.ipify.org, icanhazip.com): nothing outside the Section 12.5 enumeration learns the

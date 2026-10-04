@@ -31,7 +31,9 @@ scripts/day1/
   phase4-engines.sh            Phase 4 driver (detached); phase4/engines/<name>.sh builds and tests one engine
   verify/vNN-<name>.sh         standalone checks for Section 21; see §5
   systemd/                     unit files installed verbatim to /etc/systemd/system (templated by render_template)
-  docker/core/compose.yml      redis, chromadb, open-webui, ntfy, kokoro, speaches (whisper), docling-serve
+  docker/core/compose.yml      redis, chromadb, open-webui (Phase 2 steps 2-4)
+  docker/core/compose.voice.yml kokoro, speaches (whisper), docling (Phase 2 steps 4-5)
+  docker/ntfy/compose.yml      ntfy (Phase 1 step 7)
   docker/wg-easy/compose.yml   WG-Easy (Phase 1 step 7)
   docker/rocm-base/Dockerfile  the one ROCm/PyTorch base image for gfx1151 (Phase 4)
   docker/buildfarm/Dockerfile  Android + MinGW cross-build container (Phase 2 step 6)
@@ -58,7 +60,7 @@ scripts/day1/
 | `/opt/atlas/llama.cpp/` | llama.cpp source and build; binaries symlinked into `/usr/local/bin` | root |
 | `/opt/atlas/orchestrator/` + `/opt/atlas/venv/` | the `atlas` package and its venv | atlas |
 | `/srv/atlas/{models,engines,data,workspace,sandbox,vault,staging}` | 8 TB data volume (Section 3.5). `vault/cipher` is the gocryptfs container (backed up as ciphertext), `vault/open` the plaintext view (never backed up); `staging/vault-test-cipher` (atlas:atlas 700) is the gate's throw-away test vault, excluded with all of staging | atlas:atlas |
-| `/srv/atlas/staging/inbox/` | where the Principal drops files: `voice-references/alaric.wav`, `voice-references/gideon.wav`, `google-oauth-client.json` | principal:atlas 2770 |
+| `/srv/atlas/staging/inbox/` | where the Principal drops files: `voice-references/alaric.*`, `voice-references/gideon.*` (WAV, MP3 or M4A; Phase 2 step 5 normalises them to 16 kHz mono WAV under `staging/voice-references-normalised/`) and `google-oauth-client.json` | principal:atlas 2770 |
 | `/srv/cold`, `/srv/backups` | 4 TB OS drive (Section 3.5) | atlas / root |
 
 Service accounts: `atlas` (system user; groups `render`, `video`, `docker`), `atlas-ddns` (system user, nothing
@@ -74,7 +76,12 @@ auto-detected as the largest unmounted NVMe), `CLOUDFLARE_TXT` (default `/home/$
 `WINDOWS_SHARE` (`//host/share`), `NTFY_TOPIC=atlas`, `OPENWEBUI_PORT=3000`, `ORCH_PORT=8800`,
 `LLAMA_PORT_BASE=8100` (engine N listens on 8100+N), `HF_ENDPOINT` (unset), `DOWNLOAD_MBPS=100`.
 `ATLAS_ACCEPT_PCR7_NO_SB` (blank; `1` records the Principal's acknowledgement that, with Secure Boot disabled per D2, the PCR 7
-binding of the TPM2 enrolment does not tie the unlock to this OS image; pre-flight stops until it is set or Secure Boot is on).
+binding of the TPM2 enrolment does not tie the unlock to this OS image; pre-flight stops until it is set or Secure Boot is on),
+`BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE` (blank; `yes` records that the Principal read and accepts the Android SDK terms, Section
+16.3 item 2; Phase 2 step 6 refuses to build the cross-build container otherwise).
+The CONFIRM keys (`GOOGLE_ACCOUNTS`, `WINDOWS_SHARE`, `FAMILY_NAMES`, `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE`, and
+`ATLAS_ACCEPT_PCR7_NO_SB` while Secure Boot is off) are reported by `load_env` in one message, every blank one (and a
+`BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE` that is not `yes`) with an example value.
 
 Secrets never go in this file.
 
@@ -95,9 +102,9 @@ Step files never define `main`; each defines `step_<id>()` and the driver calls 
 |---|---|
 | `log MSG` / `warn MSG` / `die MSG` | timestamped to stdout and to the phase log; `die` exits 1 |
 | `require_root` | exits unless EUID 0 |
-| `load_env` | installs `config/atlas.env.example` to `/etc/atlas/atlas.env` if missing (auto-detecting what it can), then sources it; dies if a required key is empty |
+| `load_env` | installs `config/atlas.env.example` to `/etc/atlas/atlas.env` if missing (auto-detecting what it can), then sources it; dies naming EVERY blank CONFIRM key in one message, with an example value each and the file to edit (§3) |
 | `run_step PHASE STEP FUNC` | idempotency: if `/var/lib/atlas/day1/done/PHASE.STEP` exists, logs "skip" and returns 0; else runs `FUNC`, and on success creates the marker. STEP is the two-digit-plus-letter id from Section 17 (`01`, `05b`, `06c`) |
-| `record_v ID RESULT MSG` | appends `{"ts","phase","id","result","msg"}` to `verify.jsonl`. RESULT ∈ `pass fail deferred info`. IDs are `V1`..`V23`, with halves `V3a`/`V3b` and `V14a`/`V14b`, plus `V10a` (the Phase 2 resident-router half of V10; V10 itself is written only by the Phase 3 load test) |
+| `record_v ID RESULT MSG` | appends `{"ts","phase","id","result","msg"}` to `verify.jsonl`. RESULT ∈ `pass fail deferred info`. IDs are `V1`..`V23`, with halves `V3a`/`V3b` and `V14a`/`V14b`, plus `V10a` (the Phase 2 resident-router half of V10; V10 itself is written only by the Phase 3 load test). Two recorded-only id families are also accepted and never gate: `T-<tool>` (Phase 2 step 6 soft installs, result deferred) and `P4-wheels` (the Phase 4 wheel-index pre-flight, result info) |
 | `run_verify ID SCRIPT [ARGS]` | runs `verify/SCRIPT`, maps exit 0/1/2/3 → pass/fail/deferred/info, records its one-line stdout as MSG |
 | `gate PHASE REQUIRED_IDS... [-- OPTIONAL_IDS...]` | prints the phase table (latest result per id) and returns 1 if any REQUIRED id is `fail` or missing; `deferred` never blocks; OPTIONAL ids are printed only |
 | `apt_install PKG...` | non-interactive, idempotent, retries 3× |
@@ -111,8 +118,10 @@ Step files never define `main`; each defines `step_<id>()` and the driver calls 
 | `svc_user_run CMD...` | run as `atlas` |
 | `detached_phase NAME SCRIPT` | starts `SCRIPT --run` as a transient systemd unit `atlas-day1-NAME` (journal-logged, survives SSH loss) and prints how to follow it |
 
-Every phase script accepts `--dry-run` (print steps, run nothing), `--force STEP` (clear one marker), and
-`--status`. Phase 3 and 4 also accept `--run` (the in-unit entry).
+Every phase script accepts `--dry-run` (print steps, run nothing), `--force STEP` (clear one marker; the bare ids are
+exported as `ATLAS_FORCED_STEPS`, space-separated, for step files such as `phase2/09b-vault.sh`), and `--status`.
+Phase 3 and 4 also accept `--run` (the in-unit entry); without it they detach themselves, so `--force STEP` detaches
+like the plain command and only `--foreground` (the entry point adds `--run`) keeps them in the terminal.
 
 ## 5. Verification scripts (`verify/`)
 

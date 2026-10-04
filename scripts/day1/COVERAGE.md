@@ -54,15 +54,19 @@ through `run_phase_steps`, Phases 3 and 4 by their drivers). Markers: `/var/lib/
 
 | Step | Section 17 text (short) | File → function | Notes |
 |---|---|---|---|
-| 1 | Build the ROCm base image; `rocminfo` reports `gfx1151`; PyTorch tensor/matmul/diffusion self-test | `phase4-engines.sh` → `step_01`; `docker/rocm-base/Dockerfile`; `verify/v11-rocm-selftest.sh`; `phase4/selftest.py` | V11; the phase stops here on fail |
+| 1 | Build the ROCm base image; `rocminfo` reports `gfx1151`; PyTorch tensor/matmul/diffusion self-test | `phase4-engines.sh` → `step_01` (`_p4_wheel_preflight` before the build, then `docker build`); `phase4/wheel_preflight.py`; `docker/rocm-base/Dockerfile`; `verify/v11-rocm-selftest.sh`; `phase4/selftest.py` | `P4-wheels` info row from the pre-flight (a missing pinned wheel or an unreachable index stops the step before the build, naming the file and the index URL); V11; the phase stops here on fail |
 | 2 | Green engines in order of value: FLUX.1-dev, Wan2.2, Florence-2, Chronos, UI-TARS-1.5-7B, Rad-DINO, SAM 2, Stable Audio Open, CosyVoice2, OpenVLA | `phase4-engines.sh` → `step_02` (`_p4_run_engine` per key); `phase4/lib-engine.sh`; `phase4/engines/{flux1-dev,wan2.2,florence-2,chronos,ui-tars,rad-dino,sam2,stable-audio-open,cosyvoice2,openvla}.sh` + `<name>_test.py`; `config/phase4-engines.json` | A green failure is recorded `fail`, the phase continues |
 | 3 | Yellow engines: TRELLIS, Blender Cycles HIP with CPU fallback | `phase4-engines.sh` → `step_03`; `phase4/engines/trellis.sh`, `blender-cycles.sh` | `deferred` on failure, never blocks |
 | 4 | PointLLM (V8), Clay or Prithvi (V9), deferred if they fail | `phase4-engines.sh` → `step_04` (`record_v "$vid"`); `phase4/engines/pointllm.sh`, `clay-prithvi.sh` | |
 | 5 | Register every passing engine with the Arbiter with its measured footprint | `phase4-engines.sh` → `step_05` (`POST /arbiter/register`); `orchestrator/src/atlas/api.py` | |
-| 6 | Gate: per-engine table built/loaded/sample/footprint/pass-fail-deferred | `phase4-engines.sh` → `step_06` (`_p4_table`; `gate phase4 V11 -- V8 V9`) | Writes `done/phase4.gate` |
+| 6 | Gate: per-engine table built/loaded/sample/footprint/pass-fail-deferred | `phase4-engines.sh` → `step_06` (`_p4_table`; `gate phase4 V11 -- V8 V9 P4-wheels`) | Writes `done/phase4.gate` |
 
 `evo` and `modulus` in `config/phase4-engines.json` are tier `deferred` with no build script: they are the Section 15.5
-watch-list entries kept in the json for the Arbiter's reference, not Section 17 steps.
+watch-list entries kept in the json for the Arbiter's reference, not Section 17 steps. No engine entry is blocked only
+by an external account action or a licence (evo: FP8 hardware and an unverified port; modulus: CUDA-locked; TRELLIS:
+yellow on Section 15.2's sparse-voxel kernel risk, and its DINOv2 weight host is checked against the rendered squid
+list before any request; FLUX.1-dev and Stable Audio Open need their Hugging Face licences accepted BEFORE Phase 4 as a
+Day 1 prerequisite, README, and fail loudly rather than defer).
 
 ### Entry point and reporting
 
@@ -87,7 +91,7 @@ phase on `fail` or missing, "recorded" never blocks, `deferred` never blocks.
 | V4 | Quantised KV cache applied per model, no silent fallback (`llama_kv_cache ... K (q8_0) V (q8_0)` line + health, S22) | `phase3/loadtest.py` → `record("V4", ...)` per engine, through `phase3-models.sh` → `step_02` (`_p3_loadtest engine`) | Phase 3, required (per engine) |
 | V5 | WireGuard reachable from mobile data via `vpn.sovereign-node.link` | `phase1/07-remote.sh` → `step_07`; `verify/v05-wireguard.sh` (handshake from a non-LAN address within 540 s) | Phase 1, required |
 | V6 | PyAnnote 3.1 gated model accepted and loading | `phase2/05-voice.sh` → `step_05` and the gate; `verify/v06-pyannote.sh` | Phase 2, required |
-| V7 | Voice casting listening test; Alaric and Gideon clones | `phase2/05-voice.sh` → `step_05` and the gate; `verify/v07-voice-listen.sh` (`deferred` when `staging/inbox/voice-references/{alaric,gideon}.wav` are absent) | Phase 2, recorded |
+| V7 | Voice casting listening test; Alaric and Gideon clones | `phase2/05-voice.sh` → `step_05` (`_voice_render_v7` → `phase2/voice_render.py`) and the gate; `verify/v07-voice-listen.sh` (`deferred` when the reference recordings are absent) | Phase 2, recorded. Transcoding note: the Principal drops `alaric.*` / `gideon.*` as WAV, MP3 or M4A in `staging/inbox/voice-references/`; `phase2/05-voice.sh` converts them with ffmpeg to the 16 kHz mono WAV the Chatterbox clone reads before `phase2/voice_render.py` renders, so the format of the recording never decides V7 (README, Phase 2 step 5) |
 | V8 | PointLLM builds and runs on ROCm in the container | `phase4-engines.sh` → `step_04` (`record_v V8` from `verify_id` in `config/phase4-engines.json`); `phase4/engines/pointllm.sh` | Phase 4, recorded (deferred on failure) |
 | V9 | Clay or Prithvi builds and runs | `phase4-engines.sh` → `step_04` (`record_v V9`); `phase4/engines/clay-prithvi.sh` | Phase 4, recorded (deferred on failure) |
 | V10 | All seven GGUF engines load, generate, swap, release; tok/s within bands | `phase3/loadtest.py` → `record("V10", ...)` per engine and the summary row (`summarize`), through `phase3-models.sh` → `step_02` | Phase 3, required |
@@ -109,6 +113,19 @@ phase on `fail` or missing, "recorded" never blocks, `deferred` never blocks.
 
 Gate calls, verbatim: `gate phase1 V2 V3a V5 V19 -- V1` (`phase1/08-gate.sh`),
 `gate phase2 V3b V6 V12 V13 V14a V15 V16 V17 V18 V20 V23 -- V7 V10a` (`phase2/10-gate.sh`),
-`gate phase3 V4 V10 V14b V21 -- V22` (`phase3-models.sh`), `gate phase4 V11 -- V8 V9` (`phase4-engines.sh`).
+`gate phase3 V4 V10 V14b V21 -- V22` (`phase3-models.sh`), `gate phase4 V11 -- V8 V9 P4-wheels` (`phase4-engines.sh`).
+
+### Rows that are not V items (Section 21 scope note, v0.3.2)
+
+Written into the same `verify.jsonl` with the exact line shape `record_v` writes (`{"ts","phase","id","result","msg"}`,
+python3 `json.dumps`), but NOT by `record_v`: `lib/common.sh record_v` accepts V ids only (`^V[0-9]+[a-z]?$`,
+CONVENTIONS §4), so each writer has a local twin, named in the table. Always `deferred` or `info`, never `pass`/`fail`;
+`_atlas_verify_rows`/`verify_table`/`gate` read any id, so they appear in the gate tables (recorded-only ids) and in the
+workbook's evidence column, never as pass/fail rows of their own.
+
+| Id | What it records | Recorded by (file → function) | Shown by |
+|---|---|---|---|
+| `T-<tool>` | A Section 15.1 tool whose Phase 2 step 6 install is soft: the tool did not install (download denied, archive layout changed, licence not accepted) and the phase continued instead of stopping; the message carries the reason and the command to retry | `phase2/06-tools.sh` → `_tools_record_deferred` (called by `_tools_soft` around each `_tools_<tool>` install function), one row per tool | Phase 2 gate table (`phase2/10-gate.sh`), `status` |
+| `P4-wheels` | The Phase 4 wheel-index pre-flight: the exact wheel file names on the AMD index that satisfy `docker/rocm-base/Dockerfile`'s pins (rocm, torch, torchvision for cp312; torchaudio and amd-torch-device-gfx1151 present), each HEADed through the proxy; on a miss the exact missing file name and the index URL (the step then stops before `docker build`); on an index, project page or wheel host the proxy will not reach (or a channel whose every project page is 404) the URL, the host and the proxy error. The channel root is a reachability probe only (pip never fetches it) | `phase4-engines.sh` → `_p4_record_info` (the twin; called from `_p4_wheel_preflight`, which `step_01` runs); `phase4/wheel_preflight.py`; full result root-held in `/var/lib/atlas/day1/phase4/wheels-preflight.json` | Phase 4 gate table (`gate phase4 V11 -- V8 V9 P4-wheels`), step 05's `verify_table`, `status` |
 `tools/fill-workbook.py` turns the records into sheet 4 of `docs/ATLAS_BUILD_BASELINE.xlsx` (halves V3a/V3b and
 V14a/V14b combine; V10a is shown as the Phase 2 evidence of the V10 row; V4 is judged per engine).

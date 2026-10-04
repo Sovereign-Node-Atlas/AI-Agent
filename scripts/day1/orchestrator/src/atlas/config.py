@@ -47,7 +47,14 @@ ENGINE_KEYS: tuple[str, ...] = (
 PERSONA_KEYS: tuple[str, ...] = (
     "ren", "arthur", "gideon", "silas", "valerie", "helena", "eleanor", "alaric", "minerva", "victor",
 )
-ARBITER_CLASSES: frozenset[str] = frozenset({"core", "apex", "vision", "crosscheck", "resident", "phase4"})
+ARBITER_CLASSES: frozenset[str] = frozenset({"core", "apex", "vision", "crosscheck", "resident", "phase4", "external"})
+# Section 4.2 ("every load ... of any weight-bearing process ... Chatterbox when invoked" passes through the Arbiter):
+# class `external` is a weight-bearing process the Arbiter budgets, counts as resident (rule 3) and ledgers (rule 1) but
+# never starts or stops itself: the caller runs it in-process (Chatterbox inside phase2/voice_render.py) and POSTs
+# /arbiter/load before and /arbiter/unload after. Such entries live in engines.json's `external` list, not `engines[]`:
+# they take no port (the §8 port rule counts engines[] only), no llama-server@ unit, no sudoers line
+# (phase2/01-llama.sh counts exactly ten engines[]) and no env file (phase2/engine-env.py renders engines[] only).
+EXTERNAL_MODE = "external"
 # CONVENTIONS.md §8 names q8_0 and q4_0 only; `none` is the embedding/reranker entry (no KV cache to quantise). f16 is
 # NOT a class: Section 4.3 wants a quantised cache on every LLM engine, and V4 exists to catch a silent f16 fallback.
 # (The Arbiter's KV_CLASS_FACTOR still knows f16 for projections passed explicitly, e.g. the DeepSeek KV ladder.)
@@ -247,6 +254,12 @@ class EngineSpec(BaseModel):
         return self.arbiter_class == "phase4"
 
     @property
+    def is_external(self) -> bool:
+        """An in-process weight-bearing load the Arbiter budgets but does not start or stop (Section 4.2: Chatterbox
+        when invoked); engines.json `external` list, no unit, no port."""
+        return self.arbiter_class == "external"
+
+    @property
     def footprint_bytes(self) -> int:
         """Weights, in bytes, reading the Section 4.1/5.1 `footprint_gb` figure as GiB (binary).
 
@@ -286,10 +299,33 @@ def load_engines(cfg_dir: Path | None = None, port_base: int | None = None) -> d
             raise ConfigError(f"{path}: engine {raw.get('key')!r}: {exc}") from exc
         if spec.key in out:
             raise ConfigError(f"{path}: duplicate engine key {spec.key!r}")
+        if spec.is_external:
+            # It would take a port, a unit, a sudoers line and an env file it cannot have (EXTERNAL_MODE comment).
+            raise ConfigError(f"{path}: engine {spec.key!r}: arbiter_class 'external' belongs in the top-level "
+                              "`external` list, not in engines[] (Section 4.2 class external has no llama-server unit)")
         out[spec.key] = spec
     missing = [k for k in ENGINE_KEYS if k not in out]
     if missing:
         raise ConfigError(f"{path}: engine keys missing from CONVENTIONS.md §8 set: {missing}")
+    # The `external` list (Section 4.2 "Chatterbox when invoked"; EXTERNAL_MODE comment): Arbiter-budgeted in-process
+    # loads with no port (0) and no unit, appended after the ten engines[] so nothing that counts or indexes engines[]
+    # changes (phase2/01-llama.sh, phase2/engine-env.py, the §8 port rule).
+    extras = data.get("external", []) if isinstance(data, dict) else []
+    if not isinstance(extras, list):
+        raise ConfigError(f"{path}: `external` must be a list of engine entries")
+    for n, raw in enumerate(extras, start=1):
+        if not isinstance(raw, dict) or "key" not in raw:
+            raise ConfigError(f"{path}: external entry #{n} has no key")
+        try:
+            spec = EngineSpec.model_validate({**raw, "index": 0, "port": 0})
+        except ValueError as exc:
+            raise ConfigError(f"{path}: external engine {raw.get('key')!r}: {exc}") from exc
+        if not spec.is_external:
+            raise ConfigError(f"{path}: external engine {spec.key!r}: arbiter_class must be 'external' "
+                              f"(got {spec.arbiter_class!r}); llama-server engines belong in engines[]")
+        if spec.key in out:
+            raise ConfigError(f"{path}: duplicate engine key {spec.key!r} (engines[] and external)")
+        out[spec.key] = spec
     return out
 
 

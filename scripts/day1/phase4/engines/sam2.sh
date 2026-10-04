@@ -3,7 +3,13 @@
 # "minor mask cleanup lost"; Section 17 step 2 "SAM 2 with the extension flag").
 # Research: rocm-containers.md §3.7: `SAM2_BUILD_CUDA=0 pip install -e .` VERIFIED (INSTALL.md, setup.py). The 2.1 HF
 # id facebook/sam2.1-hiera-large is UNVERIFIED; the pull falls back to facebook/sam2-hiera-large (README example,
-# VERIFIED) and the test is told which one landed. dl.fbaipublicfiles.com is not allowlisted, so no .pt fallback.
+# VERIFIED) and the test is told which one landed. The weights come from the Hugging Face snapshot ONLY (p4_pull;
+# Section 12.5 "Hugging Face during model pulls"). The publisher's .pt checkpoints (download_ckpts.sh, on Meta's CDN
+# dl.fbaipublicfiles.com) are NOT fetched by this script: no request to that host is made here, so this build claims no
+# allowlist entry for it (rule §7.1: a host is named for a request a script makes; fix round 5 dropped the earlier
+# ".pt fallback" rationale). That host is in config/allowlist.txt for trellis's DINOv2 conditioner alone
+# (phase4/engines/trellis.sh header states its status); the allowlist comment that cites sam2 is the Phase 1 writer's
+# to drop.
 # --no-build-isolation (INSTALL.md, VERIFIED): sam2's [build-system] requires torch>=2.5.1, which pip would otherwise
 # download as the CUDA wheel (+ nvidia-* libs, ~3 GB) into a throwaway build env; with isolation off the venv's ROCm
 # torch and the image's setuptools (python3-pip depends on python3-setuptools) serve setup.py.

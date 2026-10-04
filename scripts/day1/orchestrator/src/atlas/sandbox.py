@@ -6,20 +6,50 @@ plus two flags this package adds (fix round) and says so here:
     timeout -k 5 $((SANDBOX_TIMEOUT_S + 10)) docker run --rm --init --pull never --name sb-<job> \\
       --network none --memory $SANDBOX_MEMORY --memory-swap $SANDBOX_MEMORY --cpus $SANDBOX_CPUS \\
       --pids-limit $SANDBOX_PIDS --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=$SANDBOX_TMPFS_SIZE \\
+      --mount type=tmpfs,dst=/work,tmpfs-size=$SANDBOX_WORK_SIZE \\
       --ulimit fsize=$SANDBOX_FSIZE --cap-drop ALL --security-opt no-new-privileges --user 65534:<atlas gid> \\
       -e SANDBOX_TIMEOUT_S=$SANDBOX_TIMEOUT_S \\
-      -v $SANDBOX_DIR/<job>:/work:rw -w /work atlas-sandbox:py3.12 python3 /work/main.py
+      -v $SANDBOX_DIR/<job>:/stage:ro -w /work atlas-sandbox:py3.12 \\
+      sh -c 'cp -R /stage/. /work/ && "$@" >/work/.stdout; rc=$?; \\
+             cd /work && tar -cf - .; exit $rc' sh python3 /work/main.py   > <job dir>/.results.tar
     docker rm -f sb-<job>      # always afterwards
+
+Work directory (Section 16.4 "a hard memory limit"; fix round 5): /work is a BOUNDED tmpfs
+(`--mount type=tmpfs,dst=/work,tmpfs-size=$SANDBOX_WORK_SIZE`, SANDBOX_WORK_SIZE default 2g), charged to the job's
+memory cgroup like every other page it touches, instead of the earlier unbounded `-v $SANDBOX_DIR/<job>:/work:rw` bind
+mount through which a job could fill the 8 TB data volume with 1 GiB files. The staged inputs (main.py, `files`) reach
+the container READ-ONLY at /stage and the run line's first act copies them into /work (coreutils `cp` in the image).
+The copy is `cp -R /stage/. /work/` WITHOUT `--preserve` (fix round 6): /work is the root-owned tmpfs mount point docker
+creates and the process is uid 65534 with every capability dropped; copying `/stage/.` onto an existing destination
+makes GNU cp apply the source directory's timestamps (and mode) to /work itself, which needs ownership or CAP_FOWNER,
+so `--preserve=mode,timestamps` failed with "preserving times for '/work/.': Operation not permitted", exit 1, and the
+`&&` chain never ran the job (verified with coreutils 9.4 as uid 65534). Without `--preserve` the copied files take the
+source mode through the umask (0640 staged -> readable by the job, which owns the copies) and no attribute is set on
+/work. Writing past the cap fails with ENOSPC inside the container; verify/v17-sandbox.sh runs THIS run line (RUN_SHELL
+from the installed package, a staged job directory at /stage, the results tar on stdout) and asserts exactly that, so
+a prologue that cannot run in the container fails V17 at the gate instead of every later job. Nothing a job can write
+reaches a host path: /work is tmpfs, /stage is ro, /tmp is tmpfs, the rootfs is read-only.
+Results (why not `docker cp`): a tmpfs is not part of the container's filesystem layers, so `docker cp` cannot read it
+(Docker documents tmpfs among the paths it cannot copy) and it is gone the moment the container exits. The run line
+therefore has the job's stdout written to /work/.stdout and, when the job has returned, streams a tar of /work on the
+container's STDOUT; the launcher writes that stream, not into memory, into `<job dir>/.results.tar` (its size is bounded
+by SANDBOX_WORK_SIZE on the producer side) and unpacks it into the job directory with tarfile's `data` filter (no
+absolute paths, no `..`, no links out), where the files belong to the invoking atlas account. `SandboxResult.stdout` is
+/work/.stdout from that tar (bounded to SANDBOX_OUTPUT_MAX like before), stderr is the live pipe as before, and
+`outputs_copied` says whether the tar arrived and unpacked: a job killed by the memory cap or the deadline before the
+tar streamed has `outputs_copied=False` and an empty stdout, said in the log, never a tar fragment presented as output.
+The container's exit code is the job's (`exit $rc`): 137 for an OOM or deadline kill as before, so `killed_by_cap` and
+`timed_out` read exactly as they did.
 
   * `--pull never`: an unqualified image name that is not present locally would otherwise be resolved to
     docker.io/library/atlas-sandbox:py3.12 and PULLED (registry-1.docker.io is allowlisted for build-time pulls), i.e.
     whatever a third party published under that name would run with the job's files mounted. `run()` also refuses
     up front when `docker image inspect` does not know the image, naming docker/sandbox/Dockerfile as the source.
   * `--user 65534:<atlas gid>` instead of `65534:65534`: the job directory is created 0o2770 (setgid, group atlas)
-    and every staged file 0o640, so the nobody-uid process reads and writes /work through the GROUP bit; nothing
-    under SANDBOX_DIR is world-accessible (CONVENTIONS.md §2; the earlier 1777 directory let any local account drop
-    files into a job between mkdir and docker run, and restic snapshots SANDBOX_DIR nightly), and files the job
-    creates inherit the atlas group, so atlas can always remove what it made.
+    and every staged file 0o640, so the nobody-uid process reads the read-only /stage through the GROUP bit (and
+    owns its /work copies outright); nothing under SANDBOX_DIR is world-accessible (CONVENTIONS.md §2; the earlier
+    1777 directory let any local account drop files into a job between mkdir and docker run, and restic snapshots
+    SANDBOX_DIR nightly), and the results unpacked from the tar belong to the invoking atlas account.
 
 The time bound is enforced INSIDE the container (the image's ENTRYPOINT wraps every command in coreutils
 `timeout -s KILL $SANDBOX_TIMEOUT_S`); GNU timeout on the host only signals the docker client and is a backstop
@@ -90,6 +120,14 @@ DEFAULT_MEMORY_MB = 2048
 DEFAULT_CPUS = 2.0
 DEFAULT_PIDS = 256
 DEFAULT_TMPFS = "512m"
+DEFAULT_WORK_SIZE = "2g"  # SANDBOX_WORK_SIZE: the tmpfs cap on /work (module docstring "Work directory"; Section 16.4)
+RESULTS_TAR = ".results.tar"  # the stdout stream of the run line, written into the job directory (module docstring)
+JOB_STDOUT = ".stdout"  # where the run line sends the job's stdout inside /work (then inside the tar)
+# The in-container prologue/epilogue of the run line (module docstring "Results"): inputs in, the job, the results out.
+# No `--preserve`: the process (65534, --cap-drop ALL) does not own the /work mount point, and cp would try to set the
+# source directory's times/mode on it and fail with EPERM before the job ran (module docstring "Work directory").
+RUN_SHELL = ('cp -R /stage/. /work/ && "$@" >/work/.stdout; rc=$?; '
+             "cd /work && tar -cf - .; exit $rc")
 DEFAULT_TIMEOUT_S = 300
 DEFAULT_FSIZE = 1 << 30  # SANDBOX_FSIZE: 1 GiB per file (README-contracts.md "Sandbox")
 DEFAULT_OUTPUT_MAX = 1 << 20  # SANDBOX_OUTPUT_MAX: bytes of stdout / of stderr the launcher keeps (module docstring)
@@ -116,6 +154,7 @@ __all__ = [
     "parse_memory_mb",
     "run",
     "sandbox_config_from_env",
+    "unpack_results",
 ]
 
 
@@ -129,6 +168,7 @@ class SandboxConfig:
     base_dir: str = DEFAULT_DIR
     pids: int = DEFAULT_PIDS
     tmpfs_size: str = DEFAULT_TMPFS
+    work_size: str = DEFAULT_WORK_SIZE  # /work tmpfs cap (SANDBOX_WORK_SIZE), charged to the job's memory cgroup
     fsize: int = DEFAULT_FSIZE
     output_max: int = DEFAULT_OUTPUT_MAX  # per stream, kept in the launcher (module docstring "Output bound")
     gid: int = -1  # the group the container runs with; -1 = this process's gid (atlas on the node)
@@ -185,6 +225,7 @@ def sandbox_config_from_env(env: dict[str, str] | None = None) -> SandboxConfig:
         base_dir=env.get("SANDBOX_DIR") or DEFAULT_DIR,
         pids=_int("SANDBOX_PIDS", DEFAULT_PIDS),
         tmpfs_size=env.get("SANDBOX_TMPFS_SIZE") or DEFAULT_TMPFS,
+        work_size=env.get("SANDBOX_WORK_SIZE") or DEFAULT_WORK_SIZE,
         fsize=_int("SANDBOX_FSIZE", DEFAULT_FSIZE),
         output_max=_int("SANDBOX_OUTPUT_MAX", DEFAULT_OUTPUT_MAX),
         memory_mb=parse_memory_mb(mem) if mem else DEFAULT_MEMORY_MB,
@@ -207,6 +248,7 @@ class SandboxResult:
     work_dir: str = ""
     stdout_truncated: bool = False  # the job wrote more than SANDBOX_OUTPUT_MAX; the tail was discarded
     stderr_truncated: bool = False
+    outputs_copied: bool = False  # the results tar streamed out of /work and unpacked into work_dir (module docstring)
 
     @property
     def ok(self) -> bool:
@@ -242,11 +284,17 @@ def drain_bounded(stream: Any, limit: int) -> tuple[bytes, bool]:
 
 class SubprocessDocker:
     """The real runner: argv already starts with `timeout -k 5 N docker run ...`. Output is drained with a bound
-    (module docstring "Output bound"); `last_truncated` tells run() whether either stream was cut."""
+    (module docstring "Output bound"); `last_truncated` tells run() whether either stream was cut. When `stdout_sink`
+    is set (run() sets it to <job dir>/.results.tar before the call), the child's stdout is the results tar stream and
+    is written to that file unbounded by output_max (the producer side is bounded by the /work tmpfs) and NOT kept in
+    memory; run() clears the sink afterwards. `supports_sink` tells run() this runner honours it (a stub does not)."""
+
+    supports_sink = True
 
     def __init__(self, output_max: int = DEFAULT_OUTPUT_MAX) -> None:
         self.output_max = max(int(output_max), 0)
         self.last_truncated: tuple[bool, bool] = (False, False)
+        self.stdout_sink: Path | None = None
 
     def run(self, argv: Sequence[str], *, timeout_s: float) -> tuple[int, str, str]:
         try:
@@ -256,12 +304,24 @@ class SubprocessDocker:
         except FileNotFoundError as exc:
             raise SandboxError(f"{argv[0]} not found (coreutils timeout / docker CLI missing): {exc}") from exc
         results: dict[str, tuple[bytes, bool]] = {}
+        sink = self.stdout_sink
 
         def reader(name: str, stream: Any) -> None:
             results[name] = drain_bounded(stream, self.output_max)
 
+        def sink_reader(stream: Any, path: Path) -> None:
+            # The results tar: to disk as it arrives (module docstring "Results"); nothing of it stays in memory.
+            with path.open("wb") as fh:
+                while True:
+                    chunk = stream.read(_DRAIN_CHUNK)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+            results["out"] = (b"", False)
+
         threads = [
-            threading.Thread(target=reader, args=("out", proc.stdout), daemon=True),
+            threading.Thread(target=sink_reader if sink is not None else reader,
+                             args=(proc.stdout, sink) if sink is not None else ("out", proc.stdout), daemon=True),
             threading.Thread(target=reader, args=("err", proc.stderr), daemon=True),
         ]
         for t in threads:
@@ -402,6 +462,10 @@ def build_argv(
         "--read-only",
         "--tmpfs",
         f"/tmp:rw,noexec,nosuid,nodev,size={config.tmpfs_size}",
+        # Section 16.4 hard memory limit extends to the job's files: a bounded tmpfs charged to its memory cgroup,
+        # ENOSPC past SANDBOX_WORK_SIZE (V17 asserts it), never the 8 TB volume (module docstring "Work directory").
+        "--mount",
+        f"type=tmpfs,dst=/work,tmpfs-size={config.work_size}",
         "--ulimit",
         f"fsize={int(config.fsize)}",
         "--cap-drop",
@@ -413,13 +477,53 @@ def build_argv(
         "-e",
         f"SANDBOX_TIMEOUT_S={int(timeout_s)}",
         "-v",
-        f"{work_dir}:/work:rw",
+        f"{work_dir}:/stage:ro",
         "-w",
         "/work",
         config.image,
+        # Inputs in, the job (its stdout to /work/.stdout), the results out as a tar on stdout (module docstring
+        # "Results"); the entrypoint's `timeout -s KILL` bounds the whole shell, process group included.
+        "sh",
+        "-c",
+        RUN_SHELL,
+        "sh",
         *command,
     ]
     return argv
+
+
+def unpack_results(tar_path: Path, work_dir: Path, limit: int) -> tuple[str, bool, bool]:
+    """The results tar the run line streamed (module docstring "Results") -> (job stdout, stdout_truncated, ok).
+
+    The tar is unpacked into `work_dir` with tarfile's `data` filter (absolute names, `..`, links out and device nodes
+    are refused); the job's stdout is `.stdout` inside it, read up to `limit` bytes. A missing, empty or unreadable tar
+    (the job was killed before the epilogue ran) is ok=False with an empty stdout: never a tar fragment as output. The
+    tar file itself is removed afterwards.
+    """
+    import tarfile
+
+    try:
+        size = tar_path.stat().st_size
+    except OSError:
+        return "", False, False
+    if size == 0:
+        tar_path.unlink(missing_ok=True)
+        return "", False, False
+    try:
+        with tarfile.open(tar_path, "r:") as tf:
+            tf.extractall(work_dir, filter="data")
+    except (tarfile.TarError, OSError, ValueError) as exc:
+        log.warning("sandbox: results tar %s could not be unpacked (%s); the job's /work is lost", tar_path, exc)
+        tar_path.unlink(missing_ok=True)
+        return "", False, False
+    tar_path.unlink(missing_ok=True)
+    out_path = work_dir / JOB_STDOUT
+    try:
+        with out_path.open("rb") as fh:
+            kept, cut = drain_bounded(fh, limit)
+    except OSError:
+        kept, cut = b"", False
+    return kept.decode("utf-8", errors="replace"), cut, True
 
 
 def _staged_path(work_dir: Path, name: str) -> Path:
@@ -522,10 +626,25 @@ def run(
             network,
             shlex.join(command),
         )
+        # The results tar streams on the child's stdout into the job directory (module docstring "Results"); a runner
+        # without sink support (StubDocker) hands stdout back directly and no tar is expected.
+        sink: Path | None = (work_dir / RESULTS_TAR) if getattr(runner, "supports_sink", False) else None
+        if sink is not None:
+            runner.stdout_sink = sink  # type: ignore[attr-defined]
         t0 = time.monotonic()
-        rc, out, err = runner.run(argv, timeout_s=timeout_s + HOST_TIMEOUT_SLACK_S)
+        try:
+            rc, out, err = runner.run(argv, timeout_s=timeout_s + HOST_TIMEOUT_SLACK_S)
+        finally:
+            if sink is not None:
+                runner.stdout_sink = None  # type: ignore[attr-defined]
         elapsed = time.monotonic() - t0
         out_cut, err_cut = tuple(getattr(runner, "last_truncated", (False, False)))
+        copied = False
+        if sink is not None:
+            out, out_cut, copied = unpack_results(sink, work_dir, config.output_max)
+            if not copied:
+                log.warning("sandbox job=%s: no results tar arrived from sb-%s:/work (killed before the epilogue?); "
+                            "stdout and /work are lost", job_id, job_id)
         if out_cut or err_cut:
             log.warning("sandbox job=%s output truncated at %d bytes per stream (stdout=%s stderr=%s)",
                         job_id, config.output_max, out_cut, err_cut)
@@ -553,6 +672,7 @@ def run(
             work_dir=str(work_dir),
             stdout_truncated=bool(out_cut),
             stderr_truncated=bool(err_cut),
+            outputs_copied=bool(copied),
         )
     finally:
         if not keep_work_dir:

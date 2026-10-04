@@ -18,6 +18,11 @@
 #   ATLAS_DRY_RUN        "1" makes run_step print what it would do and run nothing (set by parse_common_args --dry-run)
 #   ATLAS_ENTRY          the repository path of atlas-day1.sh, used when printing "the exact next command"
 #   ATLAS_SVC_USER       service account for svc_user_run (default: atlas)
+#   ATLAS_FORCED_STEPS   exported BY parse_common_args: the bare step ids given to --force, space-separated ("09b", "05b 07");
+#                        step files may read it (phase2/09b-vault.sh does); detached_phase passes it into the unit
+#   ATLAS_TEST_SECURE_BOOT  TEST ONLY (lib/common_test.sh): "on" or "off" replaces the firmware reading in
+#                        _atlas_secure_boot_enabled so both load_env branches run on any CI host. Never set on the node:
+#                        phase1/01-preflight.sh and verify/v02-tpm.sh read the firmware themselves and ignore it.
 #
 # Contracts this file defines that CONVENTIONS.md does not state (other writers code against these):
 #   * $ATLAS_ETC/proxy.env  — written by Phase 1 step 4 (squid). Sourceable KEY=VALUE lines:
@@ -169,7 +174,9 @@ run_phase_steps() {
 record_v() {
   local id="$1" result="$2" msg="${3:-}"
   case "$result" in pass|fail|deferred|info) ;; *) die "record_v $id: RESULT must be pass|fail|deferred|info, got '$result'" ;; esac
-  [[ "$id" =~ ^V[0-9]+[a-z]?$ ]] || die "record_v: ID must look like V7 or V3a, got '$id'"
+  # V items (V7, V3a) plus the two recorded-only row families Section 21 (v0.3.2 scope note) names:
+  # T-<tool> for Phase 2 step 6 soft installs and P4-wheels for the Phase 4 wheel-index pre-flight.
+  [[ "$id" =~ ^(V[0-9]+[a-z]?|T-[a-z0-9-]+|P4-wheels)$ ]] || die "record_v: ID must look like V7, V3a, T-<tool> or P4-wheels, got '$id'"
   _atlas_state_init
   command -v python3 >/dev/null || die "record_v needs python3"
   local line
@@ -641,7 +648,7 @@ detached_phase() {
   local unit="atlas-day1-$name"
   [[ -x "$script" ]] || die "detached_phase: $script is not executable"
   if systemctl is-active --quiet "$unit"; then
-    die "$unit is already running; follow it with: journalctl -u $unit -f"
+    die "$unit is already running; follow it with: journalctl -fu $unit"
   fi
   _atlas_state_init
   local logf
@@ -655,7 +662,7 @@ detached_phase() {
     "--setenv=ATLAS_REPO_ROOT=${ATLAS_REPO_ROOT:-}"
   )
   local v
-  for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy HF_HUB_ENABLE_HF_TRANSFER; do
+  for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy HF_HUB_ENABLE_HF_TRANSFER ATLAS_FORCED_STEPS; do
     [[ -n "${!v:-}" ]] && setenv+=("--setenv=$v=${!v}")
   done
   systemd-run --unit="$unit" --collect \
@@ -664,8 +671,13 @@ detached_phase() {
     "${setenv[@]}" "$script" --run \
     || die "systemd-run failed to start $unit"
   log "$unit started; log file $logf"
-  echo "Follow it with: journalctl -u $unit -f"
-  echo "Or tail the log:  tail -f $logf"
+  # Rule §7.10: the exact follow command, and the spelling that keeps the phase in this terminal instead (a --force
+  # detaches like the plain command; only --foreground keeps it here, atlas-day1.sh / README §5).
+  local forced=""
+  [[ -n "${ATLAS_FORCED_STEPS:-}" ]] && forced=" --force ${ATLAS_FORCED_STEPS// / --force }"
+  echo "Follow it with:  journalctl -fu $unit"
+  echo "Or tail the log: tail -f $logf"
+  echo "To run it in this terminal instead (survives no SSH drop): sudo ${ATLAS_ENTRY:-./atlas-day1.sh} $name --foreground$forced"
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -722,6 +734,24 @@ _atlas_detect_tz() {
   printf '%s\n' "$tz"
 }
 
+# _atlas_secure_boot_enabled — 0 only when the firmware reports Secure Boot ON (the SecureBoot EFI variable: 4-byte
+# attribute header, byte 4 is the value; then mokutil). A legacy-BIOS boot or an unreadable state counts as OFF, like
+# phase1/01-preflight.sh's phase1_secure_boot_state (the authoritative reading, kept there and in verify/v02-tpm.sh);
+# this copy only decides whether load_env lists ATLAS_ACCEPT_PCR7_NO_SB among the blank CONFIRM keys (D2, S9).
+_atlas_secure_boot_enabled() {
+  local f v
+  case "${ATLAS_TEST_SECURE_BOOT:-}" in on) return 0 ;; off) return 1 ;; esac   # test-only override (header)
+  for f in /sys/firmware/efi/efivars/SecureBoot-*; do
+    [[ -r "$f" ]] || continue
+    v="$(od -An -tu1 -j4 -N1 "$f" 2>/dev/null | tr -d '[:space:]')"
+    case "$v" in 1) return 0 ;; 0) return 1 ;; esac
+  done
+  if command -v mokutil >/dev/null 2>&1; then
+    case "$(mokutil --sb-state 2>/dev/null || true)" in *enabled*) return 0 ;; esac
+  fi
+  return 1
+}
+
 # load_env — install config/atlas.env.example on first run, source it, auto-detect blank detectable keys (persisting
 # them so DATA_DISK survives the LUKS format that makes it "mounted"), and die naming any required key still blank.
 load_env() {
@@ -746,12 +776,31 @@ load_env() {
   set +a
 
   # Keys the Principal must confirm; checked first because the message is deterministic and the fix is a text edit.
+  # Every blank CONFIRM key is reported in ONE message with an example value (rule §7.10: the Principal's time), not one
+  # per run. ATLAS_ACCEPT_PCR7_NO_SB is required only while Secure Boot is off (D2 / S9; phase1/01-preflight.sh has
+  # the full reasoning); BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE is the Section 16.3 item 2 acceptance phase2/06-tools.sh
+  # needs, surfaced here so it is decided before Phase 1 rather than at Phase 2 step 6: only the value `yes` passes
+  # (the same test as _tools_buildfarm_licence there), so a `no` stops here with the one message and never at step 6.
   local missing=() k
   for k in GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES; do
     [[ -n "${!k:-}" ]] || missing+=("$k")
   done
+  [[ "${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}" == yes ]] || missing+=(BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE)
+  if [[ -z "${ATLAS_ACCEPT_PCR7_NO_SB:-}" ]] && ! _atlas_secure_boot_enabled; then
+    missing+=(ATLAS_ACCEPT_PCR7_NO_SB)
+  fi
   if (( ${#missing[@]} > 0 )); then
-    die "load_env: the Principal must set ${missing[*]} in $envf (see the comments there), then re-run"
+    local lines=""
+    for k in "${missing[@]}"; do
+      case "$k" in
+        GOOGLE_ACCOUNTS) lines+=$'\n  GOOGLE_ACCOUNTS="you@company.com:corporate you@gmail.com:estate"   # the two Google accounts, each tagged with its hemisphere (Phase 2 step 6c, V20)' ;;
+        WINDOWS_SHARE)   lines+=$'\n  WINDOWS_SHARE="//192.168.1.50/atlas"                                 # the Windows PC share, //host/share (Phase 2 step 9)' ;;
+        FAMILY_NAMES)    lines+=$'\n  FAMILY_NAMES="Surname Givenname"                                     # names for the router hard rule (Section 7.2 rule 1)' ;;
+        ATLAS_ACCEPT_PCR7_NO_SB) lines+=$'\n  ATLAS_ACCEPT_PCR7_NO_SB=1          # Secure Boot is OFF (D2): acknowledge that the PCR 7 TPM2 binding (S9) does not tie the unlock to this OS image, or enable Secure Boot instead' ;;
+        BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE) lines+=$'\n  BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes   # you have read https://developer.android.com/studio/terms and accept them (Section 16.3 item 2; Phase 2 step 6 builds the Android/MinGW container)' ;;
+      esac
+    done
+    die "load_env: ${#missing[@]} CONFIRM key(s) are blank or not confirmed in $envf (${missing[*]}). Set them, then re-run:$lines"$'\n'"  Edit with: sudo nano $envf   (the comments in the file explain each key)"
   fi
   local acct
   for acct in $GOOGLE_ACCOUNTS; do
@@ -796,6 +845,8 @@ load_env() {
   LAN_IP="$(_atlas_detect_lan_ip "$LAN_IFACE" || true)"
   export PRINCIPAL_USER TZ LAN_IFACE LAN_CIDR LAN_IP DATA_DISK CLOUDFLARE_TXT WG_IFACE WG_CIDR WG_PORT DOMAIN VPN_HOST
   export GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES NTFY_TOPIC OPENWEBUI_PORT ORCH_PORT LLAMA_PORT_BASE DOWNLOAD_MBPS
+  export BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE
+  [[ -n "${ATLAS_ACCEPT_PCR7_NO_SB:-}" ]] && export ATLAS_ACCEPT_PCR7_NO_SB
   [[ -n "${HF_ENDPOINT:-}" ]] && export HF_ENDPOINT
   (( changed )) && log "load_env: auto-detected values written to $envf"
   log "load_env: user=$PRINCIPAL_USER tz=$TZ lan=$LAN_IFACE/$LAN_CIDR ip=${LAN_IP:-?} data=$DATA_DISK"
@@ -806,7 +857,9 @@ load_env() {
 # ---------------------------------------------------------------------------------------------------------------------
 # parse_common_args ARGS... — --dry-run, --force STEP, --status, --run (CONVENTIONS.md §4). Drivers set ATLAS_PHASE
 # before calling. --status prints the done markers and the latest verify table, then exits 0. --force clears
-# done/$ATLAS_PHASE.STEP (also accepts PHASE.STEP). --run marks the in-unit entry (ATLAS_IN_UNIT=1).
+# done/$ATLAS_PHASE.STEP (also accepts PHASE.STEP) and appends the bare step id to the exported ATLAS_FORCED_STEPS
+# (space-separated; phase2/09b-vault.sh treats a forced 09b as the Principal's request to initialise the real vault,
+# README-contracts.md §3). --run marks the in-unit entry (ATLAS_IN_UNIT=1).
 parse_common_args() {
   ATLAS_IN_UNIT="${ATLAS_IN_UNIT:-0}"
   while (( $# > 0 )); do
@@ -817,6 +870,8 @@ parse_common_args() {
         local step="$2" marker
         [[ "$step" == *.* ]] && marker="$ATLAS_DONE_DIR/$step" || marker="$ATLAS_DONE_DIR/$ATLAS_PHASE.$step"
         if [[ -e "$marker" ]]; then rm -f "$marker"; log "cleared marker $marker"; else warn "no marker $marker to clear"; fi
+        ATLAS_FORCED_STEPS="${ATLAS_FORCED_STEPS:+$ATLAS_FORCED_STEPS }${step#*.}"
+        export ATLAS_FORCED_STEPS
         shift 2 ;;
       --status) phase_status "$ATLAS_PHASE"; exit 0 ;;
       --run) ATLAS_IN_UNIT=1; export ATLAS_IN_UNIT; shift ;;

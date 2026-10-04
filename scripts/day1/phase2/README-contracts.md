@@ -148,12 +148,10 @@ docker rm -f sb-<job>      # always afterwards
   HF_HUB_OFFLINE=1 DO_NOT_TRACK=1 ANONYMIZED_TELEMETRY=False CHROMA_TELEMETRY_ENABLED=false
   PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONNOUSERSITE=1` (the same set v14a/v15/v16/v18 export), so a library the staged
   code brings cannot beacon to an allowlisted host once a tier grants network.
-* **Disk:** `--ulimit fsize` bounds each file a job writes (1 GiB); `/tmp` is a bounded noexec tmpfs. UNVERIFIED /
-  open: no cap on the total size of `$SANDBOX_DIR/<job>` on the 8 TB volume exists yet, and the bind mount carries no
-  nosuid/nodev. Two durable fixes, either of which changes the package's staging and is therefore recorded, not made,
-  here (§3 item 5): an XFS project quota on `$SANDBOX_DIR`, or `--mount type=tmpfs,dst=/work,tmpfs-size=$SANDBOX_WORK_SIZE`
-  (charged to the job's memory cgroup) with `docker cp` of `main.py`/inputs in and outputs out. The package removes the
-  job directory once outputs are collected.
+* **Disk:** `--ulimit fsize` bounds each file a job writes (1 GiB); `/tmp` is a bounded noexec tmpfs. RESOLVED (critic
+  fix round): `/work` is a tmpfs capped by `SANDBOX_WORK_SIZE` (default 2g, written by 06d, charged to the job's memory
+  cgroup); inputs are mounted read-only at `/stage` and copied in by the run line, results are streamed out as a tar on
+  stdout (a tmpfs cannot be `docker cp`'d), and V17 asserts ENOSPC past the cap.
 * **The docker socket is host root.** `atlas` is in the `docker` group (CONVENTIONS.md §2; `SupplementaryGroups=docker`
   in atlas-orchestrator and atlas-celery-cpu/gpu), and a docker-group member can `docker run --privileged -v /:/host`.
   The run line above bounds the **sandboxed job**; it does not bound the orchestrator that launches it. A
@@ -194,7 +192,7 @@ docker rm -f sb-<job>      # always afterwards
 **Integration note (2026-10-04):** items 1, 2, 6(a), 10, 11, 12 and 13 are now reflected in `CONVENTIONS.md` (§1, §2, §4,
 §5, §6, §7.2, §8); item 8 is closed by declaring `V10a` (10-gate.sh records it too, `tools/fill-workbook.py` shows it as the
 V10 evidence column); item 14 is clear (ruff passes). `phase1/02,03,07` now use 710 for the secrets directory. Item 3's
-`ATLAS_FORCED_STEPS` remains unimplemented in `lib/common.sh` (9b reads it defensively; `ATLAS_VAULT_INIT=1` is the
+`ATLAS_FORCED_STEPS` is implemented in `lib/common.sh` (parse_common_args exports the bare ids of every `--force`; superseded note:) it was unimplemented (9b reads it defensively; `ATLAS_VAULT_INIT=1` is the
 documented path). The Section 17 wording for 6d/9b is a baseline amendment the Principal owns (README "Known limits").
 
 1. **Vault layout versus Section 11 / Appendix C wording.** The baseline names `/srv/atlas/vault` as "the gocryptfs

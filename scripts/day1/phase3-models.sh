@@ -7,8 +7,8 @@
 #   phase3-models.sh --foreground   accepted here too (mapped to --run): run in this terminal, not in the unit
 #   phase3-models.sh                without --run/--foreground and not --dry-run: detaches itself (same unit) and
 #                                   returns; with --force STEP it clears the marker and still detaches (said so)
-#   NOTE on `atlas-day1.sh phase3 --foreground --force STEP`: the entry point's run_detached_or_foreground drops
-#   --foreground and execs this driver with only `--force STEP` (no --run), so that spelling still DETACHES; the driver
+#   NOTE on `atlas-day1.sh phase3 --foreground --force STEP`: the entry point execs this driver with --run and the
+#   pass-through args, so that spelling runs in the terminal (plain `--force STEP` detaches and prints the follow line); the driver
 #   cannot see that --foreground was typed. It says so in the log and names the spelling that stays in the terminal:
 #   `/opt/atlas/day1/phase3-models.sh --foreground --force STEP`. The driver also honours ATLAS_FOREGROUND=1 in its
 #   environment as the same request (cross-file ask of atlas-day1.sh: export it, or exec "$script" --run "${pass[@]}"
@@ -204,7 +204,7 @@ if [[ "${ATLAS_IN_UNIT:-0}" != "1" && "$ATLAS_DRY_RUN" != "1" ]]; then
   if (( P3_FORCED )); then
     # atlas-day1.sh strips --foreground and execs this driver with only `--force STEP` (its run_detached_or_foreground),
     # so the spelling that really stays in the terminal is this driver's own (cross-file note for atlas-day1.sh).
-    log "marker cleared; detaching the phase (follow with: journalctl -u atlas-day1-phase3 -f; to stay in this terminal instead run: $(readlink -f "$0") --foreground --force STEP)"
+    log "marker cleared; detaching the phase (follow with: journalctl -fu atlas-day1-phase3; to stay in this terminal instead run: sudo atlas-day1.sh phase3 --foreground --force STEP)"
   fi
   detached_phase phase3 "$(readlink -f "$0")"
   exit 0

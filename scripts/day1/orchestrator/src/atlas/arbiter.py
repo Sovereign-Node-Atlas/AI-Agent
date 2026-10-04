@@ -35,6 +35,25 @@ for a driver path that measured a real process the config does not list yet: bou
 WARNING and written to the ledger as such. The API route (POST /arbiter/register, another writer) does not pass it, so
 an unknown key is a 404 there.
 
+External engines (Section 4.2 "Chatterbox when invoked"; config/engines.json `external` list, CONVENTIONS.md §8 class
+`external`). Chatterbox is loaded in-process by phase2/voice_render.py and the orchestrator's voice path, never as a
+llama-server unit, so the Arbiter budgets it (rule 2: weights only, the measured peak RSS once POST /arbiter/register
+has recorded it), counts it as one of the two resident engines (rule 3), evicts LRU victims for it (rule 5 per victim)
+and ledgers every decision (rules 1, 9) but calls NO controller for it: the caller owns the process and POSTs
+/arbiter/unload when it has exited. RELEASE (rule 5's substance, "by polling the memory counters, not by trusting the
+process exit", with the right counter for a CPU process; fix round 6): its release is not observable on the GTT
+counter (a CPU process on the unified memory of the APU is charged to the ledger, not to mem_info_gtt_used), so
+`request_unload(key, pid=<the process>)` polls /proc/<pid> (`process_rss_bytes`) until the process is gone or its
+VmRSS is within `release_tolerance_bytes`, bounded by `release_timeout_s`; on timeout the engine STAYS resident and
+charged, an ERROR row is written and ReleaseTimeout is raised WITHOUT halting the Arbiter (the process is the caller's;
+the caller retries the unload once it has really exited). An unload WITHOUT a pid is accepted on the caller's word,
+said so in the reason ("not measured") and logged at WARNING: the step-5 renders and voice_render.py pass the pid; the
+API route (POST /arbiter/unload, another writer) is asked to forward a `pid` field. An external resident is never chosen
+as an eviction victim: a load that would need its memory is QUEUED with that reason until the caller unloads it. RULE 7
+EXCEPTION, knowingly: an Apex request while an external engine is resident is QUEUED too ("unloads any co-resident
+engine first" cannot be performed by the Arbiter on a caller-owned process; the request waits for the caller's POST
+/arbiter/unload, tests/test_arbiter.py asserts the reason), and engines.json's `external` notes say the same.
+
 Failure paths (fix round). A controller start that raises — EngineControlError from systemctl, or the parent
 EngineError from the post-start /health check — releases the reservation and clears `_busy`; a catch-all does the same
 for anything else, so a placeholder can never wedge the Arbiter. A controller stop that raises leaves the victim
@@ -147,6 +166,22 @@ class MemoryProbe(Protocol):
     def gtt_used_bytes(self) -> int: ...
 
     def gtt_total_bytes(self) -> int: ...
+
+
+def process_rss_bytes(pid: int, proc_root: Path = Path("/proc")) -> int | None:
+    """VmRSS of a live process in bytes, None once /proc/<pid> is gone: the release counter of a class-external (CPU)
+    process, Section 4.2 rule 5 (module docstring "External engines"). A zombie has no VmRSS line: its memory is
+    released (0)."""
+    try:
+        text = (proc_root / str(int(pid)) / "status").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1]) * 1024
+    return 0
 
 
 class SysfsMemoryProbe:
@@ -318,6 +353,7 @@ class _LoadPlan:
     coresident: bool
     profile: UnitProfile | None
     resident_small: bool = False
+    external: bool = False  # Section 4.2 class external: budgeted and ledgered, no controller start/stop
 
 
 DEEP_THINK_TIERS: tuple[str, ...] = ("deep", "standard", "quick")  # Section 9.1, highest first
@@ -353,10 +389,12 @@ class Arbiter:
                  resident_set_bytes: int | None = None, headroom_bytes: int = 0,
                  deep_think_engines: dict[str, Sequence[str]] | None = None,
                  engines_env_dir: Path | None = None,
-                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 rss_of: Callable[[int], int | None] = process_rss_bytes) -> None:
         self.engines = engines
         self.controller = controller
         self.probe = probe
+        self._rss_of = rss_of  # /proc/<pid> VmRSS: the release counter of a class-external process (rule 5)
         self.ledger = ledger
         self.release_timeout_s = release_timeout_s  # research §6.3: time-box 60 s
         self.release_tolerance_bytes = release_tolerance_bytes  # research §6.3: within ~1 GiB of the baseline
@@ -436,8 +474,9 @@ class Arbiter:
                    coresident: bool = False) -> Footprint:
         if spec.is_resident:
             return Footprint(0, 0, ctx, parallel, kv_class)
-        if spec.is_phase4:
-            # Containers (Section 15.2): weights only, the measurement when the driver registered one.
+        if spec.is_phase4 or spec.is_external:
+            # Containers (Section 15.2) and in-process external loads (Section 4.2 "Chatterbox when invoked"): weights
+            # only, the measurement when the driver registered one (phase2/05-voice.sh: peak RSS of the CPU render).
             if spec.key in self.measured:
                 return Footprint(self.measured[spec.key], 0, 0, 1, "none", measured=True)
             return Footprint(spec.footprint_bytes, 0, 0, 1, "none")
@@ -461,7 +500,7 @@ class Arbiter:
     def unit_profile(self, key: str) -> UnitProfile | None:
         """<engines_env_dir>/<key>.env as phase2/engine-env.py rendered it, or None (no dir, or not rendered yet)."""
         spec = self.spec(key)
-        if self.engines_env_dir is None or spec.is_resident or spec.is_phase4:
+        if self.engines_env_dir is None or spec.is_resident or spec.is_phase4 or spec.is_external:
             return None
         profile = read_unit_profile(Path(self.engines_env_dir) / f"{key}.env")
         if profile is None and key not in self._warned_no_env:
@@ -643,6 +682,9 @@ class Arbiter:
             return self._decide(Decision.QUEUED, key, task_id, fp.total_bytes,
                                 f"generation in progress on {self._gen_engine} (task {self._gen_holder}); "
                                 "never preempted (Section 4.2 rule 6)")
+        if isinstance(victims, str):
+            # An external resident (Section 4.2 "Chatterbox when invoked") cannot be stopped by the Arbiter: queued.
+            return self._decide(Decision.QUEUED, key, task_id, fp.total_bytes, victims)
         # 3. No env file and nothing stays beside it: an engine that ends up alone runs its full profile, not a
         #    quarter of its context (fix round). Re-project and re-check; everything is already being evicted.
         if profile is None and auto and co and not any(k not in victims for k in self.resident):
@@ -659,7 +701,7 @@ class Arbiter:
         for victim in victims:
             self.resident[victim].unloading = True
         self._busy = f"loading {key}" + (f" (evicting {', '.join(victims)})" if victims else "")
-        return _LoadPlan(key, spec, fp, tuple(victims), task_id, co, profile)
+        return _LoadPlan(key, spec, fp, tuple(victims), task_id, co, profile, external=spec.is_external)
 
     def _execute_load(self, plan: _LoadPlan) -> LoadDecision:
         """Outside the lock: stop the victims (rule 5 per victim), start the engine, then finalise under the lock."""
@@ -683,7 +725,9 @@ class Arbiter:
                 self._stop_and_confirm(victim, task_id, reason=why)
             used_before = self.probe.gtt_used_bytes()
             stage = "start"
-            self.controller.start(key)
+            if not plan.external:
+                # Section 4.2 class external: the caller runs the process (Chatterbox, own venv); nothing to start.
+                self.controller.start(key)
         except ReleaseTimeout:
             with self._cv:
                 self.resident.pop(key, None)  # nothing was started; the reservation is void
@@ -722,8 +766,9 @@ class Arbiter:
                     f"{stage} aborted: {type(exc).__name__}: {exc}",
                 )
             raise
-        # What the counter actually grew by is what rule 5 must see come back after the stop.
-        observed = max(0, self.probe.gtt_used_bytes() - used_before)
+        # What the counter actually grew by is what rule 5 must see come back after the stop. An external load is
+        # charged from the ledger (projection, or the registered peak RSS), not from the GTT counter (module docstring).
+        observed = 0 if plan.external else max(0, self.probe.gtt_used_bytes() - used_before)
         with self._cv:
             res = self.resident[key]
             now = self._clock()
@@ -732,12 +777,18 @@ class Arbiter:
             res.observed_bytes = observed
             self._busy = None
             self._cv.notify_all()
-            how = (
-                f"unit env {plan.profile.describe()}"
-                if plan.profile
-                else f"{'coresident ' if plan.coresident else ''}ctx {plan.footprint.ctx} x {plan.footprint.parallel} "
-                f"slots, kv {plan.footprint.kv_class}"
-            )
+            if plan.external:
+                how = (f"external process, class external (Section 4.2 'Chatterbox when invoked'): "
+                       f"{plan.footprint.total_gib:.2f} GiB charged from the ledger"
+                       f"{' (measured)' if plan.footprint.measured else ' (engines.json projection)'}; the caller runs "
+                       "it and POSTs /arbiter/unload when it exits")
+            else:
+                how = (
+                    f"unit env {plan.profile.describe()}"
+                    if plan.profile
+                    else f"{'coresident ' if plan.coresident else ''}ctx {plan.footprint.ctx} x "
+                    f"{plan.footprint.parallel} slots, kv {plan.footprint.kv_class}"
+                )
             hint = ""
             if plan.profile and not plan.profile.coresident and plan.victims and plan.spec.ctx_size_coresident:
                 hint = (
@@ -753,8 +804,9 @@ class Arbiter:
                 evicted=plan.victims,
             )
 
-    def _plan_evictions(self, spec: EngineSpec, fp: Footprint) -> list[str] | None:
-        """Which residents must go so `spec` fits; None when a needed victim is generating (rule 6)."""
+    def _plan_evictions(self, spec: EngineSpec, fp: Footprint) -> list[str] | str | None:
+        """Which residents must go so `spec` fits; None when a needed victim is generating (rule 6); a str (the
+        queued reason) when a needed victim is an external resident the Arbiter cannot stop (module docstring)."""
         if spec.is_apex:
             victims = list(self.resident)  # rule 7: everything else leaves first
         else:
@@ -774,6 +826,10 @@ class Arbiter:
                 count -= 1
         if any(self._is_generating(v) for v in victims):
             return None
+        external = [v for v in victims if self.resident[v].spec.is_external]
+        if external:
+            return (f"external engine(s) {', '.join(external)} resident (Section 4.2 class external: run by their "
+                    "caller, not stoppable by the Arbiter); retry after the caller's POST /arbiter/unload")
         return victims
 
     def _release_victims(self, victims: Sequence[str]) -> None:
@@ -787,7 +843,10 @@ class Arbiter:
     def _is_generating(self, key: str) -> bool:
         return self._gen_holder is not None and self._gen_engine == key
 
-    def request_unload(self, key: str, *, task_id: str | None = None, wait_s: float | None = None) -> LoadDecision:
+    def request_unload(self, key: str, *, task_id: str | None = None, wait_s: float | None = None,
+                       pid: int | None = None) -> LoadDecision:
+        """Unload `key` (rule 5 release check inside). `pid`: for a class-external engine, the caller's process, polled
+        in /proc until it is gone or its RSS is back (module docstring "External engines"); ignored for a unit."""
         deadline = None if wait_s is None else self._clock() + wait_s
         while True:
             with self._cv:
@@ -807,18 +866,60 @@ class Arbiter:
                     return decision
                 self._cv.wait(timeout=min(deadline - self._clock(), 1.0))
         try:
-            self._stop_and_confirm(key, task_id, reason="unload requested")
+            note = self._stop_and_confirm(key, task_id, reason="unload requested", pid=pid)
         finally:
             with self._cv:
                 self._busy = None
                 self._cv.notify_all()
+        if res.spec.is_external:
+            return self._decide(Decision.GRANTED, key, task_id, 0,
+                                f"unloaded; external process (class external) {note}")
         return self._decide(Decision.GRANTED, key, task_id, 0, "unloaded; memory release confirmed")
 
-    def _stop_and_confirm(self, key: str, task_id: str | None, *, reason: str) -> None:
+    def _release_external(self, key: str, res: Resident, task_id: str | None, reason: str, pid: int | None) -> str:
+        """Section 4.2 rule 5 for a class-external process (module docstring "External engines"): with a pid, poll
+        /proc/<pid> until the process is gone or its RSS is within the tolerance, bounded by release_timeout_s (timeout:
+        the engine stays resident and charged, ERROR row, ReleaseTimeout without halting); without one, the caller's
+        word, said so. Runs with the lock RELEASED. Returns the confirmation note for the decision."""
+        if pid is None:
+            note = ("released on the caller's word: no pid supplied, release NOT measured (pass the process pid in "
+                    "POST /arbiter/unload so /proc/<pid> is polled, Section 4.2 rule 5)")
+            log.warning("arbiter: %s unloaded without a pid; its release was not measured (Section 4.2 rule 5)", key)
+        else:
+            deadline = self._clock() + self.release_timeout_s
+            rss = self._rss_of(pid)
+            while rss is not None and rss > self.release_tolerance_bytes:
+                if self._clock() >= deadline:
+                    msg = (f"process {pid} of {key} still holds {rss / GIB:.2f} GiB RSS after "
+                           f"{self.release_timeout_s:.0f}s; {key} stays resident and charged (Section 4.2 rule 5: the "
+                           "release is confirmed by measurement, not by the caller's word)")
+                    with self._cv:
+                        res.unloading = False
+                        self._decide(Decision.ERROR, key, task_id, res.charged_bytes, msg, action="unload")
+                        self._cv.notify_all()
+                    raise ReleaseTimeout(msg + "; the Arbiter is not halted: retry the unload once the process has "
+                                         "exited (the pid is the caller's, not a unit)")
+                self._sleep(self.poll_interval_s)
+                rss = self._rss_of(pid)
+            note = (f"release confirmed: process {pid} gone" if rss is None
+                    else f"release confirmed: process {pid} RSS {rss / GIB:.2f} GiB within tolerance")
+        with self._cv:
+            del self.resident[key]
+            self._decide(Decision.GRANTED, key, task_id, res.charged_bytes,
+                         f"{reason}; external process (class external) {note}; GTT counter not the instrument",
+                         action="unload")
+            self._cv.notify_all()
+        return note
+
+    def _stop_and_confirm(self, key: str, task_id: str | None, *, reason: str, pid: int | None = None) -> str:
         """Stop the unit and poll the counter until the memory is back (rule 5). Runs with the lock RELEASED; the
-        engine stays in `resident` (unloading=True, still charged) until the release is confirmed."""
+        engine stays in `resident` (unloading=True, still charged) until the release is confirmed. Returns a note."""
         with self._cv:
             res = self.resident[key]
+            external = res.spec.is_external
+        if external:
+            # Section 4.2 class external: no unit to stop; the release counter is the process itself (/proc/<pid>).
+            return self._release_external(key, res, task_id, reason, pid)
         before = self.probe.gtt_used_bytes()
         try:
             self.controller.stop(key)
@@ -857,6 +958,7 @@ class Arbiter:
             self._decide(Decision.GRANTED, key, task_id, res.charged_bytes,
                          f"{reason}; release confirmed at {used / GIB:.2f} GiB used", action="unload")
             self._cv.notify_all()
+        return f"release confirmed at {used / GIB:.2f} GiB used"
 
     # --- generation lock (rules 3, 4, 6) ---------------------------------------------------------------------------
 
@@ -1056,5 +1158,5 @@ __all__ = [
     "APEX_KEY", "DEEP_THINK_TIERS", "GIB", "KV_BYTES_PER_TOKEN_F16", "KV_CLASS_FACTOR", "MAX_RESIDENT", "Arbiter",
     "ArbiterError", "Decision", "DeepThinkPlan", "Footprint", "LoadDecision", "MemoryProbe", "ReleaseTimeout",
     "Resident", "StubProbe", "SysfsMemoryProbe", "UnitProfile", "UnknownEngine", "build_arbiter",
-    "kv_estimate_bytes", "read_unit_profile",
+    "kv_estimate_bytes", "process_rss_bytes", "read_unit_profile",
 ]

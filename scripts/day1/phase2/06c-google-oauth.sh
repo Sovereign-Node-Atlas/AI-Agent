@@ -47,7 +47,13 @@
 #
 # The OAuth client JSON comes from $ATLAS_SRV/staging/inbox/google-oauth-client.json (Section 22: the client exists).
 # If it is absent this step prints exactly where to put it, records V20 FAIL (not deferred) and stops the phase;
-# re-running resumes here.
+# re-running resumes here. CLIENT TYPE (fix round 5, belt and braces): phase2-services.sh's minute-0 pre-flight already
+# checks the inbox JSON for the top-level "installed" key (Desktop app) and names a "web" client as the wrong type;
+# this step re-checks the copy it is about to use (inbox or the already installed $G_CLIENT) BEFORE the first consent
+# URL is printed, so a client swapped after the pre-flight, or an installed copy from an earlier revision, can never
+# send the Principal through a consent flow whose loopback redirect Google will refuse. The OAuth hosts the flow needs
+# (accounts.google.com, oauth2.googleapis.com, www.googleapis.com) are asserted present in config/allowlist.txt at the
+# same point, so a missing host is one line here and not a TCP_DENIED after the consent click.
 #
 # Contracts relied on from other writers (CONVENTIONS.md §1): /opt/atlas/venv (step 02; created here when absent,
 # logged); config/allowlist.txt: accounts.google.com, oauth2.googleapis.com, www.googleapis.com,
@@ -173,16 +179,50 @@ MSG
       record_v V20 fail "OAuth client JSON absent: put the Desktop-app client JSON at $G_SRC and re-run phase2"
       die "Google OAuth client JSON absent at $G_SRC (V20 recorded as fail)"
     fi
-    if ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if "installed" in d else 1)' "$G_SRC"; then
-      record_v V20 fail "$G_SRC is not a Desktop-app OAuth client (no top-level 'installed' key)"
-      die "$G_SRC is not a 'Desktop app' OAuth client JSON (needs the top-level key 'installed'; 'web' clients cannot use the loopback redirect)"
-    fi
+    _g_client_type_check "$G_SRC"
     install -m 600 -o atlas -g atlas "$G_SRC" "$G_CLIENT"
     log "installed the OAuth client JSON as $G_CLIENT (atlas, 600); the inbox copy is shredded once every account has passed its API proof"
   fi
+  # Belt and braces (header: CLIENT TYPE): the copy the consent flow will use is checked whichever path put it there.
+  _g_client_type_check "$G_CLIENT"
   # The consumer must be able to open it now, not in Phase 3.
   svc_user_run test -r "$G_CLIENT" \
     || die "atlas cannot read $G_CLIENT: $(stat -c '%A %U:%G, changed %y' "$ATLAS_ETC/secrets") on $ATLAS_ETC/secrets blocks traversal. Every writer's ensure_dir of that directory must be root:atlas 710 (750 also traverses; header: SECRETS DIRECTORY)"
+}
+
+# _g_client_type_check FILE — the JSON must be a "Desktop app" client (top-level "installed"); a "web" client is named as
+# the wrong type (its redirect URIs are fixed https callbacks, the loopback flow of google_oauth.py cannot use it),
+# anything else as not an OAuth client at all. V20 fail + die, before any consent URL (header: CLIENT TYPE).
+_g_client_type_check() {
+  local f="$1" kind
+  kind="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    print("unreadable: %s" % exc); sys.exit(0)
+print("installed" if isinstance(d, dict) and "installed" in d else "web" if isinstance(d, dict) and "web" in d else "other")' "$f" 2>/dev/null || echo other)"
+  case "$kind" in
+    installed) log "OAuth client $f: Desktop-app type (top-level 'installed'), as the loopback flow needs" ;;
+    web)
+      record_v V20 fail "$f is a 'web' OAuth client (top-level 'web' key), not the 'Desktop app' type the loopback flow needs"
+      die "$f is a WEB APPLICATION OAuth client (top-level key 'web'): wrong client type. The loopback redirect of the consent flow (InstalledAppFlow.run_local_server) needs a 'Desktop app' client, whose JSON has the top-level key 'installed'. In Google Cloud -> APIs & Services -> Credentials create an OAuth client ID of type 'Desktop app', download its JSON to $G_SRC and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2" ;;
+    *)
+      record_v V20 fail "$f is not a Desktop-app OAuth client (no top-level 'installed' key; $kind)"
+      die "$f is not a 'Desktop app' OAuth client JSON (needs the top-level key 'installed'; got: $kind). Download the Desktop-app client JSON from Google Cloud -> APIs & Services -> Credentials to $G_SRC and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2" ;;
+  esac
+}
+
+# _g_allowlist_check — the OAuth endpoints (services-tools.md §5.1; Section 12.5 "Google APIs") must be in
+# config/allowlist.txt, the ONLY allowlist (rule §7.1), before the first consent URL is printed.
+_g_allowlist_check() {
+  local f="$ATLAS_DAY1_DIR/config/allowlist.txt" host missing=()
+  [[ -f "$f" ]] || die "$f is missing (rule §7.1: the allowlist is that file and nothing else)"
+  for host in accounts.google.com oauth2.googleapis.com www.googleapis.com; do
+    grep -qxF "$host" "$f" || missing+=("$host")
+  done
+  (( ${#missing[@]} == 0 )) || die "config/allowlist.txt lacks the OAuth host(s) ${missing[*]} (Section 12.5 Google APIs; services-tools.md §5.1): add them BY NAME (never .googleapis.com, the Gemini guard) and reload: sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist $f"
+  log "allowlist: accounts.google.com, oauth2.googleapis.com, www.googleapis.com present in config/allowlist.txt"
 }
 
 # _g_last_json OUTPUT -> the last JSON line (the helper prints it last), or "" when there is none. `|| true` (fix round
@@ -384,6 +424,7 @@ step_06c() {
   [[ -e "$G_ENVF" ]] || install -m 640 -o root -g atlas /dev/null "$G_ENVF"
   _g_venv
   _g_client
+  _g_allowlist_check
   ensure_kv "$G_ENVF" GOOGLE_TOKEN_DIR "$G_DIR"
   ensure_kv "$G_ENVF" GOOGLE_CLIENT_JSON "$G_CLIENT"
   ensure_kv "$G_ENVF" GOOGLE_TOKEN_ACCESS direct

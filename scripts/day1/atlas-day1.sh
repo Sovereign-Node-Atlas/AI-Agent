@@ -6,8 +6,10 @@
 #
 # On every run the scripts tree is mirrored to $ATLAS_OPT/day1 and this script re-executes from there, so a
 # `git pull` during a running phase never changes the code that phase is executing. Phases 3 and 4 run detached
-# under systemd (detached_phase) unless --foreground is given; --dry-run, --status and --force always run in the
-# foreground. Phase N+1 refuses to start until phase N's gate wrote $ATLAS_STATE/done/phaseN.gate.
+# under systemd (detached_phase) unless --foreground is given; --dry-run and --status always run in the foreground.
+# --force STEP on phase3/phase4 clears the marker and then DETACHES like the plain command (the driver does it, and
+# prints the journalctl follow line); it stays in the terminal only together with --foreground (README §5).
+# Phase N+1 refuses to start until phase N's gate wrote $ATLAS_STATE/done/phaseN.gate.
 #
 # Contracts relied on from other writers (CONVENTIONS.md §1): phase1-platform.sh, phase2-services.sh,
 # phase3-models.sh and phase4-engines.sh live beside this file, accept the common args, and phases 3/4 accept --run.
@@ -30,11 +32,12 @@ commands
 
 options (phases)
   --dry-run       print the steps, run nothing
-  --force STEP    clear one step's done marker (e.g. --force 05b) before running
+  --force STEP    clear one step's done marker (e.g. --force 05b) before running; on phase3/phase4 the phase
+                  then detaches like the plain command unless --foreground is given too
   --status        markers and verify table for that phase only
   --foreground    run phase3/phase4 in this terminal instead of a transient systemd unit
 
-Follow a detached phase with:  journalctl -u atlas-day1-phase3 -f   (or -phase4)
+Follow a detached phase with:  journalctl -fu atlas-day1-phase3   (or atlas-day1-phase4)
 EOF
 }
 
@@ -68,7 +71,10 @@ require_gate() {
     || die "phase $n has not passed its gate ($ATLAS_DONE_DIR/phase$n.gate missing). Run: sudo $ATLAS_ENTRY phase$n"
 }
 
-# Split phase options into "foreground-only" markers and the pass-through list.
+# Split phase options into --foreground, the "the driver decides where it runs" markers, and the pass-through list.
+# --dry-run and --status never detach (the drivers run them in place and need no gate). --force passes through: the
+# driver clears the marker, and phase3/phase4 then detach themselves (their contract: without --run they call
+# detached_phase, which prints the follow line) unless --run reaches them, which only --foreground adds.
 foreground=0
 wants_foreground_by_args=0
 pass=()
@@ -77,7 +83,7 @@ parse_phase_opts() {
     case "$1" in
       --foreground) foreground=1; shift ;;
       --dry-run|--status) wants_foreground_by_args=1; pass+=("$1"); shift ;;
-      --force) [[ -n "${2:-}" ]] || die "--force needs a STEP id"; wants_foreground_by_args=1; pass+=("$1" "$2"); shift 2 ;;
+      --force) [[ -n "${2:-}" ]] || die "--force needs a STEP id"; pass+=("$1" "$2"); shift 2 ;;
       *) die "unknown option '$1' for $cmd (see: $0 help)" ;;
     esac
   done
@@ -94,14 +100,18 @@ run_foreground_phase() {
 run_detached_or_foreground() {
   local phase="$1" script="$2"; shift 2
   [[ -x "$script" ]] || die "$script is missing or not executable (written by the phase author; see CONVENTIONS.md §1)"
-  if (( foreground || wants_foreground_by_args )); then
-    export ATLAS_PHASE="$phase"
-    if (( ${#pass[@]} > 0 )); then
-      exec "$script" "${pass[@]}"
-    fi
-    exec "$script" --run
-  fi
   export ATLAS_PHASE="$phase"
+  if (( foreground )); then
+    # In this terminal, with any --force ids: --run is the drivers' in-unit entry and parse_common_args takes it
+    # anywhere in argv, so a --force before it is still honoured (an earlier revision dropped --run here whenever a
+    # --force was present, so `--foreground --force STEP` detached anyway).
+    log "starting $phase in the foreground: $script ${pass[*]} --run"
+    exec "$script" "${pass[@]}" --run
+  fi
+  if (( wants_foreground_by_args || ${#pass[@]} > 0 )); then
+    # --dry-run / --status run in place; --force alone: the driver clears the marker and detaches itself (README §5).
+    exec "$script" "${pass[@]}"
+  fi
   detached_phase "$phase" "$script"
 }
 

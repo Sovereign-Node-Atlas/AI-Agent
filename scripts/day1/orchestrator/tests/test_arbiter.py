@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from atlas.arbiter import (
     UnknownEngine,
     build_arbiter,
     kv_estimate_bytes,
+    process_rss_bytes,
     read_unit_profile,
 )
 from atlas.config import EngineSpec, load_phase4_engines
@@ -53,12 +55,14 @@ class FakeClock:
 
 def make(engines: dict[str, EngineSpec], *, budget_gib: float = 170.0, leak: bool = False,
          ledger: Ledger | None = None, release_timeout_s: float = 60.0,
-         engines_env_dir: Path | None = None) -> tuple[Arbiter, StubController, StubProbe, FakeClock]:
+         engines_env_dir: Path | None = None,
+         rss_of: Callable[[int], int | None] | None = None) -> tuple[Arbiter, StubController, StubProbe, FakeClock]:
     probe = StubProbe(total_bytes=int(RESIDENT_SET + budget_gib * GIB), used_bytes=RESIDENT_SET)
     controller = StubController(engines=engines, probe=probe, leak_on_stop=leak)
     clock = FakeClock()
+    extra = {"rss_of": rss_of} if rss_of is not None else {}
     arb = Arbiter(engines, controller, probe, ledger=ledger, release_timeout_s=release_timeout_s,
-                  poll_interval_s=1.0, clock=clock, sleep=clock.sleep, engines_env_dir=engines_env_dir)
+                  poll_interval_s=1.0, clock=clock, sleep=clock.sleep, engines_env_dir=engines_env_dir, **extra)
     arb.measure_resident_set()
     return arb, controller, probe, clock
 
@@ -629,6 +633,109 @@ def test_resident_small_models_are_never_budgeted(engines: dict[str, EngineSpec]
     assert d.granted and d.projected_bytes == 0 and "not budgeted" in d.reason
     assert arb.resident == {} and controller.calls == [("start", "router-qwen3.5-4b")]
     assert arb.projected_footprint("embed-bge-m3").total_bytes == 0
+
+
+def test_external_engine_is_budgeted_and_ledgered_without_systemctl(engines: dict[str, EngineSpec]) -> None:
+    """Section 4.2 "Chatterbox when invoked": class external (engines.json `external` list) passes through the Arbiter
+    like every weight-bearing load (rule 2 budget, rule 3 slot, rules 1/9 ledger) but no controller start or stop ever
+    happens (the caller runs the process), the registered peak RSS replaces the 4 GiB projection, an unload WITHOUT a
+    pid is taken on the caller's word and says so ("not measured"; the pid path is the next test), and an external
+    resident is never an eviction victim (queued instead)."""
+    ledger = Ledger(":memory:")
+    ledger.init_db()
+    arb, controller, probe, _ = make(engines, ledger=ledger)
+    spec = engines["chatterbox"]
+    assert spec.is_external and not spec.is_phase4 and arb.unit_profile("chatterbox") is None
+    d = arb.request_load("chatterbox", task_id="v7")
+    assert d.granted and d.projected_bytes == 4 * GIB and "class external" in d.reason and "ledger" in d.reason
+    assert controller.calls == [] and "chatterbox" in arb.resident and arb.resident["chatterbox"].serving
+    assert arb.charged_bytes == 4 * GIB and arb.resident["chatterbox"].observed_bytes == 0
+    assert arb.status()["resident"][0]["class"] == "external"
+    # rule 1: the measured footprint (phase2/05-voice.sh: peak RSS) replaces the projection, in place.
+    arb.register_measured("chatterbox", 3 * GIB, task_id="p2-05")
+    assert arb.charged_bytes == 3 * GIB and arb.resident["chatterbox"].measured_bytes == 3 * GIB
+    # rule 3: a second resident fits beside it; a third that would need chatterbox's slot is QUEUED, never evicts it.
+    assert arb.request_load("gpt-oss-120b", task_id="t1").granted and len(arb.resident) == 2
+    q = arb.request_load("nemotron-3-super", task_id="t2")
+    assert q.decision is Decision.QUEUED and "external engine(s) chatterbox" in q.reason
+    assert "chatterbox" in arb.resident
+    assert ("stop", "chatterbox") not in controller.calls
+    # The caller's unload without a pid: no GTT poll (the probe did not move for it), no controller call, the charge
+    # dropped on the caller's word and the reason says the release was NOT measured (fix round 6).
+    probe.used_bytes = probe.used_bytes  # unchanged on purpose: nothing of chatterbox is on the GTT counter
+    u = arb.request_unload("chatterbox", task_id="v7")
+    assert u.granted and "caller's word" in u.reason and "NOT measured" in u.reason
+    assert "chatterbox" not in arb.resident and arb.status()["halted"] is None
+    assert [c for c in controller.calls if c[1] == "chatterbox"] == []
+    rows = ledger.list_arbiter_decisions(limit=20)
+    assert any(r["engine"] == "chatterbox" and r["action"] == "unload" and "caller's word" in r["reason"] for r in rows)
+    # Now the queued load goes through (gpt-oss-120b is the LRU victim, a real unit, stopped and confirmed).
+    assert arb.request_load("nemotron-3-super", task_id="t2").granted and ("stop", "gpt-oss-120b") in controller.calls
+    # A fresh Arbiter: the projection is charged until a measurement exists; re-measuring an external engine is no-op
+    # on the GTT side (confirm_loaded is never called for it) and a plain measured load is marked as such.
+    arb2, controller2, _, _ = make(engines)
+    arb2.register_measured("chatterbox", 5 * GIB)
+    d2 = arb2.request_load("chatterbox")
+    assert d2.granted and d2.projected_bytes == 5 * GIB and "(measured)" in d2.reason and controller2.calls == []
+
+
+def test_external_release_is_confirmed_against_the_process(engines: dict[str, EngineSpec]) -> None:
+    """Section 4.2 rule 5 for class external (fix round 6): the GTT counter is the wrong instrument for a CPU process,
+    so `request_unload(pid=...)` polls /proc/<pid>: a process still holding its weights times out (the engine STAYS
+    resident and charged, an ERROR row, ReleaseTimeout WITHOUT halting the Arbiter); a process that is gone, or whose
+    RSS is back within the tolerance, confirms the release. No controller call at any point."""
+    ledger = Ledger(":memory:")
+    ledger.init_db()
+    rss: dict[int, int | None] = {4242: 3 * GIB}
+    polls: list[int] = []
+
+    def rss_of(pid: int) -> int | None:
+        polls.append(pid)
+        return rss.get(pid)
+
+    arb, controller, _, _ = make(engines, ledger=ledger, release_timeout_s=10.0, rss_of=rss_of)
+    assert arb.request_load("chatterbox", task_id="v7").granted
+    with pytest.raises(ReleaseTimeout, match=r"process 4242 of chatterbox still holds 3\.00 GiB RSS .* not halted"):
+        arb.request_unload("chatterbox", task_id="v7", pid=4242)
+    assert set(polls) == {4242} and len(polls) >= 10  # polled once per second for release_timeout_s
+    assert "chatterbox" in arb.resident and arb.resident["chatterbox"].serving and arb.charged_bytes == 4 * GIB
+    assert arb.status()["halted"] is None  # the process is the caller's: no halt, the caller retries
+    assert any(r["engine"] == "chatterbox" and r["action"] == "unload" and r["decision"] == "error"
+               for r in ledger.list_arbiter_decisions(limit=20))
+    # The process exits: /proc/<pid> is gone and the next unload confirms the release.
+    rss[4242] = None
+    u = arb.request_unload("chatterbox", task_id="v7", pid=4242)
+    assert u.granted and "release confirmed: process 4242 gone" in u.reason and "chatterbox" not in arb.resident
+    # An interpreter that lives on but freed the weights (RSS within the tolerance) confirms too.
+    assert arb.request_load("chatterbox", task_id="v7b").granted
+    rss[4242] = GIB // 2
+    u2 = arb.request_unload("chatterbox", task_id="v7b", pid=4242)
+    assert u2.granted and "within tolerance" in u2.reason and "chatterbox" not in arb.resident
+    assert controller.calls == []
+
+
+def test_process_rss_bytes_reads_proc(tmp_path: Path) -> None:
+    (tmp_path / "123").mkdir()
+    (tmp_path / "123" / "status").write_text("Name:\tpython\nVmPeak:\t 5000 kB\nVmRSS:\t 2048 kB\nThreads:\t1\n")
+    (tmp_path / "124").mkdir()
+    (tmp_path / "124" / "status").write_text("Name:\tpython\nState:\tZ (zombie)\n")  # no VmRSS: released
+    assert process_rss_bytes(123, proc_root=tmp_path) == 2048 * 1024
+    assert process_rss_bytes(124, proc_root=tmp_path) == 0
+    assert process_rss_bytes(125, proc_root=tmp_path) is None
+
+
+def test_apex_request_queues_behind_an_external_resident(engines: dict[str, EngineSpec]) -> None:
+    """Rule 7 exception, named in the module docstring and engines.json's `external` notes: "unloads any co-resident
+    engine first" cannot be performed on a caller-owned process, so an Apex request while chatterbox is resident is
+    QUEUED with that reason and goes through once the caller has unloaded."""
+    arb, controller, _, _ = make(engines)
+    assert arb.request_load("chatterbox", task_id="v7").granted
+    d = arb.request_load(APEX_KEY, task_id="t-apex")
+    assert d.decision is Decision.QUEUED
+    assert "external engine(s) chatterbox" in d.reason and "POST /arbiter/unload" in d.reason
+    assert list(arb.resident) == ["chatterbox"] and controller.calls == []
+    assert arb.request_unload("chatterbox", task_id="v7").granted
+    assert arb.request_load(APEX_KEY, task_id="t-apex").granted and list(arb.resident) == [APEX_KEY]
 
 
 def test_unknown_engine_is_an_error(engines: dict[str, EngineSpec]) -> None:

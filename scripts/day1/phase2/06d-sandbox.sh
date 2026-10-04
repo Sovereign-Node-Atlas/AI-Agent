@@ -105,6 +105,7 @@ _sandbox_env() {
   ensure_kv "$orch" SANDBOX_CPUS 2
   ensure_kv "$orch" SANDBOX_PIDS 256
   ensure_kv "$orch" SANDBOX_TMPFS_SIZE 512m
+  ensure_kv "$orch" SANDBOX_WORK_SIZE 2g   # /work tmpfs cap (atlas.sandbox.build_argv; V17 asserts ENOSPC past it)
   ensure_kv "$orch" SANDBOX_TIMEOUT_S 300
   ensure_kv "$orch" SANDBOX_FSIZE 1073741824          # --ulimit fsize (bytes): 1 GiB per file a job writes
   [[ "$(_sandbox_hash "$orch")" == "$before" ]] || SANDBOX_ENV_CHANGED=1

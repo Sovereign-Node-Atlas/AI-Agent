@@ -174,7 +174,7 @@ _cf_read_back() {
         || die "GET /zones/<id> (403, no Zone:Read) and GET dns_records both failed (HTTP $CF_HTTP): ${ans:0:200}. The token does not carry Zone:DNS:Edit on $CF_ZONE_NAME or the zone id is wrong."
       local n; n="$(jq -r '.result | length' <<<"$ans")"
       log "cloudflare: token has no Zone:Zone:Read (GET /zones/{id} 403, fine for Zone:DNS:Edit); dns_records read ok ($n A record(s) named $VPN_HOST)"
-      [[ "$n" != 0 ]] || warn "no A record named $VPN_HOST exists yet: create it once in the dashboard (DNS only, grey cloud); the ddns updater needs it"
+      [[ "$n" != 0 ]] || warn "no A record named $VPN_HOST exists yet: the ddns updater creates it (DNS only, grey cloud) on its next run; check journalctl -u atlas-ddns"
       ;;
     *) die "GET /zones/<id> failed (HTTP $CF_HTTP): ${ans:0:200}" ;;
   esac

@@ -1109,6 +1109,7 @@ The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass 
 | S26 | 13, 21 V15 | Approval gate "sends" on approve | No outbound channel exists on Day 1 (Section 13 connectors are Day 2) | V15 proves the gate against a stub sender; an approved item reports "no send channel configured" |
 | S27 | 12.1 | Open WebUI "installs as an app" | A home-screen app needs TLS; Day 1 serves plain HTTP on LAN and WireGuard | Day 2: TLS front on the WireGuard address |
 | S28 | 3.6, 16.4 | Service user in `render` and `video` only | The sandbox and Phase 4 need the Docker socket, so `atlas` is also in `docker` (root-equivalent) | Recorded as R22, accepted for Day 1 |
+| S29 | 12.5 | Outbound allowlist as enumerated in 12.5 | Three pulls fall outside the named services: Meta's weight host for the TRELLIS DINOv2 conditioner and the SAM 2 `.pt` fallback, the OpenAI tokenizer table LightRAG needs offline, and the Playwright browser CDN | Added to `config/allowlist.txt` under the "package mirrors during builds, Hugging Face during model pulls" clause, each with a comment naming the step: `dl.fbaipublicfiles.com`, `openaipublic.blob.core.windows.net`, `playwright.azureedge.net`, `cdn.playwright.dev`. The Principal may strike any of them; the dependent engine or tool then records deferred |
 
 **Watch-list additions from the build:** UI-TARS 2.0 (S16). **Reserved for the Principal:** the kernel-7.0 hang reports in S15, if V11 fails for that reason; decision D15.
 

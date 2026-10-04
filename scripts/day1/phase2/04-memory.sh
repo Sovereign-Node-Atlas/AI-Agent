@@ -28,14 +28,18 @@
 #      observation is repeated after the collection operations, where a per-operation beacon would fire.
 #   4. LightRAG 1.5.7 into the orchestrator venv (constrained to the atlas package's own `==` pins, then `pip check`),
 #      working dir $ATLAS_SRV/data/graph. tiktoken's cl100k_base table (one public BPE file, no Principal data) is
-#      delivered OFFLINE (fix round 3: no new egress host): a copy at scripts/day1/config/tiktoken/cl100k_base.tiktoken
-#      (vendored, when present) or at $ATLAS_SRV/staging/inbox/cl100k_base.tiktoken (the Principal's drop directory,
-#      CONVENTIONS §2) is verified against the sha256 tiktoken itself pins, seeded into TIKTOKEN_CACHE_DIR under the
-#      cache name tiktoken expects (sha1 of the blob URL) and proven with the network pointed at a closed port. When
-#      neither copy exists the step completes, warns with the exact download/checksum/drop commands and
-#      `phase2 --force 04` (phase1's --force 04 is the one that reboots), records LIGHTRAG_TIKTOKEN_CACHED=0 in
-#      memory.env and repeats the warning at the end of the step (a fresh Phase 2 must run unattended, Section 17; the
-#      orchestrator's graph layer refuses to index until the table is cached, so nothing fails silently).
+#      looked for in THREE places, first match by sha256 wins (fix round 5; config/tiktoken/README.md): the vendored
+#      copy scripts/day1/config/tiktoken/cl100k_base.tiktoken, then $ATLAS_SRV/staging/inbox/cl100k_base.tiktoken (the
+#      Principal's drop directory, CONVENTIONS §2), then a ONE-TIME download through the allowlist proxy from
+#      TIKTOKEN_URL (openaipublic.blob.core.windows.net, config/allowlist.txt "LightRAG tokenizer table": an ADDITION to
+#      the Section 12.5 enumeration pending the Principal's Section 23 row, as that file's comment says; if the line is
+#      struck, this path fails loudly and the step defers with the inbox remedy). Whichever path delivers it, the copy is verified against the
+#      sha256 tiktoken itself pins, seeded into TIKTOKEN_CACHE_DIR under the cache name tiktoken expects (sha1 of the
+#      blob URL) and proven with the network pointed at a closed port, so LIGHTRAG_TIKTOKEN_CACHED=1 is the NORMAL
+#      outcome. Only when all three fail does the step complete with LIGHTRAG_TIKTOKEN_CACHED=0 in memory.env, a WARN
+#      naming the exact download/checksum/drop commands and `phase2 --force 04` (phase1's --force 04 is the one that
+#      reboots), repeated at the end of the step (a fresh Phase 2 must run unattended, Section 17; the orchestrator's
+#      graph layer refuses to index until the table is cached, so nothing fails silently).
 #   5. Docling 2.129.0 into the same venv: torch AND torchvision pinned to matching +cpu builds from
 #      download.pytorch.org/whl/cpu in one resolve, then docling against them, then `pip check`; models prefetched once
 #      under HF_HOME=$ATLAS_SRV/engines/hf and proven OFFLINE by converting a generated one-page PDF through the layout
@@ -91,12 +95,15 @@
 #     DROP; _mem_chroma_telemetry_check asserts that LOG rule is present (`iptables -S DOCKER-USER`) and reads the prefix
 #     through journalctl -k. The prefix is part of the contract.
 #   * config/allowlist.txt (phase1/04-system.sh's writer) carries huggingface.co and .hf.co (the LFS/CAS hosts that
-#     resolve redirects land on *.hf.co), pypi.org, files.pythonhosted.org, download.pytorch.org (CPU torch wheels) and
-#     ghcr.io for the docling-serve image (the voice writer relies on it already). NO new host is requested: the
-#     tiktoken table is delivered offline (header item 4), so the fix-round-2 request for
-#     openaipublic.blob.core.windows.net is WITHDRAWN.
+#     resolve redirects land on *.hf.co), pypi.org, files.pythonhosted.org, download.pytorch.org (CPU torch wheels),
+#     ghcr.io for the docling-serve image (the voice writer relies on it already) and, since fix round 5,
+#     openaipublic.blob.core.windows.net for the one-time tiktoken table fetch of header item 4 (the fix-round-3
+#     withdrawal is reversed: a table that is never there in practice left LIGHTRAG_TIKTOKEN_CACHED=0 the usual outcome;
+#     fix round 6: the host is a Section 12.5 addition the Principal approves, recorded as pending in the allowlist
+#     comment with a Section 23 row requested; the review sandbox cannot vendor the file, HTTP 403).
 #   * $ATLAS_SRV/staging/inbox (phase1/03-mounts.sh, $PRINCIPAL_USER:atlas 2770) is where the Principal may drop
-#     cl100k_base.tiktoken; the file is verified by sha256 before use and left in place.
+#     cl100k_base.tiktoken; the file is verified by sha256 before use and left in place. config/tiktoken/README.md and
+#     SHA256SUMS describe the vendored copy (first in the search order) and how to commit it.
 #   * lib/common.sh hf_download: as of this round it still puts the bearer token on curl's argv (`-H "Authorization:
 #     Bearer $HF_TOKEN"`), readable by every local account in /proc/<pid>/cmdline for the whole transfer. REQUESTED of
 #     that writer: read the header from stdin (`printf ... | curl -H @- ...`, curl >= 7.55) as hf_tree_lfs below does.
@@ -746,12 +753,38 @@ print("constraints:", " ".join(out))
 PY
 }
 
-# --- tiktoken: cl100k_base delivered offline (header item 4) ---------------------------------------------------------
-# The exact next commands when no verified copy of the table is present (CONVENTIONS §7.10). `phase2 --force 04`, not
-# phase1's: step 04 of Phase 2 is idempotent and resumes in seconds; phase1's --force 04 is the one that ends in a reboot
+# --- tiktoken: cl100k_base, vendored copy / inbox / one-time download (header item 4) ------------------------------------
+# The exact next commands when no path delivered the table (CONVENTIONS §7.10). `phase2 --force 04`, not phase1's: step
+# 04 of Phase 2 is idempotent and resumes in seconds; phase1's --force 04 is the one that ends in a reboot
 # (config/allowlist.txt header).
 _mem_tiktoken_remedy() {
-  printf '%s' "on any machine with internet access run: curl -fsSL -o $TIKTOKEN_FILE $TIKTOKEN_URL && sha256sum $TIKTOKEN_FILE  (must print $TIKTOKEN_SHA256); copy the file to $ATLAS_SRV/staging/inbox/$TIKTOKEN_FILE on this node (or commit it as scripts/day1/config/tiktoken/$TIKTOKEN_FILE); then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 04 (every other part of step 04 is idempotent and resumes in seconds). No allowlist change is needed or wanted"
+  printf '%s' "the one-time download from $TIKTOKEN_URL failed through the proxy (is openaipublic.blob.core.windows.net in config/allowlist.txt and the rendered squid list? grep TCP_DENIED /var/log/squid/access.log). Either fix that and re-run, or on any machine with internet access run: curl -fsSL -o $TIKTOKEN_FILE $TIKTOKEN_URL && sha256sum $TIKTOKEN_FILE  (must print $TIKTOKEN_SHA256); copy the file to $ATLAS_SRV/staging/inbox/$TIKTOKEN_FILE on this node (or commit it as scripts/day1/config/tiktoken/$TIKTOKEN_FILE, see config/tiktoken/README.md); then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 04 (every other part of step 04 is idempotent and resumes in seconds)"
+}
+
+# _mem_tiktoken_fetch DEST — the third path: one GET of TIKTOKEN_URL through the allowlist proxy into DEST (a transient
+# file under /var/cache/atlas, never $ATLAS_STATE or $ATLAS_SRV), sha256-checked against the pin; returns 1 (and says
+# why) instead of dying, because the caller's deferred path is the honest fallback (header item 4).
+_mem_tiktoken_fetch() {
+  local dest="$1" have rc=0
+  proxy_env
+  [[ -n "${HTTPS_PROXY:-}" ]] || { warn "tiktoken: HTTPS_PROXY is not exported (proxy_env found no $ATLAS_ETC/proxy.env; rule §7.1); not fetching $TIKTOKEN_URL"; return 1; }
+  ensure_dir "$(dirname "$dest")" root:root 755
+  log "tiktoken: no vendored or inbox copy; fetching $TIKTOKEN_URL once through the proxy (config/allowlist.txt: LightRAG tokenizer table, one-time)"
+  retry 3 curl -fsSL --connect-timeout 30 --max-time 300 -o "$dest.part" "$TIKTOKEN_URL" || rc=$?
+  if (( rc != 0 )); then
+    rm -f "$dest.part"
+    warn "tiktoken: download of $TIKTOKEN_URL failed (curl exit $rc)"
+    return 1
+  fi
+  have="$(sha256sum "$dest.part" | cut -d' ' -f1)"
+  if [[ "$have" != "$TIKTOKEN_SHA256" ]]; then
+    rm -f "$dest.part"
+    warn "tiktoken: downloaded table has sha256 $have, expected $TIKTOKEN_SHA256 (tiktoken's own pin); discarded"
+    return 1
+  fi
+  mv -f "$dest.part" "$dest"
+  chmod 644 "$dest"
+  log "tiktoken: fetched $TIKTOKEN_FILE (sha256 verified) into $dest"
 }
 
 # _mem_tiktoken_source — print the path of a copy whose sha256 matches the pin, repository copy first, inbox second;
@@ -777,14 +810,15 @@ _mem_tiktoken_seed() {
   dest="$wd/tiktoken/$key"
   if [[ -f "$dest" && "$(sha256sum "$dest" | cut -d' ' -f1)" == "$TIKTOKEN_SHA256" ]]; then
     log "tiktoken: cl100k_base already cached at $dest (sha256 verified)"
-  elif src="$(_mem_tiktoken_source)"; then
+  elif src="$(_mem_tiktoken_source)" || { src="$ATLAS_CACHE_DIR/downloads/$TIKTOKEN_FILE"; _mem_tiktoken_fetch "$src"; }; then
+    # Search order (header item 4): vendored copy, inbox, then the one-time download (the third path above).
     install -m 640 -o atlas -g atlas "$src" "$dest.tmp"
     mv -f "$dest.tmp" "$dest"
     log "tiktoken: seeded $dest from $src (sha256 $TIKTOKEN_SHA256)"
   else
     [[ -e "$dest" ]] && rm -f "$dest"
     MEM_TIKTOKEN_CACHED=0
-    warn "tiktoken cl100k_base NOT cached (deferred: no verified copy at $ATLAS_DAY1_DIR/config/tiktoken/$TIKTOKEN_FILE or $ATLAS_SRV/staging/inbox/$TIKTOKEN_FILE); LightRAG is installed but D7 indexing will refuse to start until it is. Remedy: $(_mem_tiktoken_remedy)"
+    warn "tiktoken cl100k_base NOT cached (deferred: no verified copy at $ATLAS_DAY1_DIR/config/tiktoken/$TIKTOKEN_FILE or $ATLAS_SRV/staging/inbox/$TIKTOKEN_FILE, and the one-time download failed); LightRAG is installed but D7 indexing will refuse to start until it is. Remedy: $(_mem_tiktoken_remedy)"
     return 0
   fi
   # Offline proof: tiktoken must load the table from the cache alone (it re-checks the sha256 itself). The proxy
@@ -806,7 +840,7 @@ _mem_preflight() {
   if _mem_tiktoken_source >/dev/null; then
     log "tiktoken: a verified copy of $TIKTOKEN_FILE is available; cl100k_base will be seeded offline in this step"
   else
-    warn "tiktoken: no verified copy of $TIKTOKEN_FILE at $ATLAS_DAY1_DIR/config/tiktoken/ or $ATLAS_SRV/staging/inbox/; the LightRAG warm-up will be DEFERRED (the rest of step 04 runs). Remedy: $(_mem_tiktoken_remedy)"
+    log "tiktoken: no vendored or inbox copy of $TIKTOKEN_FILE (config/tiktoken/README.md); the step will fetch it once from $TIKTOKEN_URL through the proxy, and defer the LightRAG warm-up only if that fails too"
   fi
 }
 

@@ -116,7 +116,9 @@ def cmd_init_db(args: argparse.Namespace) -> int:
 # --- engines list -----------------------------------------------------------------------------------------------------
 
 
-def _unit_state(controller: SystemdEngineController, key: str) -> str:
+def _unit_state(controller: SystemdEngineController, key: str, spec: Any = None) -> str:
+    if spec is not None and getattr(spec, "is_external", False):
+        return "external (in-process, no unit)"  # class external: run by its caller, budgeted by the Arbiter
     try:
         return "active" if controller.is_active(key) else "inactive"
     except EngineControlError:
@@ -133,7 +135,7 @@ def cmd_engines_list(args: argparse.Namespace) -> int:
             "key": spec.key, "class": spec.arbiter_class, "mode": spec.mode, "kv": spec.kv_class,
             "footprint_gb": spec.footprint_gb, "ctx_size": spec.ctx_size, "parallel": spec.parallel,
             "port": spec.port, "unit": spec.systemd_unit,
-            "state": "-" if args.no_state else _unit_state(controller, spec.key),
+            "state": "-" if args.no_state else _unit_state(controller, spec.key, spec),
         })
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -161,7 +163,7 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
         out["gtt"] = {"error": str(exc)}
     active: list[EngineSpec] = []
     for spec in engines.values():
-        state = _unit_state(controller, spec.key)
+        state = _unit_state(controller, spec.key, spec)
         out["engines"][spec.key] = state
         if state == "active" and not spec.is_resident:
             active.append(spec)

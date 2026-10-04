@@ -18,12 +18,20 @@
 #   3. PyAnnote 4.0.7 into $ATLAS_OPT/venv-pyannote (see WHY TWO VENVS below), torch 2.9.1 + torchcodec 0.8.1 pinned
 #      as a pair (torchcodec wheels declare no torch dependency; see the PYANNOTE_TORCHCODEC_PIN comment for why 0.7.0,
 #      the earlier pin, cannot load on resolute at all).
-#   4. The V7 listening test is RENDERED here, once, as atlas (phase2/voice_render.py render -> $LISTENING_TEST_DIR and
-#      its summary $LISTENING_TEST_DIR/v7-listening-test.json); verify/v07-voice-listen.sh only reads that summary, so
-#      V7 stays under the 10-minute verify contract at the gate.
+#   4. The reference recordings are NORMALISED first (fix round 5): the inbox may hold alaric.* / gideon.* as WAV, MP3 or
+#      M4A (whatever the Principal's recorder produced); each is transcoded with ffmpeg (apt_install, already in
+#      _voice_apt) to 16 kHz mono PCM WAV under $ATLAS_SRV/staging/voice-references-normalised/<persona>.wav, as atlas,
+#      skipped when the normalised copy is newer than its source; the renderer and the orchestrator consume ONLY that
+#      directory. Then the V7 listening test is RENDERED here, once, as atlas (phase2/voice_render.py render
+#      --references-dir ... -> $LISTENING_TEST_DIR and its summary $LISTENING_TEST_DIR/v7-listening-test.json);
+#      verify/v07-voice-listen.sh only reads that summary, so V7 stays under the 10-minute verify contract at the gate.
 #   5. POST /arbiter/remeasure on the step-2 orchestrator (loopback admin path) so the Section 4.1 resident set includes
-#      the voice stack; V6 (verify/v06-pyannote.sh, runs the diarisation as atlas), V7 (the fast reader);
-#      $ATLAS_ETC/voice.env written.
+#      the voice stack; V6 (verify/v06-pyannote.sh, runs the diarisation as atlas: the 3.1 pipeline, and ONLY 3.1 passes,
+#      Sections 14.1 and 21; when pyannote.audio refuses the 3.1 id V6 is a FAIL whose message carries a diagnostic of
+#      the 4.x community pipeline PYANNOTE_FALLBACK_PIPELINE for the Principal's decision; fix round 6 restored the
+#      round-4 verdict). voice.env PYANNOTE_PIPELINE always stays the 14.1 value; PYANNOTE_PIPELINE_PROVEN records what
+#      V6 actually passed with (or `none`), and only the Principal switches the former after amending 14.1/21 (Section
+#      16.3 item 6). V7 (the fast reader); $ATLAS_ETC/voice.env written.
 #
 # WHY TWO VENVS (the task asked for PyAnnote "into that venv"): chatterbox-tts 0.1.7 pins torch==2.6.0 for Python
 # < 3.14 (voice-stt.md §3.1 VERIFIED pyproject) while pyannote.audio 4.0.7 requires torch>=2.8.0 (§5.1 VERIFIED).
@@ -39,26 +47,36 @@
 # $VOICE_HF_HOME may belong to another user at the end of the step (asserted), and nothing under the venvs may belong to
 # anyone but root (asserted).
 # ENGINE ARBITER (Section 4.2, hard requirement: "every load ... of any weight-bearing process ... Chatterbox when
-# invoked" passes through it; fix round 3). This step loads Chatterbox three times (the online measure, the offline
-# re-render, the V7 clone batch inside voice_render.py), and the step-2 orchestrator with its Arbiter is already running.
-# What is done here, every run:
-#   * before EACH of those loads, GET /arbiter/status: the step STOPS (die) when the ledger shows any resident or
-#     generating engine (rule 3) or when the orchestrator does not answer (step 2 is a prerequisite, §7.5; a silent skip
-#     would bypass the hard requirement);
+# invoked" passes through it; fix rounds 3 and 5). This step loads Chatterbox three times (the online measure, the
+# offline re-render, the V7 clone batch inside voice_render.py), and the step-2 orchestrator with its Arbiter is already
+# running. The key `chatterbox` is config/engines.json's `external` entry (arbiter_class external, footprint_gb 4 until
+# the measured peak RSS replaces it; CONVENTIONS §8 does NOT list the class yet — its Arbiter classes are core, apex,
+# vision, crosscheck, resident, phase4 — and §1 still calls engines.json "7 GGUF engines + 3 resident small models": both
+# rows are REQUESTED of that file's writer, fix round 6): the Arbiter grants/queues/refuses the load against
+# the live budget (rule 2), counts it as one of the two resident engines (rule 3) and ledgers it (rules 1, 9), but
+# starts and stops nothing, because the process is this step's (and voice_render.py's) own. What is done here, every run:
+#   * before EACH load, GET /arbiter/status as the rule-3 belt: the step STOPS (die) when the ledger shows any resident
+#     or generating engine, or when the orchestrator does not answer (step 2 is a prerequisite, §7.5; a silent skip would
+#     bypass the hard requirement); then POST /arbiter/load {engine: chatterbox, task_id} and the load proceeds ONLY on
+#     `granted`: a 404 means the running orchestrator does not know the key (an older package/engines.json) and is a
+#     die naming `--force 02`, never a skip; queued/refused die with the Arbiter's reason. After the render, POST
+#     /arbiter/unload WITH THE RENDER PROCESS'S PID (fix round 6; Section 4.2 rule 5's substance for a CPU process: the
+#     Arbiter confirms the release by polling /proc/<pid> until the process is gone or its RSS is back, not by taking
+#     the caller's word; the measure script prints its pid in its JSON), whatever the render did. While a load is held
+#     an EXIT trap releases it (fix round 6: a die or a dropped SSH session between load and unload used to leave
+#     chatterbox resident for ever, class external is never timed out, and the next `--force 05` died in the idle
+#     check), and the idle check treats a ledger that shows EXACTLY [chatterbox] as such a stale hold of this step:
+#     WARN, POST /arbiter/unload, re-check; any other resident set still stops the step with the exact curl to run.
+#     voice_render.py does the same pair around its clone batch itself, passing the clone-batch child's pid
+#     (--arbiter, --arbiter-token-file; its summary carries the Arbiter's answers and a refusal fails every clone);
 #   * after the measurement, POST /arbiter/register {engine: "chatterbox", total_bytes: CHATTERBOX_FOOTPRINT_BYTES} so
-#     the ledger holds the measured footprint (rule 1). The orchestrator accepts a unit-style key that is in neither
-#     engines.json nor phase4-engines.json as class `phase4` with a logged WARNING (atlas.arbiter.register_measured:
-#     "the driver measured a real process and the ledger must reflect it"); re-registered on every run because the
-#     ledger is in-memory while $ATLAS_STATE/voice-chatterbox.json survives restarts;
+#     the ledger holds the measured footprint (rule 1); re-registered on every run because the ledger is in-memory while
+#     $ATLAS_STATE/voice-chatterbox.json survives restarts;
 #   * the figures the run-time path must declare go into voice.env (CHATTERBOX_FOOTPRINT_BYTES = peak RSS of the CPU
 #     render, CHATTERBOX_GTT_DELTA_MB = GTT in use after minus before, expected ~0 on CPU, CHATTERBOX_ARBITER_KEY), and
 #     the Arbiter's resident set is re-measured once the voice services are up.
-# What is NOT possible from this file and is a BLOCKING cross-writer item (orchestrator writer; recorded for
-# phase2/README-contracts.md, not only here): POST /arbiter/load and /arbiter/unload answer 404 for a key that is not in
-# config/engines.json / atlas.engines, so the loads themselves cannot yet be granted/queued/refused by the Arbiter. Once
-# the `chatterbox` key exists (class `resident` or a CPU class, footprint from CHATTERBOX_FOOTPRINT_BYTES), this step and
-# voice_render.py must wrap each load in POST /arbiter/load ... /arbiter/unload; until then the status check above is
-# the rule-3 guard and the register call is the rule-1 ledger entry.
+# The fix-round-3 BLOCKING cross-writer item (the routes answered 404 for an unlisted key) is CLOSED by the `external`
+# entry; phase2/README-contracts.md's copy of it should be struck (that file is the gate writer's).
 #
 # UNPINNED / PINNED HERE (rule §7.9; scripts/day1/README.md does not exist yet, so the disclosure lives here and is
 # repeated for phase2/README-contracts.md): uv is pinned (UV_PIN, the PyPI release current on 2026-10-04), the managed
@@ -73,8 +91,11 @@
 #   * $ATLAS_ETC/docker.env (Phase 1 step 6): LAN_IP, ATLAS_UID, ATLAS_GID used by compose interpolation.
 #   * $ATLAS_ETC/secrets/hf-token.env (phase2-services.sh prompt, atlas:atlas 600): HF_TOKEN for the gated PyAnnote
 #     repos; verify/v06-pyannote.sh parses it (never sources it) and hands it to the atlas run through the environment.
-#   * config/voice-casting.json (content writer): personas[].key/kokoro_primary/kokoro_alternate, reference_recordings;
-#     an optional kokoro_fallback per persona is honoured by voice_render.py (Section 22 fallback).
+#   * config/voice-casting.json (content writer): personas[].key/kokoro_primary/kokoro_alternate, reference_recordings
+#     (the inbox WAV paths; this step accepts the same stem with .wav/.mp3/.m4a, header item 4); an optional
+#     kokoro_fallback per persona is honoured by voice_render.py (Section 22 fallback).
+#   * config/engines.json `external` entry `chatterbox` (header: ENGINE ARBITER) and the orchestrator's
+#     /arbiter/load|unload|register|status routes (step 2); $ATLAS_ETC/orchestrator.env ORCH_ADMIN_TOKEN_FILE when set.
 #   * config/allowlist.txt: ghcr.io, github.com (+ release/objects hosts: uv's python-build-standalone download ONLY;
 #     fix round 3: chatterbox-tts 0.1.7's PUBLISHED metadata declares `resemble-perth>=1.0.0`, resolved from
 #     pypi.org/files.pythonhosted.org like every other dependency, VERIFIED pypi.org/pypi/chatterbox-tts/0.1.7/json
@@ -90,7 +111,10 @@
 #   * $ATLAS_ETC/voice.env (root:atlas 640, also a compose --env-file): SPEACHES_PRELOAD_MODELS, SPEACHES_HF_HUB_OFFLINE,
 #     KOKORO_URL=http://127.0.0.1:8880/v1, SPEACHES_URL=http://127.0.0.1:8881/v1, STT_MODEL=<registry id>,
 #     DOCLING_URL=http://127.0.0.1:5001, VOICE_VENV=/opt/atlas/venv-voice, PYANNOTE_VENV=/opt/atlas/venv-pyannote,
-#     PYANNOTE_PIPELINE, HF_HOME=$ATLAS_SRV/engines/hf, HF_HUB_OFFLINE=1, HF_HUB_DISABLE_TELEMETRY=1,
+#     PYANNOTE_PIPELINE (ALWAYS the Section 14.1 value pyannote/speaker-diarization-3.1; the Principal edits it after a
+#     Section 23 row amends 14.1), PYANNOTE_PIPELINE_PROVEN (what V6 passed with: that id, or `none` when V6 failed),
+#     PYANNOTE_FALLBACK_PIPELINE (the diagnostic id V6 probes), VOICE_REFERENCES_DIR=$ATLAS_SRV/staging/voice-references-normalised (the 16 kHz mono
+#     WAVs every Chatterbox clone reads; header item 4), HF_HOME=$ATLAS_SRV/engines/hf, HF_HUB_OFFLINE=1, HF_HUB_DISABLE_TELEMETRY=1,
 #     PYANNOTE_METRICS_ENABLED=0, DO_NOT_TRACK=1, LISTENING_TEST_DIR=$ATLAS_SRV/staging/listening-test,
 #     V7_SUMMARY=$LISTENING_TEST_DIR/v7-listening-test.json, CHATTERBOX_FOOTPRINT_BYTES, CHATTERBOX_DEVICE=cpu,
 #     CHATTERBOX_GTT_DELTA_MB, CHATTERBOX_ARBITER_KEY=chatterbox (the ledger key registered above), UV_VERSION,
@@ -103,7 +127,8 @@
 #   * Layout additions for CONVENTIONS.md §1/§2 (recorded for phase2/README-contracts.md): docker/core/compose.voice.yml
 #     (kokoro, speaches, docling-serve overlay merged into compose.yml by this step); on the node /opt/atlas/venv-voice,
 #     /opt/atlas/venv-pyannote (root, u=rwX,go=rX), /opt/atlas/venv-uv and /opt/atlas/python (root, a+rX; shared with
-#     steps 2 and 6), /opt/atlas/tools and /opt/atlas/playwright (step 6).
+#     steps 2 and 6), /opt/atlas/tools and /opt/atlas/playwright (step 6); /srv/atlas/staging/voice-references-normalised
+#     (atlas:atlas 750: the normalised clones' inputs, recordings of real people, never world-readable; §2 row requested).
 
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
@@ -129,6 +154,13 @@ PYANNOTE_PIN="pyannote.audio==4.0.7"           # voice-stt.md §5.1 VERIFIED (Py
 PYANNOTE_TORCH_PIN="2.9.1"
 PYANNOTE_TORCHCODEC_PIN="0.8.1"
 PYANNOTE_PIPELINE="pyannote/speaker-diarization-3.1"   # Section 14.1; voice-stt.md §5.2
+# voice-stt.md §5.1 / §6 conflict 1: pyannote.audio 4.0.7 is the research's pin (the only line receiving fixes), 3.1 is
+# its "legacy" pipeline and whether 4.0.7 loads it is UNVERIFIED there; the research names the community-1 pipeline as
+# the fallback "if 3.1 fails to load". The DOCUMENT wins (CONVENTIONS line 4; Sections 14.1 and 21 name 3.1): V6 passes
+# only on 3.1 and, when 3.1 is refused, FAILS with a diagnostic saying whether this id loads, so the Principal can amend
+# 14.1/21 (Section 23) before anyone switches PYANNOTE_PIPELINE (Section 16.3 item 6; fix round 6).
+PYANNOTE_FALLBACK_PIPELINE="pyannote/speaker-diarization-community-1"
+VOICE_REFERENCE_EXTS=(wav mp3 m4a)             # what the inbox may hold per persona (header item 4); ffmpeg normalises
 # uv and its managed CPython are PINNED (rule §7.9): uv 0.12.23 is the PyPI release current on 2026-10-04 (VERIFIED);
 # cpython 3.11.17 is the newest 3.11 build that uv 0.12.23 lists for linux-x86_64-gnu (VERIFIED with
 # `uv python list --all-versions --only-downloads` on that uv). Raising either is a deliberate edit here.
@@ -146,6 +178,7 @@ PYANNOTE_VENV=""
 VOICE_HF_HOME=""
 VOICE_ENV_FILE=""
 LISTENING_DIR=""
+VOICE_REF_NORM_DIR=""
 UV_BIN=""
 SPEACHES_MODEL_ID=""
 
@@ -155,11 +188,14 @@ _voice_paths() {
   VOICE_HF_HOME="$ATLAS_SRV/engines/hf"        # same cache 04-memory.sh uses (HF_HOME contract in memory.env)
   VOICE_ENV_FILE="$ATLAS_ETC/voice.env"
   LISTENING_DIR="$ATLAS_SRV/staging/listening-test"
+  VOICE_REF_NORM_DIR="$ATLAS_SRV/staging/voice-references-normalised"
 }
 
 _voice_apt() {
-  # ffmpeg 7:8.0.1 and sox VERIFIED in resolute (voice-stt.md §1); ffmpeg is torchcodec's decoder for PyAnnote.
+  # ffmpeg 7:8.0.1 and sox VERIFIED in resolute (voice-stt.md §1); ffmpeg is torchcodec's decoder for PyAnnote and the
+  # transcoder of the reference recordings (header item 4). apt_install is idempotent: installed only when absent.
   apt_install python3-venv python3-pip ffmpeg sox curl jq unzip
+  command -v ffmpeg >/dev/null || die "ffmpeg is not on PATH after apt_install (the reference recordings cannot be normalised)"
 }
 
 _voice_dirs() {
@@ -176,6 +212,8 @@ _voice_dirs() {
   ensure_dir "$LISTENING_DIR" "$PRINCIPAL_USER:atlas" 2770
   ensure_dir "$ATLAS_SRV/staging/inbox" "$PRINCIPAL_USER:atlas" 2770
   ensure_dir "$ATLAS_SRV/staging/inbox/voice-references" "$PRINCIPAL_USER:atlas" 2770
+  # The normalised 16 kHz mono copies (header item 4): written and read by atlas only; recordings of real people.
+  ensure_dir "$VOICE_REF_NORM_DIR" atlas:atlas 750
   ensure_dir "$VOICE_CACHE_DIR" root:root 755
   ensure_dir "$VOICE_CACHE_DIR/uv" root:root 755
   # speaches model_aliases.json (voice-stt.md §4.1 VERIFIED mount path): whisper-1 -> the turbo id, so Open WebUI's
@@ -451,21 +489,29 @@ if sample != "-":
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(int(model.sr)); w.writeframes(pcm16.tobytes())
 audio_s = round(len(pcm16) / float(model.sr), 2)
 peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024   # Linux: KiB -> bytes
+import os
 print(json.dumps({"load_s": load_s, "generate_s": gen_s, "audio_s": audio_s,
-                  "rtf": round(gen_s / audio_s, 2) if audio_s else None, "peak_rss_bytes": int(peak_rss)}))
+                  "rtf": round(gen_s / audio_s, 2) if audio_s else None, "peak_rss_bytes": int(peak_rss),
+                  "pid": os.getpid()}))   # pid: the Arbiter confirms the release against /proc/<pid> (rule 5)
 '
   local text="Good morning. The overnight audit finished without exceptions, and nothing needs your attention today."
   log "chatterbox: rendering one sentence on CPU as atlas (first run downloads ResembleAI/chatterbox into $VOICE_HF_HOME)"
   _voice_arbiter_require_idle "the Chatterbox online measure (CPU load)"
+  _voice_arbiter_load "the Chatterbox online measure (CPU load)"
+  local rc=0
   gtt0="$(_voice_gtt_used_mb)"
-  rec_online="$(_voice_as_atlas HF_HUB_OFFLINE=0 "$VOICE_VENV/bin/python" -c "$script" "$sample" "$text" | tail -n1)" \
-    || die "the Chatterbox one-sentence render failed (see above; huggingface.co through the proxy?)"
+  rec_online="$(_voice_as_atlas HF_HUB_OFFLINE=0 "$VOICE_VENV/bin/python" -c "$script" "$sample" "$text" | tail -n1)" || rc=$?
   gtt1="$(_voice_gtt_used_mb)"
+  _voice_arbiter_unload "the Chatterbox online measure" "$(_voice_json_pid "$rec_online")"
+  (( rc == 0 )) || die "the Chatterbox one-sentence render failed (exit $rc; see above; huggingface.co through the proxy?)"
   log "chatterbox: online render $rec_online (GTT used before ${gtt0:-?} MiB, after ${gtt1:-?} MiB)"
   log "chatterbox: repeating a short render with HF_HUB_OFFLINE=1 (the cache must be complete; nothing may leave the node)"
   _voice_arbiter_require_idle "the Chatterbox offline re-render (CPU load)"
-  rec_offline="$(_voice_as_atlas HF_HUB_OFFLINE=1 "$VOICE_VENV/bin/python" -c "$script" - "Offline check." | tail -n1)" \
-    || die "Chatterbox could not render with HF_HUB_OFFLINE=1 from $VOICE_HF_HOME: the weight cache is incomplete or the loader still needs the network (see above)"
+  _voice_arbiter_load "the Chatterbox offline re-render (CPU load)"
+  rc=0
+  rec_offline="$(_voice_as_atlas HF_HUB_OFFLINE=1 "$VOICE_VENV/bin/python" -c "$script" - "Offline check." | tail -n1)" || rc=$?
+  _voice_arbiter_unload "the Chatterbox offline re-render" "$(_voice_json_pid "$rec_offline")"
+  (( rc == 0 )) || die "Chatterbox could not render with HF_HUB_OFFLINE=1 from $VOICE_HF_HOME (exit $rc): the weight cache is incomplete or the loader still needs the network (see above)"
   python3 - "$out" "$rec_online" "$rec_offline" "$text" "${gtt0:-}" "${gtt1:-}" <<'PY' || die "could not write $out"
 import json, sys, time
 out, on, off, text, g0, g1 = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6]
@@ -505,6 +551,50 @@ _voice_venv_pyannote() {
     || die "pyannote.audio/torch/torchcodec do not import together from $PYANNOTE_VENV (torchcodec $PYANNOTE_TORCHCODEC_PIN must match torch $PYANNOTE_TORCH_PIN and the host ffmpeg: ffmpeg -version | head -n1; a 'Could not load libtorchcodec' error names the FFmpeg majors the wheel carries)"
 }
 
+# _voice_normalise_references — header item 4: for every persona in config/voice-casting.json reference_recordings, take
+# <inbox>/<persona>.{wav,mp3,m4a} (the casting path's directory and stem; the first extension present in that order)
+# and transcode it with ffmpeg, AS ATLAS (untrusted media is never decoded by root; Section 16.3 item 6 spirit), to
+# 16 kHz mono 16-bit PCM WAV at $VOICE_REF_NORM_DIR/<persona>.wav (what the Chatterbox clone and the 3.1 card want).
+# Idempotent: skipped when the normalised copy is newer than its source. An absent recording is logged, not fatal:
+# V7 is recorded deferred for it (Section 22). An unreadable or undecodable one IS fatal (rule §7.4): the Principal
+# dropped a file and must know it is unusable.
+_voice_normalise_references() {
+  local casting="$ATLAS_DAY1_DIR/config/voice-casting.json" line key ref dir stem src="" ext out n=0
+  while IFS=$'\t' read -r key ref; do
+    [[ -n "$key" ]] || continue
+    dir="$(dirname "$ref")"; stem="$(basename "${ref%.*}")"
+    src=""
+    for ext in "${VOICE_REFERENCE_EXTS[@]}"; do
+      if [[ -f "$dir/$stem.$ext" ]]; then src="$dir/$stem.$ext"; break; fi
+      if [[ -f "$dir/$stem.${ext^^}" ]]; then src="$dir/$stem.${ext^^}"; break; fi
+    done
+    out="$VOICE_REF_NORM_DIR/$key.wav"
+    if [[ -z "$src" ]]; then
+      log "voice references: no $dir/$stem.{wav,mp3,m4a} for $key; the clone is skipped and V7 is recorded deferred (Section 22)"
+      continue
+    fi
+    if [[ -f "$out" && "$out" -nt "$src" ]]; then
+      log "voice references: $out is newer than $src; kept"
+      n=$(( n + 1 )); continue
+    fi
+    svc_user_run test -r "$src" \
+      || die "voice references: $src exists but the atlas account cannot read it (inbox is $PRINCIPAL_USER:atlas 2770; the file must be group-readable: chmod g+r $src), re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+    log "voice references: $src -> $out (ffmpeg, 16 kHz mono pcm_s16le, as atlas)"
+    rm -f "$out.part"
+    _voice_as_atlas ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" -vn -ac 1 -ar 16000 -c:a pcm_s16le -f wav "$out.part" \
+      || die "voice references: ffmpeg could not transcode $src (unsupported or damaged recording; see the error above). Re-record or convert it, then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+    mv -f "$out.part" "$out"
+    chown atlas:atlas "$out"; chmod 640 "$out"
+    line="$(python3 -c 'import sys,wave; w=wave.open(sys.argv[1]); print(f"{w.getframerate()} Hz, {w.getnchannels()} ch, {w.getnframes()/w.getframerate():.1f} s")' "$out" 2>/dev/null || echo '?')"
+    log "voice references: $key normalised: $out ($line)"
+    n=$(( n + 1 ))
+  done < <(python3 -c '
+import json, sys
+for k, v in json.load(open(sys.argv[1], encoding="utf-8")).get("reference_recordings", {}).items():
+    print(f"{k}\t{v}")' "$casting")
+  log "voice references: $n normalised recording(s) in $VOICE_REF_NORM_DIR"
+}
+
 # _voice_listening_modes — owner $PRINCIPAL_USER (listens from the XFCE desktop), group atlas with WRITE (the renderer
 # rewrites the summary and replaces WAVs on a re-run), nobody else (clones of real voices). Applied BEFORE and after
 # every render (fix round 3: an earlier verify/v07 stripped g+w at the gate, so the documented `--force 05` re-run
@@ -524,12 +614,19 @@ _voice_render_v7() {
   # A stale summary can never satisfy the check below: it is removed before the render, so whatever exists afterwards
   # was written by THIS render (voice_render.py writes it atomically, temp file + rename).
   rm -f "$summary" "$summary.part"
-  # The clone batch loads Chatterbox (CPU, ~GB) inside the renderer: Section 4.2 rule 3 guard first (header).
+  # The clone batch loads Chatterbox (CPU, ~GB) inside the renderer: Section 4.2 rule 3 belt first (header), then the
+  # renderer itself POSTs /arbiter/load and /arbiter/unload around the batch (header: ENGINE ARBITER); the admin token
+  # file travels as a path the atlas-run renderer opens itself (never the token on argv).
   _voice_arbiter_require_idle "the V7 render (Chatterbox clone batch inside voice_render.py)"
-  log "v7: rendering the listening test into $LISTENING_DIR as atlas (Kokoro paragraphs; Chatterbox clones for every reference recording present; existing files are kept)"
-  _voice_as_atlas HF_HUB_OFFLINE=1 python3 "$renderer" render --casting "$ATLAS_DAY1_DIR/config/voice-casting.json" \
+  local arb_args=(--arbiter "http://127.0.0.1:${ORCH_PORT:-8800}" --arbiter-task-id "day1-phase2-05-v7")
+  local tokf
+  tokf="$(_voice_arbiter_token_file)"
+  [[ -z "$tokf" ]] || arb_args+=(--arbiter-token-file "$tokf")
+  log "v7: rendering the listening test into $LISTENING_DIR as atlas (Kokoro paragraphs; Chatterbox clones for every normalised reference in $VOICE_REF_NORM_DIR, under the Arbiter; existing files are kept)"
+  _voice_as_atlas HF_HUB_OFFLINE=1 ATLAS_ENTRY="${ATLAS_ENTRY:-./atlas-day1.sh}" python3 "$renderer" render \
+      --casting "$ATLAS_DAY1_DIR/config/voice-casting.json" --references-dir "$VOICE_REF_NORM_DIR" \
       --out "$LISTENING_DIR" --kokoro "$KOKORO_URL" --venv-python "$VOICE_VENV/bin/python" --hf-home "$VOICE_HF_HOME" \
-      --json-out "$summary" >/dev/null || rc=$?
+      --json-out "$summary" "${arb_args[@]}" >/dev/null || rc=$?
   case "$rc" in
     0) log "v7: rendered (every reference recording present)" ;;
     2) log "v7: rendered; reference recordings absent -> V7 will be recorded deferred (Section 22)" ;;
@@ -567,25 +664,96 @@ _voice_arbiter_call() {
   rm -f "$ans"
 }
 
-# _voice_arbiter_require_idle WHAT — Section 4.2 rule 3 for a Chatterbox load the Arbiter cannot grant itself yet
-# (header): the ledger must show no resident and no generating engine, or the step stops. The orchestrator must answer:
-# step 2 is a prerequisite (§7.5), and a skipped check would bypass a hard requirement silently (§7.4).
+# _voice_arbiter_token_file — ORCH_ADMIN_TOKEN_FILE from orchestrator.env when set (the renderer, run as atlas, opens it
+# itself: the orchestrator runs as atlas, so its token file is atlas-readable), else "".
+_voice_arbiter_token_file() {
+  awk -F= '$1=="ORCH_ADMIN_TOKEN_FILE" {print $2; exit}' "$ATLAS_ETC/orchestrator.env" 2>/dev/null || true
+}
+
+# _voice_json_pid JSON — the "pid" of the render process from the measure script's JSON line, or "" (header: ENGINE
+# ARBITER; the Arbiter polls /proc/<pid> to confirm the release, Section 4.2 rule 5 for a CPU process).
+_voice_json_pid() {
+  python3 -c 'import json,sys; v=json.loads(sys.argv[1]).get("pid"); print(int(v) if v else "")' "${1:-{\}}" 2>/dev/null || true
+}
+
+# _voice_arbiter_unload_quiet — the EXIT trap armed while this step holds a Chatterbox load (header: ENGINE ARBITER):
+# a die, the ERR trap or a lost session between load and unload must not leave `chatterbox` resident in the ledger
+# (class external is never timed out or evicted by the Arbiter). Never dies: it runs on the way out.
+_voice_arbiter_unload_quiet() {
+  trap - EXIT
+  _voice_arbiter_call POST /arbiter/unload "{\"engine\": \"$CHATTERBOX_ARBITER_KEY\", \"task_id\": \"day1-phase2-05\"}" || true
+  if [[ "$VOICE_ARB_HTTP" == 200 ]]; then
+    warn "arbiter: step exiting while $CHATTERBOX_ARBITER_KEY was held; POST /arbiter/unload sent (${VOICE_ARB_BODY:0:160})"
+  else
+    warn "arbiter: step exiting while $CHATTERBOX_ARBITER_KEY was held and POST /arbiter/unload answered HTTP $VOICE_ARB_HTTP; the next --force 05 run releases the stale hold itself (idle check)"
+  fi
+}
+
+# _voice_arbiter_load WHAT — Section 4.2 rule 2 for a Chatterbox load this step performs itself (header: ENGINE
+# ARBITER): POST /arbiter/load {engine: chatterbox}; the load proceeds only on `granted`. 404 = the orchestrator does
+# not know the key (an older package or engines.json without the `external` list): die, never skip. queued/refused:
+# die with the Arbiter's reason. Paired with _voice_arbiter_unload after the render, whatever it did; the EXIT trap
+# (_voice_arbiter_unload_quiet) covers every other way out in between.
+_voice_arbiter_load() {
+  local what="$1" decision reason
+  _voice_arbiter_call POST /arbiter/load "{\"engine\": \"$CHATTERBOX_ARBITER_KEY\", \"task_id\": \"day1-phase2-05\"}"
+  case "$VOICE_ARB_HTTP" in
+    200) ;;
+    404) die "POST /arbiter/load {engine: $CHATTERBOX_ARBITER_KEY} answered 404 before $what: the running orchestrator does not know the key (config/engines.json \`external\` entry; Section 4.2: every weight-bearing load passes through the Arbiter, so this load does not happen). Deploy the package and config that carry it and restart the orchestrator: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 02, then --force 05. Answer: ${VOICE_ARB_BODY:0:200}" ;;
+    *)   die "POST /arbiter/load {engine: $CHATTERBOX_ARBITER_KEY} answered HTTP $VOICE_ARB_HTTP before $what: ${VOICE_ARB_BODY:0:300} (orchestrator down? systemctl status atlas-orchestrator)" ;;
+  esac
+  read -r decision reason <<<"$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("decision","?"), d.get("reason","?"))' <<<"$VOICE_ARB_BODY" 2>/dev/null || echo "? unparsable")"
+  [[ "$decision" == granted ]] \
+    || die "the Arbiter did not grant the $CHATTERBOX_ARBITER_KEY load before $what: $decision ($reason). Section 4.2 rule 3: wait for the resident engine(s) to unload (or POST /arbiter/unload) and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+  trap '_voice_arbiter_unload_quiet' EXIT
+  log "arbiter: load of $CHATTERBOX_ARBITER_KEY granted before $what: $reason"
+}
+
+# _voice_arbiter_unload WHAT [PID] — rule 1: the ledger must stop showing the process once it has exited; a non-granted
+# answer is fatal (the ledger would carry a phantom resident into the gate). PID (the render process, from its JSON) lets
+# the Arbiter CONFIRM the release against /proc/<pid> instead of taking this step's word (Section 4.2 rule 5's
+# substance for a CPU process; orchestrator/src/atlas/arbiter.py request_unload). Disarms the EXIT trap first.
+_voice_arbiter_unload() {
+  local what="$1" pid="${2:-}" decision reason body
+  trap - EXIT
+  body="{\"engine\": \"$CHATTERBOX_ARBITER_KEY\", \"task_id\": \"day1-phase2-05\"${pid:+, \"pid\": $pid}}"
+  _voice_arbiter_call POST /arbiter/unload "$body"
+  [[ "$VOICE_ARB_HTTP" == 200 ]] || die "POST /arbiter/unload {engine: $CHATTERBOX_ARBITER_KEY${pid:+, pid: $pid}} answered HTTP $VOICE_ARB_HTTP after $what: ${VOICE_ARB_BODY:0:300}"
+  read -r decision reason <<<"$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("decision","?"), d.get("reason","?"))' <<<"$VOICE_ARB_BODY" 2>/dev/null || echo "? unparsable")"
+  [[ "$decision" == granted ]] || die "the Arbiter did not release $CHATTERBOX_ARBITER_KEY after $what: $decision ($reason)"
+  log "arbiter: $CHATTERBOX_ARBITER_KEY unloaded after $what: $reason"
+}
+
+# _voice_arbiter_require_idle WHAT — Section 4.2 rule 3 belt before each Chatterbox load (header: ENGINE ARBITER): the
+# ledger must show no resident and no generating engine, or the step stops. The orchestrator must answer: step 2 is a
+# prerequisite (§7.5), and a skipped check would bypass a hard requirement silently (§7.4). A ledger that shows EXACTLY
+# [chatterbox] resident and nothing generating is this step's own stale hold (an earlier run ended between its load and
+# its unload before the EXIT trap existed, or the renderer was killed): released with a WARN and re-checked once; any
+# other resident set stops the step with the exact command to run (fix round 6).
 _voice_arbiter_require_idle() {
-  local what="$1" verdict state resident generating
-  _voice_arbiter_call GET /arbiter/status
-  [[ "$VOICE_ARB_HTTP" == 200 ]] || die "GET /arbiter/status answered HTTP $VOICE_ARB_HTTP before $what (Section 4.2: every weight-bearing load passes through the Arbiter): is the step-2 orchestrator up? systemctl status atlas-orchestrator; curl -sS http://127.0.0.1:${ORCH_PORT:-8800}/health"
-  # Engine keys are [A-Za-z0-9._-]+ (CONVENTIONS §8), so a comma-joined list reads back as one word.
-  verdict="$(python3 -c '
+  local what="$1" verdict state resident generating attempt
+  for attempt in 1 2; do
+    _voice_arbiter_call GET /arbiter/status
+    [[ "$VOICE_ARB_HTTP" == 200 ]] || die "GET /arbiter/status answered HTTP $VOICE_ARB_HTTP before $what (Section 4.2: every weight-bearing load passes through the Arbiter): is the step-2 orchestrator up? systemctl status atlas-orchestrator; curl -sS http://127.0.0.1:${ORCH_PORT:-8800}/health"
+    # Engine keys are [A-Za-z0-9._-]+ (CONVENTIONS §8), so a comma-joined list reads back as one word.
+    verdict="$(python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 res = ",".join(str(x.get("engine", "?")) for x in d.get("resident", []))
 g = d.get("generating")
 gen = str(g.get("engine", "?")) if isinstance(g, dict) else ""
 print("halted" if d.get("halted") else "ok", res or "-", gen or "-")' <<<"$VOICE_ARB_BODY" 2>/dev/null)" \
-    || die "GET /arbiter/status did not answer with the ledger JSON before $what: ${VOICE_ARB_BODY:0:200}"
-  read -r state resident generating <<<"$verdict"
-  [[ "$resident" == "-" && "$generating" == "-" ]] \
-    || die "refusing $what: the Arbiter ledger shows resident engine(s) [$resident] and generating [$generating] (Section 4.2 rule 3: two resident, one generating; this ~GB CPU load is not granted beside them). Wait for the engine to unload (or POST /arbiter/unload) and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+      || die "GET /arbiter/status did not answer with the ledger JSON before $what: ${VOICE_ARB_BODY:0:200}"
+    read -r state resident generating <<<"$verdict"
+    [[ "$resident" == "-" && "$generating" == "-" ]] && break
+    if (( attempt == 1 )) && [[ "$resident" == "$CHATTERBOX_ARBITER_KEY" && "$generating" == "-" ]]; then
+      warn "arbiter: the ledger shows only $CHATTERBOX_ARBITER_KEY resident before $what: a stale hold of this step (an earlier run ended between its load and its unload; class external is never timed out by the Arbiter). Releasing it with POST /arbiter/unload and re-checking"
+      _voice_arbiter_call POST /arbiter/unload "{\"engine\": \"$CHATTERBOX_ARBITER_KEY\", \"task_id\": \"day1-phase2-05-stale\"}"
+      [[ "$VOICE_ARB_HTTP" == 200 ]] || die "POST /arbiter/unload for the stale $CHATTERBOX_ARBITER_KEY hold answered HTTP $VOICE_ARB_HTTP: ${VOICE_ARB_BODY:0:300}"
+      continue
+    fi
+    die "refusing $what: the Arbiter ledger shows resident engine(s) [$resident] and generating [$generating] (Section 4.2 rule 3: two resident, one generating; this ~GB CPU load is not granted beside them). Wait for the engine to finish and unload, or release an idle one yourself: curl -sS -X POST -H 'Content-Type: application/json' -d '{\"engine\": \"<key>\", \"task_id\": \"manual\"}' http://127.0.0.1:${ORCH_PORT:-8800}/arbiter/unload (add -H 'X-Atlas-Token: <token>' from ORCH_ADMIN_TOKEN_FILE when orchestrator.env sets one); then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+  done
   [[ "$state" == ok ]] || warn "arbiter: the ledger reports halted=true (a GPU release check failed earlier); the CPU load proceeds, Phase 3 will not until it is cleared"
   log "arbiter: ledger idle (no resident, no generating engine) before $what"
 }
@@ -623,7 +791,9 @@ _voice_write_env() {
   ensure_kv "$VOICE_ENV_FILE" DOCLING_URL "$DOCLING_URL"
   ensure_kv "$VOICE_ENV_FILE" VOICE_VENV "$VOICE_VENV"
   ensure_kv "$VOICE_ENV_FILE" PYANNOTE_VENV "$PYANNOTE_VENV"
-  ensure_kv "$VOICE_ENV_FILE" PYANNOTE_PIPELINE "$PYANNOTE_PIPELINE"
+  ensure_kv "$VOICE_ENV_FILE" PYANNOTE_PIPELINE "$PYANNOTE_PIPELINE"   # Section 14.1's value, never rewritten by a script
+  ensure_kv "$VOICE_ENV_FILE" PYANNOTE_FALLBACK_PIPELINE "$PYANNOTE_FALLBACK_PIPELINE"
+  ensure_kv "$VOICE_ENV_FILE" VOICE_REFERENCES_DIR "$VOICE_REF_NORM_DIR"
   ensure_kv "$VOICE_ENV_FILE" HF_HOME "$VOICE_HF_HOME"
   # Offline and silent for good (rule §7.1, Section 12.5): no revision HEADs, no telemetry user-agent, no pyannote metrics.
   ensure_kv "$VOICE_ENV_FILE" HF_HUB_OFFLINE 1
@@ -645,6 +815,25 @@ _voice_write_env() {
   ensure_kv "$VOICE_ENV_FILE" CHATTERBOX_ARBITER_KEY "$CHATTERBOX_ARBITER_KEY"
   chown root:atlas "$VOICE_ENV_FILE"; chmod 640 "$VOICE_ENV_FILE"
   log "wrote $VOICE_ENV_FILE (CHATTERBOX_FOOTPRINT_BYTES=$fp, CHATTERBOX_GTT_DELTA_MB=${gtt:-unknown})"
+}
+
+# _voice_pyannote_pipeline_proven — what V6 actually passed with ("pipeline used: <id>" in a pass message) goes into
+# voice.env PYANNOTE_PIPELINE_PROVEN (`none` after a fail); PYANNOTE_PIPELINE itself stays the Section 14.1 value: a
+# script never swaps a baseline-fixed engine (Section 16.3 item 6; fix round 6). A V6 fail whose diagnostic says the
+# community pipeline loads is repeated here as a WARN with the decision it asks of the Principal.
+_voice_pyannote_pipeline_proven() {
+  local proven result msg
+  IFS=$'\t' read -r _ result _ msg <<<"$(_atlas_verify_rows V6 | head -n1)"
+  proven="none"
+  if [[ "${result:-}" == pass ]]; then
+    proven="$(sed -nE 's/.*pipeline used: ([^ ]+).*/\1/p' <<<"$msg")"
+    [[ -n "$proven" ]] || proven="$PYANNOTE_PIPELINE"
+  fi
+  ensure_kv "$VOICE_ENV_FILE" PYANNOTE_PIPELINE_PROVEN "$proven"
+  if [[ "$proven" == none && "${msg:-}" == *"DIAGNOSTIC: the research's fallback"*"DOES load"* ]]; then
+    warn "pyannote: V6 FAILED ($PYANNOTE_PIPELINE refused by the installed pyannote.audio) while the community pipeline $PYANNOTE_FALLBACK_PIPELINE loads. voice.env keeps PYANNOTE_PIPELINE=$PYANNOTE_PIPELINE (Section 14.1); the Principal decides: pin a 3.1-loading pyannote.audio (PYANNOTE_PIN here), or amend 14.1/21 with a Section 23 row and then set PYANNOTE_PIPELINE=$PYANNOTE_FALLBACK_PIPELINE in $VOICE_ENV_FILE and re-run V6 (voice-stt.md §6 conflict 1)"
+  fi
+  log "pyannote: PYANNOTE_PIPELINE=$PYANNOTE_PIPELINE (Section 14.1), PYANNOTE_PIPELINE_PROVEN=$proven in $VOICE_ENV_FILE"
 }
 
 _voice_assert_owners() {
@@ -672,11 +861,14 @@ step_05() {
   _voice_venv_pyannote
   _voice_write_env
   _voice_arbiter_register_chatterbox
+  _voice_normalise_references
   _voice_render_v7
   _voice_arbiter_remeasure
   # V6: recorded pass/fail, never fatal here (the Phase 2 gate blocks on a fail; the message names the licence URLs).
-  run_verify V6 v06-pyannote.sh "$PYANNOTE_VENV" "$VOICE_HF_HOME" "$PYANNOTE_PIPELINE" \
-    || warn "V6 recorded as fail: accept the PyAnnote licences named in the verify table with the HF_TOKEN account, then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+  # 3.1 only (header item 5): a refusal of the 3.1 id is a fail whose message carries the community-pipeline diagnostic.
+  run_verify V6 v06-pyannote.sh "$PYANNOTE_VENV" "$VOICE_HF_HOME" "$PYANNOTE_PIPELINE" "$PYANNOTE_FALLBACK_PIPELINE" \
+    || warn "V6 recorded as fail: accept the PyAnnote licences named in the verify table with the HF_TOKEN account (or act on the pipeline diagnostic in its message), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+  _voice_pyannote_pipeline_proven
   # V7: pass ("rendered N files; Principal to listen") or deferred (reference recordings absent), per Section 17/22.
   run_verify V7 v07-voice-listen.sh "$LISTENING_DIR/v7-listening-test.json" \
     || warn "V7 recorded as fail: Kokoro or the Chatterbox clone did not render (see the verify table)"

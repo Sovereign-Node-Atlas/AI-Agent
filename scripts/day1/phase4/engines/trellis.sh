@@ -11,12 +11,20 @@
 # dependencies (xatlas pyvista pymeshfix igraph, utils3d at the pinned commit) plus plyfile — both are imported at
 # module level by trellis/representations/gaussian/gaussian_model.py, so `from trellis.pipelines import ...` failed
 # before any shim mattered. The image conditioner is DINOv2 through torch.hub.load('facebookresearch/dinov2', ...)
-# (trellis_image_to_3d.py line 74): the code zip comes from github.com (allowlisted) and the weights from
-# dl.fbaipublicfiles.com, which Section 12.5 / config/allowlist.txt do NOT list (sam2.sh records the same decision for
-# its .pt fallback). Fix round 3: the allowlist is checked BEFORE any request (no deliberate TCP_DENIED for a request
-# known to be denied); when the host is absent this engine records deferred with that exact reason and widens nothing
-# — adding the host is the Principal's decision for the Phase 1 writer, not an engine script's. When the host is
-# allowed, the hub CODE is pinned too (rule §7.9; every other clone in this phase is): the dinov2 default-branch sha
+# (trellis_image_to_3d.py line 74): the code zip comes from github.com (allowlisted) and the weights from Meta's CDN
+# dl.fbaipublicfiles.com, which the Phase 1 writer added to config/allowlist.txt in fix round 4. ALLOWLIST STATUS (fix
+# round 5): Section 12.5's outbound enumeration names "Hugging Face during model pulls" and never this host, and
+# Section 16.3 item 6 makes the allowlist the Principal's call, so the entry is a PRINCIPAL DECISION pending its
+# baseline line (a Section 12.5 enumeration or Section 23 row: "Meta's weight CDN dl.fbaipublicfiles.com for the
+# TRELLIS DINOv2 conditioner"); this script reinterprets no clause and widens nothing. It is the ONLY scripted request
+# to that host (sam2.sh makes none; its header says so). Fix round 3, kept and corrected in fix round 5: the list
+# checked BEFORE any request is the one squid ENFORCES, /etc/squid/allowlist.txt (rendered by Phase 1 step 4 or
+# --reload-allowlist), with squid's dstdomain semantics as phase1/04-system.sh _allowlist_covers reads it (exact entry,
+# or a leading-dot entry that is a suffix). The repository copy under /opt/atlas/day1 proves nothing: atlas-day1.sh
+# refreshes it on every run, so it always lists the host while squid may still run an older render. A node whose
+# rendered list lacks the host records deferred naming the host and the one --reload-allowlist command, and issues no
+# request (no deliberate TCP_DENIED). The tier stays yellow (Section 15.2: the sparse-voxel kernel risk is unchanged by
+# the allowlist). The hub CODE is pinned too (rule §7.9; every other clone in this phase is): the dinov2 default-branch sha
 # is read once with `git ls-remote` through the proxy, recorded root-held in git-pins.json under torchhub-dinov2,
 # loaded as torch.hub.load('facebookresearch/dinov2:<sha>', ..., skip_validation=True) (torch.hub refuses a commit
 # sha without skip_validation: it is not a branch or tag), and TORCH_HOME/hub/facebookresearch_dinov2_main is made a
@@ -48,11 +56,32 @@ p4_build() {
   p4_note "attempt A: upstream TRELLIS + kroqueta-s shims; attempt B (TRELLIS.2 + paladx2105 ROCm 10.0 wheels, gfx1150-gfx1153 fat build) not automated (unverified wheel URLs)"
 }
 
+# _tr_allowlist_covers HOST — does the RENDERED squid allowlist admit HOST? The same file and the same dstdomain
+# semantics as phase1/04-system.sh _allowlist_covers (exact entry, or a leading-dot entry that is a suffix of HOST);
+# that function lives in a Phase 1 step file this script cannot source, hence the twin. Returns 1 when the file is
+# missing (squid never rendered: Phase 1 step 4 did not run on this node).
+TR_SQUID_ALLOWLIST="/etc/squid/allowlist.txt"
+_tr_allowlist_covers() {
+  local host="$1" e
+  [[ -r "$TR_SQUID_ALLOWLIST" ]] || return 1
+  while read -r e; do
+    [[ -n "$e" ]] || continue
+    if [[ "$e" == .* ]]; then
+      [[ "$host" == "${e#.}" || "$host" == *"$e" ]] && return 0
+    else
+      [[ "$host" == "$e" ]] && return 0
+    fi
+  done <"$TR_SQUID_ALLOWLIST"
+  return 1
+}
+
 # _tr_prefetch_dinov2 — torch.hub.load('facebookresearch/dinov2:<sha>', NAME, pretrained=True) with the network on,
 # into TORCH_HOME (the persisted cache lib-engine.sh mounts for every build and GPU run), so the offline GPU test finds
-# both the hub repo and the weights. Idempotent by marker. The allowlist is consulted FIRST: an absent
-# dl.fbaipublicfiles.com is the recorded, honest reason for deferred, and no request is issued for it (header).
+# both the hub repo and the weights. Idempotent by marker. The RENDERED squid allowlist is consulted FIRST (header): a
+# render without dl.fbaipublicfiles.com (older than fix round 4's repository change) is the recorded, honest reason for
+# deferred, and no request is issued.
 TR_DINO_URL="https://github.com/facebookresearch/dinov2.git"
+TR_DINO_WEIGHT_HOST="dl.fbaipublicfiles.com"
 _tr_prefetch_dinov2() {
   local marker name
   marker="$(p4_marker dinov2-prefetched)"
@@ -60,8 +89,8 @@ _tr_prefetch_dinov2() {
     log "$P4_KEY: DINOv2 conditioner already pre-fetched"
     return 0
   fi
-  if ! grep -qxF "dl.fbaipublicfiles.com" "$P4_DAY1/config/allowlist.txt" 2>/dev/null; then
-    die "$P4_KEY: attempt A cannot load offline: TRELLIS's image conditioner needs the DINOv2 weights from dl.fbaipublicfiles.com (torch.hub, trellis_image_to_3d.py line 74), a host Section 12.5 / config/allowlist.txt do not list and this script will not add; no request was made for it. Principal decision: if the host is to be allowed, add it to scripts/day1/config/allowlist.txt, then sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt (no reboot), delete $P4_RESULT and re-run: sudo ./atlas-day1.sh phase4 --force 03. Otherwise TRELLIS stays deferred (attempt B by hand)"
+  if ! _tr_allowlist_covers "$TR_DINO_WEIGHT_HOST"; then
+    die "$P4_KEY: attempt A cannot load offline: TRELLIS's image conditioner needs the DINOv2 weights from $TR_DINO_WEIGHT_HOST (torch.hub, trellis_image_to_3d.py line 74), and the rendered squid allowlist $TR_SQUID_ALLOWLIST (the list the proxy enforces) does not admit that host; no request was made for it (this script adds nothing to any allowlist). The repository's config/allowlist.txt lists it since fix round 4 (a Principal decision pending its Section 12.5 line, header): render it with sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt (re-renders squid and dnsmasq, no reboot), then delete $P4_RESULT and re-run: sudo ./atlas-day1.sh phase4 --force 03. Until then TRELLIS stays deferred (attempt B by hand)"
   fi
   name="$TR_DINO_DEFAULT"
   # pipeline.json of the pulled snapshot names the conditioner ("image_cond_model"); read it as data through the
@@ -87,7 +116,7 @@ except Exception as exc:
   fi
   log "$P4_KEY: pre-fetching the DINOv2 image conditioner '$name' via torch.hub facebookresearch/dinov2@$sha (github.com code zip + dl.fbaipublicfiles.com weights) through the proxy"
   if ! p4_in_venv --net -- python -c 'import sys, torch; m = torch.hub.load("facebookresearch/dinov2:" + sys.argv[2], sys.argv[1], pretrained=True, skip_validation=True); print("dinov2 cached:", type(m).__name__)' "$name" "$sha"; then
-    die "$P4_KEY: torch.hub.load('facebookresearch/dinov2:$sha', '$name') failed although dl.fbaipublicfiles.com is allowlisted (see $P4_LOG and /var/log/squid/access.log; delete the torchhub-dinov2 entry in $P4_GIT_PINS to re-pin to HEAD)"
+    die "$P4_KEY: torch.hub.load('facebookresearch/dinov2:$sha', '$name') failed although $TR_SQUID_ALLOWLIST admits $TR_DINO_WEIGHT_HOST (see $P4_LOG and /var/log/squid/access.log; delete the torchhub-dinov2 entry in $P4_GIT_PINS to re-pin to HEAD)"
   fi
   # TRELLIS loads 'facebookresearch/dinov2' (ref main) -> TORCH_HOME/hub/facebookresearch_dinov2_main: point that name at
   # the pinned checkout (inside the container, as atlas; the hub dir is the persisted TORCH_HOME mount).

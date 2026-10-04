@@ -36,6 +36,12 @@
 #   4. An unhealthy service stops here with the verify table and the list (no gate marker is written); otherwise
 #      `gate phase2` with V3b V6 V12 V13 V14a V15 V16 V17 V18 V20 V23 required and V7 V10a recorded only, and the
 #      Phase 3 start command is printed.
+#   5. The step-6 SOFT installs (phase2/06-tools.sh, fix round 5: Blender, Bonsai, MCP4IFC, EnergyPlus, OpenStudio, the
+#      buildfarm image; UNVERIFIED inputs) record a `T-<tool>` deferred row in verify.jsonl when they fail instead of
+#      stopping the phase, and a superseding `pass` row for the same id when a `--force 06` re-run installs the tool
+#      (fix round 6). The gate prints every T-* id it finds as its own table (latest record per id), OPTIONAL and
+#      NON-BLOCKING (the gate judges the Section 21 ids only), after the service table; the `--force 06` reminder and
+#      the WARN are printed only while some tool's LATEST record is still deferred, never for an installed one.
 #
 # Contracts relied on from other writers (all listed in phase2/README-contracts.md): unit names from
 # phase2/02-orchestrator.sh (atlas-orchestrator, atlas-celery-cpu/gpu/beat), 01-llama.sh + 04-memory.sh
@@ -58,7 +64,7 @@
 
 SANDBOX_IMAGE="atlas-sandbox:py3.12"                 # services-tools.md S9 name; built by phase2/06d-sandbox.sh from docker/sandbox/Dockerfile
 SANDBOX_IMAGE_VERSION="4"                            # label org.atlas.sandbox.version in the Dockerfile (4 = digest-pinned base + telemetry opt-outs)
-SANDBOX_KEYS=(SANDBOX_IMAGE SANDBOX_DIR SANDBOX_MEMORY SANDBOX_CPUS SANDBOX_PIDS SANDBOX_TMPFS_SIZE SANDBOX_TIMEOUT_S SANDBOX_FSIZE)
+SANDBOX_KEYS=(SANDBOX_IMAGE SANDBOX_DIR SANDBOX_MEMORY SANDBOX_CPUS SANDBOX_PIDS SANDBOX_TMPFS_SIZE SANDBOX_WORK_SIZE SANDBOX_TIMEOUT_S SANDBOX_FSIZE)
 GATE_UNHEALTHY=()
 GATE_HEALTH_ROWS=()
 
@@ -175,6 +181,11 @@ _gate_sandbox() {
   else
     _gate_row sandbox "orchestrator.env SANDBOX_*" "${#SANDBOX_KEYS[@]} keys present"
   fi
+  # The /work tmpfs cap (orchestrator/src/atlas/sandbox.py, fix round 5; Section 16.4): optional key, the package
+  # defaults it to 2g; printed so the figure is visible, never judged (06d may add SANDBOX_WORK_SIZE to its keys).
+  local ws
+  ws="$(sed -nE 's/^SANDBOX_WORK_SIZE=(.+)$/\1/p' "$orch" 2>/dev/null | head -n1)"
+  _gate_row sandbox "orchestrator.env SANDBOX_WORK_SIZE" "${ws:-unset (package default 2g: /work tmpfs cap, V17 asserts ENOSPC)}"
 }
 
 # /etc/atlas/secrets is root:atlas 710 (traverse-only; the one Phase 2 value, README-contracts.md §3 item 10). That is
@@ -534,6 +545,52 @@ _gate_verifies() {
   run_verify V23 v23-cloudflare-token.sh || warn "V23 fail recorded"
 }
 
+# --- step-6 soft installs: T-<tool> rows, printed, never judged (header item 5) ----------------------------------------------
+_gate_tools_deferred() {
+  local ids=() still=()
+  [[ -f "$ATLAS_VERIFY_FILE" ]] || return 0
+  # Every T-id ever recorded, in first-seen order, each tagged with its LATEST result (a later pass row supersedes an
+  # earlier deferred one, phase2/06-tools.sh _tools_soft; fix round 6).
+  local rows=() r
+  mapfile -t rows < <(python3 - "$ATLAS_VERIFY_FILE" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+order = []
+latest = {}
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        i = str(rec.get("id", ""))
+        if i.startswith("T-"):
+            if i not in latest:
+                order.append(i)
+            latest[i] = str(rec.get("result", ""))
+for i in order:
+    print(f"{i}\t{latest[i]}")
+PY
+)
+  for r in "${rows[@]}"; do
+    [[ -n "$r" ]] || continue
+    ids+=("${r%%$'\t'*}")
+    [[ "${r#*$'\t'}" == deferred ]] && still+=("${r%%$'\t'*}")
+  done
+  (( ${#ids[@]} > 0 )) || return 0
+  echo
+  echo "STEP 6 SOFT INSTALLS (phase2/06-tools.sh; optional, never blocks the gate): latest record per tool"
+  verify_table "${ids[@]}"
+  if (( ${#still[@]} > 0 )); then
+    echo "  A 'deferred' row = that UNVERIFIED-input install failed and was skipped; the hard installs completed. Re-run them:"
+    echo "    sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06"
+    warn "step 6 soft installs still deferred: ${still[*]} (see the table; non-blocking)"
+  else
+    log "step 6 soft installs: every tool once deferred is now installed (${ids[*]}; latest record pass)"
+  fi
+}
+
 # --- 4. the gate --------------------------------------------------------------------------------------------------------
 _gate_vault_pending_note() {
   local flag="$ATLAS_STATE/vault-init-pending"
@@ -550,6 +607,7 @@ step_10() {
   _gate_check_pytest
   _gate_services
   _gate_verifies
+  _gate_tools_deferred
   if (( ${#GATE_UNHEALTHY[@]} > 0 )); then
     echo
     verify_table V3b V6 V12 V13 V14a V15 V16 V17 V18 V20 V23 V7 V10a

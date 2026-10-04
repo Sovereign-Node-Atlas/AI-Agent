@@ -6,6 +6,14 @@
 # Sources phase2/NN-*.sh in Section 17 order through run_phase_steps (CONVENTIONS.md §4); every step is idempotent.
 # Interactive pauses in this phase (CONVENTIONS.md §7.6): (1) the Hugging Face token prompt below when
 # $ATLAS_ETC/secrets/hf-token.env is absent; (2) the two Google OAuth links in step 6c (phase2/06c-google-oauth.sh).
+# MINUTE-0 INPUT CHECK (fix round 5; CONVENTIONS.md §7.10 "the Principal's time is the scarcest resource"): everything
+# the unattended steps will need from the Principal is checked HERE, before the token prompt and before step 1, and every
+# missing item is reported in ONE message before the driver stops: /etc/atlas/secrets/smb.cred when WINDOWS_SHARE is set
+# (step 9 would otherwise stop ~15 minutes in), the Desktop-app OAuth client JSON in the inbox with its top-level
+# "installed" key (step 6c; a "web" client is the wrong type and is named as such), and
+# BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes in atlas.env (step 6, Section 16.3 item 2). An item whose step is already
+# marked done, or whose relocated copy already exists, is not asked for again. Each item prints the exact recipe
+# (the smb.cred one never puts the password on a command line, §7.2).
 # Step 9b (phase2/09b-vault.sh) pauses ONLY when the Principal opts in with
 # `sudo env ATLAS_VAULT_INIT=1 ./atlas-day1.sh phase2 --force 09b` (phase2/README-contracts.md §1); a plain run leaves
 # the real vault uninitialised and continues. Everything else is unattended.
@@ -103,6 +111,72 @@ hf_token_prompt() {
   esac
   unset tok
 }
+
+# --- Minute-0 input check (header: MINUTE-0 INPUT CHECK) -----------------------------------------------------------------
+phase2_preflight_inputs() {
+  if [[ "$ATLAS_DRY_RUN" == "1" ]]; then
+    log "DRY-RUN would check the Principal's inputs (smb.cred, OAuth client JSON, Android SDK licence key)"
+    return 0
+  fi
+  local missing=() entry="${ATLAS_ENTRY:-./atlas-day1.sh}"
+  local inbox="$ATLAS_SRV/staging/inbox" cred="$ATLAS_ETC/secrets/smb.cred" oauth_src kind
+  oauth_src="$inbox/google-oauth-client.json"
+  # (a) Windows share credentials (phase2/09-windows-share.sh contract: root:root 600, username=/password=/domain=). The
+  #     domain is the Principal's value (Section 22 names `domain=` among what they supply); WORKGROUP is only the default.
+  if [[ -n "${WINDOWS_SHARE:-}" && ! -e "$ATLAS_DONE_DIR/phase2.09" && ! -s "$cred" ]]; then
+    missing+=("$cred is missing (step 9 mounts WINDOWS_SHARE=$WINDOWS_SHARE with it). Create it with the Windows account that can read and write the share; the password is read from the terminal, never typed on a command line (§7.2); the domain is the PC's workgroup or AD domain (Section 22), Enter keeps WORKGROUP:
+      sudo bash -c 'umask 077; read -rp \"Windows user: \" u; read -rsp \"Windows password: \" p; echo; read -rp \"Windows domain [WORKGROUP]: \" d; printf \"username=%s\\npassword=%s\\ndomain=%s\\n\" \"\$u\" \"\$p\" \"\${d:-WORKGROUP}\" > $cred; chown root:root $cred; chmod 600 $cred'")
+  fi
+  # (b) The Google OAuth client JSON (phase2/06c-google-oauth.sh contract: Desktop-app type, top-level "installed").
+  if [[ ! -e "$ATLAS_DONE_DIR/phase2.06c" && ! -s "$ATLAS_ETC/secrets/google/client_secret.json" ]]; then
+    if [[ ! -s "$oauth_src" ]]; then
+      missing+=("$oauth_src is missing (step 6c, the Google OAuth pause). In Google Cloud -> APIs & Services -> Credentials create an OAuth client ID of type 'Desktop app' (its JSON has a top-level \"installed\" key), download it and copy it to EXACTLY that path (owner $PRINCIPAL_USER, any mode; the inbox is $PRINCIPAL_USER:atlas).")
+    else
+      kind="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    print("unreadable: %s" % exc); sys.exit(0)
+print("installed" if isinstance(d, dict) and "installed" in d else "web" if isinstance(d, dict) and "web" in d else "other")' "$oauth_src" 2>/dev/null || echo other)"
+      case "$kind" in
+        installed) log "pre-flight: $oauth_src is a Desktop-app OAuth client (top-level 'installed')" ;;
+        web) missing+=("$oauth_src is a WEB APPLICATION OAuth client (top-level key \"web\"): the wrong client type. Step 6c's loopback consent flow needs a 'Desktop app' client (top-level key \"installed\"). Create one of that type in Google Cloud -> APIs & Services -> Credentials and replace the file.") ;;
+        *) missing+=("$oauth_src is not a Desktop-app OAuth client JSON (no top-level \"installed\" key; got: $kind). Download the 'Desktop app' client JSON from Google Cloud -> APIs & Services -> Credentials to that path.") ;;
+      esac
+    fi
+  fi
+  # (c) The Android SDK licence decision (phase2/06-tools.sh; Section 16.3 item 2: the Principal accepts, never a script).
+  #     load_env already refuses a BLANK key (CONVENTIONS §3 CONFIRM keys), so what reaches here is the key SET to
+  #     something other than `yes` (a `no`, a typo); the remedy edits the existing line instead of appending a second one
+  #     (the installed atlas.env.example carries a blank `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=` line).
+  if [[ ! -e "$ATLAS_DONE_DIR/phase2.06" && "${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}" != yes ]]; then
+    missing+=("BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE='${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}' in $ATLAS_ETC/atlas.env is not 'yes' (step 6 builds the Android/MinGW build container, whose image build runs 'sdkmanager --licenses'; Section 16.3 item 2 reserves accepting https://developer.android.com/studio/terms for you). Read the terms, then set the existing line once:
+      sudo sed -i 's/^BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=.*/BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes/' $ATLAS_ETC/atlas.env   (or edit it: sudo nano $ATLAS_ETC/atlas.env)")
+  fi
+  # (d) The Hugging Face token, only when the prompt below cannot ask for it (stdin not a terminal); otherwise the prompt
+  #     handles it right after this check, so one run collects the token and reports the rest.
+  if [[ ! -s "$ATLAS_ETC/secrets/hf-token.env" && ! -t 0 ]]; then
+    missing+=("$ATLAS_ETC/secrets/hf-token.env is missing and stdin is not a terminal, so the token cannot be prompted for. Re-run from a terminal, or create it without the token ever appearing on a command line:
+      sudo bash -c 'umask 077; printf \"HF token: \"; IFS= read -rs t; echo; printf \"HF_TOKEN=%s\\n\" \"\$t\" > $ATLAS_ETC/secrets/hf-token.env; chown atlas:atlas $ATLAS_ETC/secrets/hf-token.env; chmod 600 $ATLAS_ETC/secrets/hf-token.env'")
+  fi
+  if (( ${#missing[@]} == 0 )); then
+    log "pre-flight: every input the unattended steps need is in place (smb.cred, OAuth client JSON, Android SDK licence key)"
+    return 0
+  fi
+  local i=0 item
+  echo
+  echo "  ==== Phase 2 cannot run unattended yet: ${#missing[@]} input(s) to provide, ALL listed here (fix them in one go) ===="
+  for item in "${missing[@]}"; do
+    i=$(( i + 1 ))
+    echo "  $i. $item"
+    echo
+  done
+  echo "  Then re-run:  sudo $entry phase2   (nothing has been changed; completed steps are skipped)"
+  echo "  ======================================================================================================"
+  die "Phase 2 pre-flight: ${#missing[@]} missing input(s) listed above (CONVENTIONS.md §7.10: all at once, not 15 minutes apart)"
+}
+phase2_preflight_inputs
 hf_token_prompt
 
 log "Phase 2 starting: steps in $ATLAS_DAY1_DIR/phase2 (dry-run=$ATLAS_DRY_RUN)"

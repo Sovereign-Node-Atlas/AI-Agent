@@ -12,8 +12,12 @@ The scripts stop with a precise message when something below is missing. Having 
 
 **Node (Section 22, build-side preconditions)**
 
-- Ubuntu Server 26.04.1 on the 4 TB NVMe (installer encryption of the OS volume is expected; an unencrypted OS volume
-  stops pre-flight), the 8 TB NVMe unpartitioned. BIOS: UMA minimum, IOMMU on, fTPM on.
+- Ubuntu Server 26.04.1 installed with the **encrypted LVM (LUKS) option** on the 4 TB NVMe (Section 3.5 requires LUKS2
+  on both volumes; an unencrypted OS volume stops pre-flight and no setting waives it), the 8 TB NVMe unpartitioned.
+  BIOS: UMA minimum, IOMMU on, fTPM on.
+- Your SSH public key in `~/.ssh/authorized_keys` on the node (your login user). Pre-flight stops without it, because
+  Phase 1 step 4 makes SSH key-only (Section 3.6) and then reboots; the message gives the one `ssh` command that adds
+  the key from the Windows PC.
 - **Secure Boot decision.** D2 closes Secure Boot as disabled; S9 binds the TPM2 enrolment to PCR 7 alone. With Secure
   Boot off, PCR 7 does not tie the unlock to this OS image (any OS booted on the hardware can unseal the keys, so the
   encryption protects against disk removal, not theft of the whole node). Pre-flight stops until you either enable
@@ -25,15 +29,19 @@ The scripts stop with a precise message when something below is missing. Having 
   in 100.64.0.0/10 you are behind CGNAT and V5 cannot pass (R11).
 - `/home/<you>/CLOUDFLARE.txt` holding the `Zone:DNS:Edit` token for `sovereign-node.link` (a 40-character
   `[A-Za-z0-9_-]` string anywhere in the file). Optional, saves a prompt: a line `Zone ID: <32 hex>` beside it. A
-  DNS-edit-only token cannot look the zone up, so Phase 1 step 7 asks for the id once if it is not there (S11).
+  DNS-edit-only token cannot look the zone up, so Phase 1 step 7 asks for the id once if it is not there (S11). The
+  `vpn.sovereign-node.link` A record itself need not exist: the one updater run that Phase 1 step 7 starts creates it
+  (DNS-only, grey cloud) if the zone has none, as your Section 17 step 7 command (a DNS change, Section 16.3 item 4,
+  so the 5-minute timer never creates: it only ever changes the address, and a record you delete stays deleted).
 - The Google Cloud OAuth client (Desktop-app type) created for Gmail, Calendar and Drive, as a JSON file.
 - A Hugging Face access token (read scope), and with the same account the licences accepted on huggingface.co for
   `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0` (Phase 2, V6), `black-forest-labs/FLUX.1-dev` and
   `stabilityai/stable-audio-open-1.0` (Phase 4). A 403 during a pull stops with the licence URL to visit.
 - The Windows PC's share path and an account on it that can read and write the share.
 - Your phone with the **WireGuard** app and the **ntfy** app installed (Phase 1 step 7).
-- Reference recordings for Alaric's voice and (if the British male presets collide) Gideon's: `alaric.wav`,
-  `gideon.wav`. Without them V7 is recorded `deferred`, not failed.
+- Reference recordings for Alaric's voice and (if the British male presets collide) Gideon's: any WAV, MP3 or M4A
+  named `alaric.*` / `gideon.*`; Phase 2 step 5 converts them to 16 kHz mono WAV. Without them V7 is recorded
+  `deferred`, not failed.
 
 **Settings the scripts cannot detect** — on the first run `load_env` installs `config/atlas.env.example` to
 `/etc/atlas/atlas.env` and stops naming the blank `CONFIRM` keys. Edit the file and re-run:
@@ -42,8 +50,14 @@ The scripts stop with a precise message when something below is missing. Having 
 GOOGLE_ACCOUNTS="you@company.com:corporate you@gmail.com:estate"
 WINDOWS_SHARE="//192.168.1.50/atlas"
 FAMILY_NAMES="Surname Givenname"
-ATLAS_ACCEPT_PCR7_NO_SB=      # 1 only after the Secure Boot decision above
+ATLAS_ACCEPT_PCR7_NO_SB=      # 1 only after the Secure Boot decision above (demanded only while Secure Boot is off)
+BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes   # after reading https://developer.android.com/studio/terms (Section 16.3 item 2)
 ```
+
+`BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE` is asked here, before Phase 1, because Phase 2 step 6 builds the Android + MinGW
+cross-build container and its image build runs `sdkmanager --licenses`, which accepts those terms: that acceptance is
+yours to make, never a script's, so any value but `yes` stops `load_env` here (and step 6 checks again). `load_env`
+prints every blank or unconfirmed key in one message, each with an example value, so one edit fixes them all.
 
 Everything else in that file is auto-detected (`PRINCIPAL_USER`, `TZ`, `LAN_IFACE`, `LAN_CIDR`, `DATA_DISK` as the
 largest unmounted NVMe by `/dev/disk/by-id`) or has a default (ports, `DOMAIN`, `VPN_HOST`, `WG_*`, `NTFY_TOPIC`).
@@ -53,7 +67,7 @@ largest unmounted NVMe by `/dev/disk/by-id`) or has a default (ports, `DOMAIN`, 
 | File | Where | Used by |
 |---|---|---|
 | OAuth client JSON | `/srv/atlas/staging/inbox/google-oauth-client.json` | Phase 2 step 6c (shredded after the tokens are proven) |
-| `alaric.wav`, `gideon.wav` | `/srv/atlas/staging/inbox/voice-references/` | Phase 2 step 5, V7 |
+| `alaric.*`, `gideon.*` (WAV, MP3 or M4A; step 5 converts to 16 kHz mono WAV) | `/srv/atlas/staging/inbox/voice-references/` | Phase 2 step 5, V7 |
 | Windows credentials | `/etc/atlas/secrets/smb.cred` (root 600, `username=`/`password=`/`domain=` lines) | Phase 2 step 9; step 2 checks it exists so the phase stops early, and prints the exact `read -rs` command to create it without the password touching a command line |
 | `cl100k_base.tiktoken` (optional) | `/srv/atlas/staging/inbox/` | Phase 2 step 4 (LightRAG's tokenizer table, offline); when absent the step completes with a warning and the download/checksum command |
 
@@ -68,9 +82,9 @@ sudo ./atlas-day1.sh phase1          # Phase 1 steps 1-4, then the node reboots
 sudo ./atlas-day1.sh phase1          # after the reboot: steps 5, 5b, 6, 7, 8 (gate)
 sudo ./atlas-day1.sh phase2          # steps 1-10; three interactive pauses (below)
 sudo ./atlas-day1.sh phase3          # detached; ~15 h of download + ~30 min of load tests
-journalctl -u atlas-day1-phase3 -f   # follow it (or: tail -f /var/lib/atlas/day1/logs/phase3-<date>.log)
+journalctl -fu atlas-day1-phase3     # follow it (or: tail -f /var/lib/atlas/day1/logs/phase3-<date>.log)
 sudo ./atlas-day1.sh phase4          # detached; several hours, can run overnight
-journalctl -u atlas-day1-phase4 -f
+journalctl -fu atlas-day1-phase4
 sudo ./atlas-day1.sh status          # done markers for every phase and the full verification table
 sudo ./atlas-day1.sh report          # fills sheet "4 Verification" of a COPY of docs/ATLAS_BUILD_BASELINE.xlsx
 ```
@@ -82,7 +96,9 @@ when a variable must reach a step, write `sudo env VAR=value ./atlas-day1.sh ...
 
 Options for every phase: `--dry-run` (print the steps, run nothing), `--force STEP` (clear one step's done marker,
 then run), `--status` (markers and table for that phase). Phases 3 and 4 add `--foreground` (run in this terminal
-instead of the transient unit). Phase 1 only, called directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
+instead of the transient unit); on those two phases `--force STEP` detaches like the plain command, and the exact
+`journalctl -fu atlas-day1-phase3` follow line is printed every time a phase detaches (§5). Phase 1 only, called
+directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
 (stage step 4 and leave the reboot to you) and `--reload-allowlist [FILE]` (re-render the squid allowlist).
 
 ### What each phase does
@@ -99,6 +115,11 @@ instead of the transient unit). Phase 1 only, called directly as `/opt/atlas/day
   Chatterbox, Whisper (speaches), PyAnnote; the Section 15.1 tools and the cross-build container; Cloudflare token
   relocation (V23); Google OAuth (V20); the AEGIS sandbox image; restic + AEGIS timers (V13); Sentinel and prune
   timers; the Windows share automount; the gocryptfs vault; gate.
+- **Day 1 close-out, before Phase 3 starts downloading:** copy the recovery material to the USB drive and store it
+  away from the node, not beside it (Section 22, R16; D3): `/etc/atlas/secrets/restic.pass` (`sudo cat` it; shown once
+  in Phase 2 step 7), the LUKS recovery key shown in Phase 1 step 2 (on-node copy under `/etc/atlas/secrets/`), and the
+  vault passphrase you chose (plus the gocryptfs master key shown once) if you initialised the vault (§3). A fire or
+  burglary that takes the node takes anything beside it; the USB copy is the one that survives.
 - **Phase 3 — core LLM pull** (download-bound): the seven GGUF engines at their fixed quantisations, sha256 from the
   Hugging Face tree API into `MANIFEST.json`; per-engine load tests through the Arbiter (V4 KV proof, tok/s at 512 and
   8k, swap time, memory returned); the two-residency test (V14b, V21); gate. The Sentinel/prune timers, the GPU Celery
@@ -160,6 +181,16 @@ after the last completed step; a step that failed has no marker and runs again. 
 first (ids are the Section 17 numbers: `01`, `05b`, `06c`, `09b`; Phase 3 and 4 use `01`..`06`). Downloads resume
 (`hf_download` skips files whose sha256 already matches), builds skip when the artefact exists, and Phases 3 and 4 are
 resumable per file and per engine.
+
+`--force` exports the ids it was given as `ATLAS_FORCED_STEPS` (space-separated), which step files may read: a forced
+`09b` is how Phase 2 step 9b knows the Principal asked for the real vault (together with `ATLAS_VAULT_INIT=1`, §3).
+
+**`--force` on Phases 3 and 4 detaches.** `sudo ./atlas-day1.sh phase3 --force 02` clears the marker and then starts
+the transient unit exactly like the plain `phase3` command; the driver prints the follow line
+(`journalctl -fu atlas-day1-phase3`, or `tail -f` on the phase log) and the spelling that keeps it in the terminal.
+Only `--foreground` runs the phase in your terminal: `sudo ./atlas-day1.sh phase3 --foreground --force 02`. The
+foreground run dies with a dropped SSH session, which is why detaching is the default for the two long phases
+(Section 17: "detached under systemd"); `--dry-run` and `--status` always run in the terminal.
 
 Each phase ends with `gate <phase> REQUIRED... -- RECORDED...`, which prints the latest record per id and writes the
 gate marker only when no required id is `fail` or missing. `deferred` never blocks. `info` never blocks.
@@ -345,8 +376,14 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 phase3 phase4 tools`, `bash lib/common_test.sh`, and the package tests (Python 3.12+):
 
 ```
-cd orchestrator && pip install -e . && CONFIG_DIR=$PWD/tests/fixtures/config python -m pytest
+cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest
 ```
 
+The orchestrator's config directory is `ATLAS_CONFIG_DIR` from `/etc/atlas/orchestrator.env`, which Phase 2 step 2
+writes as `/opt/atlas/day1/config` (the mirror of this `config/`; `load_env` itself fixes the scripts' own view to
+`$ATLAS_DAY1_DIR/config`). Nothing on the node sets `CONFIG_DIR`. Only the orchestrator tests override the directory:
+the `config_dir` fixture in `tests/conftest.py` points `ATLAS_CONFIG_DIR` at `tests/fixtures/config` and scrubs
+`CONFIG_DIR` for the tests that use it; tests that do not use the fixture read whatever your shell exports, which is
+what the `env -u CONFIG_DIR -u ATLAS_CONFIG_DIR` above removes.
 `tests/test_config.py::test_real_config_tree_loads` also loads the real `config/` tree beside the checkout, so a
 renamed engine key or a domain card outside the §8 H1 form fails there before it fails on the node.

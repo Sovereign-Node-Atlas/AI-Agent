@@ -177,5 +177,18 @@
       "model_file_pattern": "bge-reranker-v2-m3-Q8_0.gguf",
       "port": 8110
     }
+  ],
+  "external": [
+    {
+      "key": "chatterbox",
+      "display_name": "Chatterbox 0.1.7 (ResembleAI/chatterbox, CPU, in-process)",
+      "mode": "external",
+      "arbiter_class": "external",
+      "kv_class": "none",
+      "footprint_gb": 4,
+      "ctx_size": 0,
+      "parallel": 1,
+      "notes": "Fixture twin of config/engines.json's external list (Section 4.2 class external: budgeted and ledgered by the Arbiter, started by its caller; no port, no unit). Release confirmed through the caller's pid (/proc/<pid>), or on the caller's word when none is passed; an Apex request while it is resident is queued (rule 7 exception, module docstring)."
+    }
   ]
 }

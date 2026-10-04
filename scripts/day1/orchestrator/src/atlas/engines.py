@@ -313,6 +313,12 @@ class SystemdEngineController:
         if self.engines and key not in self.engines:
             raise EngineControlError(f"engine key {key!r} is not in engines.json (CONVENTIONS.md §8); the sudoers "
                                      "fragment names exactly those keys")
+        spec = self.engines.get(key)
+        if spec is not None and spec.is_external:
+            # Section 4.2 class external (engines.json `external` list): no llama-server@ unit, no sudoers line; the
+            # Arbiter budgets it without ever reaching this controller, so a call here is a bug, named as such.
+            raise EngineControlError(f"engine key {key!r} is class external (no llama-server unit; the caller runs the "
+                                     "process, Section 4.2 'Chatterbox when invoked'); refusing systemctl for it")
         return key
 
     def _systemctl(self, verb: str, key: str, timeout_s: float) -> None:
@@ -357,6 +363,9 @@ class SystemdEngineController:
         self._systemctl("restart", key, self.start_timeout_s)
 
     def is_active(self, key: str) -> bool:
+        spec = self.engines.get(key)
+        if spec is not None and spec.is_external:
+            return False  # no unit exists for a class-external engine (Section 4.2; engines.json `external` list)
         unit = f"{UNIT_PREFIX}{self._check_key(key)}"
         try:
             proc = self._run([SYSTEMCTL, "is-active", "--quiet", unit], stdin=subprocess.DEVNULL, capture_output=True,

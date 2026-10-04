@@ -317,5 +317,20 @@
       "kv_proof_lines": 0,
       "notes": "--reranking sets embedding=true and pooling=rank itself (arg.cpp, VERIFIED). Endpoints /v1/rerank, /rerank, /reranking."
     }
+  ],
+  "external": [
+    {
+      "key": "chatterbox",
+      "display_name": "Chatterbox 0.1.7 (ResembleAI/chatterbox, CPU, in-process) — character and cloning TTS",
+      "role": "Section 14.1 character and cloning tier: the Alaric and Gideon clones (Section 14.3, V7); loaded inside phase2/voice_render.py and the orchestrator's voice path, never a llama-server unit",
+      "mode": "external",
+      "arbiter_class": "external",
+      "kv_class": "none",
+      "footprint_gb": 4,
+      "ctx_size": 0,
+      "parallel": 1,
+      "n_keep": 0,
+      "notes": "Section 4.2: 'every load ... of any weight-bearing process ... Chatterbox when invoked' passes through the Arbiter. Class external = the Arbiter grants/queues/refuses the load against the live budget (rule 2), counts it as one of the two resident engines (rule 3), evicts LRU victims for it (rule 5 per victim) and holds its footprint in the ledger (rules 1, 9), but starts and stops nothing: the caller runs the process in /opt/atlas/venv-voice (phase2/voice_render.py clone-batch; the orchestrator's voice path) and POSTs /arbiter/load {engine: chatterbox} before and /arbiter/unload after; a 404 from either route means the running orchestrator does not read this list and the caller FAILS, it never skips. footprint_gb 4 is the planning figure (voice-stt.md section 7: ~2-4 GB while loaded); phase2/05-voice.sh registers the measured peak RSS (CHATTERBOX_FOOTPRINT_BYTES) through POST /arbiter/register on every run, which replaces it. Listed under `external`, not `engines`: no port (the CONVENTIONS.md section 8 port rule counts engines[] only), no hf_repo/files (the weights are the HF cache phase2/05-voice.sh fills, HF_HUB_OFFLINE=1 afterwards), no llama-server@ unit, no sudoers line (phase2/01-llama.sh counts exactly ten engines[]) and no env file (phase2/engine-env.py renders engines[] only). Release (Section 4.2 rule 5, with the right counter for a CPU process; fix round 6): not observable on the GTT counter, so the caller passes its process pid in POST /arbiter/unload and the Arbiter polls /proc/<pid> until the process is gone or its RSS is back (bounded; a timeout leaves the engine charged and is retried by the caller); an unload without a pid is accepted on the caller's word and marked 'not measured'. An external resident is never an eviction victim: a load that needs its memory is queued until the caller unloads. RULE 7 EXCEPTION, knowingly: an Apex request while chatterbox is resident is queued as well (the Arbiter cannot stop a caller-owned process; 'unloads any co-resident engine first' waits for the caller's unload)."
+    }
   ]
 }

@@ -19,7 +19,22 @@
 #      The image's entrypoint (coreutils `timeout -s KILL`) must SIGKILL it at the deadline (exit 137 within a few
 #      seconds of 5 s) and the container must be gone afterwards, so a program that ignores the host-side signal has
 #      no way to outlive its time bound. The host-side GNU timeout is only the backstop and must not be what fired.
-# The exit codes and the elapsed seconds of both runs are printed, with the image id and the base image the Dockerfile
+#   3. Work-directory cap AND the package's run line (fix rounds 5 and 6; Section 16.4 "a hard memory limit" extends to
+#      the job's files): /work is the package's bounded tmpfs (`--mount type=tmpfs,dst=/work,tmpfs-size=...`,
+#      SANDBOX_WORK_SIZE, default 2g), here 64m. This run is the package's EXACT line: a job directory staged like
+#      sandbox.run() stages it (directory 2770 group atlas, main.py 0640) bind-mounted read-only at /stage, and the
+#      in-container prologue/epilogue RUN_SHELL read from the installed package (/opt/atlas/venv; the repository source
+#      when the venv has no package yet, said in the message): `cp` of /stage into /work as uid 65534, the job's stdout
+#      to /work/.stdout, `tar -cf - .` of /work on the container's stdout, the job's own exit code. main.py writes 1 MiB
+#      chunks to /work/fill until the write fails and must see ENOSPC (errno 28) after no more than 64 MiB and no less
+#      than 32 MiB (a cap that is not there would let 128 MiB through; one far smaller than asked is a different mount),
+#      removes /work/fill (the job's stdout is /work/.stdout under this run line, so a job that has filled /work must
+#      free space before its last line can land there; it also keeps the results tar small) and exits 0 printing the
+#      figure. Asserted: exit 0 (so the prologue ran: fix round 6 found the earlier
+#      `cp --preserve` failing with EPERM on the root-owned mount point and no job ever running), the results tar lists
+#      ./.stdout and ./main.py, and ./.stdout carries the ENOSPC line. The old unbounded `-v <job>:/work:rw` bind mount
+#      would have put those bytes on the 8 TB volume; the tmpfs is charged to the job's memory cgroup.
+# The exit codes and the elapsed seconds of the runs are printed, with the image id and the base image the Dockerfile
 # pinned by digest (label org.atlas.sandbox.base; fix round 2, rule §7.9). The image is built by phase2/06d-sandbox.sh.
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
@@ -53,16 +68,21 @@ load_before="$(load1)"
 stamp="$$-$(date +%s)"
 name="atlas-v17-$stamp"
 name2="atlas-v17-timeout-$stamp"
+name3="atlas-v17-work-$stamp"
 errf="$(mktemp)"
-trap 'rm -f "$errf"; docker rm -f "$name" "$name2" >/dev/null 2>&1 || true' EXIT
+stage3="$(mktemp -d)"
+tar3="$(mktemp)"
+trap 'rm -rf "$errf" "$stage3" "$tar3"; docker rm -f "$name" "$name2" "$name3" >/dev/null 2>&1 || true' EXIT
 
 # The run line of docker/sandbox/Dockerfile minus the job mount (nothing to mount here). The gid is the atlas group's,
 # as the package's build_argv passes it (header).
 atlas_gid="$(getent group atlas 2>/dev/null | cut -d: -f3 || true)"
 gid_note=""
 if [[ -z "$atlas_gid" ]]; then atlas_gid=65534; gid_note=" (atlas group absent: ran as 65534:65534, not the package's gid)"; fi
+# fsize is per run: 1 MiB for the two bombs (nothing to write), the package's default SANDBOX_FSIZE (1 GiB) for run 3,
+# whose writer must reach the tmpfs cap, not the file-size cap (RLIMIT_FSIZE is in bytes).
 run_flags=(--init --pull never --cpus=1 --pids-limit=64 --network none --read-only
-  --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=64m" --ulimit fsize=1048576
+  --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=64m"
   --cap-drop ALL --security-opt no-new-privileges --user "65534:$atlas_gid")
 
 # --- 1. the memory cap ------------------------------------------------------------------------------------------------
@@ -72,7 +92,7 @@ while True:
 t0="$(date +%s.%N)"
 rc=0
 timeout -k 5 "$timeout_s" docker run --rm --name "$name" --memory=512m --memory-swap=512m \
-  -e "SANDBOX_TIMEOUT_S=$timeout_s" "${run_flags[@]}" \
+  -e "SANDBOX_TIMEOUT_S=$timeout_s" "${run_flags[@]}" --ulimit fsize=1048576 \
   "$image" python3 -c "$bomb" >/dev/null 2>"$errf" || rc=$?
 t1="$(date +%s.%N)"
 elapsed="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')"
@@ -131,7 +151,7 @@ host_limit=40   # the backstop; it must NOT be what ends the run
 t0="$(date +%s.%N)"
 rc2=0
 timeout -k 5 "$host_limit" docker run --rm --name "$name2" --memory=64m --memory-swap=64m \
-  -e "SANDBOX_TIMEOUT_S=$in_limit" "${run_flags[@]}" \
+  -e "SANDBOX_TIMEOUT_S=$in_limit" "${run_flags[@]}" --ulimit fsize=1048576 \
   "$image" python3 -c "$stubborn" >/dev/null 2>"$errf" || rc2=$?
 t1="$(date +%s.%N)"
 elapsed2="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')"
@@ -150,5 +170,80 @@ if awk -v e="$elapsed2" -v t="$in_limit" 'BEGIN { exit (e < t + 10) ? 0 : 1 }'; 
   exit 1
 fi
 
-echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); SIGTERM-ignoring job killed by the in-container timeout: exit 137 after ${elapsed2}s (limit ${in_limit}s), container gone; $host (Δload1 $load_delta)$llama_note; runs as 65534:$atlas_gid$gid_note; image $image ${image_id:-?} (base ${image_base:-unlabelled})"
+# --- 3. the /work tmpfs cap under the package's run line (Section 16.4; orchestrator/src/atlas/sandbox.py build_argv) ------
+# The same mount flag the package emits, with a 64 MiB cap; the memory cap is well above it so the OOM killer cannot be
+# what stops the writer (tmpfs pages are charged to the cgroup). The writer stops at the first failed write. It runs as
+# the staged /work/main.py of a job directory, through RUN_SHELL exactly as the package types it (header item 3).
+run_shell=""
+run_shell_src="$ATLAS_OPT/venv (installed package)"
+run_shell="$("$ATLAS_OPT/venv/bin/python" -c 'from atlas.sandbox import RUN_SHELL; print(RUN_SHELL)' 2>/dev/null || true)"
+if [[ -z "$run_shell" ]]; then
+  # No installed package yet (V17 run by hand before step 02): the repository source is the same text; sandbox.py
+  # imports the standard library only, so the host python3 can read it.
+  run_shell="$(PYTHONPATH="$ATLAS_DAY1_DIR/orchestrator/src" python3 -c 'from atlas.sandbox import RUN_SHELL; print(RUN_SHELL)' 2>/dev/null || true)"
+  run_shell_src="$ATLAS_DAY1_DIR/orchestrator/src (repository source; the venv has no atlas package)"
+fi
+[[ -n "$run_shell" ]] || { echo "V17 fail: cannot read atlas.sandbox.RUN_SHELL from $ATLAS_OPT/venv or $ATLAS_DAY1_DIR/orchestrator/src (the package's run line is what this run proves); $host"; exit 1; }
+# Unbuffered writes (buffering=0): the failing write raises where it happens, not again at close. The fill is removed
+# before printing: under the package's run line stdout is /work/.stdout on the very tmpfs the job has just filled.
+filler='import errno, os, sys
+chunk = b"x" * (1 << 20)
+written = 0
+err = None
+try:
+    fh = open("/work/fill", "wb", buffering=0)
+    while written < 128:
+        fh.write(chunk)
+        os.fsync(fh.fileno())
+        written += 1
+except OSError as exc:
+    err = exc
+try:
+    fh.close()
+except Exception:
+    pass
+try:
+    os.remove("/work/fill")
+except OSError:
+    pass
+if err is not None and err.errno == errno.ENOSPC:
+    print(f"ENOSPC after {written} MiB")
+    sys.exit(0)
+if err is not None:
+    print(f"OSError {err.errno} {err}")
+    sys.exit(4)
+print(f"no ENOSPC: {written} MiB written")
+sys.exit(5)'
+work_cap=64m
+# The job directory as sandbox.run() stages it: 2770 group atlas (the gid the container runs with), main.py 0640, so the
+# nobody-uid process reads /stage through the group bit exactly as a real job does (sandbox.py module docstring).
+printf '%s\n' "$filler" >"$stage3/main.py"
+chgrp "$atlas_gid" "$stage3" "$stage3/main.py"
+chmod 2770 "$stage3"; chmod 640 "$stage3/main.py"
+t0="$(date +%s.%N)"
+rc3=0
+timeout -k 5 60 docker run --rm --name "$name3" --memory=512m --memory-swap=512m \
+  -e "SANDBOX_TIMEOUT_S=50" "${run_flags[@]}" --ulimit "fsize=$((1 << 30))" \
+  --mount "type=tmpfs,dst=/work,tmpfs-size=$work_cap" -v "$stage3:/stage:ro" -w /work \
+  "$image" sh -c "$run_shell" sh python3 /work/main.py >"$tar3" 2>"$errf" || rc3=$?
+t1="$(date +%s.%N)"
+elapsed3="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')"
+docker rm -f "$name3" >/dev/null 2>&1 || true
+if (( rc3 != 0 )); then
+  echo "V17 fail: the package's run line (RUN_SHELL from $run_shell_src; /work tmpfs $work_cap): expected the staged main.py to hit ENOSPC and the shell to exit 0, got exit $rc3 after ${elapsed3}s: $(tr '\n' ' ' <"$errf" | cut -c1-300); a prologue that cannot run as 65534:$atlas_gid (cp of /stage into /work) fails every sandbox job; $host"
+  exit 1
+fi
+listing="$(tar -tf "$tar3" 2>/dev/null || true)"
+if ! grep -qx './.stdout' <<<"$listing" || ! grep -qx './main.py' <<<"$listing"; then  # `./` and ./fill are gone
+  echo "V17 fail: the results tar the run line streamed ($(stat -c %s "$tar3" 2>/dev/null || echo ?) bytes) does not list ./.stdout and ./main.py (got: $(tr '\n' ' ' <<<"$listing" | cut -c1-200)): the copy into /work or the tar epilogue did not run as the package expects; $host"
+  exit 1
+fi
+out3="$(tar -xOf "$tar3" ./.stdout 2>/dev/null | tr -d '\r' | tail -n1 || true)"
+mib="$(sed -nE 's/^ENOSPC after ([0-9]+) MiB$/\1/p' <<<"$out3")"
+if [[ -z "$mib" ]] || (( mib > 64 || mib < 32 )); then
+  echo "V17 fail: /work tmpfs cap ($work_cap) under the package's run line: ./.stdout in the results tar reads '${out3}' (expected ENOSPC between 32 and 64 MiB); the mount is not the bounded tmpfs the package's run line declares; $host"
+  exit 1
+fi
+
+echo "runaway python killed by the 512m cap: exit 137 after ${elapsed}s (limit ${timeout_s}s); SIGTERM-ignoring job killed by the in-container timeout: exit 137 after ${elapsed2}s (limit ${in_limit}s), container gone; the package's run line (RUN_SHELL from $run_shell_src: cp /stage -> /work, .stdout, results tar) ran a staged main.py to exit 0 and /work tmpfs cap $work_cap gave ENOSPC after ${mib} MiB (${elapsed3}s; the package mounts /work as tmpfs-size=SANDBOX_WORK_SIZE, default 2g); $host (Δload1 $load_delta)$llama_note; runs as 65534:$atlas_gid$gid_note; image $image ${image_id:-?} (base ${image_base:-unlabelled})"
 exit 0

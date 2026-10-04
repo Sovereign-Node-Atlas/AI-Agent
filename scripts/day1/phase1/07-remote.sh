@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # phase1/07-remote.sh — Phase 1 step 7 (Sections 9.3, 12.2, 12.3, 17, 21 V5; R7, R11): WG-Easy from
 # docker/wg-easy/compose.yml (admin UI published on 127.0.0.1 only; fix round 3), the Cloudflare dynamic-DNS updater under
-# atlas-ddns, ntfy with default-deny auth and a node token, the WireGuard bridge address added to the SSH/Cockpit/
+# atlas-ddns (the run THIS step starts may create the DNS-only A record for $VPN_HOST when the zone has none: a DNS change
+# commanded by the Principal through Section 17 step 7, authorised once with a create-once marker, never by the timer,
+# Section 16.3 item 4; the zone-id resolution below is unchanged), ntfy with default-deny auth and a node token, the WireGuard bridge address added to the SSH/Cockpit/
 # xrdp bindings, and V5 (DNS matches the public IP; a handshake from mobile data within 10 minutes passes, else
 # V5 is recorded as FAIL with the exact re-run command: the step itself completes, the gate shows the red row and
 # Phase 2 waits for `--force 07`; CONVENTIONS §6 gives V5 no deferral provision).
@@ -241,10 +243,23 @@ _ddns_install() {
   install -m 644 "$ATLAS_DAY1_DIR/systemd/atlas-ddns.timer" /etc/systemd/system/atlas-ddns.timer
   systemctl daemon-reload
   systemctl enable --now atlas-ddns.timer >/dev/null
+  # Creating the A record is a DNS change (Section 16.3 item 4), so the updater does it only on the run this step starts:
+  # the Principal's Section 17 step 7 command (first run or `--force 07`) is the authority, expressed as a one-shot marker
+  # in the unit's StateDirectory that the run consumes (cloudflare-ddns.sh header). The timer never creates, so a record
+  # the Principal deletes in the dashboard stays deleted. Started under the hardened unit, not systemd-run, so the one
+  # run that may POST runs in the same sandbox as every other. The journal is read from this start only (--since), so
+  # a "created" line of an earlier run is never reported as this run's.
+  local statedir=/var/lib/atlas-ddns since
+  install -d -m 755 -o atlas-ddns -g atlas-ddns "$statedir"
+  install -m 600 -o atlas-ddns -g atlas-ddns /dev/null "$statedir/create-once"
+  since="$(date +%s)"
   if systemctl start atlas-ddns.service; then
-    log "ddns: first run ok, public IP $(cat /var/lib/atlas-ddns/last-ip 2>/dev/null || echo '?') -> $VPN_HOST"
+    log "ddns: first run ok, public IP $(cat "$statedir/last-ip" 2>/dev/null || echo '?') -> $VPN_HOST ($(journalctl -u atlas-ddns --since "@$since" --no-pager -o cat 2>/dev/null | grep -oE 'atlas-ddns: (created|updated)[^(]*' | tail -n1 || echo 'record already current'))"
   else
-    warn "ddns: first run failed (journalctl -u atlas-ddns -n 20); the timer retries every 5 minutes. V5 will show whether DNS matches."
+    warn "ddns: first run failed (journalctl -u atlas-ddns --since @$since); the timer retries every 5 minutes (it may create the record only if this run did not get as far as the record lookup; otherwise the authority is spent). V5 will show whether DNS matches."
+  fi
+  if [[ -e "$statedir/create-once" ]]; then
+    warn "ddns: the one-shot create authority was not consumed (the run failed before the record lookup); the timer's next successful run may create $VPN_HOST once, then never again"
   fi
 }
 

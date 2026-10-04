@@ -37,7 +37,7 @@ Endpoints
     POST /arbiter/register             {engine, total_bytes, task_id}: Phase 3/4 record a measured footprint (rule 1)
     POST /arbiter/load                 {engine, ctx, parallel, task_id} -> {decision: granted|queued|refused, reason,
                                        projected_bytes}: a load through the Arbiter (4.2 rule 2; phase3/loadtest.py)
-    POST /arbiter/unload               {engine, task_id} -> the same shape (rule 5 release check inside)
+    POST /arbiter/unload               {engine, task_id, pid?} -> the same shape (rule 5 release check inside; pid for class-external)
     POST /arbiter/remeasure            re-read the resident set (4.1) while NO engine is resident: Phase 2 step 4/5
                                        add the small models after the orchestrator measured at step 2. The chat path
                                        and /arbiter/load also re-measure lazily whenever nothing is resident.
@@ -491,6 +491,9 @@ class LoadRequest(BaseModel):
 class UnloadRequest(BaseModel):
     engine: str
     task_id: str | None = None
+    # Section 4.2 rule 5 for a class-external (CPU) engine: the caller's process, polled in /proc until it is gone
+    # (phase2/voice_render.py sends the clone-batch child's pid). Ignored for llama-server engines.
+    pid: int | None = None
 
 
 class StrikeRequest(BaseModel):
@@ -942,7 +945,7 @@ def build_app(deps: AppDeps) -> FastAPI:
         if req.engine not in deps.config.engines:
             raise HTTPException(404, f"unknown engine {req.engine!r} (CONVENTIONS.md §8 keys)")
         try:
-            dec = deps.arbiter.request_unload(req.engine, task_id=req.task_id, wait_s=deps.load_wait_s)
+            dec = deps.arbiter.request_unload(req.engine, task_id=req.task_id, wait_s=deps.load_wait_s, pid=req.pid)
         except UnknownEngine as exc:
             raise HTTPException(404, str(exc)) from exc
         except ReleaseTimeout as exc:

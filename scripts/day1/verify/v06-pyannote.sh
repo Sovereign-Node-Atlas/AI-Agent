@@ -13,12 +13,19 @@
 #      into HF_HOME) and once with HF_HUB_OFFLINE=1 (proves the cache loads without network, Section 12.5). Both runs
 #      execute as the atlas service account (runuser) when this script runs as root, so the HF cache entries and lock
 #      files are owned by the account that uses them at run time (CONVENTIONS.md §2: /srv/atlas is atlas:atlas).
-#   3. Section 21 defines V6 as "PyAnnote 3.1 ... loading" and Section 14.1 fixes 3.1, so if pyannote.audio 4.0.7 cannot
-#      load the legacy 3.1 pipeline (UNVERIFIED, voice-stt.md §6 conflict 1) V6 is a FAIL that blocks the Phase 2 gate;
-#      the community-1 pipeline is probed for DIAGNOSTIC text only (does the token have it, does it load) so the
-#      Principal can decide between pinning pyannote.audio to a release that loads 3.1 and amending Section 14.1.
-#      It is never the pass path (fix round; CONVENTIONS.md §7.4: a verification that fails is recorded as fail).
+#   3. Section 21 defines V6 as "PyAnnote 3.1 ... loading" and Section 14.1 fixes 3.1. The pin is pyannote.audio 4.0.7
+#      (voice-stt.md §5.1 VERIFIED: the release current in 2026, the only line receiving fixes; the research names no 3.x
+#      release and calls 3.1 the "legacy" pipeline under 4.x, UNVERIFIED whether 4.0.7 loads it, §6 conflict 1). V6
+#      PASSES ONLY WHEN 3.1 LOADS (fix round 6 restores the round-4 verdict; CONVENTIONS.md line 4: the document wins over
+#      the research, and no Section 23 row amends 14.1/21). When the installed pyannote.audio REFUSES the 3.1 id (exit 3
+#      below: a load error, not a run error and not a licence refusal) V6 is a FAIL whose message carries a DIAGNOSTIC:
+#      whether the research's 4.x fallback (pyannote/speaker-diarization-community-1, gated too) loads under the same
+#      install, so the Principal can decide between pinning a 3.1-loading release and amending 14.1/21 (a Section 23 row)
+#      to name the community pipeline, after which phase2/05-voice.sh may switch PYANNOTE_PIPELINE; the scripts never
+#      switch it themselves (Section 16.3 item 6). Neither loads -> FAIL too (never deferred; CONVENTIONS.md §7.4);
+#      3.1's licence not accepted -> FAIL naming the URLs (Section 14.1 fixes 3.1, the fallback is not a way around it).
 # Usage: v06-pyannote.sh [VENV=/opt/atlas/venv-pyannote] [HF_HOME=/srv/atlas/engines/hf] [PIPELINE=pyannote/speaker-diarization-3.1]
+#                        [FALLBACK=pyannote/speaker-diarization-community-1   (diagnostic only, header item 3)]
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -26,6 +33,7 @@ source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 venv="${1:-$ATLAS_OPT/venv-pyannote}"
 hf_home="${2:-$ATLAS_SRV/engines/hf}"
 pipeline="${3:-pyannote/speaker-diarization-3.1}"
+fallback="${4:-pyannote/speaker-diarization-community-1}"
 tokf="$ATLAS_ETC/secrets/hf-token.env"
 entry="${ATLAS_ENTRY:-./atlas-day1.sh}"
 
@@ -147,31 +155,39 @@ PY
 }
 
 err_of() { python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("error","?"))' "$1" 2>/dev/null || echo "$1"; }
+pa_version="$(as_runtime_user "$venv/bin/python" -c 'import importlib.metadata as m; print(m.version("pyannote.audio"))' 2>/dev/null || echo '?')"
 
+used="$pipeline"
+note=""
 online="$(diarise "$pipeline" 0)" && rc=0 || rc=$?
 if (( rc == 3 )); then
-  # 3. Diagnostic only (never the pass path): is community-1 accepted, and does it load under this pyannote.audio?
-  alt="pyannote/speaker-diarization-community-1"
-  ralt="$(head_code "$base/$alt/resolve/main/config.yaml")"
-  alt_state="not accepted (HTTP $ralt at https://huggingface.co/$alt)"
-  if [[ "$ralt" == 200* ]]; then
-    if altout="$(diarise "$alt" 0)"; then alt_state="loaded"; else alt_state="accepted but failed: $(err_of "$altout")"; fi
+  # 3. The installed pyannote.audio refused the 3.1 pipeline id: a FAIL (Sections 14.1 and 21 name 3.1; header item 3).
+  #    The research's fallback is probed as a DIAGNOSTIC for the Principal's decision, never as the pass path.
+  refusal="$(err_of "$online")"
+  rfb="$(head_code "$base/$fallback/resolve/main/config.yaml")"
+  if [[ "$rfb" != 200* ]]; then
+    diag="the research's fallback $fallback is not reachable either (HTTP $rfb at https://huggingface.co/$fallback: its user conditions are not accepted with the HF_TOKEN account, or the host is unreachable)"
+  elif fbout="$(diarise "$fallback" 0)"; then
+    diag="DIAGNOSTIC: the research's fallback $fallback DOES load and diarise under the same install ($(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(f"load {d[\"load_s\"]}s, run {d[\"run_s\"]}s, {d[\"speakers\"]} speaker(s)")' "$fbout" 2>/dev/null || echo ok)); switching to it needs a Section 23 row amending 14.1/21 first (research conflict 1), then PYANNOTE_PIPELINE in voice.env"
+  else
+    diag="the research's fallback $fallback does not load either ($(err_of "$fbout"))"
   fi
-  echo "V6 fail: $pipeline did not load under pyannote.audio 4.0.7: $(err_of "$online"); community-1 $alt_state (research conflict 1: pin pyannote.audio to a release that loads 3.1, or amend Section 14.1 to community-1; then re-run: sudo $entry phase2 --force 05)"
+  echo "V6 fail: $pipeline did not load under pyannote.audio $pa_version ($refusal); Section 14.1 names PyAnnote 3.1, so this is a fail, not a fallback. $diag. Remedy: pin pyannote.audio (phase2/05-voice.sh PYANNOTE_PIN) to a release that loads 3.1, or amend 14.1/21; then re-run: sudo $entry phase2 --force 05"
   exit 1
-fi
-if (( rc != 0 )); then
+elif (( rc != 0 )); then
   echo "V6 fail: diarisation with $pipeline failed: $(err_of "$online")"
   exit 1
 fi
-offline="$(diarise "$pipeline" 1)" || { echo "V6 fail: $pipeline loaded online but not with HF_HUB_OFFLINE=1 from $hf_home: $(err_of "$offline")"; exit 1; }
+offline="$(diarise "$used" 1)" || { echo "V6 fail: $used loaded online but not with HF_HUB_OFFLINE=1 from $hf_home: $(err_of "$offline")"; exit 1; }
+# `used` is always the 3.1 id here (header item 3); kept as a variable so the message names what was proven.
 
-summary="$(python3 - "$online" "$offline" "$pipeline" "$r31" "$rseg" <<'PY'
+summary="$(python3 - "$online" "$offline" "$used" "$r31" "$rseg" "$pa_version" "$note" <<'PY'
 import json, sys
 on, off = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-used, r31, rseg = sys.argv[3:6]
-print(f"{used} accepted (HEAD 3.1 config.yaml {r31}, segmentation-3.0 pytorch_model.bin {rseg}); loaded in {on['load_s']}s, "
-      f"diarised 10 s of synthetic audio in {on['run_s']}s ({on['speakers']} speaker(s) found); offline reload {off['load_s']}s")
+used, r31, rseg, pav, note = sys.argv[3:8]
+print(f"pipeline used: {used} (pyannote.audio {pav}); 3.1 accepted (HEAD 3.1 config.yaml {r31}, segmentation-3.0 "
+      f"pytorch_model.bin {rseg}); loaded in {on['load_s']}s, diarised 10 s of synthetic audio in {on['run_s']}s "
+      f"({on['speakers']} speaker(s) found); offline reload {off['load_s']}s{note}")
 PY
 )"
 echo "$summary"

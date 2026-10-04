@@ -8,7 +8,13 @@
 #
 # Steps (CONVENTIONS.md §1, §6; each wrapped in run_step, so a re-run skips what is complete):
 #   01  the ONE base image docker/rocm-base/Dockerfile -> atlas/rocm-base:10.0.0 (AMD's gfx1151 wheels, ROCm 10.0.0,
-#       torch 2.13.0; conflict 12) built through the allowlist proxy, its freeze/constraints kept root-held under
+#       torch 2.13.0; conflict 12). BEFORE docker build, the wheel pre-flight (_p4_wheel_preflight ->
+#       phase4/wheel_preflight.py, fix round 4): the exact wheel file names the Dockerfile's pins need are resolved from
+#       the AMD index through the proxy and each wheel URL is HEADed; the result is the `P4-wheels` info row (Section
+#       21 scope note, v0.3.2; written by _p4_record_info, below); a miss stops the step with the exact missing file
+#       name and the index URL, an unreachable index or wheel host with the URL and the proxy error, so no pin failure
+#       is ever discovered inside docker build.
+#       Then the image is built through the allowlist proxy, its freeze/constraints kept root-held under
 #       $ATLAS_STATE/phase4/ and published to $ATLAS_SRV/engines/manifests/ by the image itself (as atlas), then V11
 #       (verify/v11-rocm-selftest.sh -> phase4/selftest.py: rocminfo gfx1151, torch sees the device, matmul, 4 GB
 #       alloc, two-step diffusion). V11 also records which container flags the GPU needs
@@ -35,7 +41,7 @@
 #       after the per-engine table and the gate table (rule §7.10). A passing engine without a measured footprint_mb is
 #       never registered as 0 bytes (rule §7.4: the ledger holds measurements, never fabricated ones).
 #   06  the per-engine table, $ATLAS_STATE/phase4/summary.json (+ a copy published as atlas to
-#       $ATLAS_SRV/engines/phase4-results.json), `gate phase4 V11 -- V8 V9`.
+#       $ATLAS_SRV/engines/phase4-results.json), `gate phase4 V11 -- V8 V9 P4-wheels`.
 #
 # Contracts relied on from other writers (CONVENTIONS.md §1; each is checked and fails loudly when absent):
 #   * /etc/atlas/docker.env (phase1/06-docker.sh): ATLAS_UID ATLAS_GID RENDER_GID VIDEO_GID CONTAINER_HTTP_PROXY
@@ -46,6 +52,13 @@
 #     the inode's owner and mode, so the container's atlas uid reads it; no copy anywhere, fix round 3) and dies when
 #     the owner is not the atlas uid or the mode is not 600. Absent -> those two engines fail before any container
 #     starts, naming the token prompt and the licence URL; the phase continues.
+#   * lib/common.sh record_v accepts V ids ONLY (^V[0-9]+[a-z]?$; CONVENTIONS §4), so the `P4-wheels` row (Section 21
+#     scope note, v0.3.2: "the scripts also record rows that are not V items: T-<tool> ..., P4-wheels ...; they appear
+#     in the gate tables and in the workbook's evidence column, never as pass/fail rows of their own") is written by
+#     this file's _p4_record_info, a local twin of record_v with the same strict-JSON line, exactly as phase2/06-tools.sh
+#     _tools_record_deferred writes T-<tool> (fix round 5: an earlier revision called record_v and died at the record,
+#     before any build). What IS relied on: _atlas_verify_rows / verify_table / gate read any id from verify.jsonl
+#     (they do; natural() sorts non-V ids last), so the row shows among the recorded-only ids.
 #   * /etc/atlas/orchestrator.env (phase2/02-orchestrator.sh): ORCH_URL, and ORCH_ADMIN_TOKEN_FILE when the admin
 #     routes carry a token (atlas/api.py: without it the admin routes accept loopback clients, which this driver is).
 #     The token header is handed to curl on STDIN (-H @-), never on argv (/proc/<pid>/cmdline is world-readable;
@@ -59,6 +72,8 @@
 # $ATLAS_STATE/phase4/summary.json and $ATLAS_SRV/engines/phase4-results.json (the Section 17 step 6 table as JSON),
 # $ATLAS_STATE/phase4/registry.json ([{key, footprint_mb, total_bytes, class, registered, http}]),
 # $ATLAS_STATE/phase4/diag-image.txt (the digest of the diagnostic image once pulled, when the json pins none),
+# $ATLAS_STATE/phase4/wheels-preflight.json (the wheel pre-flight's full result: root_http, per spec the page and its
+# page_http, file name, URL, HEAD status and size; `missing` names what was not there; `status` ok|missing|unreachable),
 # $ATLAS_STATE/phase4/hf-manifests/ and git-pins.json (lib-engine.sh: pull listings, revision pins, clone pins), each
 # engine's $ATLAS_STATE/phase4/manifests/<key>.json published as atlas to $ATLAS_SRV/engines/<key>/MANIFEST.json (the
 # file phase2/atlas-aegis.sh collects into the restic set; Appendix C "manifest only").
@@ -327,6 +342,71 @@ _p4_diag_run() {
   echo "$ref ($pinned; $used) exit $rc: $(tr '\n' ' ' <<<"$out" | cut -c1-600)"
 }
 
+# _p4_wheel_preflight — BEFORE `docker build` (fix round 4): resolve, on the index the Dockerfile builds against
+# (base_image.rocm_index), the exact wheel file names its pins need (rocm==ROCM_VER, torch==TORCH_VER+rocmROCM_VER,
+# torchvision==TORCHVISION_VER+rocmROCM_VER, all cp312: the image's python is 3.12) plus the two names the build asserts
+# without a version (torchaudio, amd-torch-device-gfx1151); HEAD every wheel URL through the allowlist proxy; record the
+# `P4-wheels` info row (Section 21 scope note, v0.3.2). Rule §7.4: a renamed or withdrawn wheel stops the step HERE,
+# with the exact missing file name and the index URL, not an hour into a 5 GB build with pip's "no matching
+# distribution"; an index or wheel host that cannot be fetched through the proxy stops with the URL and the proxy error
+# (exit 2). The channel ROOT is only a reachability probe (fix round 5): pip never fetches it, and whether
+# stable.repo.amd.com serves a root listing is UNVERIFIED, so a 404 there is logged and the per-project pages decide;
+# "channel URL wrong or gone" is concluded only when EVERY project page is 404. Rule §7.9: the resolved names
+# are the pins made concrete and are kept root-held in $P4_STATE/wheels-preflight.json. ROCM_VER reaches the Dockerfile
+# as a build arg from the json; TORCH_VER/TORCHVISION_VER are the Dockerfile's own ARG defaults, read from it so what is
+# checked is what is built, and the json's torch string must agree with them (the image-manifest log line uses it).
+# phase4/wheel_preflight.py reads the index the way pip does (PEP 503 pages, PEP 427 file names); the extras' own
+# wheels (rocm-sdk-*, the [device-gfx1151] packs) are resolved by pip inside the build and are not pinned here.
+#
+# _p4_record_info MSG — one verify.jsonl line {"ts","phase","id":"P4-wheels","result":"info","msg"}, the shape record_v
+# writes (lib/common.sh), produced by python3's json module like record_v does. A local twin, as phase2/06-tools.sh
+# _tools_record_deferred is for T-<tool>: record_v refuses ids outside ^V[0-9]+[a-z]?$ (CONVENTIONS §4), and the
+# Section 21 scope note (v0.3.2) makes P4-wheels a recorded row that is never a V item. Always `info` (never pass/fail:
+# the step's own die is the verdict). orchestrator/tests/test_wheel_preflight.py runs this function against
+# lib/common.sh in a temp state dir and reads the row back through verify_table.
+_p4_record_info() {
+  local msg="$1" line
+  _atlas_state_init
+  line="$(python3 -c '
+import json, sys
+print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": "P4-wheels", "result": "info", "msg": sys.argv[3]}))
+' "$(date -Is)" "$ATLAS_PHASE" "$msg")"
+  printf '%s\n' "$line" >>"$ATLAS_VERIFY_FILE"
+  log "verify P4-wheels=info: $msg"
+}
+
+_p4_wheel_preflight() {
+  local index rocm_ver torch_ver tv_ver torch_pin out summary rc=0
+  index="$(_p4_cfg rocm_index)"; rocm_ver="$(_p4_cfg rocm_version)"; torch_pin="$(_p4_cfg torch)"
+  torch_ver="$(sed -nE 's/^ARG TORCH_VER=([^[:space:]]+)[[:space:]]*$/\1/p' "$P4_DOCKERFILE_DIR/Dockerfile" | head -n1)"
+  tv_ver="$(sed -nE 's/^ARG TORCHVISION_VER=([^[:space:]]+)[[:space:]]*$/\1/p' "$P4_DOCKERFILE_DIR/Dockerfile" | head -n1)"
+  [[ -n "$index" && -n "$rocm_ver" ]] || die "config/phase4-engines.json base_image lacks rocm_index / rocm_version"
+  [[ -n "$torch_ver" && -n "$tv_ver" ]] || die "$P4_DOCKERFILE_DIR/Dockerfile has no 'ARG TORCH_VER=' / 'ARG TORCHVISION_VER=' line to read the pins from"
+  [[ "$torch_pin" == "${torch_ver}+rocm${rocm_ver}" ]] \
+    || die "config/phase4-engines.json base_image.torch is '$torch_pin' but the Dockerfile pins ${torch_ver}+rocm${rocm_ver}: change both together (rule §7.9)"
+  [[ -f "$ATLAS_DAY1_DIR/phase4/wheel_preflight.py" ]] || die "$ATLAS_DAY1_DIR/phase4/wheel_preflight.py is missing"
+  proxy_env
+  mkdir -p "$P4_STATE"
+  log "wheel pre-flight: resolving the Dockerfile's pins on $index (cp312) through ${HTTPS_PROXY:-no proxy (proxy.env missing?)}"
+  out="$(python3 "$ATLAS_DAY1_DIR/phase4/wheel_preflight.py" --index "$index" --python-tag cp312 \
+           --prefer-local "rocm${rocm_ver}" --json "$P4_STATE/wheels-preflight.json" \
+           "rocm==${rocm_ver}" "torch==${torch_ver}+rocm${rocm_ver}" "torchvision==${tv_ver}+rocm${rocm_ver}" \
+           torchaudio amd-torch-device-gfx1151 </dev/null)" || rc=$?
+  summary="$(tail -n1 <<<"$out")"
+  [[ -n "$summary" ]] || summary="wheel_preflight.py exited $rc without a summary line"
+  # The die happens inside run_step before the marker is written, so the plain phase4 command re-runs step 01; no
+  # --force (which would be misleading here, and on a node whose image already exists it skips the build anyway).
+  case "$rc" in
+    0) _p4_record_info "$summary"
+       log "wheel pre-flight ok (detail $P4_STATE/wheels-preflight.json)" ;;
+    1) _p4_record_info "$summary"
+       die "wheel pre-flight: a wheel the Dockerfile pins is not on the index; nothing was built. $summary. If AMD renamed or withdrew it, change the pins in docker/rocm-base/Dockerfile and config/phase4-engines.json base_image together (rule §7.9), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (step 01 is not marked done)" ;;
+    2) _p4_record_info "$summary"
+       die "wheel pre-flight: $summary. stable.repo.amd.com AND the host each wheel href points at (the summary names it; AMD may serve the files from another host) must be in config/allowlist.txt, and squid up (grep TCP_DENIED /var/log/squid/access.log); a missing host is added to the repository copy and rendered with: sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt; then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (step 01 is not marked done)" ;;
+    *) die "wheel pre-flight: phase4/wheel_preflight.py exited $rc: $out" ;;
+  esac
+}
+
 step_01() {
   command -v docker >/dev/null || die "docker is not installed (Phase 1 step 6)"
   [[ -r "$P4_DOCKER_ENV" ]] || die "$P4_DOCKER_ENV missing (Phase 1 step 6 writes the container proxy and gids)"
@@ -355,6 +435,7 @@ step_01() {
   if [[ "$(docker image inspect -f "{{index .Config.Labels \"$P4_LABEL\"}}" "$P4_IMAGE" 2>/dev/null)" == "$P4_IMAGE_VER" ]]; then
     log "$P4_IMAGE already built (label $P4_LABEL=$P4_IMAGE_VER); skipping the build"
   else
+    _p4_wheel_preflight    # fix round 4: the pins exist on the index, or the step stops here with the missing file name
     notify "Phase 4 step 1: building $P4_IMAGE (ROCm 10.0.0 gfx1151 wheels, ~5 GB through the proxy)"
     log "docker build $P4_IMAGE from $P4_DOCKERFILE_DIR (index $(_p4_cfg rocm_index); archive.ubuntu.com, security.ubuntu.com, pypi.org, files.pythonhosted.org and stable.repo.amd.com must be in config/allowlist.txt — never the .ubuntu.com wildcard)"
     docker build --pull -t "$P4_IMAGE" \
@@ -407,7 +488,7 @@ step_01() {
   fi
   notify "Phase 4 STOPPED: V11 failed in $P4_IMAGE (see journalctl -u atlas-day1-phase4)"
   # Rule §7.10: the gate table and the exact next command even when the phase stops here.
-  gate phase4 V11 -- V8 V9 || true
+  gate phase4 V11 -- V8 V9 P4-wheels || true
   echo "V11 is the Phase 4 gate: fix the image or the kernel question above, then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 --force 01"
   die "V11 failed: the ROCm base image did not pass the gfx1151 self-test; nothing else in Phase 4 can run (Section 17 step 1)"
 }
@@ -546,7 +627,7 @@ PY
     # is the only next command.
     echo; _p4_table; echo
     echo "Verify records so far (the Phase 4 gate itself is step 06, after registration):"
-    verify_table V11 V8 V9
+    verify_table V11 V8 V9 P4-wheels
     (( ${#unmeasured[@]} == 0 )) || warn "step 05: passing engine(s) without a measured footprint: ${unmeasured[*]} (delete $P4_STATE/<key>.json and re-run the engine with --force 02/03/04 so the GTT delta is measured)"
     die "step 05: $registered of ${#passing[@]} measured passing engines registered with the Arbiter at $url${unmeasured:+; ${#unmeasured[@]} passing engine(s) unmeasured} (404 = the running orchestrator rejects class-phase4 keys: restart it on the current atlas package, or fix atlas/arbiter.py; 000 = orchestrator down), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (the step is not marked done)"
   fi
@@ -612,8 +693,9 @@ step_06() {
   _p4_table
   echo "Per-engine detail: $P4_STATE/<key>.json; logs: $ATLAS_LOG_DIR/phase4-<key>.log; samples: $ATLAS_SRV/workspace/phase4-samples/<key>/; venv freezes: $P4_ENGINES_DIR/manifests/<key>/freeze.txt; pull records and pins: $P4_STATE/hf-manifests/, $P4_STATE/git-pins.json (published per engine as $P4_ENGINES_DIR/<key>/MANIFEST.json for the AEGIS backup)"
   echo
-  # CONVENTIONS.md §6: V11 required; V8, V9 recorded, deferred never blocks.
-  if gate phase4 V11 -- V8 V9; then
+  # CONVENTIONS.md §6: V11 required; V8, V9 recorded, deferred never blocks; P4-wheels is the Section 21 scope-note
+  # info row (never pass/fail), listed so the gate table shows which wheel files the image was built from.
+  if gate phase4 V11 -- V8 V9 P4-wheels; then
     notify "Phase 4 gate: PASS. Next: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} report"
     return 0
   fi

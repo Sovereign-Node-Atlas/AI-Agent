@@ -7,14 +7,38 @@
 # /opt/atlas/venv with the models prefetched, and docker/core/compose.voice.yml runs docling-serve for Open WebUI
 # (step 5). This step only asserts the venv import so the 15.1 table is complete.
 #
+# HARD AND SOFT INSTALLS (fix round 5; CONVENTIONS.md §7.4 "fail loudly, never silently", §7.10 the Principal's time).
+# The installs whose inputs are VERIFIED pins (IfcOpenShell/IfcMCP from PyPI, KiCad from apt, Playwright from PyPI and
+# its VERIFIED CDN, Radiance's sha256-fixed zip) stay HARD: a failure stops the phase with its line, as before. The
+# installs whose inputs are UNVERIFIED (the Blender 4.5.N patch chosen from a live listing, Bonsai through the UNVERIFIED
+# extensions.blender.org API, the OpenStudio/EnergyPlus 24.04 builds on 26.04, the research-code MCP4IFC checkout, the
+# buildfarm image with its UNVERIFIED sdkmanager ids) run under _tools_soft: a failure inside one of them is caught in a
+# subshell, recorded in verify.jsonl as a DEFERRED row with the id T-<tool> (the same JSON shape record_v writes, tool
+# name and the last error line in the message), logged with the exact `--force 06` re-run command, and the step CONTINUES
+# with the next tool and with step 6b, instead of parking the whole phase on an upstream listing or API that moved. A tool
+# whose prerequisite was deferred (Bonsai needs Blender, MCP4IFC needs Blender and Bonsai) is deferred without an attempt,
+# naming the prerequisite. The step MARKER is written only when every HARD install succeeded (run_step: the function
+# returns 0 once the hard part is done); the T-rows are printed by phase2/10-gate.sh as an optional, non-blocking table
+# (latest record per id). A soft install that SUCCEEDS on a later `--force 06` re-run after a deferred row therefore
+# records a superseding `pass` row for the same T-id (fix round 6; nothing is written when no earlier row exists), so
+# the gate's table and its `--status` reminder stop naming a tool that is installed. The stderr of a soft install stays
+# stderr (the _atlas_emit split of the rest of the phase): only that stream is captured for the last-error line.
+# The Android SDK licence check stays HARD (below): it is the Principal's decision, not an upstream failure.
+# T-ids are written by _tools_record_t, a local twin of lib/common.sh record_v, because record_v's ID regex
+# (^V[0-9]+[a-z]?$) rejects them; request (lib/common.sh writer, and CONVENTIONS §4 which lists V ids only although
+# Section 21's scope notes name `T-<tool>` rows): accept `T-[a-z0-9-]+` (and `P4-wheels`) there and this twin goes.
+#
 # Facts typed from services-tools.md §4 and S10/S11 (VERIFIED unless marked UNVERIFIED in the code); adjudicated
 # conflicts honoured: Blender is the 4.5 LTS tarball under /opt/blender (conflict 18), never apt's 5.0.1; Radiance
 # comes from LBNL-ETA (research conflict 1); OpenStudio/EnergyPlus from NatLabRockies (research conflict 2). MCP4IFC
 # (fix round 3): Section 15.1 lists it as a Phase 2 tool "confirmed real and GPU-independent"; services-tools.md's
 # research conflict 5 proposes treating it as yellow, but that conflict is NOT among the adjudicated ones and
-# CONVENTIONS §7.4's yellow semantics belong to Section 15.2 Phase 4 engines only, so the baseline wins: an MCP4IFC
-# install failure STOPS the phase with the failing line (the Principal can re-run `--force 06` after fixing the cause,
-# or amend 15.1 by moving the row to 15.2 yellow, a request recorded in the notes for phase2/README-contracts.md).
+# CONVENTIONS §7.4's yellow semantics belong to Section 15.2 Phase 4 engines only, so the baseline wins on the VERDICT:
+# an MCP4IFC install failure is never silently a pass. Since fix round 5 it is one of the SOFT installs (HARD AND SOFT
+# INSTALLS below): the failing line is logged, a `T-mcp4ifc` deferred row is recorded with the last error and the
+# `--force 06` re-run command, and the step continues to 6b instead of parking the whole phase on unverified upstream
+# code (the Principal can still amend 15.1 by moving the row to 15.2 yellow, a request recorded in the notes for
+# phase2/README-contracts.md).
 #
 # WHO RUNS WHAT (fix round 2):
 #   * Root installs packages and extracts tarballs; every archive is unpacked with --no-same-owner --no-same-permissions,
@@ -54,10 +78,10 @@
 #     CONVENTIONS §7.6). Without it the step STOPS (fix round 3, major: the build container is a Section 17 step 6
 #     deliverable, and a WARN-and-succeed left it silently unbuilt on a default run, with no V item or gate row to
 #     notice): BUILDFARM_STATUS=licence-not-accepted goes into tools.env and `die` prints the one-line fix; the marker
-#     is not written, so the next phase2 run resumes here. The Dockerfile refuses to run sdkmanager without the matching
-#     build arg. REQUEST (config/atlas.env.example, another writer's file): add BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE as
-#     a CONFIRM key that load_env refuses blank (like GOOGLE_ACCOUNTS), with the terms URL in its comment, so the
-#     decision is made before Phase 1 instead of surfacing here.
+#     is not written, so the next phase2 run resumes here. This check is HARD and runs BEFORE the soft buildfarm build
+#     (fix round 5). The Dockerfile refuses to run sdkmanager without the matching build arg. The key is a CONFIRM key
+#     (CONVENTIONS §3): load_env refuses a BLANK value before any phase runs, with the terms URL in its message, and
+#     phase2-services.sh's minute-0 input check covers the remaining case, a value that is set but is not `yes`.
 #   * APT PINS are strict (fix round 3; rule §7.9): the Dockerfile has no fallback to the archive's current versions, so
 #     a moved-on archive fails the image build and this step dies naming the two pins to bump deliberately
 #     (BUILDFARM_JDK_PIN, BUILDFARM_MINGW_PIN, mirrored in the Dockerfile and its version label). After a build the
@@ -97,9 +121,10 @@
 #   * $ATLAS_ETC/tools.env (root:atlas 640): BLENDER_BIN, BLENDER_VERSION, BLENDER_TARBALL_SHA256, BLENDER_ARGS,
 #     BLENDER_USER_CONFIG, BONSAI_VERSION, RADIANCE_BIN, RAYPATH, ENERGYPLUS_BIN, OPENSTUDIO_BIN, KICAD_CLI,
 #     PLAYWRIGHT_BROWSERS_PATH, TOOLS_VENV, IFCMCP_BIN, MCP4IFC_DIR, MCP4IFC_COMMIT, MCP4IFC_STATUS (installed when the
-#     step completes; uv-sync-failed / import-failed are left behind only by a step that died), MCP4IFC_PYTHON,
+#     soft install completed; uv-sync-failed / import-failed / deferred behind a T-mcp4ifc row), MCP4IFC_PYTHON,
 #     MCP4IFC_ADDON_ZIP, MCP4IFC_BLENDER_PACKAGES (not-installed: see _tools_mcp4ifc_work), BUILDFARM_STATUS (built;
-#     licence-not-accepted only behind a died step), BUILDFARM_CAPS_ENFORCED (yes | no, see DOCKER GROUP), BUILDFARM_RUN
+#     licence-not-accepted only behind a died step; deferred behind a T-buildfarm row), TOOLS_DEFERRED (the T-tools of the
+#     last run, space-separated, or none), BUILDFARM_CAPS_ENFORCED (yes | no, see DOCKER GROUP), BUILDFARM_RUN
 #     (the wrapper), BUILDFARM_IMAGE, BUILDFARM_MEMORY, BUILDFARM_CPUS, BUILDFARM_PIDS, BUILDFARM_TMPFS_SIZE,
 #     BUILDFARM_TIMEOUT_S, BUILDFARM_UID, BUILDFARM_GID, BUILDFARM_WORK_ROOT, BUILDFARM_JDK_VERSION,
 #     BUILDFARM_MINGW_VERSION, BUILDFARM_APT_DRIFT, UV_VERSION. Sourceable KEY=VALUE lines. phase2/10-gate.sh does not
@@ -303,6 +328,90 @@ _tools_pip() {
   _tools_venv_harden     # new site-packages files take the invariant immediately
 }
 
+# --- Soft installs (header: HARD AND SOFT INSTALLS) ---------------------------------------------------------------------
+TOOLS_DEFERRED_TOOLS=()   # the T-tools deferred in this run, in order
+
+# _tools_kv_get KEY — the value of KEY in tools.env (the soft installs run in a subshell, so their status lives there).
+_tools_kv_get() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$TOOLS_ENV_FILE" 2>/dev/null || true; }
+
+# _tools_record_t TOOL RESULT MSG — one verify.jsonl line {"ts","phase","id":"T-<tool>","result","msg"}, the shape
+# record_v writes (lib/common.sh), produced by python3's json module like record_v does; RESULT is deferred (the install
+# failed) or pass (a later re-run installed it: the superseding row the gate's latest-per-id table needs, header). A
+# local twin because record_v refuses ids outside ^V[0-9]+[a-z]?$ (header).
+_tools_record_t() {
+  local tool="$1" result="$2" msg="$3" line
+  case "$result" in deferred|pass) ;; *) die "_tools_record_t T-$tool: RESULT must be deferred|pass, got '$result'" ;; esac
+  _atlas_state_init
+  line="$(python3 -c '
+import json, sys
+print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": sys.argv[3], "result": sys.argv[4], "msg": sys.argv[5]}))
+' "$(date -Is)" "$ATLAS_PHASE" "T-$tool" "$result" "$msg")"
+  printf '%s\n' "$line" >>"$ATLAS_VERIFY_FILE"
+  log "verify T-$tool=$result: $msg"
+}
+
+# _tools_has_t_row TOOL — true when verify.jsonl already carries a T-<tool> row (an earlier deferred install).
+_tools_has_t_row() {
+  [[ -f "$ATLAS_VERIFY_FILE" ]] || return 1
+  python3 - "$ATLAS_VERIFY_FILE" "T-$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        try:
+            if json.loads(line).get("id") == sys.argv[2]:
+                sys.exit(0)
+        except ValueError:
+            continue
+sys.exit(1)
+PY
+}
+
+# _tools_soft TOOL FUNC [PREREQ_TOOL...] — run FUNC (an UNVERIFIED-input install) in a subshell with errexit and the ERR
+# trap live inside it; a failure (die, or any failing command) records T-<tool> deferred with the last error line, logs
+# the re-run command and returns 0 so the step continues. A PREREQ_TOOL that was deferred in this run defers TOOL
+# without an attempt. The subshell's stdout goes to the console unchanged; its STDERR is tee'd to the console's stderr
+# (the _atlas_emit split: WARN/ERROR/FATAL and tracebacks stay on stderr, fix round 6) and to a temp file the last
+# error line is taken from (every line that grep looks for is a stderr line). No process substitution: bash does not
+# wait for one, so the file could be read before tee had flushed; the brace group's fd 3 carries stdout past the
+# pipeline instead. `set +e` around the pipeline: inside an `if`/`||` bash would switch errexit OFF in the subshell too
+# and FUNC would run past its first failing command. The parent's ERR trap is parked for the pipeline (it would name
+# `tee` as the failing command) and re-armed INSIDE the subshell, so the failing line of FUNC is still logged by the
+# usual "command failed (exit N) at ..." line. On success after an earlier T-row, a superseding pass row (header).
+_tools_soft() {
+  local tool="$1" func="$2"; shift 2
+  local p entry="${ATLAS_ENTRY:-./atlas-day1.sh}" saved_trap
+  for p in "$@"; do
+    if [[ " ${TOOLS_DEFERRED_TOOLS[*]} " == *" $p "* ]]; then
+      TOOLS_DEFERRED_TOOLS+=("$tool")
+      _tools_record_t "$tool" deferred "$tool not attempted: prerequisite $p deferred in this run; re-run after fixing it: sudo $entry phase2 --force 06"
+      warn "DEFERRED $tool: prerequisite $p was deferred; re-run: sudo $entry phase2 --force 06"
+      return 0
+    fi
+  done
+  local outf rc=0 last
+  outf="$(mktemp)"
+  log "soft install $tool ($func): UNVERIFIED inputs, a failure records T-$tool deferred and the step continues"
+  saved_trap="$(trap -p ERR)"
+  set +e; trap - ERR
+  # stdout -> fd 3 (the console's stdout, untouched); stderr -> the pipe -> tee -> the file and the console's stderr.
+  { ( eval "${saved_trap:-:}"; set -e; "$func" ) 2>&1 >&3 | tee -a "$outf" >&2; rc="${PIPESTATUS[0]}"; } 3>&1
+  eval "${saved_trap:-:}"; set -e
+  if (( rc == 0 )); then
+    rm -f "$outf"
+    if _tools_has_t_row "$tool"; then
+      _tools_record_t "$tool" pass "$tool installed on $(date -I) (re-run after an earlier deferred row; supersedes it in the gate table)"
+    fi
+    return 0
+  fi
+  last="$(grep -E ' (FATAL|ERROR|WARN) ' "$outf" | tail -n1 | cut -c1-400 || true)"
+  [[ -n "$last" ]] || last="$(tail -n1 "$outf" | cut -c1-400 || true)"
+  rm -f "$outf"
+  TOOLS_DEFERRED_TOOLS+=("$tool")
+  _tools_record_t "$tool" deferred "$tool install failed (exit $rc); last error: ${last:-(no output)}; re-run after fixing the cause: sudo $entry phase2 --force 06"
+  warn "DEFERRED $tool (exit $rc): ${last:-(no output)}. The step continues; re-run after fixing the cause: sudo $entry phase2 --force 06"
+  return 0
+}
+
 # --- 1. IfcOpenShell + IfcMCP -------------------------------------------------------------------------------------------
 _tools_ifcopenshell() {
   if ! "$TOOLS_VENV/bin/python" -c 'import importlib.metadata as m; assert m.version("ifcopenshell") == "0.8.5" and m.version("ifcopenshell-mcp") == "0.8.5"' 2>/dev/null; then
@@ -495,7 +604,7 @@ _tools_mcp4ifc() {
 
 _tools_mcp4ifc_work() {
   # Section 15.1 names MCP4IFC a confirmed Phase 2 tool (header: the research's "yellow" is not adjudicated, so every
-  # failure below STOPS the phase with its line; fix round 3). The upstream code is a research artefact bound to a live
+  # failure below is a die -- caught by _tools_soft as T-mcp4ifc deferred with its line, fix round 5). The upstream code is a research artefact bound to a live
   # Blender + Bonsai GUI session; what Day 1 proves is what can be proven headlessly: the pinned checkout, its venv, the
   # MCP server import, the Blender add-on zip and its headless enable for atlas. Everything below runs as atlas on the
   # pinned commit, in an atlas-owned checkout for the duration of this function only (the caller re-owns it root:atlas).
@@ -530,12 +639,12 @@ _tools_mcp4ifc_work() {
   local uvenv=(env UV_CACHE_DIR="$TOOLS_CACHE_DIR/uv-atlas" UV_PYTHON_INSTALL_DIR="$ATLAS_OPT/python" UV_PYTHON_DOWNLOADS=never UV_HTTP_TIMEOUT=600)
   if ! (cd "$dir" && retry 2 _tools_as_atlas "${uvenv[@]}" "$TOOLS_UV" sync --quiet --python "$MCP4IFC_PYTHON_SERIES"); then
     MCP4IFC_STATUS="uv-sync-failed"; _tools_kv MCP4IFC_STATUS "$MCP4IFC_STATUS"
-    die "MCP4IFC: 'uv sync --python $MCP4IFC_PYTHON_SERIES' failed in $dir as atlas (Section 15.1 lists MCP4IFC as a confirmed Phase 2 tool, so the phase stops here). Needs the managed CPython of step 5 under $ATLAS_OPT/python and pypi.org/files.pythonhosted.org through the proxy; the resolver output above names the package. Fix the cause and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06, or ask the Principal to move the MCP4IFC row to Section 15.2 yellow (research conflict 5)"
+    die "MCP4IFC: 'uv sync --python $MCP4IFC_PYTHON_SERIES' failed in $dir as atlas (Section 15.1 lists MCP4IFC as a confirmed Phase 2 tool; recorded as T-mcp4ifc deferred, the step continues). Needs the managed CPython of step 5 under $ATLAS_OPT/python and pypi.org/files.pythonhosted.org through the proxy; the resolver output above names the package. Fix the cause and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06, or ask the Principal to move the MCP4IFC row to Section 15.2 yellow (research conflict 5)"
   fi
   local py="$dir/.venv/bin/python"
   if ! _tools_as_atlas "$py" -c 'import blender_mcp.server'; then
     MCP4IFC_STATUS="import-failed"; _tools_kv MCP4IFC_STATUS "$MCP4IFC_STATUS"
-    die "MCP4IFC: blender_mcp.server does not import from $py (README module name; traceback above). Section 15.1 tool: the phase stops here; re-run after fixing: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06"
+    die "MCP4IFC: blender_mcp.server does not import from $py (README module name; traceback above). Section 15.1 tool, recorded as T-mcp4ifc deferred; re-run after fixing: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06"
   fi
   _tools_kv MCP4IFC_PYTHON "$py"
   # scripts/install_blender_packages.py is NOT run (fix round 3): at MCP4IFC_COMMIT it pip-installs ifcopenshell/trimesh/
@@ -794,11 +903,8 @@ _tools_buildfarm_kv_caps() {
   _tools_kv BUILDFARM_RUN "$BUILDFARM_WRAPPER"
 }
 
-_tools_buildfarm() {
-  command -v docker >/dev/null || die "docker is not installed (Phase 1 step 6)"
-  local ctx="$ATLAS_DAY1_DIR/docker/buildfarm"
-  [[ -f "$ctx/Dockerfile" ]] || die "$ctx/Dockerfile is missing"
-  ensure_dir "$ATLAS_SRV/workspace" atlas:atlas 755
+# _tools_buildfarm_require_licence — HARD (header: ANDROID SDK LICENCE), before the soft build: the Principal's decision.
+_tools_buildfarm_require_licence() {
   _tools_buildfarm_kv_caps
   if ! _tools_buildfarm_licence; then
     # Section 16.3 item 2: accepting the Android SDK terms is the Principal's act, expressed as a setting (§7.6: no
@@ -806,6 +912,16 @@ _tools_buildfarm() {
     BUILDFARM_STATUS="licence-not-accepted"; _tools_kv BUILDFARM_STATUS "$BUILDFARM_STATUS"
     die "buildfarm: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE is not 'yes' in $ATLAS_ETC/atlas.env, so the Section 17 step 6 build container cannot be built: its image build runs 'sdkmanager --licenses', which accepts the Android SDK licence terms ($ANDROID_TERMS_URL), and Section 16.3 item 2 reserves that act for you. Read the terms, then once: sudo bash -c 'echo BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes >> $ATLAS_ETC/atlas.env' and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 (the phase resumes at this step)"
   fi
+}
+
+_tools_buildfarm() {
+  command -v docker >/dev/null || die "docker is not installed (Phase 1 step 6)"
+  local ctx="$ATLAS_DAY1_DIR/docker/buildfarm"
+  [[ -f "$ctx/Dockerfile" ]] || die "$ctx/Dockerfile is missing"
+  ensure_dir "$ATLAS_SRV/workspace" atlas:atlas 755
+  _tools_buildfarm_licence || die "buildfarm: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE is not 'yes' (internal: _tools_buildfarm_require_licence runs first)"
+  # A failed earlier soft run may have left BUILDFARM_STATUS=deferred in tools.env: the wrapper refuses to run until
+  # the status reads built, which this function writes only after the build.
   if [[ "$(docker image inspect -f '{{index .Config.Labels "org.atlas.buildfarm.version"}}' "$BUILDFARM_IMAGE" 2>/dev/null)" == "$BUILDFARM_IMAGE_REVISION" ]]; then
     log "$BUILDFARM_IMAGE already built (revision $BUILDFARM_IMAGE_REVISION)"
   else
@@ -883,27 +999,43 @@ step_06() {
   [[ -e "$TOOLS_ENV_FILE" ]] || install -m 640 -o root -g atlas /dev/null "$TOOLS_ENV_FILE"
   _tools_apt
   _tools_venv
-  _tools_ifcopenshell
-  _tools_blender
-  _tools_bonsai
-  _tools_mcp4ifc
-  _tools_radiance
-  _tools_energyplus
-  _tools_openstudio
-  _tools_kicad
-  _tools_playwright
-  _tools_buildfarm
+  # HARD installs (VERIFIED inputs) die on failure; SOFT installs (UNVERIFIED inputs) record T-<tool> deferred and
+  # continue (header: HARD AND SOFT INSTALLS). The Android SDK licence check is hard and comes before the soft build.
+  _tools_ifcopenshell                                   # hard: PyPI pins
+  _tools_soft blender _tools_blender                     # soft: patch level from a live listing, no sha256 to type
+  _tools_soft bonsai _tools_bonsai blender               # soft: UNVERIFIED extensions API; needs blender
+  _tools_soft mcp4ifc _tools_mcp4ifc blender bonsai      # soft: research code, pinned commit; needs blender + bonsai
+  _tools_radiance                                       # hard: sha256-fixed zip
+  _tools_soft energyplus _tools_energyplus               # soft: 24.04 build on 26.04 UNVERIFIED
+  _tools_soft openstudio _tools_openstudio               # soft: 24.04 .deb/tar.gz on 26.04 UNVERIFIED
+  _tools_kicad                                          # hard: apt
+  _tools_playwright                                     # hard: PyPI pin + VERIFIED CDN hosts
+  _tools_buildfarm_require_licence                      # hard: the Principal's decision (Section 16.3 item 2)
+  _tools_soft buildfarm _tools_buildfarm                 # soft: UNVERIFIED sdkmanager ids, strict apt pins may move
   _tools_docling_assert
   chown root:atlas "$TOOLS_ENV_FILE"; chmod 640 "$TOOLS_ENV_FILE"
   _tools_venv_harden     # Section 16.3 item 6: root:atlas, no group/other write, asserted (the step-02/04 invariant)
-  # Reaching this line means every Section 15.1 tool installed and passed its smoke test (a failure died above); the two
-  # statuses are asserted, not reported as options.
-  [[ "$MCP4IFC_STATUS" == installed ]] || die "step 06 reached its end with MCP4IFC_STATUS=$MCP4IFC_STATUS (internal: every other value must have died earlier)"
-  [[ "$BUILDFARM_STATUS" == built ]] || die "step 06 reached its end with BUILDFARM_STATUS=$BUILDFARM_STATUS (internal: every other value must have died earlier)"
-  if [[ "$BUILDFARM_CAPS_ENFORCED" != yes ]]; then
-    warn "SUMMARY step 06: BUILDFARM_CAPS_ENFORCED=$BUILDFARM_CAPS_ENFORCED: the buildfarm wrapper and its Section 16.4 caps are bypassable by the atlas account while it is in the docker group (phase1/06-docker.sh); the Phase 1 writer is asked to drop that membership once the sandbox has its own root-owned wrapper (header: DOCKER GROUP)"
+  # Reaching this line means every HARD Section 15.1 tool installed and passed its smoke test (a failure died above).
+  # The soft installs ran in subshells, so their statuses are read back from tools.env, never from this shell's globals.
+  local mstat bstat caps t
+  mstat="$(_tools_kv_get MCP4IFC_STATUS)"; bstat="$(_tools_kv_get BUILDFARM_STATUS)"; caps="$(_tools_kv_get BUILDFARM_CAPS_ENFORCED)"
+  for t in "${TOOLS_DEFERRED_TOOLS[@]}"; do
+    case "$t" in
+      mcp4ifc) mstat="deferred"; _tools_kv MCP4IFC_STATUS deferred ;;
+      buildfarm) bstat="deferred"; _tools_kv BUILDFARM_STATUS deferred ;;
+    esac
+  done
+  _tools_kv TOOLS_DEFERRED "${TOOLS_DEFERRED_TOOLS[*]:-none}"
+  if (( ${#TOOLS_DEFERRED_TOOLS[@]} == 0 )); then
+    [[ "$mstat" == installed ]] || die "step 06 reached its end with MCP4IFC_STATUS=$mstat and no T-mcp4ifc row (internal: every other value must have died or been deferred earlier)"
+    [[ "$bstat" == built ]] || die "step 06 reached its end with BUILDFARM_STATUS=$bstat and no T-buildfarm row (internal: every other value must have died or been deferred earlier)"
+  else
+    warn "SUMMARY step 06: ${#TOOLS_DEFERRED_TOOLS[@]} UNVERIFIED-input install(s) DEFERRED, recorded as T-<tool> rows in $ATLAS_VERIFY_FILE (phase2/10-gate.sh prints them, non-blocking): ${TOOLS_DEFERRED_TOOLS[*]}. The hard installs are complete and the step marker is written; re-run the deferred ones after fixing their cause: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06"
   fi
-  warn "SUMMARY step 06: MCP4IFC_BLENDER_PACKAGES=not-installed: the GUI add-on's extra packages (trimesh, pillow) are not installed into Blender's bundled Python, which is root-owned read-only by design; the MCP server, the add-on zip and its headless enable are proven (see _tools_mcp4ifc_work)"
-  log "step 06 done: Section 15.1 tools installed; paths in $TOOLS_ENV_FILE (MCP4IFC_STATUS=$MCP4IFC_STATUS, BUILDFARM_STATUS=$BUILDFARM_STATUS, BUILDFARM_CAPS_ENFORCED=$BUILDFARM_CAPS_ENFORCED)"
-  notify "Phase 2 step 6 done: IfcOpenShell, Bonsai, MCP4IFC, Radiance, EnergyPlus, OpenStudio, KiCad, Playwright, buildfarm built (caps enforced: $BUILDFARM_CAPS_ENFORCED)"
+  if [[ "$bstat" == built && "$caps" != yes ]]; then
+    warn "SUMMARY step 06: BUILDFARM_CAPS_ENFORCED=${caps:-unknown}: the buildfarm wrapper and its Section 16.4 caps are bypassable by the atlas account while it is in the docker group (phase1/06-docker.sh); the Phase 1 writer is asked to drop that membership once the sandbox has its own root-owned wrapper (header: DOCKER GROUP)"
+  fi
+  [[ "$mstat" != installed ]] || warn "SUMMARY step 06: MCP4IFC_BLENDER_PACKAGES=not-installed: the GUI add-on's extra packages (trimesh, pillow) are not installed into Blender's bundled Python, which is root-owned read-only by design; the MCP server, the add-on zip and its headless enable are proven (see _tools_mcp4ifc_work)"
+  log "step 06 done: Section 15.1 hard tools installed; paths in $TOOLS_ENV_FILE (MCP4IFC_STATUS=$mstat, BUILDFARM_STATUS=$bstat, BUILDFARM_CAPS_ENFORCED=${caps:-unknown}, deferred: ${TOOLS_DEFERRED_TOOLS[*]:-none})"
+  notify "Phase 2 step 6 done: IfcOpenShell, Radiance, KiCad, Playwright installed; soft installs deferred: ${TOOLS_DEFERRED_TOOLS[*]:-none} (MCP4IFC $mstat, buildfarm $bstat, caps enforced: ${caps:-unknown})"
 }

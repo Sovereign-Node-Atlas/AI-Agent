@@ -74,8 +74,15 @@ def test_parse_env_file_unreadable_falls_back_to_the_process_env(tmp_path: Path,
 
 def test_engines_ports_follow_the_port_rule(config_dir: Path) -> None:
     engines = load_engines(config_dir, 8100)
-    assert list(engines) == list(ENGINE_KEYS)
-    assert [e.port for e in engines.values()] == list(range(8101, 8111))
+    # The ten llama-server engines (CONVENTIONS.md §8) come first and take the ports; the `external` list (Section 4.2
+    # class external: chatterbox, in-process, budgeted by the Arbiter but no unit) is appended with port 0.
+    units = {k: e for k, e in engines.items() if not e.is_external}
+    assert list(units) == list(ENGINE_KEYS)
+    assert [e.port for e in units.values()] == list(range(8101, 8111))
+    assert list(engines) == [*ENGINE_KEYS, "chatterbox"]
+    ext = engines["chatterbox"]
+    assert ext.is_external and ext.port == 0 and ext.index == 0 and not ext.is_resident and not ext.is_phase4
+    assert ext.footprint_gb == 4 and ext.kv_class == "none" and ext.hf_repo == "" and ext.files == []
     assert engines["deepseek-v4-flash"].is_apex and engines["deepseek-v4-flash"].exclusive
     assert engines["router-qwen3.5-4b"].is_resident
     assert engines["gpt-oss-120b"].systemd_unit == "llama-server@gpt-oss-120b"
@@ -96,6 +103,39 @@ def test_engines_missing_key_fails_loudly(tmp_path: Path) -> None:
     (tmp_path / "engines.json").write_text('{"_meta": {"purpose": "x"}}')
     with pytest.raises(ConfigError, match=r"engines\.json: no engines\[\] list"):
         load_engines(tmp_path, 8100)
+
+
+def test_external_list_is_the_only_home_of_class_external(config_dir: Path, tmp_path: Path) -> None:
+    """Section 4.2 class external (chatterbox) lives in engines.json's `external` list: inside engines[] it would take a
+    port, a unit, a sudoers line and an env file it cannot have (phase2/01-llama.sh counts ten, engine-env.py renders
+    engines[]); and only class external may be listed there. Both mistakes are a ConfigError naming the entry."""
+    real = json.loads((config_dir / "engines.json").read_text(encoding="utf-8"))
+    bad = dict(real)
+    bad["engines"] = [*real["engines"], real["external"][0]]
+    bad.pop("external")
+    (tmp_path / "engines.json").write_text(json.dumps(bad))
+    with pytest.raises(ConfigError, match=r"chatterbox.*belongs in the top-level `external` list"):
+        load_engines(tmp_path, 8100)
+    bad = dict(real)
+    bad["external"] = [{**real["external"][0], "arbiter_class": "core", "kv_class": "q8_0"}]
+    (tmp_path / "engines.json").write_text(json.dumps(bad))
+    with pytest.raises(ConfigError, match=r"external engine 'chatterbox': arbiter_class must be 'external'"):
+        load_engines(tmp_path, 8100)
+    bad = dict(real)
+    bad["external"] = [{**real["external"][0], "key": "gpt-oss-120b"}]
+    (tmp_path / "engines.json").write_text(json.dumps(bad))
+    with pytest.raises(ConfigError, match=r"duplicate engine key 'gpt-oss-120b'"):
+        load_engines(tmp_path, 8100)
+    bad = dict(real)
+    bad["external"] = {"key": "chatterbox"}
+    (tmp_path / "engines.json").write_text(json.dumps(bad))
+    with pytest.raises(ConfigError, match=r"`external` must be a list"):
+        load_engines(tmp_path, 8100)
+    # Without the list the ten engines load as before (an older engines.json keeps working).
+    bad = dict(real)
+    bad.pop("external")
+    (tmp_path / "engines.json").write_text(json.dumps(bad))
+    assert list(load_engines(tmp_path, 8100)) == list(ENGINE_KEYS)
 
 
 def test_kv_classes_are_the_conventions_set_and_llm_engines_are_quantised(tmp_path: Path) -> None:
@@ -233,8 +273,13 @@ def test_real_config_tree_loads(tmp_path: Path, caplog: pytest.LogCaptureFixture
         cfg = load_config(settings)
     assert set(cfg.personas) == {"ren", "arthur", "gideon", "silas", "valerie", "helena", "eleanor", "alaric",
                                  "minerva", "victor"}
-    assert len(cfg.domain_cards) == 36 and len(cfg.task_forces) == 23 and len(cfg.engines) == 10  # §1 counts
-    assert list(cfg.engines) == list(ENGINE_KEYS) and len(cfg.phase4_engines) >= 16
+    # §1 counts: "the 7 GGUF engines + 3 resident small models" are the ten llama-server units (arbiter_class !=
+    # external); engines.json's `external` list adds chatterbox (Section 4.2 "Chatterbox when invoked":
+    # Arbiter-budgeted, in-process, no unit, no port), so the whole map holds 11 and the unit count stays an honest 10.
+    units = [k for k, e in cfg.engines.items() if not e.is_external]
+    assert len(cfg.domain_cards) == 36 and len(cfg.task_forces) == 23 and len(units) == 10
+    assert units == list(ENGINE_KEYS) and len(cfg.engines) == 11 and cfg.engines["chatterbox"].is_external
+    assert len(cfg.phase4_engines) >= 16
     drift = [ln for ln in caplog.text.splitlines() if "not in the CONVENTIONS.md §8 form" in ln]
     try:
         load_domain_cards(tree, strict=True)

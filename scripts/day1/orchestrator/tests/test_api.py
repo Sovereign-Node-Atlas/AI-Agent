@@ -435,6 +435,29 @@ def test_arbiter_load_unload_and_remeasure_routes(harness: dict[str, Any]) -> No
     assert harness["arbiter"].budget_bytes == budget_before - 8 * 1024**3
 
 
+def test_arbiter_routes_know_the_external_chatterbox_key(harness: dict[str, Any]) -> None:
+    """Section 4.2 "Chatterbox when invoked": phase2/voice_render.py POSTs /arbiter/load {engine: chatterbox} before
+    each clone render and /arbiter/unload after, and treats a 404 as "the Arbiter does not know the key" (a hard
+    failure). The key comes from engines.json's `external` list, so the routes answer 200 and the stub controller is
+    never asked to start or stop a unit for it."""
+    client: TestClient = harness["client"]
+    r = client.post("/arbiter/load", json={"engine": "chatterbox", "task_id": "day1-phase2-05-v7"})
+    assert r.status_code == 200, r.text
+    assert r.json()["decision"] == "granted" and r.json()["projected_bytes"] == 4 * 1024**3
+    assert "chatterbox" in harness["arbiter"].resident
+    assert [c for c in harness["controller"].calls if c[1] == "chatterbox"] == []
+    r = client.post("/arbiter/register", json={"engine": "chatterbox", "total_bytes": 3 * 1024**3})
+    assert r.status_code == 200 and harness["arbiter"].charged_bytes == 3 * 1024**3
+    # The route does not forward a `pid` yet (UnloadRequest has engine and task_id; the extra field is ignored), so the
+    # Arbiter releases on the caller's word and SAYS the release was not measured (Section 4.2 rule 5; fix round 6).
+    # REQUESTED of the api.py writer: `pid: int | None = None` on UnloadRequest, passed as `pid=req.pid`, after which
+    # this assertion flips to "release confirmed" (phase2/05-voice.sh and voice_render.py already send the pid).
+    r = client.post("/arbiter/unload", json={"engine": "chatterbox", "task_id": "day1-phase2-05-v7", "pid": 1})
+    assert r.status_code == 200 and r.json()["decision"] == "granted" and harness["arbiter"].resident == {}
+    assert "NOT measured" in r.json()["reason"]
+    assert [c for c in harness["controller"].calls if c[1] == "chatterbox"] == []
+
+
 def test_admin_token_guards_every_route_but_health_and_v1(harness: dict[str, Any]) -> None:
     deps: AppDeps = harness["deps"]
     deps.admin_token = "s3cret-token"

@@ -8,16 +8,35 @@
 #   timeout -k 5 $((SANDBOX_TIMEOUT_S + 10)) docker run --rm --init --pull never --name sb-<job> \
 #     --network none --memory $SANDBOX_MEMORY --memory-swap $SANDBOX_MEMORY --cpus $SANDBOX_CPUS \
 #     --pids-limit $SANDBOX_PIDS --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=$SANDBOX_TMPFS_SIZE \
+#     --mount type=tmpfs,dst=/work,tmpfs-size=$SANDBOX_WORK_SIZE \
 #     --ulimit fsize=$SANDBOX_FSIZE --cap-drop ALL --security-opt no-new-privileges --user 65534:<atlas gid> \
 #     -e SANDBOX_TIMEOUT_S=$SANDBOX_TIMEOUT_S \
-#     -v $SANDBOX_DIR/<job>:/work:rw -w /work atlas-sandbox:py3.12 python3 /work/main.py
+#     -v $SANDBOX_DIR/<job>:/stage:ro -w /work atlas-sandbox:py3.12 \
+#     sh -c 'cp -R /stage/. /work/ && "$@" >/work/.stdout; rc=$?; \
+#            cd /work && tar -cf - .; exit $rc' sh python3 /work/main.py   > $SANDBOX_DIR/<job>/.results.tar
 #   docker rm -f sb-<job>   (always, afterwards: the client may have been killed while the container lived on)
 #
 # This is the line orchestrator/src/atlas/sandbox.py build_argv() produces (fix round 2: the three copies — this header,
 # README-contracts.md §1 and the package — now agree). `--pull never`: an unqualified name that is not present locally
 # would otherwise be resolved to docker.io/library/atlas-sandbox:py3.12 and pulled. `--user 65534:<atlas gid>`: the job
-# directory is created setgid group atlas (0o2770) and staged files 0o640, so the nobody-uid process reads and writes
-# /work through the group bit and nothing else of atlas's.
+# directory is created setgid group atlas (0o2770) and staged files 0o640, so the nobody-uid process reads /stage
+# through the group bit and nothing else of atlas's.
+# WORK DIRECTORY (fix round 5; Section 16.4 "a hard memory limit"): /work is a BOUNDED tmpfs, tmpfs-size =
+# SANDBOX_WORK_SIZE (default 2g, SandboxConfig.work_size; 06d may write the key into orchestrator.env), charged to the
+# job's memory cgroup like every other page it touches; writing past it fails with ENOSPC inside the container (V17's
+# third run asserts exactly that, under THIS run line). The staged inputs are bind-mounted READ-ONLY at /stage and the
+# run line's first act copies them into /work (`cp` and `tar` are coreutils/tar, essential packages present in slim),
+# so nothing a job writes reaches the 8 TB volume and the earlier unbounded `-v <job>:/work:rw` is gone. The copy has
+# NO `--preserve` (fix round 6): uid 65534 with every capability dropped does not own the /work mount point, and GNU cp
+# copying `/stage/.` onto it tried to set the source directory's times/mode on /work itself, failed with EPERM and the
+# `&&` chain never ran the job (coreutils 9.4, verified as uid 65534). RESULTS: a tmpfs is not part
+# of the container's layers, so `docker cp` cannot read it (Docker lists tmpfs among the paths cp does not copy) and it
+# is gone at exit; the run line instead sends the job's stdout to /work/.stdout and, once the job has returned, streams
+# `tar -cf - .` of /work on the container's stdout, which the package writes to <job dir>/.results.tar (bounded by the
+# tmpfs on the producer side) and unpacks there with tarfile's `data` filter; the shell exits with the job's own code,
+# so 137 still means the memory cap or the deadline. /work below is the mount point (its mode is irrelevant once the
+# tmpfs is mounted); /stage is created by docker for the bind mount. Nothing in the image changed for this, so the
+# label version stays 4.
 #
 # Two timeouts, on purpose (fix round). GNU timeout on the host only signals the docker CLIENT; a sandboxed program
 # that does `signal.signal(SIGTERM, SIG_IGN)` survives the proxied SIGTERM and the follow-up SIGKILL hits the client
@@ -26,13 +45,10 @@
 # the program is SIGKILLed at the deadline whatever it ignores (exit 137, disambiguated from the OOM kill by the
 # elapsed time, as the package already does). The host-side timeout is a backstop 10 s later for a hung daemon;
 # --init makes docker-init PID 1 so signals and zombies are handled and the wrapper is an ordinary process.
-# --ulimit fsize bounds every file a job writes (SANDBOX_FSIZE, default 1 GiB); /tmp is a bounded, noexec tmpfs.
-# UNVERIFIED / OPEN: no per-job cap on the TOTAL size of $SANDBOX_DIR/<job> exists here, and the bind mount carries no
-# nosuid/nodev of its own, so a job may fill the 8 TB volume with many 1 GiB files. Two durable fixes, both a decision
-# outside this file because they change the package's staging (README-contracts.md §3): an XFS project quota on
-# $SANDBOX_DIR, or a bounded `--mount type=tmpfs,dst=/work,tmpfs-size=$SANDBOX_WORK_SIZE` charged to the job's memory
-# cgroup with `docker cp` in and out instead of the bind mount. Until then the package removes the job directory after
-# collecting outputs.
+# --ulimit fsize bounds every file a job writes (SANDBOX_FSIZE, default 1 GiB); /tmp is a bounded, noexec tmpfs, and
+# /work is a bounded tmpfs too (WORK DIRECTORY above): the fix-round-4 "no per-job cap on the total size of
+# $SANDBOX_DIR/<job>" item is closed by the run line, not by an XFS quota. The package still removes the job directory
+# after collecting the copied-out results (keep_work_dir=False).
 #
 # DOCKER SOCKET == HOST ROOT (recorded, fix round; the same decision is in systemd/atlas-orchestrator.service and
 # phase1/06-docker.sh): the account that runs this line, `atlas`, is in the docker group (CONVENTIONS.md §2), and a

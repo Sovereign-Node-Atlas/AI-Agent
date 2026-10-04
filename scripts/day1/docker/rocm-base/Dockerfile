@@ -66,12 +66,18 @@ LABEL org.atlas.rocm-base.version="1" \
 # PYTHONNOUSERSITE=1 (fix round 2): the shared bind-mounted HOME could carry a ~/.local/lib/python3.12/site-packages
 # planted by any earlier install; the system python (and every --system-site-packages venv) must never import from it,
 # even in a hand run that bypasses lib-engine.sh (which sets it again at run time).
+# HF_HUB_DISABLE_XET=1 and HF_HUB_ENABLE_HF_TRANSFER=0 are set HERE, before the first RUN (fix round 4), so every
+# Hugging Face download in this image, at build time and at run time, uses huggingface_hub's plain HTTPS client, which
+# honours https_proxy and therefore goes through squid (Section 12.5: outbound only through the allowlist; CONVENTIONS
+# §7.1). hf_xet and hf_transfer are the two paths that may bypass the proxy (header); neither is ever on in this image.
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONNOUSERSITE=1
+    PYTHONNOUSERSITE=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=0 \
+    HF_HUB_DISABLE_XET=1
 
 # Python 3.12 (Ubuntu 24.04's default), build tools for source builds (SAM 2 without CUDA, tokenizers), media libs
 # (ffmpeg for Wan/Stable Audio, sox and libsndfile for CosyVoice), and the X/GL runtime libs the Blender tarball needs
@@ -136,13 +142,12 @@ RUN set -e; \
     test -x /usr/local/bin/rocminfo || exit 1; \
     echo "rocminfo linked from $BIN"
 
-# gfx1151 runtime knobs (research §2.2). HF_HOME is bind-mounted from the host (Appendix C: one cache for all engines).
+# gfx1151 runtime knobs (research §2.2). HF_HOME is bind-mounted from the host (Appendix C: one cache for all engines);
+# the HF download-path switches (XET, hf_transfer) are in the first ENV block above so they also bind at build time.
 ENV TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
     TORCH_BLAS_PREFER_HIPBLASLT=1 \
     HIP_VISIBLE_DEVICES=0 \
     HF_HOME=/srv/atlas/engines/hf \
-    HF_HUB_ENABLE_HF_TRANSFER=0 \
-    HF_HUB_DISABLE_XET=1 \
     MIOPEN_USER_DB_PATH=/srv/atlas/engines/miopen \
     MIOPEN_CUSTOM_CACHE_DIR=/srv/atlas/engines/miopen \
     HOME=/srv/atlas/engines/home \

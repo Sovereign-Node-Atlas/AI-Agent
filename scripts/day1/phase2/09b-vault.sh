@@ -101,7 +101,7 @@
 #      confirmed written down (the only recovery for a forgotten passphrase, D3). ATLAS_VAULT_INIT=1 without a terminal
 #      dies with that message (an opt-in that cannot be honoured must not be skipped silently). The passphrase lives in
 #      this process's memory only, is piped to the helper, never appears in argv, in a file that survives, or in any log.
-#      A driver that exports ATLAS_FORCED_STEPS (contract requested in README-contracts.md §3; common.sh does not yet)
+#      A driver that exports ATLAS_FORCED_STEPS (lib/common.sh parse_common_args exports it: the bare step ids of every --force)
 #      containing `09b` is honoured like ATLAS_VAULT_INIT=1 when a terminal is present.
 #   5. Mechanics proof from the shell through the REAL button path (user atlas -> sudo-rs -> atlas-vault open ->
 #      systemd unit): mount, write a file as atlas under $VAULT_MOUNT_DIR/.atlas-selftest/ (the ONLY path Day 1
@@ -645,7 +645,7 @@ SUDO
 _vault_has_tty() { [[ -r /dev/tty && -w /dev/tty ]] && { : </dev/tty; } 2>/dev/null; }
 
 # _vault_init_requested — the Principal asked for the real vault's initialisation in this run (header part 4):
-# ATLAS_VAULT_INIT=1 in the environment, or a driver that exports ATLAS_FORCED_STEPS naming 09b (contract requested).
+# ATLAS_VAULT_INIT=1 in the environment, or ATLAS_FORCED_STEPS naming 09b (exported by parse_common_args on --force 09b).
 _vault_init_requested() {
   [[ "${ATLAS_VAULT_INIT:-0}" == 1 ]] && return 0
   [[ " ${ATLAS_FORCED_STEPS:-} " == *" 09b "* ]] && return 0

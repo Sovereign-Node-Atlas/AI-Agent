@@ -142,9 +142,13 @@ step_01() {
     log "network: $LAN_IP on $LAN_IFACE is a static (non-dynamic) address"
   fi
 
-  # --- Things later steps need from the Principal; warn now so they are fixed before the LUKS pause ------------
+  # --- Things later steps need from the Principal; settled now so they are fixed before the LUKS pause ---------
+  # The SSH key is a STOP, not a warning: step 4 makes SSH key-only (Section 3.6) and dies without a key, but by then
+  # LUKS is enrolled and the node is about to reboot into the hardened configuration; a missing key found at step 1
+  # costs one ssh command, found after the reboot it costs a console session. Section 22 (build-side preconditions)
+  # is where the key belongs; the README §1 node list names it.
   local ak="/home/$PRINCIPAL_USER/.ssh/authorized_keys"
-  [[ -s "$ak" ]] || warn "pre-flight: $ak is missing or empty. Step 4 makes SSH key-only and STOPS if no key is present: add your public key first (or work from the console for Phase 1)."
+  [[ -s "$ak" ]] || die "pre-flight: $ak is missing or empty, and step 4 makes SSH key-only (Section 3.6). Add your public key BEFORE anything is enrolled. From the Windows PC (PowerShell; ssh-keygen -t ed25519 first if you have no key): type \$env:USERPROFILE\\.ssh\\id_ed25519.pub | ssh $PRINCIPAL_USER@${LAN_IP:-<node-ip>} \"mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys\"   — or on the console: mkdir -p ~/.ssh && chmod 700 ~/.ssh && nano ~/.ssh/authorized_keys (paste the .pub line) && chmod 600 ~/.ssh/authorized_keys. Then re-run: sudo $ATLAS_ENTRY phase1"
   [[ -s "$CLOUDFLARE_TXT" ]] || warn "pre-flight: $CLOUDFLARE_TXT is missing or empty; step 7 needs the Cloudflare token there (it is relocated and shredded in Phase 2 step 6b)"
 
   # --- V1: network, informational (Section 21, R9) -------------------------------------------------------------

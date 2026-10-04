@@ -6,6 +6,24 @@ Renders ONE fixed paragraph for every persona x Kokoro candidate in config/voice
 reference recording listed under "reference_recordings" (Alaric, Gideon), a Chatterbox clone sample
 <out>/<persona>-chatterbox-clone.wav rendered inside /opt/atlas/venv-voice (the venv phase2/05-voice.sh builds).
 
+Reference recordings (fix round 5): the Principal may drop alaric.* / gideon.* as WAV, MP3 or M4A into the inbox;
+phase2/05-voice.sh transcodes whatever is there to 16 kHz mono WAV under $ATLAS_SRV/staging/voice-references-normalised/
+and passes that directory as --references-dir, so the clone always consumes <references-dir>/<persona>.wav. Without
+--references-dir the casting file's paths are used as they are (the earlier behaviour).
+
+ENGINE ARBITER (Section 4.2, hard requirement: "every load ... of any weight-bearing process ... Chatterbox when
+invoked" passes through it; fix round 5). Before the clone batch loads ChatterboxTTS this renderer POSTs
+/arbiter/load {"engine": "chatterbox", "task_id": ...} on the step-2 orchestrator (--arbiter, loopback; the admin
+token from --arbiter-token-file when orchestrator.env configures one) and POSTs /arbiter/unload after the batch WITH
+THE CLONE-BATCH CHILD'S PID (fix round 6: Section 4.2 rule 5's substance for a CPU process, the Arbiter confirms the
+release against /proc/<pid> instead of taking this program's word; the child has exited by then, so it is gone),
+whatever happened inside it. The key is config/engines.json's `external` entry (class external: budgeted, counted as
+resident and ledgered by the Arbiter, run by this process). A 404 from either route means "the Arbiter does not know
+the key" (an orchestrator running a package or an engines.json without the entry) and is a FAILURE of every clone in
+the batch, named as such in the summary: the load is never skipped around the Arbiter. A decision other than
+granted (queued, refused), an unreachable orchestrator or a non-200 answer fail the clones the same way; the Kokoro
+renders still happen, and the summary's status is "fail" so V7 is recorded fail (rule §7.4), never a silent pass.
+
 A persona whose reference recording is absent AND that has no Kokoro candidate at all (Alaric: 14.3 says "no preset
 delivers gravel") still gets a sample: Section 22 promises "both fall back to the nearest Kokoro preset", so
 <out>/<persona>-<voice>-fallback.wav is rendered with the persona's "kokoro_fallback" key when config/voice-casting.json
@@ -20,13 +38,15 @@ exists (and, for clones, is newer than its reference recording) is kept and coun
 Exit codes of `render` (the contract verify/v07-voice-listen.sh maps onto V7):
     0  every render succeeded and every reference recording was present   -> pass ("Principal to listen")
     2  a reference recording is absent (Kokoro renders still happen)       -> deferred, naming the paths
-    1  a Kokoro render failed, Kokoro is unreachable, or a present clone failed (or hit --deadline) -> fail
+    1  a Kokoro render failed, Kokoro is unreachable, a present clone failed (or hit --deadline), or the Arbiter
+       did not grant / does not know the chatterbox key (ENGINE ARBITER above)                   -> fail
 
 stdout: exactly one JSON line (the summary); progress goes to stderr. The summary is also written to --json-out.
 
 Usage:
     voice_render.py render [--casting FILE] [--out DIR] [--kokoro URL] [--venv-python FILE] [--hf-home DIR]
-                           [--json-out FILE] [--skip-clone] [--deadline SECONDS]
+                           [--json-out FILE] [--skip-clone] [--deadline SECONDS] [--references-dir DIR]
+                           [--arbiter URL] [--arbiter-token-file FILE] [--arbiter-task-id ID]
     voice_render.py clone-batch --jobs FILE      (internal: re-executed under the voice venv; FILE is a JSON list of
                                                   {"ref","text","out"}; ChatterboxTTS is loaded ONCE for all entries)
 
@@ -65,6 +85,10 @@ PARAGRAPH = (
 FALLBACK_VOICE = "am_onyx"
 
 DEFAULT_CASTING = Path(__file__).resolve().parent.parent / "config" / "voice-casting.json"
+# The step-2 orchestrator (CONVENTIONS.md §8: ORCH_PORT 8800) and the engines.json `external` key (Section 4.2).
+DEFAULT_ARBITER = f"http://127.0.0.1:{os.environ.get('ORCH_PORT') or 8800}"
+ARBITER_KEY = os.environ.get("CHATTERBOX_ARBITER_KEY") or "chatterbox"
+REFERENCE_EXTS = (".wav", ".mp3", ".m4a")  # what phase2/05-voice.sh accepts in the inbox and normalises
 DEFAULT_OUT = Path(os.environ.get("ATLAS_SRV", "/srv/atlas")) / "staging" / "listening-test"
 DEFAULT_KOKORO = "http://127.0.0.1:8880"
 DEFAULT_VENV_PY = Path(os.environ.get("ATLAS_OPT", "/opt/atlas")) / "venv-voice" / "bin" / "python"
@@ -110,6 +134,89 @@ def wav_ok(path: Path) -> bool:
         return path.is_file() and wav_seconds(path) > 0.0
     except (OSError, wave.Error, EOFError):
         return False
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Engine Arbiter (Section 4.2; module docstring ENGINE ARBITER)
+# ---------------------------------------------------------------------------------------------------------------
+class ArbiterRefusal(RuntimeError):
+    """The Arbiter did not grant the Chatterbox load (or does not know the key): the clones must not render."""
+
+
+def _arbiter_token(token_file: str) -> str:
+    """ORCH_ADMIN_TOKEN=... or the bare token, as phase2/02-orchestrator.sh writes the file; '' when no file."""
+    if not token_file:
+        return ""
+    text = Path(token_file).read_text(encoding="utf-8")
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("ORCH_ADMIN_TOKEN="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return text.strip()
+
+
+def arbiter_call(base: str, token: str, path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """POST <base><path> on the loopback orchestrator (never through the proxy); (HTTP status, JSON body or {})."""
+    req = urllib.request.Request(
+        f"{base.rstrip('/')}{path}", method="POST", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", **({"X-Atlas-Token": token} if token else {})},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=120) as resp:
+            code, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        code, raw = exc.code, exc.read()
+    try:
+        data = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except ValueError:
+        data = {"detail": raw.decode("utf-8", "replace")[:300]}
+    return code, data if isinstance(data, dict) else {"detail": data}
+
+
+def arbiter_load(base: str, token: str, task_id: str) -> dict[str, Any]:
+    """POST /arbiter/load for the chatterbox key; returns the granted decision or raises ArbiterRefusal (loudly)."""
+    entry = os.environ.get("ATLAS_ENTRY") or "./atlas-day1.sh"
+    try:
+        code, data = arbiter_call(base, token, "/arbiter/load", {"engine": ARBITER_KEY, "task_id": task_id})
+    except (urllib.error.URLError, OSError) as exc:
+        raise ArbiterRefusal(
+            f"POST {base}/arbiter/load unreachable ({exc}); Section 4.2: the Chatterbox load passes through the "
+            "Arbiter or does not happen (is the step-2 orchestrator up? systemctl status atlas-orchestrator)"
+        ) from exc
+    if code == 404:
+        raise ArbiterRefusal(
+            f"the Arbiter does not know engine key {ARBITER_KEY!r} (HTTP 404 from {base}/arbiter/load: "
+            f"{data.get('detail', '')}). The running orchestrator does not read config/engines.json's `external` "
+            "list (Section 4.2 class external): deploy the package and config that carry it and restart it "
+            f"(sudo {entry} phase2 --force 02), then re-run step 5. The clone render is NOT skipped around the Arbiter"
+        )
+    if code != 200:
+        raise ArbiterRefusal(f"POST {base}/arbiter/load answered HTTP {code}: {data.get('detail', data)}")
+    if data.get("decision") != "granted":
+        raise ArbiterRefusal(
+            f"the Arbiter did not grant the {ARBITER_KEY} load: {data.get('decision')} ({data.get('reason', '?')}); "
+            "Section 4.2 rule 3: wait for the resident engine(s) to unload and re-run step 5"
+        )
+    return data
+
+
+def arbiter_unload(base: str, token: str, task_id: str, pid: int | None = None) -> dict[str, Any]:
+    """POST /arbiter/unload; `pid` (the clone-batch child) lets the Arbiter confirm the release in /proc (rule 5)."""
+    body: dict[str, Any] = {"engine": ARBITER_KEY, "task_id": task_id}
+    if pid is not None:
+        body["pid"] = int(pid)
+    try:
+        code, data = arbiter_call(base, token, "/arbiter/unload", body)
+    except (urllib.error.URLError, OSError) as exc:
+        raise ArbiterRefusal(f"POST {base}/arbiter/unload unreachable ({exc}); the ledger still shows "
+                             f"{ARBITER_KEY} resident (Section 4.2 rule 1)") from exc
+    if code == 404:
+        raise ArbiterRefusal(f"the Arbiter does not know engine key {ARBITER_KEY!r} on unload (HTTP 404)")
+    if code != 200 or data.get("decision") != "granted":
+        raise ArbiterRefusal(f"POST {base}/arbiter/unload: HTTP {code} {data.get('decision')} "
+                             f"({data.get('reason', data.get('detail', '?'))})")
+    return data
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -192,13 +299,22 @@ def cmd_clone_batch(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+class CloneBatchError(RuntimeError):
+    """The clone-batch child failed; `pid` is still reported to /arbiter/unload so the release is measured."""
+
+    def __init__(self, msg: str, pid: int | None) -> None:
+        super().__init__(msg)
+        self.pid = pid
+
+
 def chatterbox_clone_batch(
     venv_python: Path, hf_home: Path, jobs: list[dict[str, str]], budget_s: float | None
 ) -> dict[str, Any]:
     """Re-execute this file under the voice venv ONCE for all clones (its torch/chatterbox pins differ from the host).
 
     `budget_s` is the wall-clock budget left (None = unlimited). On timeout every job that has no result is reported
-    with the error "timed out", never silently skipped.
+    with the error "timed out", never silently skipped. The result carries the child's `pid` for POST /arbiter/unload
+    (module docstring: the Arbiter confirms the release against /proc/<pid>).
     """
     import subprocess
     import tempfile
@@ -220,35 +336,43 @@ def chatterbox_clone_batch(
     with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="v7-clone-jobs-", delete=False) as fh:
         json.dump(jobs, fh)
         jobs_file = fh.name
+    pid: int | None = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [str(venv_python), str(Path(__file__).resolve()), "clone-batch", "--jobs", jobs_file],
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=budget_s,
-            check=False,
         )
-    except subprocess.TimeoutExpired as exc:
-        tail = ((exc.stderr or "") if isinstance(exc.stderr, str) else "").strip().splitlines()[-3:]
-        return {
-            "load_s": None,
-            "results": [
-                {"out": j["out"], "error": f"timed out after {budget_s:.0f}s budget ({' | '.join(tail)})"}
-                for j in jobs
-                if not wav_ok(Path(j["out"]))
-            ],
-        }
+        pid = proc.pid
+        try:
+            out, err = proc.communicate(timeout=budget_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, err = proc.communicate()
+            tail = (err or "").strip().splitlines()[-3:]
+            return {
+                "load_s": None,
+                "pid": pid,
+                "results": [
+                    {"out": j["out"], "error": f"timed out after {budget_s:.0f}s budget ({' | '.join(tail)})"}
+                    for j in jobs
+                    if not wav_ok(Path(j["out"]))
+                ],
+            }
     finally:
         try:
             os.unlink(jobs_file)
         except OSError:
             pass
-    last = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    out = out or ""
+    last = out.strip().splitlines()[-1] if out.strip() else ""
     if not last.startswith("{"):
-        tail = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
-        raise RuntimeError(f"chatterbox clone-batch failed (exit {proc.returncode}): {' | '.join(tail)}")
+        tail = ((err or "") or out).strip().splitlines()[-5:]
+        raise CloneBatchError(f"chatterbox clone-batch failed (exit {proc.returncode}): {' | '.join(tail)}", pid)
     result: dict[str, Any] = json.loads(last)
+    result["pid"] = pid
     return result
 
 
@@ -326,8 +450,15 @@ def cmd_render(args: argparse.Namespace) -> int:
         if not ref_path:
             continue
         ref = Path(ref_path)
+        if args.references_dir:
+            # phase2/05-voice.sh normalised whatever the inbox held (WAV/MP3/M4A) to <references-dir>/<key>.wav.
+            ref = Path(args.references_dir) / f"{key}.wav"
         if not ref.is_file():
-            missing_refs.append(str(ref))
+            if args.references_dir:
+                stem = Path(ref_path).with_suffix("")
+                missing_refs.append(f"{stem}{{{','.join(REFERENCE_EXTS)}}} (no normalised 16 kHz WAV at {ref})")
+            else:
+                missing_refs.append(str(ref))
             eprint(f"clone    {key:8s} reference absent: {ref}")
             if not candidates:
                 # Section 22: "both fall back to the nearest Kokoro preset and V7 is recorded as deferred".
@@ -355,12 +486,30 @@ def cmd_render(args: argparse.Namespace) -> int:
         clone_jobs.append({"ref": str(ref), "text": PARAGRAPH, "out": str(target)})
         clone_meta[str(target)] = (key, ref)
 
+    arbiter: dict[str, Any] = {}
     if clone_jobs:
         budget: float | None = None
         if deadline is not None:
             budget = max(60.0, deadline - (time.monotonic() - started))
+        # Section 4.2 (module docstring ENGINE ARBITER): the load is granted by the Arbiter or does not happen.
+        task_id = args.arbiter_task_id or f"day1-phase2-05-v7-{int(time.time())}"
+        token = ""
+        try:
+            token = _arbiter_token(args.arbiter_token_file)
+            granted = arbiter_load(args.arbiter, token, task_id)
+            arbiter["load"] = granted.get("reason")
+            eprint(f"arbiter  {ARBITER_KEY:8s} load granted: {granted.get('reason')}")
+        except (ArbiterRefusal, OSError) as exc:
+            arbiter["load_error"] = str(exc)
+            for job in clone_jobs:
+                errors.append(f"{clone_meta[job['out']][0]}/clone: not rendered, Arbiter: {exc}")
+            eprint(f"arbiter  {ARBITER_KEY:8s} FAILED: {exc}")
+            clone_jobs = []
+    if clone_jobs:
+        batch_pid: int | None = None  # the clone-batch child, reported to /arbiter/unload (module docstring)
         try:
             batch = chatterbox_clone_batch(Path(args.venv_python), Path(args.hf_home), clone_jobs, budget)
+            batch_pid = batch.get("pid")
             seen: set[str] = set()
             for res in batch.get("results", []):
                 key, ref = clone_meta.get(res.get("out", ""), ("?", Path("?")))
@@ -387,9 +536,21 @@ def cmd_render(args: argparse.Namespace) -> int:
                     key = clone_meta[job["out"]][0]
                     errors.append(f"{key}/clone: no result reported by clone-batch")
         except Exception as exc:  # broad on purpose: recorded, the summary decides the exit code
+            batch_pid = getattr(exc, "pid", None)
             for job in clone_jobs:
                 errors.append(f"{clone_meta[job['out']][0]}/clone: {exc}")
             eprint(f"clone    batch FAILED: {exc}")
+        finally:
+            # Rule 1: the ledger must stop showing the process resident once it has exited, whatever happened above;
+            # rule 5: the child's pid lets the Arbiter confirm that it has (the child has returned or been killed here).
+            try:
+                released = arbiter_unload(args.arbiter, token, task_id, batch_pid)
+                arbiter["unload"] = released.get("reason")
+                eprint(f"arbiter  {ARBITER_KEY:8s} unloaded: {released.get('reason')}")
+            except (ArbiterRefusal, OSError) as exc:
+                arbiter["unload_error"] = str(exc)
+                errors.append(f"arbiter/unload: {exc}")
+                eprint(f"arbiter  {ARBITER_KEY:8s} unload FAILED: {exc}")
 
     kokoro_n = sum(1 for r in rendered if r["engine"] == "kokoro")
     fallback_n = sum(1 for r in rendered if r["engine"] == "fallback")
@@ -411,6 +572,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         "chatterbox_files": clone_n,
         "missing_references": missing_refs,
         "errors": errors,
+        "arbiter": arbiter,
         "rendered": rendered,
         "elapsed_s": round(time.monotonic() - started, 1),
         "rendered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -450,6 +612,15 @@ def main(argv: list[str] | None = None) -> int:
         default="0",
         help="total wall-clock budget in seconds for the whole render (0 = none); clones past it are recorded as fail",
     )
+    r.add_argument(
+        "--references-dir",
+        default="",
+        help="directory of normalised 16 kHz mono <persona>.wav references (phase2/05-voice.sh); "
+        "default: the casting file's paths as they are",
+    )
+    r.add_argument("--arbiter", default=DEFAULT_ARBITER, help="the step-2 orchestrator (POST /arbiter/load|unload)")
+    r.add_argument("--arbiter-token-file", default="", help="ORCH_ADMIN_TOKEN_FILE when orchestrator.env sets one")
+    r.add_argument("--arbiter-task-id", default="", help="task id written to the Arbiter ledger (Section 4.2 rule 9)")
     r.set_defaults(func=cmd_render)
 
     c = sub.add_parser("clone-batch", help="internal: Chatterbox clones under the voice venv, model loaded once")

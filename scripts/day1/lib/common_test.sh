@@ -154,6 +154,11 @@ check "parse_common_args: --dry-run sets ATLAS_DRY_RUN" test "$rc" -eq 0
 check "parse_common_args: --run sets ATLAS_IN_UNIT" test "$rc" -eq 0
 ( parse_common_args --force 01 ) >/dev/null 2>&1
 check "parse_common_args: --force clears the marker" test ! -e "$ATLAS_STATE/done/phasetest.01"
+# ATLAS_FORCED_STEPS: bare ids, space-joined, in argv order, PHASE.STEP reduced to STEP, exported (09b-vault.sh reads it).
+out="$( unset ATLAS_FORCED_STEPS; parse_common_args --force 09b --force phasetest.05b 2>/dev/null; env | grep '^ATLAS_FORCED_STEPS=' )"
+check "parse_common_args: --force exports ATLAS_FORCED_STEPS space-joined" test "$out" = "ATLAS_FORCED_STEPS=09b 05b"
+( unset ATLAS_FORCED_STEPS; parse_common_args --dry-run; [ -z "${ATLAS_FORCED_STEPS:-}" ] ); rc=$?
+check "parse_common_args: no --force leaves ATLAS_FORCED_STEPS unset" test "$rc" -eq 0
 out="$( parse_common_args --status 2>/dev/null )"; rc=$?
 check "parse_common_args: --status exits 0" test "$rc" -eq 0
 check "parse_common_args: --status prints the verify table" grep -q '^V2 *pass' <<<"$out"
@@ -161,13 +166,44 @@ check "parse_common_args: --status prints the verify table" grep -q '^V2 *pass' 
 check "parse_common_args: unknown argument dies" test "$rc" -ne 0
 
 # --- load_env (deterministic parts only: install on first run, die naming blank CONFIRM keys) -------------------------
-( load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
+# ATLAS_TEST_SECURE_BOOT (test-only override, common.sh header) fixes the Secure Boot reading so both branches run here.
+( ATLAS_TEST_SECURE_BOOT=off load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
 check "load_env: installs the example on first run" test -f "$ATLAS_ETC/atlas.env"
 check "load_env: dies naming the blank CONFIRM keys" test "$rc" -ne 0
-check "load_env: message names GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES" grep -q 'GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES' "$TMP/load_env.out"
+# One message, every blank CONFIRM key, an example value for each (the Principal fixes them all in one edit).
+check "load_env: ONE FATAL line for all the blank keys" test "$(grep -c 'FATAL' "$TMP/load_env.out")" -eq 1
+check "load_env: message names GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE" \
+  grep -q 'GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE' "$TMP/load_env.out"
+check "load_env: example value for GOOGLE_ACCOUNTS" grep -q 'GOOGLE_ACCOUNTS="you@company.com:corporate you@gmail.com:estate"' "$TMP/load_env.out"
+check "load_env: example value for WINDOWS_SHARE" grep -q 'WINDOWS_SHARE="//192.168.1.50/atlas"' "$TMP/load_env.out"
+check "load_env: example value for FAMILY_NAMES" grep -q 'FAMILY_NAMES="Surname Givenname"' "$TMP/load_env.out"
+check "load_env: example value and terms URL for the SDK licence" grep -q 'BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes .*developer.android.com/studio/terms' "$TMP/load_env.out"
+check "load_env: names the file to edit" grep -q "sudo nano $ATLAS_ETC/atlas.env" "$TMP/load_env.out"
+# ATLAS_ACCEPT_PCR7_NO_SB is listed exactly when Secure Boot is off (D2 / S9): both branches, independent of this host.
+absent() { ! grep -q "$1" "$2"; }
+check "load_env: Secure Boot off -> ATLAS_ACCEPT_PCR7_NO_SB=1 example listed" grep -q 'ATLAS_ACCEPT_PCR7_NO_SB=1 ' "$TMP/load_env.out"
+check "load_env: Secure Boot off -> ATLAS_ACCEPT_PCR7_NO_SB in the key list" grep -q 'BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE ATLAS_ACCEPT_PCR7_NO_SB)' "$TMP/load_env.out"
+( ATLAS_TEST_SECURE_BOOT=on load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
+check "load_env: Secure Boot on -> still dies on the other blank keys" test "$rc" -ne 0
+check "load_env: Secure Boot on -> ATLAS_ACCEPT_PCR7_NO_SB not demanded" absent ATLAS_ACCEPT_PCR7_NO_SB "$TMP/load_env.out"
+check "load_env: Secure Boot on -> still ONE FATAL line" test "$(grep -c 'FATAL' "$TMP/load_env.out")" -eq 1
+( ATLAS_TEST_SECURE_BOOT=bogus _atlas_secure_boot_enabled ); rc_real=$?
+( _atlas_secure_boot_enabled ); rc_plain=$?
+check "_atlas_secure_boot_enabled: a value other than on/off falls through to the firmware reading" test "$rc_real" -eq "$rc_plain"
+# The licence key passes only as `yes` (the test phase2/06-tools.sh applies): a `no` is listed like a blank, with the
+# yes example, so the Principal is stopped here and not again at Phase 2 step 6.
 ensure_kv "$ATLAS_ETC/atlas.env" GOOGLE_ACCOUNTS '"a@b.com:corporate c@d.com:estate"'
-ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE 'not-a-share'
+ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE '"//host/share"'
 ensure_kv "$ATLAS_ETC/atlas.env" FAMILY_NAMES 'Rida'
+ensure_kv "$ATLAS_ETC/atlas.env" BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE 'no'
+ensure_kv "$ATLAS_ETC/atlas.env" ATLAS_ACCEPT_PCR7_NO_SB '1'
+( ATLAS_TEST_SECURE_BOOT=off load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
+check "load_env: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=no dies" test "$rc" -ne 0
+check "load_env: =no is listed as the one unconfirmed key" grep -q '1 CONFIRM key(s) are blank or not confirmed .* (BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE)' "$TMP/load_env.out"
+check "load_env: =no shows the yes example" grep -q 'BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes ' "$TMP/load_env.out"
+check "load_env: =no does not list the confirmed keys" absent 'GOOGLE_ACCOUNTS=' "$TMP/load_env.out"
+ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE 'not-a-share'
+ensure_kv "$ATLAS_ETC/atlas.env" BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE 'yes'
 ( load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
 check "load_env: rejects a malformed WINDOWS_SHARE" test "$rc" -ne 0
 check "load_env: WINDOWS_SHARE message" grep -q 'WINDOWS_SHARE must look like //host/share' "$TMP/load_env.out"
