@@ -37,7 +37,8 @@ Endpoints
     POST /arbiter/register             {engine, total_bytes, task_id}: Phase 3/4 record a measured footprint (rule 1)
     POST /arbiter/load                 {engine, ctx, parallel, task_id} -> {decision: granted|queued|refused, reason,
                                        projected_bytes}: a load through the Arbiter (4.2 rule 2; phase3/loadtest.py)
-    POST /arbiter/unload               {engine, task_id, pid?} -> the same shape (rule 5 release check inside; pid for class-external)
+    POST /arbiter/unload               {engine, task_id, pid?} -> the same shape (rule 5 release check inside;
+                                       pid: the caller's process, for a class-external engine)
     POST /arbiter/remeasure            re-read the resident set (4.1) while NO engine is resident: Phase 2 step 4/5
                                        add the small models after the orchestrator measured at step 2. The chat path
                                        and /arbiter/load also re-measure lazily whenever nothing is resident.

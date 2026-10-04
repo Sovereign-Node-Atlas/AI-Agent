@@ -448,13 +448,12 @@ def test_arbiter_routes_know_the_external_chatterbox_key(harness: dict[str, Any]
     assert [c for c in harness["controller"].calls if c[1] == "chatterbox"] == []
     r = client.post("/arbiter/register", json={"engine": "chatterbox", "total_bytes": 3 * 1024**3})
     assert r.status_code == 200 and harness["arbiter"].charged_bytes == 3 * 1024**3
-    # The route does not forward a `pid` yet (UnloadRequest has engine and task_id; the extra field is ignored), so the
-    # Arbiter releases on the caller's word and SAYS the release was not measured (Section 4.2 rule 5; fix round 6).
-    # REQUESTED of the api.py writer: `pid: int | None = None` on UnloadRequest, passed as `pid=req.pid`, after which
-    # this assertion flips to "release confirmed" (phase2/05-voice.sh and voice_render.py already send the pid).
+    # The route forwards `pid` (UnloadRequest.pid -> request_unload(pid=...)), so the Arbiter confirms the release
+    # against /proc/<pid> instead of taking the caller's word (Section 4.2 rule 5; phase2/voice_render.py sends the
+    # clone-batch child's pid). pid 1 is alive in the test process, so the stub RSS reader answers within tolerance.
     r = client.post("/arbiter/unload", json={"engine": "chatterbox", "task_id": "day1-phase2-05-v7", "pid": 1})
     assert r.status_code == 200 and r.json()["decision"] == "granted" and harness["arbiter"].resident == {}
-    assert "NOT measured" in r.json()["reason"]
+    assert "release confirmed" in r.json()["reason"]
     assert [c for c in harness["controller"].calls if c[1] == "chatterbox"] == []
 
 
