@@ -213,17 +213,16 @@ written with the reason, shown in the table and the workbook, and never silently
 
 ## 6. Known limits
 
-### Baseline amendments the scripts depend on (the Principal's to make in `docs/ATLAS_FRAMEWORK_REVIEW.md`)
+### Baseline amendments the scripts depended on (made in `docs/ATLAS_FRAMEWORK_REVIEW.md` v0.3.2)
 
-- Section 17 Phase 2 has no sandbox and no vault step; the scripts add `6d` (AEGIS sandbox image, Section 16.4, V17)
-  between 6c and 7, and `9b` (gocryptfs vault, Section 11, V18) between 9 and 10. `CONVENTIONS.md` §1 lists both.
-- Section 23 S21 says the control path is one sudoers fragment with three `systemctl` verbs; the node carries two
-  fragments, `atlas-engines` and `atlas-vault` (`atlas-vault open|lock|status`). `CONVENTIONS.md` §8 records the
-  implemented state.
-- Section 20 has no R-item for the Secure Boot / PCR 7 consequence (`ATLAS_ACCEPT_PCR7_NO_SB`, §1 above).
-- Section 11 / Appendix C name `/srv/atlas/vault` as the container; the layout is `vault/cipher` (backed up) and
-  `vault/open` (plaintext, never backed up), test vault under `staging/`.
-- The Phase 3 gate's V10 has a declared Phase 2 half, `V10a` (`CONVENTIONS.md` §4).
+- Section 17 Phase 2 now carries step `6d` (AEGIS sandbox image, Section 16.4, V17) and step `9b` (gocryptfs vault,
+  Section 11, V18); `CONVENTIONS.md` §1 lists both.
+- Section 23 S21 records the two sudoers fragments, `atlas-engines` and `atlas-vault`.
+- The Secure Boot / PCR 7 consequence is decision **D15** (open, recommendation: enable Secure Boot) and risk R23; the
+  Docker-group reach of the `atlas` user is R22.
+- Section 11 and Appendix C name `vault/cipher` (backed up) and `vault/open` (never backed up).
+- Section 21 declares `V10a`, the `T-<tool>` and `P4-wheels` recorded-only rows, and the Day 2 scope of V15's send
+  channels; Section 23 S24–S29 list what the build added, deferred to Day 2, or admitted to the allowlist.
 
 ### Versions without a research pin (rule §7.9)
 
