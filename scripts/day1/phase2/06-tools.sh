@@ -79,9 +79,9 @@
 #     deliverable, and a WARN-and-succeed left it silently unbuilt on a default run, with no V item or gate row to
 #     notice): BUILDFARM_STATUS=licence-not-accepted goes into tools.env and `die` prints the one-line fix; the marker
 #     is not written, so the next phase2 run resumes here. This check is HARD and runs BEFORE the soft buildfarm build
-#     (fix round 5). The Dockerfile refuses to run sdkmanager without the matching build arg. The key is a CONFIRM key
-#     (CONVENTIONS §3): load_env refuses a BLANK value before any phase runs, with the terms URL in its message, and
-#     phase2-services.sh's minute-0 input check covers the remaining case, a value that is set but is not `yes`.
+#     (fix round 5). The Dockerfile refuses to run sdkmanager without the matching build arg. The key is a Principal key
+#     (CONVENTIONS §3, policy v0.3.3): load_env asks for it once with the terms URL and records a to-do when it is left
+#     blank; phase2-services.sh's minute-0 input check lists it again, and the build is deferred, never a stop.
 #   * APT PINS are strict (fix round 3; rule §7.9): the Dockerfile has no fallback to the archive's current versions, so
 #     a moved-on archive fails the image build and this step dies naming the two pins to bump deliberately
 #     (BUILDFARM_JDK_PIN, BUILDFARM_MINGW_PIN, mirrored in the Dockerfile and its version label). After a build the
@@ -910,7 +910,10 @@ _tools_buildfarm_require_licence() {
     # Section 16.3 item 2: accepting the Android SDK terms is the Principal's act, expressed as a setting (§7.6: no
     # pause). Fatal (header: ANDROID SDK LICENCE): the marker is not written, so the next phase2 run resumes here.
     BUILDFARM_STATUS="licence-not-accepted"; _tools_kv BUILDFARM_STATUS "$BUILDFARM_STATUS"
-    die "buildfarm: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE is not 'yes' in $ATLAS_ETC/atlas.env, so the Section 17 step 6 build container cannot be built: its image build runs 'sdkmanager --licenses', which accepts the Android SDK licence terms ($ANDROID_TERMS_URL), and Section 16.3 item 2 reserves that act for you. Read the terms, then once: sudo bash -c 'echo BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes >> $ATLAS_ETC/atlas.env' and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 (the phase resumes at this step)"
+    TOOLS_DEFERRED_TOOLS+=(buildfarm)
+    _tools_record_t buildfarm deferred "build container not built: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE is not 'yes' in $ATLAS_ETC/atlas.env (Section 16.3 item 2: accepting $ANDROID_TERMS_URL is the Principal's act); set it, then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06"
+    todo_add input-android-sdk-licence "Android SDK terms not accepted: the Android/Windows build container is deferred" "Read $ANDROID_TERMS_URL; if you accept, set BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes in $ATLAS_ETC/atlas.env and re-run: atlas-day1.sh phase2 --force 06"
+    return 0
   fi
 }
 
@@ -1010,8 +1013,11 @@ step_06() {
   _tools_soft openstudio _tools_openstudio               # soft: 24.04 .deb/tar.gz on 26.04 UNVERIFIED
   _tools_kicad                                          # hard: apt
   _tools_playwright                                     # hard: PyPI pin + VERIFIED CDN hosts
-  _tools_buildfarm_require_licence                      # hard: the Principal's decision (Section 16.3 item 2)
-  _tools_soft buildfarm _tools_buildfarm                 # soft: UNVERIFIED sdkmanager ids, strict apt pins may move
+  if _tools_buildfarm_licence; then
+    _tools_soft buildfarm _tools_buildfarm               # soft: UNVERIFIED sdkmanager ids, strict apt pins may move
+  else
+    _tools_buildfarm_require_licence                     # policy v0.3.3: records T-buildfarm deferred + the to-do, never stops
+  fi
   _tools_docling_assert
   chown root:atlas "$TOOLS_ENV_FILE"; chmod 640 "$TOOLS_ENV_FILE"
   _tools_venv_harden     # Section 16.3 item 6: root:atlas, no group/other write, asserted (the step-02/04 invariant)

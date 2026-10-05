@@ -17,7 +17,7 @@
 # means ufw rules on ${LAN_IFACE} and on br-atlas-wg (10.42.42.0/24). The admin UI (51821) is published on
 # 127.0.0.1 ONLY (fix round 3): INSECURE=true is plain HTTP, so a LAN publish would let the admin password cross the
 # home Wi-Fi in clear whenever a login is made from the Windows PC, and nothing on the LAN needs the page (the phone
-# QR is produced at the node, VPN clients never need admin). The Principal reaches it from the RDP session's Firefox
+# QR is produced at the node, VPN clients never need admin). The Principal reaches it from the RDP session's Chrome
 # (http://127.0.0.1:51821) or over `ssh -L 51821:127.0.0.1:51821`; step 7's V5 text says so. UDP 51820 is published
 # on every address by design.
 #

@@ -78,15 +78,24 @@ hf_token_prompt() {
   fi
   # Non-terminal remedy (fix round 3): a form that never puts the token on argv or in the shell history (printf and
   # read are bash builtins, read -s hides the input; bash, not sh: dash has no read -s), so the only copy is the 600 file (§7.2).
-  [[ -t 0 ]] || die "$tokf is absent and stdin is not a terminal. Re-run from a terminal, or create it without the token ever appearing on a command line: sudo bash -c 'umask 077; printf \"HF token: \"; IFS= read -rs t; echo; printf \"HF_TOKEN=%s\\n\" \"\$t\" > $tokf; chown atlas:atlas $tokf; chmod 600 $tokf'"
+  # Policy v0.3.3: asked once (hidden input); no token -> to-do input-hf-token, and the gated models (PyAnnote now,
+  # FLUX.1-dev and Stable Audio Open in Phase 4) defer themselves. Nothing stops.
   echo
-  echo "Phase 2 needs a Hugging Face access token (read scope) for the gated models: PyAnnote 3.1 now, FLUX.1-dev and"
-  echo "Stable Audio Open in Phase 4. Accept those licences on huggingface.co with the account that owns the token."
-  echo "The token is written once to $tokf (atlas:atlas, mode 600, CONVENTIONS §2) and never printed."
+  echo "Hugging Face token (optional now). It unlocks the gated models: PyAnnote (voice), FLUX.1-dev and Stable Audio"
+  echo "Open (Phase 4). Create one at huggingface.co -> Settings -> Access Tokens (read), and accept those models'"
+  echo "licences with the same account. It is stored once in $tokf (mode 600) and never printed."
   local tok=""
-  read -r -s -p "HF token (input hidden): " tok
-  echo
-  [[ "$tok" =~ ^hf_[A-Za-z0-9_]+$ ]] || die "that does not look like a Hugging Face token (expected hf_...); nothing written"
+  ask tok "HF token (input hidden; Enter to skip and leave it for later): " secret
+  if [[ -z "$tok" ]]; then
+    todo_add input-hf-token "Hugging Face token not provided: PyAnnote (V6), FLUX.1-dev and Stable Audio Open are deferred" \
+      "Create a read token at huggingface.co, accept the licences of pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0, black-forest-labs/FLUX.1-dev and stabilityai/stable-audio-open-1.0, then: sudo bash -c 'umask 077; printf \"HF token: \"; IFS= read -rs t; echo; printf \"HF_TOKEN=%s\\n\" \"\$t\" > $tokf; chown atlas:atlas $tokf; chmod 600 $tokf' and re-run: atlas-day1.sh phase2 --force 05"
+    return 0
+  fi
+  if [[ ! "$tok" =~ ^hf_[A-Za-z0-9_]+$ ]]; then
+    warn "that does not look like a Hugging Face token (expected hf_...); nothing written"
+    todo_add input-hf-token "Hugging Face token not provided (the value typed did not look like hf_...): PyAnnote (V6), FLUX.1-dev and Stable Audio Open are deferred" "Re-run: atlas-day1.sh phase2 --force 05 with the token ready"
+    return 0
+  fi
   (umask 077; printf 'HF_TOKEN=%s\n' "$tok" >"$tokf")
   chown atlas:atlas "$tokf"
   chmod 600 "$tokf"
@@ -106,7 +115,7 @@ hf_token_prompt() {
             "$hf_base/api/whoami-v2" || true)"
   case "$code" in
     200) log "hf token: accepted by huggingface.co (whoami-v2 200); written to $tokf" ;;
-    401|403) rm -f "$tokf"; die "huggingface.co rejected the token (HTTP $code); nothing kept, re-run to try again" ;;
+    401|403) rm -f "$tokf"; warn "huggingface.co rejected the token (HTTP $code); nothing kept"; todo_add input-hf-token "Hugging Face token rejected (HTTP $code): create a valid read token and re-run: atlas-day1.sh phase2 --force 05" "PyAnnote (V6), FLUX.1-dev and Stable Audio Open are deferred until then"; return 0 ;;
     *) warn "hf token: could not verify with huggingface.co (HTTP ${code:-none}); kept $tokf, hf_download will report a bad token loudly" ;;
   esac
   unset tok
@@ -147,8 +156,8 @@ print("installed" if isinstance(d, dict) and "installed" in d else "web" if isin
     fi
   fi
   # (c) The Android SDK licence decision (phase2/06-tools.sh; Section 16.3 item 2: the Principal accepts, never a script).
-  #     load_env already refuses a BLANK key (CONVENTIONS §3 CONFIRM keys), so what reaches here is the key SET to
-  #     something other than `yes` (a `no`, a typo); the remedy edits the existing line instead of appending a second one
+  #     load_env asked once and recorded a to-do when it stayed blank (CONVENTIONS §3, policy v0.3.3); whatever is not
+  #     `yes` here is listed again with the remedy, which edits the existing line instead of appending a second one
   #     (the installed atlas.env.example carries a blank `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=` line).
   if [[ ! -e "$ATLAS_DONE_DIR/phase2.06" && "${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}" != yes ]]; then
     missing+=("BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE='${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}' in $ATLAS_ETC/atlas.env is not 'yes' (step 6 builds the Android/MinGW build container, whose image build runs 'sdkmanager --licenses'; Section 16.3 item 2 reserves accepting https://developer.android.com/studio/terms for you). Read the terms, then set the existing line once:
@@ -161,20 +170,28 @@ print("installed" if isinstance(d, dict) and "installed" in d else "web" if isin
       sudo bash -c 'umask 077; printf \"HF token: \"; IFS= read -rs t; echo; printf \"HF_TOKEN=%s\\n\" \"\$t\" > $ATLAS_ETC/secrets/hf-token.env; chown atlas:atlas $ATLAS_ETC/secrets/hf-token.env; chmod 600 $ATLAS_ETC/secrets/hf-token.env'")
   fi
   if (( ${#missing[@]} == 0 )); then
-    log "pre-flight: every input the unattended steps need is in place (smb.cred, OAuth client JSON, Android SDK licence key)"
+    log "pre-flight: every optional input is in place (OAuth client JSON, Android SDK licence key, HF token)"
     return 0
   fi
-  local i=0 item
+  # Policy v0.3.3 (the Principal): a missing input never stops a phase. Each one is listed here once, recorded as a
+  # to-do for the live ATLAS, and the step that needs it defers itself (V20 / T-buildfarm / V6 record deferred).
+  local i=0 item tid
   echo
-  echo "  ==== Phase 2 cannot run unattended yet: ${#missing[@]} input(s) to provide, ALL listed here (fix them in one go) ===="
+  echo "  ==== ${#missing[@]} optional input(s) not provided yet: recorded as to-dos, Phase 2 continues ===="
   for item in "${missing[@]}"; do
     i=$(( i + 1 ))
     echo "  $i. $item"
     echo
+    case "$item" in
+      *smb.cred*)   tid=input-smb-cred ;;
+      *OAuth*)      tid=input-google-oauth-client ;;
+      *LICENCE*)    tid=input-android-sdk-licence ;;
+      *hf-token*)   tid=input-hf-token ;;
+      *)            tid=input-other ;;
+    esac
+    todo_add "$tid" "${item%%$'\n'*}" "Provide it, then re-run the step that needs it with --force (see README §5)"
   done
-  echo "  Then re-run:  sudo $entry phase2   (nothing has been changed; completed steps are skipped)"
-  echo "  ======================================================================================================"
-  die "Phase 2 pre-flight: ${#missing[@]} missing input(s) listed above (CONVENTIONS.md §7.10: all at once, not 15 minutes apart)"
+  echo "  ==========================================================================================="
 }
 phase2_preflight_inputs
 hf_token_prompt

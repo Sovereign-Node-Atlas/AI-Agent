@@ -111,7 +111,16 @@ _winpc_test() {
 }
 
 step_09() {
+  # Policy v0.3.3: the Windows share is on the live to-do list unless both the share and its credentials exist.
+  if [[ -z "${WINDOWS_SHARE:-}" ]]; then
+    log "step 09 skipped: WINDOWS_SHARE is blank (to-do input-windows-share); re-run with --force 09 once it is set"
+    return 0
+  fi
   [[ "${WINDOWS_SHARE:-}" =~ ^//[^/]+/.+$ ]] || die "WINDOWS_SHARE='${WINDOWS_SHARE:-}' must look like //host/share (load_env should have refused this)"
+  if [[ ! -s "$WINPC_CRED" ]]; then
+    log "step 09 skipped: $WINPC_CRED is missing (to-do input-smb-cred); re-run with --force 09 once it exists"
+    return 0
+  fi
   apt_install cifs-utils
   _winpc_credentials
   _winpc_units

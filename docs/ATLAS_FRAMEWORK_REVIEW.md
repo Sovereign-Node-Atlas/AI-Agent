@@ -3,12 +3,12 @@
 | Field | Value |
 |---|---|
 | Document | ATLAS_FRAMEWORK_REVIEW.md |
-| Version | 0.3.2 — Day 1 scripts delivered; one decision reopened (D15) |
-| Date | 2026-09-21 |
-| Supersedes | v0.3.1 (2026-09-27); v0.3 (2026-09-21); v0.2.1 and v0.2 (2026-09-21); v0.1 (2026-09-18) |
+| Version | 0.3.3 — D15 closed (Secure Boot enabled); Day 1 scripts never stop on a missing input from the Principal |
+| Date | 2026-10-05 |
+| Supersedes | v0.3.2 (2026-10-05); v0.3.1 (2026-09-27); v0.3 (2026-09-21); v0.2.1 and v0.2 (2026-09-21); v0.1 (2026-09-18) |
 | Scope | Everything agreed in the design conversation, through the Principal's completed confirmation workbook and the September hardware change |
 | Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions resolved, risks, and what Day 1 must prove before anything is trusted |
-| Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21. Nothing has been executed. The Day 1 scripts under `scripts/day1/` are written against this document; the fact-checking that preceded them corrected the baseline in the places listed in Section 23, none of which reopens a decision. |
+| Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21. Nothing has been executed. The Day 1 scripts under `scripts/day1/` are written against this document; the fact-checking that preceded them corrected the baseline in the places listed in Section 23. D15, reopened by the build, was closed by the Principal on 2026-10-05 as option (a): Secure Boot enabled. Policy v0.3.3 (the Principal, 2026-10-05): a missing input from the Principal never stops a phase; the scripts ask once, defer the item and keep a to-do list for the live ATLAS. |
 
 ## How to read this document
 
@@ -28,7 +28,7 @@ Sections 1–17 are the consolidated framework. Sections 18–22 are the audit. 
 
 ## 0. Executive summary
 
-**Verdict.** The framework is coherent, fully decided, and buildable. All fourteen open decisions are closed, all twenty original contradictions accepted, and six further resolutions have been added since v0.1. The Day 1 script is now written against this document.
+**Verdict.** The framework is coherent, fully decided, and buildable. All fifteen decisions are closed (D15, Secure Boot, closed 2026-10-05), all twenty original contradictions accepted, and six further resolutions have been added since v0.1. The Day 1 scripts are written against this document and, since v0.3.3, never stop on a missing input from the Principal: they ask once, defer, and keep a to-do list for the live ATLAS.
 
 **What changed since v0.1, in order of consequence:**
 
@@ -116,7 +116,7 @@ Prompt processing: ~350 tok/s stock, ~1,000 tok/s tuned, measured on a 7B model;
 | UMA frame buffer | Smallest offered, 512 MB if available | On Linux the GPU takes memory dynamically via GTT; a fixed carve-out only wastes it |
 | IOMMU | Enabled | Required for containers passing GPU devices |
 | fTPM | Enabled | Required for LUKS auto-unlock (Section 3.5). **VERIFY V2** |
-| Secure Boot | **Disabled (D2 closed)** | Avoids module-signing friction on a headless node behind a firewall |
+| Secure Boot | **Enabled (D15 closed, supersedes D2)** | Ties the TPM2 PCR 7 unlock to this OS image; no out-of-tree kernel modules in this stack, so no signing friction. The Principal enables it in the BIOS before Phase 1 (Section 22) |
 
 ### 3.3 Kernel parameters — AGREED, VERIFY V3
 
@@ -167,7 +167,7 @@ Two different stacks serve two different layers, and this is deliberate:
 - `ufw` default deny inbound; allow SSH, Cockpit, Open WebUI, ntfy on LAN and WireGuard; allow UDP 51820 from anywhere. Default deny outbound except the allowlist (Section 12.5).
 - Cockpit for system health and in-browser terminal.
 - Docker with the GPU device nodes passed to containers that need them; the service user in `render` and `video` groups.
-- XFCE desktop and xrdp, listening on LAN and WireGuard interfaces only, never internet-facing. Firefox installed in the desktop session for the Principal's own use.
+- XFCE desktop and xrdp, listening on LAN and WireGuard interfaces only, never internet-facing. Google Chrome installed in the desktop session for the Principal's own use (the Principal's choice, v0.3.3; Google's apt repository, managed policy with metrics, sign-in, sync and background mode off).
 
 ---
 
@@ -642,9 +642,9 @@ Open WebUI is the face, not the brain. It runs in Docker, handles chat, voice, a
 
 The token is currently in a plain-text file named `CLOUDFLARE.txt`. The Principal asked for this to be automated rather than done by hand, and it is: Phase 2 step 6b performs it and V23 proves it. The specification the script implements is to create a scoped API Token with `Zone:DNS:Edit` on `sovereign-node.link` only, never the Global API Key; store it in an environment file with mode 600 owned by the updater's service account, outside `/srv/atlas`, outside any git-tracked path, and outside restic's include set; delete the plain-text file. The token value has not been shared in this conversation, so no rotation is required, only relocation.
 
-### 12.4 The Windows PC — AGREED
+### 12.4 The Windows PC — AGREED; mount deferred to the live ATLAS (v0.3.3)
 
-Accessed on demand only, with write capability, as a shared folder the node mounts when a task needs it and releases afterwards. No software installed on the PC. Most of the Principal's data lives in cloud services (Section 13), so the PC is a minor source. It is not a server.
+Accessed on demand only, with write capability, as a shared folder the node mounts when a task needs it and releases afterwards. No software installed on the PC. Most of the Principal's data lives in cloud services (Section 13), so the PC is a minor source. It is not a server. **Day 1 scope (v0.3.3):** on the Principal's instruction the share is not configured on Day 1; Phase 2 step 9 is skipped while `WINDOWS_SHARE` is blank and the item sits on the live ATLAS to-do list (`input-windows-share`), to be picked up with the Principal once the node is running.
 
 ### 12.5 Trust zones and outbound allowlist — AGREED
 
@@ -859,7 +859,9 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 
 ## 17. Day 1 Execution Protocol
 
-**Implemented by `scripts/day1/`** (entry point `atlas-day1.sh`; `README.md` there gives the commands in order, the interactive pauses and what to have ready; `COVERAGE.md` maps every step and every V item below to its file). Four phases. One entry command per phase. Every phase is idempotent: re-running skips what is complete. Every phase writes a log and ends with a printed pass/fail table. Phases 3 and 4 run detached under systemd so a dropped SSH session cannot kill them, and both are resumable at the file level.
+**Implemented by `scripts/day1/`** (entry point `atlas-day1.sh`; `README.md` there gives the commands in order, the prompts and what to have ready; `COVERAGE.md` maps every step and every V item below to its file). Four phases. One entry command per phase. Every phase is idempotent: re-running skips what is complete. Every phase writes a log and ends with a printed pass/fail table. Phases 3 and 4 run detached under systemd so a dropped SSH session cannot kill them, and both are resumable at the file level.
+
+**Policy v0.3.3 — a missing input from the Principal never stops a phase.** Whatever a step needs from the Principal (a token, an SSH key, a Google account, an OAuth client file, a voice recording, a licence acceptance, a test from the phone or the Windows PC) is asked for once, in plain words with an example, and may be skipped. A skipped item is recorded as `deferred` in the verification table (never `fail`), written to the to-do list at `/var/lib/atlas/day1/todo.jsonl` (shown by `atlas-day1.sh status`) with the exact command that completes it later, and the phase continues. Gates never block on `deferred`. Only broken machinery stops a phase. The live ATLAS takes the to-do list up with the Principal.
 
 ### Phase 1 — Platform (reboot in the middle)
 
@@ -868,7 +870,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 3. Mount layout per Section 3.5; swap off; tmpfs for `/tmp`.
 4. System update; kernel parameters (V3); firewall baseline; SSH hardening; Cockpit.
 5. Reboot. Post-reboot: `vulkaninfo` shows the Radeon 8065S, and the GTT pool read from `/sys/class/drm` matches the kernel parameters (V3, first half). The `llama-cli --list-devices` confirmation of ~170 GB usable moves to the Phase 2 gate, since llama.cpp is installed in Phase 2 (V3, second half).
-5b. XFCE and xrdp installed, bound to LAN and WireGuard only; Firefox in the desktop session; one RDP connection tested from the Principal's Windows PC.
+5b. XFCE and xrdp installed, bound to LAN and WireGuard only; Google Chrome in the desktop session (v0.3.3); one RDP connection tested from the Principal's Windows PC (V19; no connection within 10 minutes is deferred with a to-do, not failed).
 6. Docker with GPU device passthrough; service account in `render` and `video`.
 7. WG-Easy, Cloudflare dynamic DNS with the relocated scoped token (R7), ntfy.
 8. **Gate:** table of V2, V3 first half, V5 and V19 results. Phase 2 does not start on a red row. V1 is recorded as informational only, since the node runs on Wi-Fi.
@@ -886,7 +888,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 6d. AEGIS sandbox image (Section 16.4): built and proved by killing a runaway process under the memory cap (V17). *Added in v0.3.2; the build showed Section 17 had no home for V17.*
 7. restic repository on the second drive; nightly timer; first backup; first restore test.
 8. Sentinel timer, enabled with the feeds closed under D6: CoinDesk, an ASX and US index feed, RSS news, node telemetry. Pruning timer.
-9. Windows PC share mount unit, on-demand.
+9. Windows PC share mount unit, on-demand. *Skipped on Day 1 (v0.3.3, Section 12.4): runs when `WINDOWS_SHARE` and the credential file exist.*
 9b. Vault (Section 11): gocryptfs initialised with a passphrase the Principal types once, the open/lock/idle mechanics proved, and the memory rule proved (V18). *Added in v0.3.2.*
 10. **Gate:** every service healthy; V3 second half (`llama-cli --list-devices` reports ~170 GB), V6, V7 (listening test, deferred if the reference recordings do not exist yet), V12, V13, V14 first half, V15, V16, V17, V18, V20, V23 recorded, plus V10's resident-router half. The Arbiter's refusal logic is unit-tested here against stub footprints; the real two-engine test is V21 in Phase 3. Tool installs whose inputs could not be verified in advance (Bonsai, Blender, OpenStudio/EnergyPlus, MCP4IFC, the build container) record a deferred `T-<tool>` row and never block the gate; `--force 06` re-runs them.
 
@@ -950,12 +952,12 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 
 ---
 
-## 19. Decisions — fourteen closed, one reopened by the build (D15)
+## 19. Decisions — fifteen closed (D15 closed 2026-10-05)
 
 | # | Decision | The Principal's answer | Note |
 |---|---|---|---|
 | D1 | Inference backend: llama-server or Ollama | llama-server, Ollama not installed | Accepted as recommended |
-| D2 | Secure Boot: disable, or enrol keys | Disabled on a headless node behind a firewall | Accepted as recommended |
+| D2 | Secure Boot: disable, or enrol keys | Disabled on a headless node behind a firewall | Accepted as recommended; **superseded by D15 (enabled)** |
 | D3 | Where the LUKS recovery key and restic passphrase live | On the node and on an external USB drive | Changed by the Principal. See R16: the USB copy is the one that survives node loss, so it must be stored away from the node |
 | D4 | Router model and embedding model | Qwen3.5 4B-class instruct, bge-m3, bge-reranker-v2-m3 | Accepted as recommended |
 | D5 | Whether the reserve domains are adopted | Adopted now, with nine further areas supplied. Six new domains, five subspecialty folds | Changed by the Principal (8.2, C24) |
@@ -968,7 +970,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 | D12 | Meditron-70B: include or skip | Included in Phase 3 at Q8_0 | Accepted, with "include now" noted |
 | D13 | Vault idle auto-lock period | 15 minutes | Accepted as recommended |
 | D14 | Director mailboxes or aliases | Aliases auto-generated from each director's name on the Workspace domain, firstname.lastname pattern | Accepted, with automatic generation requested |
-| D15 | Secure Boot and the TPM binding (reopens D2) | **OPEN.** D2 disables Secure Boot; S9 binds the TPM2 unlock to PCR 7. With Secure Boot off, PCR 7 is the same for any boot medium, so the data volume unseals for any OS booted on this hardware: the encryption then protects against disk removal, not theft of the whole node. Pre-flight stops until the Principal chooses. Options: **(a)** enable Secure Boot in the BIOS and keep PCR 7 — reverses D2, but this stack has no out-of-tree kernel modules (amdgpu and WireGuard are in-tree, Docker needs none), so the module-signing friction D2 feared does not arise, and no script change is needed; **(b)** keep Secure Boot off and bind PCRs 0+4+7 (firmware and boot-loader measurements), which also defeats foreign boot media, at the cost of a re-enrolment with the recovery key after a firmware or GRUB update — a one-line change to the Phase 1 script; **(c)** keep Secure Boot off and accept the weaker binding by writing `ATLAS_ACCEPT_PCR7_NO_SB=1` in `/etc/atlas/atlas.env`, recorded on every V2 row | **Recommendation: (a).** Awaiting the Principal; the workbook carries the row |
+| D15 | Secure Boot and the TPM binding (reopens D2) | **CLOSED 2026-10-05: option (a), Secure Boot enabled.** With Secure Boot off, PCR 7 is the same for any boot medium, so the data volume would unseal for any OS booted on this hardware. Enabling Secure Boot reverses D2 at no cost: this stack has no out-of-tree kernel modules (amdgpu and WireGuard are in-tree, Docker needs none). The Principal enables it in the BIOS; it is a precondition in Section 22. Until it is on, pre-flight warns, every V2 row notes the state and the to-do `secure-boot` stays open (no acknowledgement key exists any more; options (b) and (c) are withdrawn) | **Decided by the Principal: (a).** R23 mitigated once the BIOS setting is made |
 
 ---
 
@@ -989,7 +991,7 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 | R20 | Wi-Fi throughput and stability over a ~690 GB download | Medium | Low, time only | Phases 3 and 4 detached and resumable; retries are free |
 | R21 | XFCE and xrdp widen the surface beyond a headless server | Low | Medium | Bound to LAN and WireGuard only, never internet-facing; no desktop autologin |
 | R22 | The `atlas` service user is in the `docker` group, which is root-equivalent on the host; the orchestrator needs the socket for the sandbox and Phase 4 containers | Medium | High if the orchestrator is ever compromised | Accepted for Day 1 and recorded in every script header; Day 2 options are rootless Docker or a socket proxy that allows only the sandbox and engine images. New in v0.3.2 |
-| R23 | TPM2 unlock bound to PCR 7 with Secure Boot disabled unseals for any boot medium (see D15) | Medium | High for physical theft of the node | Decision D15; until it is made, Phase 1 pre-flight refuses to enrol. New in v0.3.2 |
+| R23 | TPM2 unlock bound to PCR 7 with Secure Boot disabled unseals for any boot medium (see D15) | Medium | High for physical theft of the node | D15 closed as Secure Boot enabled (v0.3.3); mitigated once the Principal makes the BIOS setting. Until then pre-flight warns, V2 notes it and the to-do `secure-boot` is open; the enrolment itself proceeds. New in v0.3.2 |
 | R10 | Sustained thermal load in a small chassis | Medium | Low | Monitor temperatures in Cockpit; the chip's configurable ceiling is 120 W and the Principal is adding external cooling |
 | R11 | CGNAT prevents inbound WireGuard | Low, port forward already succeeded | High for remote access | V5 from mobile data, static IP from the ISP if needed |
 | R12 | Fictitious directors corresponding as humans, AI non-disclosure | Medium | Medium to high, legal | Gideon's sensitive-tier check, approval gate, 16.5 |
@@ -1030,7 +1032,9 @@ The brief keeps its rules. These are recorded so the Principal decides with eyes
 | V22 | DeepSeek V4 Flash loads at `UD-Q4_K_XL` and generates; if not, it is deferred without blocking the phase | Phase 3 gate |
 | V23 | Cloudflare token relocated to a mode-600 environment file and `CLOUDFLARE.txt` deleted | Phase 2 step 6b |
 
-**Scope notes added in v0.3.2.** V15 proves the gate logic (hold, auto-send-and-log, cross-check required for sensitive) against a stub send channel; the real channels are Day 2 (Section 13). V14's second half and V21 prove the Arbiter against real engines, but the Deep Think rubric weights and the Ouroboros similarity threshold are untuned until the first real sessions, and Section 9.1's timings are estimates until then. The scripts also record rows that are not V items: `T-<tool>` (deferred Phase 2 tool installs), `P4-wheels` (the Phase 4 wheel-index pre-flight) and the V2 acknowledgement text when D15 option (c) is chosen; they appear in the gate tables and in the workbook's evidence column, never as pass/fail rows of their own.
+**Scope notes added in v0.3.2.** V15 proves the gate logic (hold, auto-send-and-log, cross-check required for sensitive) against a stub send channel; the real channels are Day 2 (Section 13). V14's second half and V21 prove the Arbiter against real engines, but the Deep Think rubric weights and the Ouroboros similarity threshold are untuned until the first real sessions, and Section 9.1's timings are estimates until then. The scripts also record rows that are not V items: `T-<tool>` (deferred Phase 2 tool installs), `P4-wheels` (the Phase 4 wheel-index pre-flight) and the Secure Boot state in every V2 row; they appear in the gate tables and in the workbook's evidence column, never as pass/fail rows of their own.
+
+**Scope note added in v0.3.3.** Six V items can be recorded `deferred` when the Principal's input is missing and are never a red row in that case: V5 (no handshake from the phone yet), V19 (no RDP session yet), V6 (no Hugging Face token, or licence not yet accepted), V20 (no Google accounts or no OAuth client file), V23 (no Cloudflare token or zone id), and V7 as before (no reference recordings). Each leaves a to-do with the `--force` command that records the real result later.
 
 ---
 
@@ -1044,13 +1048,14 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 - [x] Decide where the LUKS recovery key and restic passphrase live (D3). **Done**: node plus external USB.
 - [x] Confirm the Sentinel feed list (D6), the director alias pattern (D14), and the Apple build path (D11, removed).
 - [ ] Have the USB recovery drive present on Day 1 and **write it at the Day 1 close-out**: the LUKS recovery key (shown once in Phase 1 step 2), the restic passphrase (`/etc/atlas/secrets/restic.pass`, shown once in Phase 2 step 7) and the vault passphrase you chose (step 9b); then store it away from the node, not beside it (R16). *Reworded in v0.3.2: the material does not exist before Day 1, so the drive cannot be "stored" yet.*
-- [ ] **New in v0.3.2:** your SSH public key in `~/.ssh/authorized_keys` on the node before Phase 1 (step 4 turns password login off; pre-flight stops if the file is missing).
-- [ ] **New in v0.3.2:** fill the `CONFIRM` keys in `/etc/atlas/atlas.env` when the first run installs it: `GOOGLE_ACCOUNTS` (two addresses, each tagged `corporate` or `estate`), `WINDOWS_SHARE` (`//host/share`), `FAMILY_NAMES` (for the router's hard rule), `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE` (Google's Android SDK licence, needed by the build container), and `ATLAS_ACCEPT_PCR7_NO_SB` only if D15 is decided as option (c). The first run prints every blank key with an example value and stops.
-- [ ] **New in v0.3.2:** `/etc/atlas/secrets/smb.cred` (root, mode 600; `username=`, `password=`, `domain=` lines) for the Windows share account; Phase 2 checks it at minute 0 and prints the command that creates it without the password touching a command line.
-- [ ] **New in v0.3.2:** decide D15 (Secure Boot and the TPM binding) before Phase 1 step 2.
+- [ ] **New in v0.3.3:** enable Secure Boot in the BIOS before Phase 1 (D15, option (a)). The one BIOS change since the workbook; without it pre-flight warns and the to-do `secure-boot` stays open, nothing stops.
+- [ ] **Optional, asked at the prompt (v0.3.3):** your SSH public key, pasted when Phase 1 step 1 asks (the step prints the PowerShell command that shows it); skipped, password SSH stays on until the key is added (to-do `ssh-key`).
+- [ ] **Optional, asked at the prompt (v0.3.3):** `GOOGLE_ACCOUNTS` (two addresses, each tagged `corporate` or `estate`), `FAMILY_NAMES` (for the router's hard rule) and `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE` (Google's Android SDK licence, needed by the build container) are asked once by the first run, with an example each; a skip records a to-do and the dependent step defers itself. `WINDOWS_SHARE` is not asked (Section 12.4: live to-do).
+- [x] ~~`/etc/atlas/secrets/smb.cred` for the Windows share account~~ **Deferred to the live ATLAS (v0.3.3)** with the share itself; Phase 2 step 9 is skipped. No action before Day 1.
+- [x] Decide D15 (Secure Boot and the TPM binding). **Done 2026-10-05: option (a).**
 - [x] Create the Google Cloud OAuth client for Gmail, Calendar and Drive, and be reachable for roughly five minutes during the Phase 2 pause (V20). **Client created.** The consent click itself still happens during Phase 2; Google requires the account owner to click Allow. The client must be of the **Desktop app** type (its JSON has a top-level `installed` key; a `web` key is the wrong type and Phase 2 stops at minute 0 saying so). Drop the JSON into `/srv/atlas/staging/inbox/google-oauth-client.json` once Phase 1 has created that folder.
-- [ ] **New in v0.3.1:** create a Hugging Face access token (read scope) and, with the same account, accept the licences of the gated models on huggingface.co: `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0` (V6), `black-forest-labs/FLUX.1-dev` and `stabilityai/stable-audio-open-1.0` (Phase 4). Phase 2 asks for the token once at its start and stores it under `/etc/atlas/secrets/`; a 403 during a pull names the licence page to visit.
-- [ ] **New in v0.3.1:** have the Cloudflare zone id for `sovereign-node.link` to hand (Overview page of the zone). A `Zone:DNS:Edit`-only token cannot look the zone up by name; Phase 1 step 7 asks for the id once if the token cannot list zones.
+- [ ] **Optional, asked at the prompt (v0.3.1, relaxed in v0.3.3):** create a Hugging Face access token (read scope) and, with the same account, accept the licences of the gated models on huggingface.co: `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0` (V6), `black-forest-labs/FLUX.1-dev` and `stabilityai/stable-audio-open-1.0` (Phase 4). Phase 2 asks for the token once at its start (hidden input) and stores it under `/etc/atlas/secrets/`; skipped, V6 and the gated Phase 4 engines are deferred with the to-do `input-hf-token`.
+- [ ] **Optional, asked at the prompt (v0.3.1, relaxed in v0.3.3):** have the Cloudflare zone id for `sovereign-node.link` to hand (Overview page of the zone). A `Zone:DNS:Edit`-only token cannot look the zone up by name; Phase 1 step 7 asks for the id once if the token cannot list zones. A missing `CLOUDFLARE.txt` or a skipped zone id defers dynamic DNS and V23 with a to-do.
 - [x] Source reference recordings for Alaric's gravelly voice and, if the British male presets collide, Gideon's. **Sourced.** Drop them as `alaric.*` and `gideon.*` (WAV, MP3 or M4A; step 5 converts to 16 kHz mono WAV) into `/srv/atlas/staging/inbox/voice-references/` once Phase 1 has created the folder; if absent, both fall back to the nearest Kokoro preset and V7 is recorded as deferred, not failed.
 - [x] Have a monitor and keyboard available for Phase 1 only, in case first boot needs a hand. **Done.**
 
@@ -1061,9 +1066,9 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 
 **Build-side preconditions**
 
-- [x] Ubuntu Server 26.04.1 installed on the 4 TB drive **with the installer's encrypted-LVM (LUKS) option** (Section 3.5 requires both volumes encrypted; pre-flight stops on an unencrypted OS volume); 8 TB drive unpartitioned. **Done** per the returned workbook; confirm the encryption option was taken.
-- [x] BIOS: UMA minimum, IOMMU on, fTPM on, Secure Boot disabled (D2). **Done.**
-- [x] LAN address reserved for the node on the router, over Wi-Fi; UDP 51820 forward confirmed to that address. **Done.**
+- [x] Ubuntu Server 26.04.1 installed on the 4 TB drive **with the installer's encrypted-LVM (LUKS) option** (installer storage step: *Use an entire disk*, the 4 TB drive, tick *Encrypt the LVM group with LUKS*, choose a disk passphrase; Section 3.5 requires both volumes encrypted; v0.3.3: an unencrypted OS volume is a warning and the to-do `os-volume-encryption`, not a stop); 8 TB drive unpartitioned. No desktop needed at install time: Phase 1 step 5b installs XFCE, xrdp and Chrome. **Done** per the returned workbook; confirm the encryption option was taken.
+- [x] BIOS: UMA minimum, IOMMU on, fTPM on. **Done.** Secure Boot: **enabled** (D15, v0.3.3; see the Principal's actions above).
+- [x] LAN address reserved for the node on the router (DHCP reservation for the node's MAC, Wi-Fi or cable: Phase 1 uses whichever interface is up); UDP 51820 forward confirmed to that address. **Done.** The reservation is what keeps the forward pointing at the node; no further IP action is needed, and the VPN test from mobile data (V5) can be done whenever convenient.
 - [x] Internet bandwidth known, so the ~690 GB Phase 3 download can be planned. **Done**; the figure was not recorded in the workbook, so the 100 Mbps planning assumption in 15.4 stands until stated.
 
 **Accepted resolutions**
@@ -1076,7 +1081,7 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 
 ## 23. Day 1 script build — corrections folded into the baseline (v0.3.1)
 
-The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass over every package, image, model repository and flag the baseline names. Where the checked fact disagreed with the document, the scripts follow the fact and the document is amended above. None of S1–S23 reopens a decision (D1–D14) or a resolution (C1–C26); each is a correction of a literal the baseline typed before it was checked. S24–S28, added when the scripts were complete, record what the build itself had to add or could not deliver on Day 1; S25 reopens D2 as D15. Listed here so the Principal can see what moved and why.
+The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass over every package, image, model repository and flag the baseline names. Where the checked fact disagreed with the document, the scripts follow the fact and the document is amended above. None of S1–S23 reopens a decision (D1–D14) or a resolution (C1–C26); each is a correction of a literal the baseline typed before it was checked. S24–S29, added when the scripts were complete, record what the build itself had to add or could not deliver on Day 1; S25 reopened D2 as D15, which the Principal closed on 2026-10-05 (Secure Boot enabled). S30–S31 record the Principal's two Day 1 scope instructions of 2026-10-05: no phase stops on a missing input, and the Windows share waits for the live ATLAS. Listed here so the Principal can see what moved and why.
 
 | # | Where | What the baseline said | What is true (September 2026) | Effect on Day 1 |
 |---|---|---|---|---|
@@ -1092,7 +1097,7 @@ The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass 
 | S10 | 17 step 3 | tmpfs for `/tmp` enabled | Already the 26.04 default; the old unit path no longer exists | Verified, not enabled |
 | S11 | 12.3 | Token scoped `Zone:DNS:Edit` only | Such a token cannot list zones to find the zone id | `CF_ZONE_ID` stored beside the token; resolved once if the token allows, else asked for once (Section 22) |
 | S12 | 3.6, App. B | Services "bound to LAN and WireGuard interfaces" | WG-Easy runs in Docker: there is no host `wg0`; VPN traffic arrives from the compose bridge. Docker bypasses ufw for published ports and container egress | Binding is expressed as ufw rules on the LAN interface and the WG-Easy bridge; every published port is pinned to the LAN address; container egress is enforced in the `DOCKER-USER` chain; the outbound allowlist is a local Squid proxy with owner-matched egress (hostnames cannot be filtered by ufw) |
-| S13 | 17 step 5b | Firefox installed | The archive package is a snap stub | Mozilla's apt repository, added to the allowlist |
+| S13 | 17 step 5b | Firefox installed | The archive package is a snap stub | Google Chrome from Google's apt repository (the Principal's choice, v0.3.3), `dl.google.com` on the allowlist, managed policy with telemetry and sign-in off |
 | S14 | 17 step 1, 5 | Identify the Radeon 8065S | No public PCI id for the 8065S; `vulkaninfo` prints the RADV device string | Pre-flight identifies the GPU by vendor and DRM class; the post-boot check matches `RADV GFX1151`, never the marketing name |
 | S15 | 3.4 R1 | Community scottt PyTorch wheel | AMD publishes gfx1151 wheels (ROCm 10.0.0, torch 2.13.0); open kernel-7.0 hang reports remain | AMD's index is the base image; the kernel risk is flagged, not acted on |
 | S16 | 15.2 | UI-TARS 2.0 | No open weights; technical report only | UI-TARS-1.5-7B built; 2.0 on the watch-list |
@@ -1105,13 +1110,16 @@ The Day 1 scripts under `scripts/day1/` were written after a fact-checking pass 
 | S23 | 9.3 vs 9.7 | Sentinel on a systemd timer; Celery replaces separate schedulers | Both, read together | The timers only enqueue the Celery task; Celery executes. AEGIS nightly and the 72-hour prune use the same pattern, with restic's own timer as the fallback if the orchestrator is down |
 
 | S24 | 17, 21 | Phase 2 had no step for V17 or V18 | The sandbox and the vault need an install step | Steps 6d and 9b added to Section 17 |
-| S25 | 3.5, 17 step 2, D2 | PCR 7 binding with Secure Boot disabled | Unseals for any boot medium | Decision D15 reopened; pre-flight refuses to enrol until it is made (R23) |
+| S25 | 3.5, 17 step 2, D2 | PCR 7 binding with Secure Boot disabled | Unseals for any boot medium | Decision D15 reopened, then closed 2026-10-05 as Secure Boot enabled (R23); pre-flight warns while it is still off |
 | S26 | 13, 21 V15 | Approval gate "sends" on approve | No outbound channel exists on Day 1 (Section 13 connectors are Day 2) | V15 proves the gate against a stub sender; an approved item reports "no send channel configured" |
 | S27 | 12.1 | Open WebUI "installs as an app" | A home-screen app needs TLS; Day 1 serves plain HTTP on LAN and WireGuard | Day 2: TLS front on the WireGuard address |
 | S28 | 3.6, 16.4 | Service user in `render` and `video` only | The sandbox and Phase 4 need the Docker socket, so `atlas` is also in `docker` (root-equivalent) | Recorded as R22, accepted for Day 1 |
 | S29 | 12.5 | Outbound allowlist as enumerated in 12.5 | Three pulls fall outside the named services: Meta's weight host for the TRELLIS DINOv2 conditioner and the SAM 2 `.pt` fallback, the OpenAI tokenizer table LightRAG needs offline, and the Playwright browser CDN | Added to `config/allowlist.txt` under the "package mirrors during builds, Hugging Face during model pulls" clause, each with a comment naming the step: `dl.fbaipublicfiles.com`, `openaipublic.blob.core.windows.net`, `playwright.azureedge.net`, `cdn.playwright.dev`. The Principal may strike any of them; the dependent engine or tool then records deferred |
 
-**Watch-list additions from the build:** UI-TARS 2.0 (S16). **Reserved for the Principal:** the kernel-7.0 hang reports in S15, if V11 fails for that reason; decision D15.
+| S30 | 17, 21, 22 | Pre-flight and `load_env` stop on a missing SSH key, blank settings, a missing credential file or token | The Principal's instruction (2026-10-05): a missing input must never stop a phase | Policy v0.3.3: ask once in plain words, record `deferred` plus a to-do (`/var/lib/atlas/day1/todo.jsonl`), continue; the live ATLAS takes the list up. Section 17 intro, Section 21 scope note, Section 22 rewritten |
+| S31 | 12.4, 17 step 9 | Windows PC share mounted on Day 1 | The Principal: not needed during the build | Step 9 skipped while `WINDOWS_SHARE` is blank; to-do `input-windows-share` |
+
+**Watch-list additions from the build:** UI-TARS 2.0 (S16); Qwen3.8-LiveTranslate and Qwen-Image-2.1 (the Principal keeps FLUX.1-dev for quality, 2026-10-05). **Reserved for the Principal:** the kernel-7.0 hang reports in S15, if V11 fails for that reason.
 
 ---
 

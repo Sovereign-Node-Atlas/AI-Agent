@@ -660,7 +660,7 @@ _proxy_selftest() {
 # motd-news and apt-news (motd.ubuntu.com), the Ubuntu Pro timers (contracts.canonical.com, esm.ubuntu.com),
 # apport/whoopsie crash uploads (daisy.ubuntu.com), fwupd's daily LVFS metadata refresh (cdn.fwupd.org), the
 # release-upgrade check (changelogs.ubuntu.com meta-release, Prompt=never), popularity-contest, ubuntu-report and
-# snapd's refresh loop (Section 3.1 takes Firefox as Mozilla's .deb, so nothing here needs snap).
+# snapd's refresh loop (Section 3.1 takes Google Chrome as Google's .deb, so nothing here needs snap).
 # Deliberately LEFT at the distro default (fix round): unattended-upgrades and the apt-daily timers. The baseline
 # never asks for OS security updates to be switched off on a node with an internet-facing UDP port, and they run
 # through the proxy (apt.conf.d/90atlas-proxy; security.ubuntu.com is allowlisted). An earlier run's
@@ -741,25 +741,40 @@ _grub_params() {
 }
 
 _ssh_harden() {
-  local ak="/home/$PRINCIPAL_USER/.ssh/authorized_keys"
-  [[ -s "$ak" ]] || die "SSH is about to become key-only but $ak is missing or empty. Add the Principal's public key (from the console: mkdir -p ~/.ssh && nano ~/.ssh/authorized_keys), then re-run: sudo $ATLAS_ENTRY phase1"
+  local ak="/home/$PRINCIPAL_USER/.ssh/authorized_keys" keyonly=1
+  # Policy v0.3.3: no public key yet (or ATLAS_SSH_PASSWORD_AUTH=keep from the pre-flight) keeps password login on,
+  # recorded as the to-do ssh-key; the rest of the hardening (no root, LAN/WireGuard binding, limits) applies either way.
+  if [[ ! -s "$ak" || "${ATLAS_SSH_PASSWORD_AUTH:-}" == keep ]]; then
+    keyonly=0
+    warn "SSH stays password-enabled: no public key in $ak yet (to-do ssh-key; SSH listens on LAN and WireGuard only, never internet-facing)"
+  fi
   # 00- so it sorts before Ubuntu's 50-cloud-init.conf: sshd keeps the FIRST value it reads for each keyword.
-  cat >/etc/ssh/sshd_config.d/00-atlas.conf <<'CONF'
-# ATLAS Phase 1 step 4 (Section 3.6): keys only, no passwords, no root.
-PasswordAuthentication no
-KbdInteractiveAuthentication no
+  {
+    echo "# ATLAS Phase 1 step 4 (Section 3.6): no root; keys only once the Principal's key is present."
+    if (( keyonly )); then
+      echo "PasswordAuthentication no"
+      echo "KbdInteractiveAuthentication no"
+      echo "AuthenticationMethods publickey"
+    else
+      echo "PasswordAuthentication yes"
+      echo "KbdInteractiveAuthentication yes"
+    fi
+    cat <<'CONF'
 PermitRootLogin no
 PubkeyAuthentication yes
-AuthenticationMethods publickey
 X11Forwarding no
 AllowTcpForwarding yes
 ClientAliveInterval 300
 ClientAliveCountMax 2
 MaxAuthTries 3
 CONF
+  } >/etc/ssh/sshd_config.d/00-atlas.conf
   phase1_listen_addrs "$LAN_IP" 127.0.0.1
   local eff; eff="$(sshd -T 2>/dev/null | grep -E '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication) ' | tr '\n' ' ')"
-  grep -q 'passwordauthentication no' <<<"$eff" || die "sshd -T still reports password auth on: $eff"
+  if (( keyonly )); then
+    grep -q 'passwordauthentication no' <<<"$eff" || die "sshd -T still reports password auth on: $eff"
+  fi
+  grep -q 'permitrootlogin no' <<<"$eff" || die "sshd -T still reports root login on: $eff"
   log "sshd hardened: $eff"
 }
 

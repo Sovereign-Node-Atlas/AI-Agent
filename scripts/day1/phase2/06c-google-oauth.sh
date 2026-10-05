@@ -6,7 +6,7 @@
 # For each entry email:tag in GOOGLE_ACCOUNTS:
 #   1. phase2/google_oauth.py authorise runs InstalledAppFlow.run_local_server(host="localhost", port=8765+i,
 #      open_browser=False) (services-tools.md §5.1 VERIFIED), prints the URL in a framed block (on stderr, so the
-#      captured stdout keeps only the JSON answer) with the instruction to open it in Firefox on the node's own desktop
+#      captured stdout keeps only the JSON answer) with the instruction to open it in Google Chrome on the node's own desktop
 #      (xrdp), and waits up to 30 minutes (never less than 15);
 #   2. the token is stored at $ATLAS_ETC/secrets/google/<email>.json, mode 600, owner atlas;
 #   3. Gmail (labels list), Calendar (calendar list) and Drive (about.get) are proven with that token, and the
@@ -176,15 +176,17 @@ _g_client() {
   The phase resumes at this step. The inbox copy is shredded once the accounts are proven; the installed copy is $G_CLIENT.
   =========================================================================================
 MSG
-      record_v V20 fail "OAuth client JSON absent: put the Desktop-app client JSON at $G_SRC and re-run phase2"
-      die "Google OAuth client JSON absent at $G_SRC (V20 recorded as fail)"
+      # Policy v0.3.3: a to-do, not a stop; V20 deferred and the step returns.
+      record_v V20 deferred "OAuth client JSON not provided yet (to-do input-google-oauth-client): Gmail, Calendar and Drive wait"
+      todo_add input-google-oauth-client "Google OAuth client JSON not provided: create a 'Desktop app' OAuth client in Google Cloud -> APIs & Services -> Credentials, download its JSON to $G_SRC, then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06c" "Section 13 / V20"
+      return 1
     fi
-    _g_client_type_check "$G_SRC"
+    _g_client_type_check "$G_SRC" || return 1
     install -m 600 -o atlas -g atlas "$G_SRC" "$G_CLIENT"
     log "installed the OAuth client JSON as $G_CLIENT (atlas, 600); the inbox copy is shredded once every account has passed its API proof"
   fi
   # Belt and braces (header: CLIENT TYPE): the copy the consent flow will use is checked whichever path put it there.
-  _g_client_type_check "$G_CLIENT"
+  _g_client_type_check "$G_CLIENT" || return 1
   # The consumer must be able to open it now, not in Phase 3.
   svc_user_run test -r "$G_CLIENT" \
     || die "atlas cannot read $G_CLIENT: $(stat -c '%A %U:%G, changed %y' "$ATLAS_ETC/secrets") on $ATLAS_ETC/secrets blocks traversal. Every writer's ensure_dir of that directory must be root:atlas 710 (750 also traverses; header: SECRETS DIRECTORY)"
@@ -205,11 +207,13 @@ print("installed" if isinstance(d, dict) and "installed" in d else "web" if isin
   case "$kind" in
     installed) log "OAuth client $f: Desktop-app type (top-level 'installed'), as the loopback flow needs" ;;
     web)
-      record_v V20 fail "$f is a 'web' OAuth client (top-level 'web' key), not the 'Desktop app' type the loopback flow needs"
-      die "$f is a WEB APPLICATION OAuth client (top-level key 'web'): wrong client type. The loopback redirect of the consent flow (InstalledAppFlow.run_local_server) needs a 'Desktop app' client, whose JSON has the top-level key 'installed'. In Google Cloud -> APIs & Services -> Credentials create an OAuth client ID of type 'Desktop app', download its JSON to $G_SRC and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2" ;;
+      record_v V20 deferred "$f is a 'web' OAuth client (top-level 'web' key), not the 'Desktop app' type the loopback flow needs (to-do input-google-oauth-client)"
+      todo_add input-google-oauth-client "The OAuth client JSON is of the 'Web application' type; create a 'Desktop app' client instead, download its JSON to $G_SRC, then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06c" "Section 13 / V20"
+      return 1 ;;
     *)
-      record_v V20 fail "$f is not a Desktop-app OAuth client (no top-level 'installed' key; $kind)"
-      die "$f is not a 'Desktop app' OAuth client JSON (needs the top-level key 'installed'; got: $kind). Download the Desktop-app client JSON from Google Cloud -> APIs & Services -> Credentials to $G_SRC and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2" ;;
+      record_v V20 deferred "$f is not a Desktop-app OAuth client (no top-level 'installed' key; $kind) (to-do input-google-oauth-client)"
+      todo_add input-google-oauth-client "The file at $G_SRC is not an OAuth client JSON (needs the top-level key 'installed'); download the 'Desktop app' client JSON there, then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06c" "Section 13 / V20"
+      return 1 ;;
   esac
 }
 
@@ -419,11 +423,17 @@ _g_shred_inbox() {
 
 step_06c() {
   _g_paths
+  # Policy v0.3.3: no Google accounts given -> the whole step is a to-do (load_env recorded input-google-accounts).
+  if [[ -z "${GOOGLE_ACCOUNTS:-}" ]]; then
+    record_v V20 deferred "no Google accounts set in $ATLAS_ETC/atlas.env (to-do input-google-accounts): Gmail, Calendar and Drive wait"
+    log "step 06c skipped: GOOGLE_ACCOUNTS is blank; set it and re-run with --force 06c"
+    return 0
+  fi
   # Created with its final mode (root:atlas 640, like every Phase 2 settings file; header: the addresses in it are
   # settings, not secrets): a die anywhere in the step never leaves it world-readable.
   [[ -e "$G_ENVF" ]] || install -m 640 -o root -g atlas /dev/null "$G_ENVF"
   _g_venv
-  _g_client
+  _g_client || { log "step 06c deferred (see the to-do list); re-run with --force 06c once the client JSON is in place"; return 0; }
   _g_allowlist_check
   ensure_kv "$G_ENVF" GOOGLE_TOKEN_DIR "$G_DIR"
   ensure_kv "$G_ENVF" GOOGLE_CLIENT_JSON "$G_CLIENT"

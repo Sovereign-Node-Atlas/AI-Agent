@@ -31,13 +31,12 @@
 #   * step 7's non-interactive path for the zone id: a "Zone ID: <32 hex>" line beside the token in CLOUDFLARE.txt, or
 #     CF_ZONE_ID= pre-seeded in /etc/atlas/secrets/cloudflare.env (no atlas.env key: CONVENTIONS §3 does not list one).
 # Waits that are not prompts: steps 5b and 7 WAIT up to 10 minutes each for the Principal's RDP session and phone
-# handshake. A timeout records V19/V5 as FAIL (CONVENTIONS §6 lists both as required with no deferral), the step
-# still completes, and the Phase 1 gate blocks Phase 2 until `--force 05b` / `--force 07` re-runs the wait.
-# No waiver of Section 3.5 exists (fix round 3): an unencrypted OS volume stops step 1; the on-node recovery copy of
-# D3 is always written. One recorded acknowledgement exists, ATLAS_ACCEPT_PCR7_NO_SB=1 in /etc/atlas/atlas.env: D2
-# (Secure Boot disabled) makes the S9 PCR 7 binding unseal to any OS booted on the hardware, and step 1 / V2 stop
-# until the Principal either enables Secure Boot or records that acknowledgement (see phase1/01-preflight.sh). The
-# key is listed in CONVENTIONS §3 and config/atlas.env.example (blank by default).
+# handshake. A timeout records V19/V5 as DEFERRED with a to-do (policy v0.3.3: the Principal's input never stops a phase), the step
+# still completes, the gate never blocks on deferred, and `--force 05b` / `--force 07` re-runs the wait later.
+# An unencrypted OS volume (Section 3.5) is a warning plus to-do os-volume-encryption, not a stop; the on-node recovery
+# copy of D3 is always written. Secure Boot (D15, 2026-10-05): the Principal enables it in the BIOS; while it is off
+# the S9 PCR 7 binding unseals to any OS booted on the hardware, so step 1 warns, every V2 row notes the state and
+# to-do secure-boot stays open (see phase1/01-preflight.sh). No acknowledgement key exists any more.
 # Phase-1-owned settings file: /etc/atlas/network.env (LAN_DNS_SERVERS, written by step 4, read by step 7,
 # docker-egress-rules.sh and --reload-allowlist); nothing Phase 1 derives is written into atlas.env (§3 key set).
 

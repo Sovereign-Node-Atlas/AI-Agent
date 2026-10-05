@@ -89,7 +89,7 @@
 #                                             file). (a) is the implemented state; 07-restic.sh's negative sudo test
 #                                             probes atlas-aegis verbs only, so the two fragments do not collide.
 #      The orchestrator's POST /vault/open therefore pipes the passphrase into `sudo -n /usr/local/bin/atlas-vault open`.
-#   4. REAL-VAULT INITIALISATION IS OPT-IN (fix round 2). CONVENTIONS.md §7.6 lists exactly three interactive pauses and
+#   4. REAL-VAULT INITIALISATION IS OPT-IN (fix round 2). CONVENTIONS.md §7.6 lists the few skippable prompts and
 #      says everything else runs unattended, so a plain `sudo ./atlas-day1.sh phase2` never stops here: by default the
 #      real vault is left uninitialised (flag $ATLAS_STATE/vault-init-pending, warned, pushed by ntfy), the test vault is
 #      initialised and proven, and the gate runs V18 on it and prints the exact command. The Principal initialises the
@@ -842,7 +842,7 @@ step_09b() {
     rm -f "$VAULT_PENDING_FLAG"
     _vault_mechanics "$VAULT_TEST_CIPHER_DIR" "$VAULT_TEST_PASS_FILE"
   else
-    # CONVENTIONS §7.6: this phase has exactly three interactive pauses and this step is not one of them, so the default
+    # CONVENTIONS §7.6: this step is not one of the phase's few declared prompts, so the default
     # run never prompts. Deferred loudly, never silently, never fatal: the button answers "not initialised" (exit 2)
     # until the Principal runs the opt-in command from a console.
     date -Is >"$VAULT_PENDING_FLAG"

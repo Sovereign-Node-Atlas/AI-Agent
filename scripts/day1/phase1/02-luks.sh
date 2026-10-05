@@ -22,8 +22,8 @@
 # TPM at boot, the recovery key (USB + on-node copy).
 #
 # PCR 7 WITH SECURE BOOT OFF (fix round 3, major): D2 disables Secure Boot, so PCR 7 carries no image authority and the
-# TPM unseals to any OS booted on this hardware. Step 1 stops until the Principal either enables Secure Boot or records
-# ATLAS_ACCEPT_PCR7_NO_SB=1 in atlas.env; verify/v02-tpm.sh enforces the same and names the Secure Boot state in
+# TPM unseals to any OS booted on this hardware. D15 (2026-10-05): the Principal enables Secure Boot in the BIOS; step 1
+# records a to-do while it is off and never stops (policy v0.3.3); verify/v02-tpm.sh names the Secure Boot state in
 # every V2 row. The mask stays --tpm2-pcrs=7 (S9, adjudicated conflict 1); a stronger mask needs a Section 23 amendment.
 #
 # No package is installed here: cryptsetup, systemd-cryptsetup and dracut are seeded on the 26.04 Server ISO

@@ -8,7 +8,7 @@ line ({"ok": true|false, ...}) so the bash caller can parse it; everything human
   authorise --client FILE --token FILE --email EMAIL --port N --timeout S [--owner USER]
       InstalledAppFlow.run_local_server(host="localhost", port=N, open_browser=False, timeout_seconds=S)
       (services-tools.md §5.1 VERIFIED signature and behaviour): the authorisation URL is printed in a framed
-      block with the instruction to open it in Firefox on the node's own desktop (xrdp), because Google redirects
+      block with the instruction to open it in Google Chrome on the node's own desktop (xrdp), because Google redirects
       to http://localhost:N/ which only reaches this process from a browser running on the node. Then the token is
       stored mode 600 owned by --owner and the three APIs are proven. An existing valid/refreshable token skips
       the browser (idempotent re-runs).
@@ -157,7 +157,7 @@ def cmd_authorise(args: argparse.Namespace) -> int:
         prompt = (
             f"\n{FRAME}\n"
             f"  GOOGLE AUTHORISATION ({args.label}): {args.email}\n"
-            f"  Open this URL in Firefox ON THE NODE'S OWN DESKTOP (the xrdp/XFCE session), sign in as\n"
+            f"  Open this URL in Google Chrome ON THE NODE'S OWN DESKTOP (the xrdp/XFCE session), sign in as\n"
             f"  {args.email} and click Allow. Google redirects to http://localhost:{args.port}/ and that address\n"
             f"  only reaches this script from a browser running on the node itself.\n\n"
             f"  {{url}}\n\n"

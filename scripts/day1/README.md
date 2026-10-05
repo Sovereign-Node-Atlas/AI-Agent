@@ -8,71 +8,66 @@ the host, or lets a request leave the node except through the local allowlist pr
 
 ## 1. Before you run anything
 
-The scripts stop with a precise message when something below is missing. Having it ready is faster.
+**Rule (policy v0.3.3, the Principal's instruction): a missing input never stops a phase.** Whatever the scripts need
+from you (a token, a key, an account, a file, a test from your phone or PC) is asked for once, in plain words, with an
+example and the option to press Enter and leave it for later. A skipped item goes on the to-do list at
+`/var/lib/atlas/day1/todo.jsonl` (shown by `sudo ./atlas-day1.sh status`), the verification it belongs to is recorded
+`deferred` (never `fail`), and the phase continues. When ATLAS is live it picks the list up with you. Only broken
+machinery (a disk that does not mount, a service that does not start) stops a phase.
 
-**Node (Section 22, build-side preconditions)**
+**Three things must be true before Phase 1** (the scripts cannot do them for you):
 
-- Ubuntu Server 26.04.1 installed with the **encrypted LVM (LUKS) option** on the 4 TB NVMe (Section 3.5 requires LUKS2
-  on both volumes; an unencrypted OS volume stops pre-flight and no setting waives it), the 8 TB NVMe unpartitioned.
-  BIOS: UMA minimum, IOMMU on, fTPM on.
-- Your SSH public key in `~/.ssh/authorized_keys` on the node (your login user). Pre-flight stops without it, because
-  Phase 1 step 4 makes SSH key-only (Section 3.6) and then reboots; the message gives the one `ssh` command that adds
-  the key from the Windows PC.
-- **Secure Boot decision.** D2 closes Secure Boot as disabled; S9 binds the TPM2 enrolment to PCR 7 alone. With Secure
-  Boot off, PCR 7 does not tie the unlock to this OS image (any OS booted on the hardware can unseal the keys, so the
-  encryption protects against disk removal, not theft of the whole node). Pre-flight stops until you either enable
-  Secure Boot or write `ATLAS_ACCEPT_PCR7_NO_SB=1` in `/etc/atlas/atlas.env`; every V2 row then carries that
-  acknowledgement. Decide before Phase 1 step 2 enrols anything.
-- A monitor and keyboard on the node for Phase 1 (the recovery key is shown on the console, and first boot may need a
-  hand). Phase 1 can also run over an interactive SSH session, never detached.
-- The Wi-Fi LAN address reserved on the router and UDP 51820 forwarded to it (for V5). If the router's WAN address is
-  in 100.64.0.0/10 you are behind CGNAT and V5 cannot pass (R11).
-- `/home/<you>/CLOUDFLARE.txt` holding the `Zone:DNS:Edit` token for `sovereign-node.link` (a 40-character
-  `[A-Za-z0-9_-]` string anywhere in the file). Optional, saves a prompt: a line `Zone ID: <32 hex>` beside it. A
-  DNS-edit-only token cannot look the zone up, so Phase 1 step 7 asks for the id once if it is not there (S11). The
-  `vpn.sovereign-node.link` A record itself need not exist: the one updater run that Phase 1 step 7 starts creates it
-  (DNS-only, grey cloud) if the zone has none, as your Section 17 step 7 command (a DNS change, Section 16.3 item 4,
-  so the 5-minute timer never creates: it only ever changes the address, and a record you delete stays deleted).
-- The Google Cloud OAuth client (Desktop-app type) created for Gmail, Calendar and Drive, as a JSON file.
-- A Hugging Face access token (read scope), and with the same account the licences accepted on huggingface.co for
-  `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0` (Phase 2, V6), `black-forest-labs/FLUX.1-dev` and
-  `stabilityai/stable-audio-open-1.0` (Phase 4). A 403 during a pull stops with the licence URL to visit.
-- The Windows PC's share path and an account on it that can read and write the share.
-- Your phone with the **WireGuard** app and the **ntfy** app installed (Phase 1 step 7).
-- Reference recordings for Alaric's voice and (if the British male presets collide) Gideon's: any WAV, MP3 or M4A
-  named `alaric.*` / `gideon.*`; Phase 2 step 5 converts them to 16 kHz mono WAV. Without them V7 is recorded
-  `deferred`, not failed.
+1. **Ubuntu Server 26.04.1 installed on the 4 TB NVMe with the "encrypted LVM" option.** In the installer's storage
+   step choose *Use an entire disk*, pick the 4 TB drive, tick *Encrypt the LVM group with LUKS* and type a disk
+   passphrase (you will type it at boot once; Phase 1 step 2 then lets the TPM unlock it). Leave the 8 TB NVMe
+   untouched (do not select it). Create your login user when asked; that user is the Principal.
+2. **Secure Boot enabled in the BIOS** (D15). The TPM only ties the disk unlock to this OS image when Secure Boot is
+   on. If it is off, pre-flight warns, every V2 row notes it, to-do `secure-boot` stays open, and nothing stops.
+   Also in the BIOS: UMA at its minimum, IOMMU on, fTPM on.
+3. **The node's LAN address reserved in the router** (DHCP reservation for the node's MAC address, Wi-Fi or
+   cable). Phase 1 uses whatever interface is up; the reservation keeps the address stable so the UDP 51820 forward
+   you already made keeps pointing at the node. If the router's WAN address is in 100.64.0.0/10 you are behind
+   CGNAT and the VPN test cannot pass from outside (R11).
 
-**Settings the scripts cannot detect** — on the first run `load_env` installs `config/atlas.env.example` to
-`/etc/atlas/atlas.env` and stops naming the blank `CONFIRM` keys. Edit the file and re-run:
+Also useful for Phase 1: a monitor and keyboard on the node (the recovery key is shown on the console), or an
+interactive SSH session with your password, never a detached one. No desktop (GUI) is needed on the install: Phase 1
+step 5b installs XFCE, xrdp and Google Chrome, and you reach the desktop from the Windows PC with Remote Desktop.
+
+**Everything else is optional on Day 1** and is asked for at the moment it is needed:
+
+| Item | When it is asked | If you skip it |
+|---|---|---|
+| Your SSH public key (Windows: `type $env:USERPROFILE\.ssh\id_ed25519.pub` in PowerShell, after `ssh-keygen -t ed25519` once) | Phase 1 step 1, paste the one line | Password SSH stays on (`ATLAS_SSH_PASSWORD_AUTH=keep`), to-do `ssh-key` |
+| Google accounts (`you@company.com:corporate you@gmail.com:estate`), family names | First `load_env` run | Gmail/Calendar/Drive (V20) and the family-name rule deferred |
+| `yes` to Google's Android SDK terms (https://developer.android.com/studio/terms) | First `load_env` run | The Android/Windows build container is deferred |
+| `/home/<you>/CLOUDFLARE.txt` with the `Zone:DNS:Edit` token for `sovereign-node.link` (40 characters, anywhere in the file; optional `Zone ID: <32 hex>` line) | Phase 1 step 7 looks for the file; the zone id is asked once if the token cannot list zones | Dynamic DNS and V23 deferred, to-do `cloudflare-token` |
+| WireGuard test from your phone on mobile data (WireGuard and ntfy apps installed) | Phase 1 step 7 waits 10 minutes | V5 deferred, to-do `vpn-mobile-test` |
+| One Remote Desktop connection from the Windows PC | Phase 1 step 5b waits 10 minutes | V19 deferred, to-do `rdp-test` |
+| Hugging Face token (read scope) with the licences accepted for `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0`, `black-forest-labs/FLUX.1-dev`, `stabilityai/stable-audio-open-1.0` | Phase 2 start, hidden input | PyAnnote (V6) and the gated Phase 4 engines deferred, to-do `input-hf-token` |
+| Google OAuth client JSON (Desktop-app type) at `/srv/atlas/staging/inbox/google-oauth-client.json`, then one sign-in per account | Phase 2 step 6c | V20 deferred, to-do `input-google-oauth-client` |
+| Voice references `alaric.*` / `gideon.*` (WAV, MP3 or M4A) in `/srv/atlas/staging/inbox/voice-references/` | Phase 2 step 5 | V7 deferred |
+| `cl100k_base.tiktoken` in `/srv/atlas/staging/inbox/` | Phase 2 step 4 | Warning with the download command |
+
+**Not on Day 1 at all (the Principal's choice):** the Windows PC share. `WINDOWS_SHARE` stays blank, Phase 2 step 9 is
+skipped, and to-do `input-windows-share` reminds the live ATLAS. To add it later: set `WINDOWS_SHARE="//host/share"` in
+`/etc/atlas/atlas.env`, create `/etc/atlas/secrets/smb.cred` (root 600, `username=`/`password=`/`domain=` lines; step 2
+prints the `read -rs` command so the password never touches a command line) and run `sudo ./atlas-day1.sh phase2
+--force 09`.
+
+**Settings file.** On the first run `load_env` installs `config/atlas.env.example` to `/etc/atlas/atlas.env`,
+auto-detects what it can (`PRINCIPAL_USER`, `TZ`, `LAN_IFACE`, `LAN_CIDR`, `DATA_DISK` as the largest unmounted NVMe
+by `/dev/disk/by-id`), uses defaults for the rest (ports, `DOMAIN`, `VPN_HOST`, `WG_*`, `NTFY_TOPIC`) and asks the
+three optional keys above once. Answers are written to the file; you can also edit it by hand at any time:
 
 ```
 GOOGLE_ACCOUNTS="you@company.com:corporate you@gmail.com:estate"
-WINDOWS_SHARE="//192.168.1.50/atlas"
 FAMILY_NAMES="Surname Givenname"
-ATLAS_ACCEPT_PCR7_NO_SB=      # 1 only after the Secure Boot decision above (demanded only while Secure Boot is off)
 BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes   # after reading https://developer.android.com/studio/terms (Section 16.3 item 2)
+WINDOWS_SHARE=                             # blank on Day 1 (above)
 ```
 
-`BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE` is asked here, before Phase 1, because Phase 2 step 6 builds the Android + MinGW
-cross-build container and its image build runs `sdkmanager --licenses`, which accepts those terms: that acceptance is
-yours to make, never a script's, so any value but `yes` stops `load_env` here (and step 6 checks again). `load_env`
-prints every blank or unconfirmed key in one message, each with an example value, so one edit fixes them all.
-
-Everything else in that file is auto-detected (`PRINCIPAL_USER`, `TZ`, `LAN_IFACE`, `LAN_CIDR`, `DATA_DISK` as the
-largest unmounted NVMe by `/dev/disk/by-id`) or has a default (ports, `DOMAIN`, `VPN_HOST`, `WG_*`, `NTFY_TOPIC`).
-
-**Files to drop before Phase 2** (Phase 1 step 3 creates the inbox, owned by you, group `atlas`):
-
-| File | Where | Used by |
-|---|---|---|
-| OAuth client JSON | `/srv/atlas/staging/inbox/google-oauth-client.json` | Phase 2 step 6c (shredded after the tokens are proven) |
-| `alaric.*`, `gideon.*` (WAV, MP3 or M4A; step 5 converts to 16 kHz mono WAV) | `/srv/atlas/staging/inbox/voice-references/` | Phase 2 step 5, V7 |
-| Windows credentials | `/etc/atlas/secrets/smb.cred` (root 600, `username=`/`password=`/`domain=` lines) | Phase 2 step 9; step 2 checks it exists so the phase stops early, and prints the exact `read -rs` command to create it without the password touching a command line |
-| `cl100k_base.tiktoken` (optional) | `/srv/atlas/staging/inbox/` | Phase 2 step 4 (LightRAG's tokenizer table, offline); when absent the step completes with a warning and the download/checksum command |
-
 The HF token is typed at the Phase 2 prompt (hidden input) and stored at `/etc/atlas/secrets/hf-token.env`; it never
-appears on a command line.
+appears on a command line. Secrets never go in `atlas.env`.
 
 ## 2. The commands, in order
 
@@ -80,12 +75,12 @@ appears on a command line.
 git clone <repo> && cd <repo>/scripts/day1
 sudo ./atlas-day1.sh phase1          # Phase 1 steps 1-4, then the node reboots
 sudo ./atlas-day1.sh phase1          # after the reboot: steps 5, 5b, 6, 7, 8 (gate)
-sudo ./atlas-day1.sh phase2          # steps 1-10; three interactive pauses (below)
+sudo ./atlas-day1.sh phase2          # steps 1-10; a few skippable prompts (below)
 sudo ./atlas-day1.sh phase3          # detached; ~15 h of download + ~30 min of load tests
 journalctl -fu atlas-day1-phase3     # follow it (or: tail -f /var/lib/atlas/day1/logs/phase3-<date>.log)
 sudo ./atlas-day1.sh phase4          # detached; several hours, can run overnight
 journalctl -fu atlas-day1-phase4
-sudo ./atlas-day1.sh status          # done markers for every phase and the full verification table
+sudo ./atlas-day1.sh status          # done markers, the full verification table and the to-do list
 sudo ./atlas-day1.sh report          # fills sheet "4 Verification" of a COPY of docs/ATLAS_BUILD_BASELINE.xlsx
 ```
 
@@ -107,14 +102,14 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   8 TB drive with the recovery key printed once; mounts under `/srv/atlas`, `/srv/cold`, `/srv/backups`, swap off,
   tmpfs `/tmp` verified; dist-upgrade, kernel parameters (`amdgpu.gttsize`, `ttm.pages_limit`,
   `amdgpu.lockup_timeout=10000,60000,10000,10000`), ufw, SSH hardening, Cockpit, the squid allowlist proxy; reboot;
-  post-reboot V3a; XFCE + xrdp + Firefox (Mozilla's apt repo, never the snap); Docker with GPU passthrough and the
+  post-reboot V3a; XFCE + xrdp + Google Chrome (Google's apt repo, telemetry/sign-in off by policy, never a snap); Docker with GPU passthrough and the
   DOCKER-USER egress rules; WG-Easy, Cloudflare ddns, ntfy; gate.
 - **Phase 2 — engines and services** (30-60 min, no large downloads): llama.cpp Vulkan build (`-DLLAMA_OPENSSL=ON`,
   `-DLLAMA_USE_PREBUILT_UI=OFF`); Redis, Celery, the orchestrator (`atlas` package: Arbiter, router, approval queue,
   ledger); Open WebUI hardened offline; ChromaDB, LightRAG, the three resident small models, Docling; Kokoro,
   Chatterbox, Whisper (speaches), PyAnnote; the Section 15.1 tools and the cross-build container; Cloudflare token
   relocation (V23); Google OAuth (V20); the AEGIS sandbox image; restic + AEGIS timers (V13); Sentinel and prune
-  timers; the Windows share automount; the gocryptfs vault; gate.
+  timers; the Windows share automount (skipped on Day 1); the gocryptfs vault; gate.
 - **Day 1 close-out, before Phase 3 starts downloading:** copy the recovery material to the USB drive and store it
   away from the node, not beside it (Section 22, R16; D3): `/etc/atlas/secrets/restic.pass` (`sudo cat` it; shown once
   in Phase 2 step 7), the LUKS recovery key shown in Phase 1 step 2 (on-node copy under `/etc/atlas/secrets/`), and the
@@ -129,23 +124,29 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   2.13.0) and its self-test (V11); the green engines, then the yellow ones, then PointLLM (V8) and Clay/Prithvi (V9);
   registration of every passing engine with the Arbiter; the per-engine table and gate.
 
-## 3. The interactive pauses
+## 3. The prompts and waits
 
-CONVENTIONS §7.6 names three; the scripts have one more prompt and two waits, all declared here.
+Every prompt below can be skipped (press Enter, or let the time run out): the item is then recorded `deferred`, goes
+on the to-do list, and the phase continues (CONVENTIONS §7.4/§7.6). The one exception that waits for you is the
+recovery key, because it is shown once.
 
 | Phase/step | What it asks | How long |
 |---|---|---|
+| 1 / 1 | Your SSH public key, one pasted line (the step prints the PowerShell command that shows it). | 5 minutes |
+| 1 / start | `GOOGLE_ACCOUNTS`, `FAMILY_NAMES`, the Android SDK terms (`load_env`, once each). | 5 minutes each |
 | 1 / 2 | The LUKS recovery key is shown on the console once; type `WRITTEN DOWN` to continue (the screen is wiped). In the same pause, if the installer encrypted the OS volume and it has no TPM2 token yet, the OS LUKS passphrase is asked once for the enrolment (never stored). | Until you answer |
-| 1 / 7 | Only when the Cloudflare token cannot list zones and no `Zone ID:` line or `CF_ZONE_ID` exists: the zone id, once. | 5-minute timeout, then a warning |
-| 2 / start | The Hugging Face token (hidden input), only when `/etc/atlas/secrets/hf-token.env` is absent. | Until you answer |
-| 2 / 6c | One Google authorisation link per account, printed in a framed block. Open it in Firefox **on the node's own desktop over RDP** (the callback is `localhost:8765+i`), sign in as that account and click Allow. | 30 minutes per account |
+| 1 / 7 | Only when the Cloudflare token cannot list zones and no `Zone ID:` line or `CF_ZONE_ID` exists: the zone id, once. | 5 minutes |
+| 2 / start | The Hugging Face token (hidden input), only when `/etc/atlas/secrets/hf-token.env` is absent. | 5 minutes |
+| 2 / 6b | The zone id again, only if step 7 was skipped and the token still cannot list zones. | 5 minutes |
+| 2 / 6c | One Google authorisation link per account, printed in a framed block. Open it in Google Chrome **on the node's own desktop over Remote Desktop** (the callback is `localhost:8765+i`), sign in as that account and click Allow. | 30 minutes per account |
 
-Waits that are not prompts: Phase 1 step 5b waits up to 10 minutes for your RDP session from the Windows PC (V19),
-and step 7 waits up to 10 minutes for a WireGuard handshake from your phone **on mobile data** (V5): the step prints
-the WG-Easy admin URL (`http://127.0.0.1:51821/`, reachable only from the node: RDP Firefox or `ssh -L`), the admin
-password file, and the ntfy login (`principal`, password in `/etc/atlas/secrets/ntfy-principal.env`, topic `atlas`).
-A timeout records the V item as `fail`; the step completes, the Phase 1 gate blocks Phase 2, and
-`sudo ./atlas-day1.sh phase1 --force 05b` / `--force 07` runs the wait again.
+Waits that are not prompts: Phase 1 step 5b waits up to 10 minutes for your Remote Desktop session from the Windows
+PC (V19), and step 7 waits up to 10 minutes for a WireGuard handshake from your phone **on mobile data** (V5): the
+step prints the WG-Easy admin URL (`http://127.0.0.1:51821/`, reachable only from the node: Chrome in the Remote
+Desktop session, or `ssh -L`), the admin password file, and the ntfy login (`principal`, password in
+`/etc/atlas/secrets/ntfy-principal.env`, topic `atlas`). A timeout records the V item as `deferred` with a to-do; the
+step completes, the Phase 1 gate does not block on it, and `sudo ./atlas-day1.sh phase1 --force 05b` / `--force 07`
+runs the wait again whenever you are ready.
 
 Things shown once, without waiting: the restic passphrase (Phase 2 step 7, also kept root-only at
 `/etc/atlas/secrets/restic.pass`); copy it and the LUKS recovery key to the USB drive stored away from the node (D3).
@@ -253,8 +254,9 @@ its computed hash as UNVERIFIED.
 **phase1/04-system.sh** — 387, 391: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). 471, 542:
 Canonical NTP pool addresses / router NTP fallback.
 
-**phase1/05b-desktop.sh** — 7, 115, 121, 129: the Mozilla apt repository recipe (key URL, suite); fails loudly on a
-non-armoured key. 56, 62: policies.json location for Mozilla's .deb (placed in both candidate directories).
+**phase1/05b-desktop.sh** — the Google apt repository recipe for Chrome (key URL `dl.google.com/linux/linux_signing_key.pub`,
+suite `stable main`); fails loudly on a non-armoured key. Chrome's managed policy path `/etc/opt/chrome/policies/managed/`
+and the policy names are VERIFIED against the Chrome Enterprise documentation.
 
 **phase1/06-docker.sh** — 35: default daemon ulimits (baseline silent).
 

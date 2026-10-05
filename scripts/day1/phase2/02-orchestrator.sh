@@ -182,8 +182,14 @@ _orch_apt() {
 # /etc/atlas/secrets/smb.cred with the Windows account that can read and write WINDOWS_SHARE" plus this command.
 _orch_preflight_smb_cred() {
   local cred="$ATLAS_ETC/secrets/smb.cred"
+  if [[ -z "${WINDOWS_SHARE:-}" ]]; then
+    log "step 9 pre-flight: WINDOWS_SHARE is blank (the Windows share is on the live to-do list); step 9 will be skipped"
+    return 0
+  fi
   if [[ ! -s "$cred" ]]; then
-    die "$cred is missing: step 9 (the Windows PC share, Section 12.4) needs it and §7.6 sanctions no prompt there, so Phase 2 stops NOW rather than ~40 min later. Create it (the password is read from the terminal, never typed on a command line where shell history and /proc/<pid>/cmdline would keep it, §7.2), then re-run the phase: sudo bash -c 'umask 077; read -rp \"Windows user: \" u; read -rsp \"Windows password: \" p; echo; printf \"username=%s\\npassword=%s\\ndomain=WORKGROUP\\n\" \"\$u\" \"\$p\" > $cred; chown root:root $cred; chmod 600 $cred' && sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2"
+    # Policy v0.3.3: a to-do, not a stop; step 9 skips itself while the file is absent.
+    todo_add input-smb-cred "Windows share credentials missing: create $cred (username=, password=, domain= lines; root 600), then: atlas-day1.sh phase2 --force 09" "Section 12.4"
+    return 0
   fi
   if ! grep -q '^username=.\+' "$cred" || ! grep -q '^password=.\+' "$cred"; then
     die "$cred lacks a username= or password= line (mount.cifs credentials format: username=, password=, domain=); fix it before step 9"

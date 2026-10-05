@@ -42,8 +42,8 @@ security.ubuntu.com
 # anything from it over HTTP.
 ntp.ubuntu.com
 
-# --- Mozilla apt repository: Firefox as a .deb, never the snap stub (adjudicated conflict 5) -------------------------
-packages.mozilla.org
+# --- Google apt repository: Google Chrome for the Principal's desktop session (Section 3.6; chosen 2026-10-05) ------------
+dl.google.com
 
 # --- Docker: Docker's own apt repo, Docker Hub registry and blob CDN, GitHub Container Registry ----------------------
 # A pull touches registry-1.docker.io (manifests), auth.docker.io (token) and the blob CDN; index.docker.io (login,
@@ -86,7 +86,7 @@ huggingface.co
 # TWO HOSTS BELOW ARE ADDITIONS TO THE SECTION 12.5 ENUMERATION, PENDING THE PRINCIPAL (fix round 6). 12.5 names one
 # model-pull vendor (Hugging Face) and "package mirrors during builds"; neither host is literally either, and Section
 # 16.3 item 6 / rule §7.1 make the allowlist the Principal's to approve. A Section 23 row recording both (precedent: S13
-# recorded packages.mozilla.org) is REQUESTED of the document's editor; the hosts stay because removing them degrades
+# recorded dl.google.com) is REQUESTED of the document's editor; the hosts stay because removing them degrades
 # two deliverables honestly but materially (phase4/engines/trellis.sh checks this file first and defers TRELLIS without
 # the Meta CDN; phase2/04-memory.sh defers LightRAG indexing without a tiktoken table), and the scripts that use them
 # fail loudly, never silently, if the Principal strikes them instead.

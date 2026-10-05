@@ -84,23 +84,19 @@ step_01() {
   log "tpm2: $(grep '/dev/tpmrm0' <<<"$tpmlist" | head -n1)"
   [[ ! -e /etc/systemd/tpm2-pcr-public-key.pem ]] \
     || die "pre-flight: /etc/systemd/tpm2-pcr-public-key.pem exists; systemd-cryptenroll would also bind to a PCR 11 signature that GRUB boots cannot satisfy. Remove it (it belongs to UKI/systemd-boot setups) and re-run."
-  # --- Secure Boot vs the PCR 7 binding (fix round 3, major). D2 closes Secure Boot as DISABLED and S9 fixes the TPM2
-  # enrolment to PCR 7. With Secure Boot off, PCR 7 measures only the SecureBoot=0/PK/KEK/db/dbx variables and no
-  # image-authority event, so its value is the same for the installed GRUB and for any live USB booted on this
-  # hardware: the TPM would unseal both volumes' keys to anyone who boots their own OS on the node, and Section 3.5's
-  # encryption at rest protects against disk removal only, not theft of the whole node. Two closed decisions meet
-  # here with a consequence the baseline does not record; the Principal settles it, and the scripts never report
-  # V2 green over it unnoticed. The acknowledgement is ATLAS_ACCEPT_PCR7_NO_SB=1 in atlas.env (also enforced by
-  # verify/v02-tpm.sh, which puts the Secure Boot state in every V2 row). CONVENTIONS §3 / config/atlas.env.example
-  # list the key (blank by default); Section 20 still needs an R-item for the decision (README "Known limits").
+  # --- Secure Boot vs the PCR 7 binding. S9 fixes the TPM2 enrolment to PCR 7. With Secure Boot off, PCR 7 measures
+  # only the SecureBoot=0/PK/KEK/db/dbx variables and no image-authority event, so the TPM would unseal both volumes'
+  # keys to anyone who boots their own OS on the node. D15 (2026-10-05) closes it: the Principal enables Secure Boot
+  # in the BIOS (a precondition in README §1); until then the state is a warning, a note in every V2 row and a to-do.
   local sb; sb="$(phase1_secure_boot_state)"
-  log "secure boot: $sb (D2 closes it as disabled; step 2 binds the TPM2 tokens to PCR 7, S9)"
+  log "secure boot: $sb (D15: to be enabled in the BIOS; step 2 binds the TPM2 tokens to PCR 7, S9)"
   if [[ "$sb" != enabled ]]; then
-    if [[ "${ATLAS_ACCEPT_PCR7_NO_SB:-0}" == "1" ]]; then
-      warn "pre-flight: Secure Boot is $sb, so the PCR 7 binding of step 2 does not tie the TPM unlock to this OS image (any OS booted on this hardware can unseal); ACKNOWLEDGED by ATLAS_ACCEPT_PCR7_NO_SB=1 in $ATLAS_ETC/atlas.env and recorded in every V2 row"
-    else
-      die "pre-flight: Secure Boot is $sb (D2) and step 2 binds the TPM2 enrolment to PCR 7 only (S9). With Secure Boot off, PCR 7 carries no image-authority measurement, so the TPM unseals both volumes' keys to ANY OS booted on this hardware (a rescue USB): the encryption at rest then protects against disk removal only, not theft of the whole node. Decide before anything is enrolled: (a) enable Secure Boot in the BIOS (reopens D2; PCR 7 then carries the image authority; the shim/GRUB path of Ubuntu boots signed) or (b) accept the weaker binding knowingly with ATLAS_ACCEPT_PCR7_NO_SB=1 in $ATLAS_ETC/atlas.env (every V2 row records it). Not offered here: --tpm2-pcrs=0+4+7, because PCR 4 changes on every GRUB/shim update and the headless node would stop at a console passphrase prompt after unattended-upgrades; it needs a Section 23 amendment of S9 first. Then re-run: sudo $ATLAS_ENTRY phase1"
-    fi
+    # D15 (decided 2026-10-05): the Principal enables Secure Boot in the BIOS. Until then the PCR 7 binding of step 2
+    # does not tie the TPM unlock to this OS image (any OS booted on this hardware could unseal). Policy v0.3.3: this is
+    # a to-do, never a stop; V2 records the Secure Boot state in its message.
+    warn "pre-flight: Secure Boot is $sb. Enable it in the BIOS (D15); until then the TPM binding protects against disk removal only, not theft of the whole node. Enrolment proceeds."
+    todo_add secure-boot "Enable Secure Boot in the BIOS (D15), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 02 so the TPM binding is re-enrolled with Secure Boot measured" \
+      "Section 3.2, D15, R23. Reboot into the BIOS, switch Secure Boot on, boot Ubuntu (it is signed), run the command."
   fi
 
   # --- NVMe: two drives; DATA_DISK is a blank whole disk, not the root disk ------------------------------------
@@ -132,7 +128,11 @@ step_01() {
   if lsblk -sno TYPE "$root_src" 2>/dev/null | grep -qx crypt; then
     log "OS volume: LUKS present (installer choice, Section 3.5)"
   else
-    die "pre-flight: the OS volume is NOT encrypted, but Section 3.5 requires LUKS2 on both volumes ('nothing transient touches disk unencrypted'; Section 22 presumes the encrypted-LVM install). Reinstall Ubuntu Server with the encrypted-LVM option and re-run: sudo $ATLAS_ENTRY phase1. (No setting waives this: a change to 3.5/D3 is a Section 23 amendment, not a script option.)"
+    # Policy v0.3.3: a to-do, not a stop. The 8 TB data volume (everything ATLAS stores) is encrypted by step 2
+    # regardless; the OS volume holds the system and logs. Section 3.5 still wants both, so it stays on the list.
+    warn "pre-flight: the OS volume is NOT encrypted (the installer's 'Encrypt the LVM group with LUKS' option was not taken). The data volume will be encrypted by step 2; the OS volume stays as it is. Recorded as a to-do (Section 3.5)."
+    todo_add os-volume-encryption "OS volume is unencrypted: reinstall Ubuntu Server with 'Set up this disk as an LVM group' + 'Encrypt the LVM group with LUKS' when convenient, then run Day 1 again (the data volume and its contents survive)" \
+      "Section 3.5 wants LUKS2 on both volumes. Logs and the OS live on this one; all ATLAS data is on the encrypted 8 TB volume."
   fi
   # SSH, Cockpit and xrdp bind to LAN_IP itself (Section 3.6). A DHCP lease that later changes would leave them on
   # the stale address (console-only recovery), so a dynamic address is flagged for a router reservation.
@@ -147,9 +147,32 @@ step_01() {
   # LUKS is enrolled and the node is about to reboot into the hardened configuration; a missing key found at step 1
   # costs one ssh command, found after the reboot it costs a console session. Section 22 (build-side preconditions)
   # is where the key belongs; the README §1 node list names it.
-  local ak="/home/$PRINCIPAL_USER/.ssh/authorized_keys"
-  [[ -s "$ak" ]] || die "pre-flight: $ak is missing or empty, and step 4 makes SSH key-only (Section 3.6). Add your public key BEFORE anything is enrolled. From the Windows PC (PowerShell; ssh-keygen -t ed25519 first if you have no key): type \$env:USERPROFILE\\.ssh\\id_ed25519.pub | ssh $PRINCIPAL_USER@${LAN_IP:-<node-ip>} \"mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys\"   — or on the console: mkdir -p ~/.ssh && chmod 700 ~/.ssh && nano ~/.ssh/authorized_keys (paste the .pub line) && chmod 600 ~/.ssh/authorized_keys. Then re-run: sudo $ATLAS_ENTRY phase1"
-  [[ -s "$CLOUDFLARE_TXT" ]] || warn "pre-flight: $CLOUDFLARE_TXT is missing or empty; step 7 needs the Cloudflare token there (it is relocated and shredded in Phase 2 step 6b)"
+  local ak="/home/$PRINCIPAL_USER/.ssh/authorized_keys" keyline=""
+  if [[ ! -s "$ak" ]]; then
+    # Policy v0.3.3: ask once, plainly; no key means step 4 keeps password login on (ATLAS_SSH_PASSWORD_AUTH=keep) and
+    # the hardening is a to-do, instead of locking the Principal out or stopping here.
+    echo
+    echo "  SSH key (optional now). Step 4 normally switches SSH to key-only login. On your Windows PC, PowerShell:"
+    echo "    ssh-keygen -t ed25519            (Enter three times)"
+    echo "    type \$env:USERPROFILE\\.ssh\\id_ed25519.pub"
+    echo "  and paste the single line it prints (starts with ssh-ed25519) here."
+    ask keyline "  Public key line (Enter to skip; password login then stays on and this becomes a to-do): "
+    if [[ "$keyline" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|sk-ssh-ed25519@openssh.com)\ [A-Za-z0-9+/=]+ ]]; then
+      install -d -m 700 -o "$PRINCIPAL_USER" -g "$PRINCIPAL_USER" "/home/$PRINCIPAL_USER/.ssh"
+      printf '%s\n' "$keyline" >>"$ak"
+      chown "$PRINCIPAL_USER:$PRINCIPAL_USER" "$ak"; chmod 600 "$ak"
+      log "SSH public key added to $ak"
+    else
+      [[ -z "$keyline" ]] || warn "that did not look like an OpenSSH public key line; skipping"
+      ensure_kv "$ATLAS_ETC/atlas.env" ATLAS_SSH_PASSWORD_AUTH keep
+      export ATLAS_SSH_PASSWORD_AUTH=keep
+      todo_add ssh-key "Add your SSH public key to $ak and switch SSH to key-only: set ATLAS_SSH_PASSWORD_AUTH= (blank) in $ATLAS_ETC/atlas.env, then sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 04" \
+        "Section 3.6. Password login stays enabled until then (LAN and WireGuard only; never internet-facing)."
+    fi
+  fi
+  if [[ ! -s "$CLOUDFLARE_TXT" && ! -s "$ATLAS_ETC/secrets/cloudflare.env" ]]; then
+    warn "pre-flight: no Cloudflare token at $CLOUDFLARE_TXT; step 7 installs WireGuard and ntfy and leaves the dynamic DNS updater for later (to-do)"
+  fi
 
   # --- V1: network, informational (Section 21, R9) -------------------------------------------------------------
   run_verify V1 v01-network.sh "$LAN_IFACE" || true

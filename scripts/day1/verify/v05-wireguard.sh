@@ -8,10 +8,10 @@
 #   WG_IFACE is the interface name inside the container ($WG_IFACE from atlas.env, CONVENTIONS §3); wg0 is only the
 #   default when called by hand.
 # Exit 0 pass (carrier handshake seen), 1 fail: container/interface missing OR no carrier handshake within WAIT_S.
-# A timeout is a FAIL, not a deferral (fix round): CONVENTIONS §6 lists V5 as Required for Phase 1 with no deferral
-# provision and rule §7.4 records a verification that did not pass as fail; Section 21 V5 is "confirm the node is
-# reachable from mobile data before relying on it". The gate then shows a red row and Phase 2 is blocked until the
-# Principal re-runs with RERUN_HINT (nothing is lost: step 7 is idempotent). Never prompts. Runs under run_verify's
+# A timeout exits 1 here; the caller (phase1/07-remote.sh) records it as DEFERRED with a to-do (policy v0.3.3; CONVENTIONS §6
+# lists V5 as Required-deferrable; Section 21 V5 is "confirm the node is reachable from mobile data before relying on
+# it"). The gate never blocks on deferred; the Principal records V5 later with RERUN_HINT (nothing is lost: step 7 is
+# idempotent). Never prompts. Runs under run_verify's
 # 660 s cap.
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh

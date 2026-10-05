@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # phase2/06b-cloudflare-token.sh — Section 17 Phase 2 step 6b: the Cloudflare token relocation (Section 12.3, R7, V23).
-# Sourced by phase2-services.sh through run_phase_steps; defines step_06b only. Runs unattended (CONVENTIONS.md §7.6
-# names the only three interactive pauses; this step is not one of them).
+# Sourced by phase2-services.sh through run_phase_steps; defines step_06b only. Runs unattended except for the one
+# skippable zone-id prompt (CONVENTIONS.md §7.6; a skip defers V23 with a to-do, policy v0.3.3).
 #
 # Phase 1 step 7 (phase1/07-remote.sh) already READ the token from $CLOUDFLARE_TXT and wrote
 # $ATLAS_ETC/secrets/cloudflare.env (CF_API_TOKEN, CF_ZONE_NAME, CF_ZONE_ID, CF_RECORD_NAME) for the ddns updater,
@@ -143,13 +143,26 @@ _cf_zone_id() {
       log "zone id for $CF_ZONE_NAME resolved with GET /zones (the token carries Zone:Zone:Read)"
     else
       # Adjudicated conflict 3: a Zone:DNS:Edit-only token cannot list zones (HTTP $CF_HTTP). Same lookup as
-      # phase1/07-remote.sh: a "Zone ID: <32 hex>" line beside the token in CLOUDFLARE.txt. No prompt (§7.6).
+      # phase1/07-remote.sh: a "Zone ID: <32 hex>" line beside the token in CLOUDFLARE.txt. Policy v0.3.3: when that
+      # is absent too, ask once (the zone id is not a secret), and a skip defers V23 with a to-do instead of stopping.
       local http="$CF_HTTP"
       if [[ -s "$CLOUDFLARE_TXT" ]]; then
         CF_ZONE_ID="$(grep -oiE 'zone[ _-]?id[^0-9a-f]*[0-9a-f]{32}' "$CLOUDFLARE_TXT" 2>/dev/null | grep -oE '[0-9a-f]{32}' | head -n1 || true)"
         [[ -n "$CF_ZONE_ID" ]] && log "zone id found beside the token in $CLOUDFLARE_TXT (GET /zones answered HTTP $http: Zone:DNS:Edit only)"
       fi
-      [[ -n "$CF_ZONE_ID" ]] || die "CF_ZONE_ID is blank: the token cannot list zones (GET /zones answered HTTP $http; Zone:DNS:Edit only, adjudicated conflict 3) and no 'Zone ID: <32 hex>' line sits beside the token in $CLOUDFLARE_TXT. Manual fix (once): set CF_ZONE_ID=<32-hex id> in $CF_ENVF (Cloudflare dashboard -> $CF_ZONE_NAME -> Overview -> API -> Zone ID), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06b"
+      if [[ -z "$CF_ZONE_ID" ]]; then
+        local zid=""
+        ask zid "The Cloudflare token cannot list zones, so the Zone ID of $CF_ZONE_NAME is needed (Cloudflare dashboard -> $CF_ZONE_NAME -> Overview -> API -> Zone ID, 32 hex characters). Paste it, or press Enter to leave it for later: "
+        if [[ "$zid" =~ ^[0-9a-f]{32}$ ]]; then
+          CF_ZONE_ID="$zid"; log "zone id for $CF_ZONE_NAME provided at the prompt"
+        else
+          [[ -z "$zid" ]] || warn "that is not a 32-hex zone id (value not shown); left for later"
+          record_v V23 deferred "token found but the zone id of $CF_ZONE_NAME is unknown (Zone:DNS:Edit-only token, HTTP $http on GET /zones; to-do cloudflare-zone-id); $CLOUDFLARE_TXT kept"
+          todo_add cloudflare-zone-id "Give the Cloudflare Zone ID of $CF_ZONE_NAME: set CF_ZONE_ID=<32-hex id> in $CF_ENVF (or add a 'Zone ID: <id>' line to $CLOUDFLARE_TXT), then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 06b" \
+            "Section 12.2 / V23. Dashboard -> $CF_ZONE_NAME -> Overview -> API -> Zone ID. Until then the token stays in $CLOUDFLARE_TXT (mode 600) and DDNS waits."
+          return 1
+        fi
+      fi
     fi
   fi
   # The value itself is never printed: a slip (the token pasted as the zone id) must not reach the log or the backup.
@@ -221,11 +234,16 @@ _cf_shred() {
 }
 
 step_06b() {
+  # Policy v0.3.3: no token yet (Phase 1 step 7 recorded the to-do) -> nothing to relocate; V23 deferred, not failed.
+  if [[ ! -s "$ATLAS_ETC/secrets/cloudflare.env" && ! -s "$CLOUDFLARE_TXT" ]]; then
+    record_v V23 deferred "no Cloudflare token yet (to-do cloudflare-token): nothing to relocate; re-run phase1 --force 07 then phase2 --force 06b"
+    return 0
+  fi
   apt_install jq curl
   _cf_read_env
   _cf_check_file
   _cf_verify_token
-  _cf_zone_id
+  _cf_zone_id || return 0
   _cf_read_back
   _cf_write_env
   # §7.2 order, literally: the read-back test of the API runs against the token read from the file just written, and

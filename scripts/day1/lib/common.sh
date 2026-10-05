@@ -52,6 +52,7 @@ ATLAS_DAY1_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 export ATLAS_DAY1_DIR
 
 ATLAS_VERIFY_FILE="$ATLAS_STATE/verify.jsonl"
+ATLAS_TODO_FILE="$ATLAS_STATE/todo.jsonl"      # the live ATLAS to-do list (inputs the Principal did not have on Day 1)
 ATLAS_DONE_DIR="$ATLAS_STATE/done"
 ATLAS_LOG_DIR="$ATLAS_STATE/logs"
 export ATLAS_VERIFY_FILE ATLAS_DONE_DIR ATLAS_LOG_DIR
@@ -186,6 +187,74 @@ print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": sys.argv[3], "r
 ' "$(date -Is)" "$ATLAS_PHASE" "$id" "$result" "$msg")"
   printf '%s\n' "$line" >>"$ATLAS_VERIFY_FILE"
   log "verify $id=$result: $msg"
+}
+
+# ask VAR PROMPT [secret] — one plain question on the terminal, 300 s. No terminal (systemd-run, nohup) or no answer
+# leaves VAR empty, and the caller records a to-do instead of stopping: the Principal's rule (v0.3.3) is that a missing
+# input never stops a phase. ATLAS_ASK_ANSWER, when set, is the answer (self-test hook; also handy for scripted runs).
+ask() {
+  local __var="$1" prompt="$2" secret="${3:-}" __ans=""
+  if [[ -n "${ATLAS_ASK_ANSWER+x}" ]]; then
+    __ans="$ATLAS_ASK_ANSWER"
+  elif ( : </dev/tty ) 2>/dev/null; then
+    if [[ "$secret" == secret ]]; then
+      read -r -s -t 300 -p "$prompt" __ans </dev/tty >/dev/tty || __ans=""
+      echo >/dev/tty
+    else
+      read -r -t 300 -p "$prompt" __ans </dev/tty >/dev/tty || __ans=""
+    fi
+  fi
+  printf -v "$__var" '%s' "$__ans"
+}
+
+# todo_add ID TITLE [DETAIL] — append an item to the live ATLAS to-do list ($ATLAS_TODO_FILE, one JSON object per line;
+# the latest line per ID wins, todo_done closes one). Logged as a warning so it is visible in the phase log too.
+todo_add() {
+  local id="$1" title="$2" detail="${3:-}"
+  [[ "$id" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || die "todo_add: ID must be lowercase [a-z0-9.-], got '$id'"
+  _atlas_state_init
+  command -v python3 >/dev/null || die "todo_add needs python3"
+  python3 -c '
+import json, sys
+print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": sys.argv[3], "title": sys.argv[4], "detail": sys.argv[5], "done": False}))
+' "$(date -Is)" "$ATLAS_PHASE" "$id" "$title" "$detail" >>"$ATLAS_TODO_FILE"
+  warn "TO-DO [$id]: $title — recorded for the live ATLAS; the phase continues"
+}
+
+# todo_done ID — close a to-do item (the input arrived later, or a re-run with --force picked it up).
+todo_done() {
+  local id="$1"
+  _atlas_state_init
+  python3 -c '
+import json, sys
+print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": sys.argv[3], "title": "", "detail": "", "done": True}))
+' "$(date -Is)" "$ATLAS_PHASE" "$id" >>"$ATLAS_TODO_FILE"
+  log "to-do $id closed"
+}
+
+# todo_list — the open items, latest record per ID, as a table (atlas-day1.sh status; the Phase gates print it too).
+todo_list() {
+  [[ -s "${ATLAS_TODO_FILE:-}" ]] || { echo "  (no to-do items)"; return 0; }
+  python3 - "$ATLAS_TODO_FILE" <<'PY'
+import json, sys
+latest = {}
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    latest[r["id"]] = r
+rows = [r for r in latest.values() if not r.get("done")]
+if not rows:
+    print("  (no open to-do items)")
+for r in rows:
+    print(f"  {r['id']:<28} {r['title']}")
+    if r.get("detail"):
+        print(f"  {'':<28}   {r['detail']}")
+PY
 }
 
 # run_verify ID SCRIPT [ARGS] — run verify/SCRIPT (§5 contract: exit 0/1/2/3, one stdout line) and record it.
@@ -737,7 +806,7 @@ _atlas_detect_tz() {
 # _atlas_secure_boot_enabled — 0 only when the firmware reports Secure Boot ON (the SecureBoot EFI variable: 4-byte
 # attribute header, byte 4 is the value; then mokutil). A legacy-BIOS boot or an unreadable state counts as OFF, like
 # phase1/01-preflight.sh's phase1_secure_boot_state (the authoritative reading, kept there and in verify/v02-tpm.sh);
-# this copy only decides whether load_env lists ATLAS_ACCEPT_PCR7_NO_SB among the blank CONFIRM keys (D2, S9).
+# this copy is kept for callers that only need a yes/no (the pre-flight logs the state; D15: the Principal enables it).
 _atlas_secure_boot_enabled() {
   local f v
   case "${ATLAS_TEST_SECURE_BOOT:-}" in on) return 0 ;; off) return 1 ;; esac   # test-only override (header)
@@ -753,7 +822,8 @@ _atlas_secure_boot_enabled() {
 }
 
 # load_env — install config/atlas.env.example on first run, source it, auto-detect blank detectable keys (persisting
-# them so DATA_DISK survives the LUKS format that makes it "mounted"), and die naming any required key still blank.
+# them so DATA_DISK survives the LUKS format that makes it "mounted"), ask once for the Principal's keys and record a
+# to-do for any left blank (never a stop: v0.3.3).
 load_env() {
   local envf="$ATLAS_ETC/atlas.env"
   local example="$ATLAS_DAY1_DIR/config/atlas.env.example"
@@ -775,39 +845,62 @@ load_env() {
   source "$envf"
   set +a
 
-  # Keys the Principal must confirm; checked first because the message is deterministic and the fix is a text edit.
-  # Every blank CONFIRM key is reported in ONE message with an example value (rule §7.10: the Principal's time), not one
-  # per run. ATLAS_ACCEPT_PCR7_NO_SB is required only while Secure Boot is off (D2 / S9; phase1/01-preflight.sh has
-  # the full reasoning); BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE is the Section 16.3 item 2 acceptance phase2/06-tools.sh
-  # needs, surfaced here so it is decided before Phase 1 rather than at Phase 2 step 6: only the value `yes` passes
-  # (the same test as _tools_buildfarm_licence there), so a `no` stops here with the one message and never at step 6.
-  local missing=() k
-  for k in GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES; do
-    [[ -n "${!k:-}" ]] || missing+=("$k")
-  done
-  [[ "${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}" == yes ]] || missing+=(BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE)
-  if [[ -z "${ATLAS_ACCEPT_PCR7_NO_SB:-}" ]] && ! _atlas_secure_boot_enabled; then
-    missing+=(ATLAS_ACCEPT_PCR7_NO_SB)
+  # Keys the Principal provides. Policy (v0.3.3, the Principal's instruction): a blank key NEVER stops a phase.
+  # Each blank key is asked ONCE on the terminal in plain words; an answer is written to atlas.env; no answer (or no
+  # terminal) records a to-do for the live ATLAS and the step that needs the key defers itself instead of failing.
+  # WINDOWS_SHARE is not asked at all: the Principal moved the Windows share to the live to-do list (Section 12.4).
+  # Secure Boot is the Principal's BIOS action (D15: enabled); there is no acknowledgement key any more.
+  local ans=""
+  _atlas_confirm_key() { # KEY QUESTION EXAMPLE TODO_ID TODO_TITLE
+    local key="$1" q="$2" ex="$3" tid="$4" title="$5"
+    local asked="$ATLAS_STATE/asked.$key"
+    if [[ -n "${!key:-}" ]]; then
+      # Provided (now or later): close the to-do the earlier blank left open.
+      [[ -e "$asked" ]] && { rm -f "$asked"; todo_done "$tid"; }
+      return 0
+    fi
+    [[ -e "$asked" ]] && return 0   # asked once and recorded once; the to-do stays open until the key is set
+    if [[ ! -e "$asked" ]]; then
+      ask ans "$q (example: $ex; press Enter to skip and leave it for later): "
+      if [[ -n "$ans" ]]; then
+        ensure_kv "$envf" "$key" "\"$ans\""
+        printf -v "$key" '%s' "$ans"; export "${key?}"
+        log "load_env: $key set in $envf"
+        return 0
+      fi
+      _atlas_state_init; : >"$asked"
+    fi
+    todo_add "$tid" "$title" "Set $key in $envf (example: $key=\"$ex\"), then re-run the step that needs it with --force"
+  }
+  _atlas_confirm_key GOOGLE_ACCOUNTS "Your two Google account addresses, each tagged corporate or estate" \
+    "you@company.com:corporate you@gmail.com:estate" input-google-accounts \
+    "Google accounts not given: Gmail, Calendar and Drive (Phase 2 step 6c, V20) are deferred"
+  _atlas_confirm_key FAMILY_NAMES "Family members' names for the privacy routing rule, space separated" \
+    "Surname Givenname" input-family-names \
+    "Family names not given: the router's family-name hard rule (Section 7.2) is inactive"
+  if [[ "${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}" != yes ]]; then
+    BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=""
+    _atlas_confirm_key BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE \
+      "Type yes if you accept Google's Android SDK terms (https://developer.android.com/studio/terms) so the Android build container can be built" \
+      "yes" input-android-sdk-licence \
+      "Android SDK terms not accepted: the Android/Windows build container (Phase 2 step 6) is deferred"
+    [[ "${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}" == yes ]] || BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=""
   fi
-  if (( ${#missing[@]} > 0 )); then
-    local lines=""
-    for k in "${missing[@]}"; do
-      case "$k" in
-        GOOGLE_ACCOUNTS) lines+=$'\n  GOOGLE_ACCOUNTS="you@company.com:corporate you@gmail.com:estate"   # the two Google accounts, each tagged with its hemisphere (Phase 2 step 6c, V20)' ;;
-        WINDOWS_SHARE)   lines+=$'\n  WINDOWS_SHARE="//192.168.1.50/atlas"                                 # the Windows PC share, //host/share (Phase 2 step 9)' ;;
-        FAMILY_NAMES)    lines+=$'\n  FAMILY_NAMES="Surname Givenname"                                     # names for the router hard rule (Section 7.2 rule 1)' ;;
-        ATLAS_ACCEPT_PCR7_NO_SB) lines+=$'\n  ATLAS_ACCEPT_PCR7_NO_SB=1          # Secure Boot is OFF (D2): acknowledge that the PCR 7 TPM2 binding (S9) does not tie the unlock to this OS image, or enable Secure Boot instead' ;;
-        BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE) lines+=$'\n  BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes   # you have read https://developer.android.com/studio/terms and accept them (Section 16.3 item 2; Phase 2 step 6 builds the Android/MinGW container)' ;;
-      esac
-    done
-    die "load_env: ${#missing[@]} CONFIRM key(s) are blank or not confirmed in $envf (${missing[*]}). Set them, then re-run:$lines"$'\n'"  Edit with: sudo nano $envf   (the comments in the file explain each key)"
+  export BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE
+  if [[ -n "${WINDOWS_SHARE:-}" && -e "$ATLAS_STATE/asked.WINDOWS_SHARE" ]]; then
+    rm -f "$ATLAS_STATE/asked.WINDOWS_SHARE"; todo_done input-windows-share
+  fi
+  if [[ -z "${WINDOWS_SHARE:-}" && ! -e "$ATLAS_STATE/asked.WINDOWS_SHARE" ]]; then
+    _atlas_state_init; : >"$ATLAS_STATE/asked.WINDOWS_SHARE"
+    todo_add input-windows-share "Windows PC share not configured (the Principal's choice for Day 1): Phase 2 step 9 is skipped" \
+      "Set WINDOWS_SHARE=\"//host/share\" in $envf and create $ATLAS_ETC/secrets/smb.cred, then: atlas-day1.sh phase2 --force 09"
   fi
   local acct
-  for acct in $GOOGLE_ACCOUNTS; do
+  for acct in ${GOOGLE_ACCOUNTS:-}; do
     [[ "$acct" =~ ^[^:[:space:]]+@[^:[:space:]]+:(corporate|estate)$ ]] \
-      || die "load_env: GOOGLE_ACCOUNTS entry '$acct' must be email:corporate or email:estate"
+      || die "load_env: GOOGLE_ACCOUNTS entry '$acct' must be email:corporate or email:estate (edit $envf)"
   done
-  [[ "$WINDOWS_SHARE" =~ ^//[^/]+/.+$ ]] || die "load_env: WINDOWS_SHARE must look like //host/share, got '$WINDOWS_SHARE'"
+  [[ -z "${WINDOWS_SHARE:-}" || "$WINDOWS_SHARE" =~ ^//[^/]+/.+$ ]] || die "load_env: WINDOWS_SHARE must look like //host/share, got '$WINDOWS_SHARE' (edit $envf)"
 
   # Auto-detected keys: detect when blank, persist, die when detection fails.
   local changed=0 v
@@ -846,7 +939,6 @@ load_env() {
   export PRINCIPAL_USER TZ LAN_IFACE LAN_CIDR LAN_IP DATA_DISK CLOUDFLARE_TXT WG_IFACE WG_CIDR WG_PORT DOMAIN VPN_HOST
   export GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES NTFY_TOPIC OPENWEBUI_PORT ORCH_PORT LLAMA_PORT_BASE DOWNLOAD_MBPS
   export BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE
-  [[ -n "${ATLAS_ACCEPT_PCR7_NO_SB:-}" ]] && export ATLAS_ACCEPT_PCR7_NO_SB
   [[ -n "${HF_ENDPOINT:-}" ]] && export HF_ENDPOINT
   (( changed )) && log "load_env: auto-detected values written to $envf"
   log "load_env: user=$PRINCIPAL_USER tz=$TZ lan=$LAN_IFACE/$LAN_CIDR ip=${LAN_IP:-?} data=$DATA_DISK"
@@ -899,4 +991,6 @@ phase_status() {
   done
   echo "== verify records ($ATLAS_VERIFY_FILE)"
   verify_table
+  echo "== to-do list for the live ATLAS ($ATLAS_TODO_FILE)"
+  todo_list
 }

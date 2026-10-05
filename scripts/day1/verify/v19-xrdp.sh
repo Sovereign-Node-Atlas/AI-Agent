@@ -5,8 +5,8 @@
 #       deny with per-interface rules (phase1/04-system.sh) is what refuses everything outside LAN/WireGuard.
 #   (b) waits up to WAIT_S for the Principal's session: an established TCP connection on 3389 plus a logind session
 #       of PRINCIPAL_USER whose service is xrdp-sesman. No session in time -> exit 1 (FAIL, fix round): CONVENTIONS §6
-#       lists V19 as Required for Phase 1 with no deferral provision and rule §7.4 records what did not pass as fail,
-#       so the gate shows a red row until the Principal re-runs with the hint (step 5b is idempotent).
+#       lists V19 as Required-deferrable for Phase 1 (policy v0.3.3): the caller records a timeout as deferred + to-do,
+#       the gate never blocks on it, and the Principal records V19 later with the hint (step 5b is idempotent).
 # Usage: v19-xrdp.sh PRINCIPAL_USER WAIT_S RERUN_HINT ADDR [ADDR...]
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh

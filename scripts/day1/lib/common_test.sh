@@ -22,6 +22,7 @@ check() { # check DESCRIPTION CONDITION...
   if "$@"; then ok "$desc"; else bad "$desc"; fi
 }
 quiet() { "$@" >/dev/null 2>&1; }
+absent() { ! grep -q -- "$1" "$2"; }   # absent PATTERN FILE
 
 # --- run_step --------------------------------------------------------------------------------------------------------
 calls=0
@@ -165,48 +166,53 @@ check "parse_common_args: --status prints the verify table" grep -q '^V2 *pass' 
 ( parse_common_args --bogus ) >/dev/null 2>&1; rc=$?
 check "parse_common_args: unknown argument dies" test "$rc" -ne 0
 
-# --- load_env (deterministic parts only: install on first run, die naming blank CONFIRM keys) -------------------------
-# ATLAS_TEST_SECURE_BOOT (test-only override, common.sh header) fixes the Secure Boot reading so both branches run here.
-( ATLAS_TEST_SECURE_BOOT=off load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
+# --- load_env (ask once, never stop: v0.3.3) ----------------------------------------------------------------------------
+# The auto-detected keys need `ip` and real disks; this host may have neither, so they are pre-seeded here and only
+# the deterministic parts are exercised (first-run install, the ask-or-defer block, the format checks).
+( ATLAS_ASK_ANSWER="" load_env ) >/dev/null 2>&1 || true
 check "load_env: installs the example on first run" test -f "$ATLAS_ETC/atlas.env"
-check "load_env: dies naming the blank CONFIRM keys" test "$rc" -ne 0
-# One message, every blank CONFIRM key, an example value for each (the Principal fixes them all in one edit).
-check "load_env: ONE FATAL line for all the blank keys" test "$(grep -c 'FATAL' "$TMP/load_env.out")" -eq 1
-check "load_env: message names GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE" \
-  grep -q 'GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE' "$TMP/load_env.out"
-check "load_env: example value for GOOGLE_ACCOUNTS" grep -q 'GOOGLE_ACCOUNTS="you@company.com:corporate you@gmail.com:estate"' "$TMP/load_env.out"
-check "load_env: example value for WINDOWS_SHARE" grep -q 'WINDOWS_SHARE="//192.168.1.50/atlas"' "$TMP/load_env.out"
-check "load_env: example value for FAMILY_NAMES" grep -q 'FAMILY_NAMES="Surname Givenname"' "$TMP/load_env.out"
-check "load_env: example value and terms URL for the SDK licence" grep -q 'BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes .*developer.android.com/studio/terms' "$TMP/load_env.out"
-check "load_env: names the file to edit" grep -q "sudo nano $ATLAS_ETC/atlas.env" "$TMP/load_env.out"
-# ATLAS_ACCEPT_PCR7_NO_SB is listed exactly when Secure Boot is off (D2 / S9): both branches, independent of this host.
-absent() { ! grep -q "$1" "$2"; }
-check "load_env: Secure Boot off -> ATLAS_ACCEPT_PCR7_NO_SB=1 example listed" grep -q 'ATLAS_ACCEPT_PCR7_NO_SB=1 ' "$TMP/load_env.out"
-check "load_env: Secure Boot off -> ATLAS_ACCEPT_PCR7_NO_SB in the key list" grep -q 'BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE ATLAS_ACCEPT_PCR7_NO_SB)' "$TMP/load_env.out"
-( ATLAS_TEST_SECURE_BOOT=on load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
-check "load_env: Secure Boot on -> still dies on the other blank keys" test "$rc" -ne 0
-check "load_env: Secure Boot on -> ATLAS_ACCEPT_PCR7_NO_SB not demanded" absent ATLAS_ACCEPT_PCR7_NO_SB "$TMP/load_env.out"
-check "load_env: Secure Boot on -> still ONE FATAL line" test "$(grep -c 'FATAL' "$TMP/load_env.out")" -eq 1
-( ATLAS_TEST_SECURE_BOOT=bogus _atlas_secure_boot_enabled ); rc_real=$?
-( _atlas_secure_boot_enabled ); rc_plain=$?
-check "_atlas_secure_boot_enabled: a value other than on/off falls through to the firmware reading" test "$rc_real" -eq "$rc_plain"
-# The licence key passes only as `yes` (the test phase2/06-tools.sh applies): a `no` is listed like a blank, with the
-# yes example, so the Principal is stopped here and not again at Phase 2 step 6.
-ensure_kv "$ATLAS_ETC/atlas.env" GOOGLE_ACCOUNTS '"a@b.com:corporate c@d.com:estate"'
-ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE '"//host/share"'
-ensure_kv "$ATLAS_ETC/atlas.env" FAMILY_NAMES 'Rida'
+for kv in LAN_IFACE=eth0 LAN_CIDR=192.168.1.0/24 DATA_DISK=/dev/null PRINCIPAL_USER=tester TZ=Australia/Sydney; do
+  ensure_kv "$ATLAS_ETC/atlas.env" "${kv%%=*}" "${kv#*=}"
+done
+rm -f "$ATLAS_STATE/asked."* "$ATLAS_TODO_FILE"
+( ATLAS_ASK_ANSWER="" load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
+check "load_env: blank Principal keys never stop it (rc 0)" test "$rc" -eq 0
+check "load_env: no FATAL for blank keys" absent FATAL "$TMP/load_env.out"
+check "load_env: to-do recorded for the Google accounts" grep -q '"id": "input-google-accounts"' "$ATLAS_TODO_FILE"
+check "load_env: to-do recorded for the family names" grep -q '"id": "input-family-names"' "$ATLAS_TODO_FILE"
+check "load_env: to-do recorded for the Android SDK terms" grep -q '"id": "input-android-sdk-licence"' "$ATLAS_TODO_FILE"
+check "load_env: to-do recorded for the Windows share (never asked)" grep -q '"id": "input-windows-share"' "$ATLAS_TODO_FILE"
+check "load_env: each key is asked once (marker files)" test -e "$ATLAS_STATE/asked.GOOGLE_ACCOUNTS" -a -e "$ATLAS_STATE/asked.WINDOWS_SHARE"
+n_before="$(wc -l <"$ATLAS_TODO_FILE")"
+( ATLAS_ASK_ANSWER="" load_env ) >/dev/null 2>&1
+check "load_env: a second run does not re-ask or re-record" test "$(wc -l <"$ATLAS_TODO_FILE")" -eq "$n_before"
+out="$(todo_list)"
+check "todo_list: shows the open items" grep -q 'input-google-accounts' <<<"$out"
+todo_done input-google-accounts
+todo_list >"$TMP/todo.out"
+check "todo_done: closes an item" absent 'input-google-accounts' "$TMP/todo.out"
+# An answer typed at the prompt lands in atlas.env and in the environment.
+rm -f "$ATLAS_STATE/asked.FAMILY_NAMES"; ensure_kv "$ATLAS_ETC/atlas.env" FAMILY_NAMES ''
+( ATLAS_ASK_ANSWER="Rida Moussa" load_env; [ "$FAMILY_NAMES" = "Rida Moussa" ] ); rc=$?
+check "load_env: an answer is exported" test "$rc" -eq 0
+check "load_env: an answer is written to atlas.env" grep -q '^FAMILY_NAMES="Rida Moussa"' "$ATLAS_ETC/atlas.env"
+# The licence key passes only as `yes`; anything else is blank (asked once, then a to-do).
 ensure_kv "$ATLAS_ETC/atlas.env" BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE 'no'
-ensure_kv "$ATLAS_ETC/atlas.env" ATLAS_ACCEPT_PCR7_NO_SB '1'
-( ATLAS_TEST_SECURE_BOOT=off load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
-check "load_env: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=no dies" test "$rc" -ne 0
-check "load_env: =no is listed as the one unconfirmed key" grep -q '1 CONFIRM key(s) are blank or not confirmed .* (BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE)' "$TMP/load_env.out"
-check "load_env: =no shows the yes example" grep -q 'BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes ' "$TMP/load_env.out"
-check "load_env: =no does not list the confirmed keys" absent 'GOOGLE_ACCOUNTS=' "$TMP/load_env.out"
-ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE 'not-a-share'
+( ATLAS_ASK_ANSWER="" load_env; [ -z "${BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE:-}" ] ); rc=$?
+check "load_env: BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=no is treated as not accepted, no stop" test "$rc" -eq 0
 ensure_kv "$ATLAS_ETC/atlas.env" BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE 'yes'
+ensure_kv "$ATLAS_ETC/atlas.env" GOOGLE_ACCOUNTS '"a@b.com:corporate c@d.com:estate"'
+ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE '"host/share"'
 ( load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
 check "load_env: rejects a malformed WINDOWS_SHARE" test "$rc" -ne 0
 check "load_env: WINDOWS_SHARE message" grep -q 'WINDOWS_SHARE must look like //host/share' "$TMP/load_env.out"
+ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE '"//host/share"'
+( ATLAS_ASK_ANSWER="" load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
+check "load_env: well-formed keys load cleanly" test "$rc" -eq 0
+
+( ATLAS_TEST_SECURE_BOOT=bogus _atlas_secure_boot_enabled ); rc_real=$?
+( _atlas_secure_boot_enabled ); rc_plain=$?
+check "_atlas_secure_boot_enabled: a value other than on/off falls through to the firmware reading" test "$rc_real" -eq "$rc_plain"
 
 # --- notify / proxy_env without configuration --------------------------------------------------------------------------
 out="$(notify "hello" 2>&1)"; rc=$?

@@ -6,7 +6,7 @@
 # Section 16.3 item 4; the zone-id resolution below is unchanged), ntfy with default-deny auth and a node token, the WireGuard bridge address added to the SSH/Cockpit/
 # xrdp bindings, and V5 (DNS matches the public IP; a handshake from mobile data within 10 minutes passes, else
 # V5 is recorded as FAIL with the exact re-run command: the step itself completes, the gate shows the red row and
-# Phase 2 waits for `--force 07`; CONVENTIONS §6 gives V5 no deferral provision).
+# recorded as deferred with a to-do, policy v0.3.3; `--force 07` records it later, the gate never blocks on it).
 #
 # THE ONE POSSIBLE PROMPT IN THIS STEP (Section 22, S11): when the Cloudflare token cannot list zones
 # (Zone:DNS:Edit only, adjudicated conflict 3) and no zone id is found beside the token in CLOUDFLARE.txt or in an
@@ -134,7 +134,7 @@ _wg_easy_up() {
     log "wg-easy recreated without INIT_PASSWORD in its environment (the admin credential stays only in $envf)"
   fi
   ss -lunH "sport = :$WG_PORT" | grep -q ":$WG_PORT" || die "UDP $WG_PORT is not bound on the host (docker port wg-easy)"
-  log "WG-Easy up: admin http://127.0.0.1:51821/ (loopback only; RDP Firefox or ssh -L), UDP $WG_PORT published"
+  log "WG-Easy up: admin http://127.0.0.1:51821/ (loopback only; Chrome in the RDP session or ssh -L), UDP $WG_PORT published"
 }
 
 # _wg_easy_check — the admin UI answers and $WG_IFACE is up inside the container.
@@ -163,10 +163,18 @@ _cloudflare_env() {
     [[ -n "$zone_id" ]] && log "zone id taken from the existing $envf"
   fi
   if [[ -z "$token" ]]; then
-    [[ -s "$CLOUDFLARE_TXT" ]] || die "$CLOUDFLARE_TXT is missing or empty: the scoped Cloudflare token (Zone:DNS:Edit on $DOMAIN) must be there for the ddns updater (Section 12.3)"
+    if [[ ! -s "$CLOUDFLARE_TXT" ]]; then
+      # Policy v0.3.3: a to-do, not a stop. WireGuard and ntfy still come up; the dynamic DNS updater waits for the token.
+      todo_add cloudflare-token "Cloudflare token not provided: put the scoped Zone:DNS:Edit token for $DOMAIN in $CLOUDFLARE_TXT (and optionally a 'Zone ID: <32 hex>' line), then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 07" \
+        "Section 12.2/12.3. Until then vpn.$DOMAIN is not maintained; connect to WireGuard by the node's public IP shown by the gate."
+      return 1
+    fi
     # Accept "token", "KEY=token", "KEY: token" or a line of prose containing it: the first 40-char token-shaped word.
     token="$(grep -oE '[A-Za-z0-9_-]{40}' "$CLOUDFLARE_TXT" | head -n1 || true)"
-    [[ -n "$token" ]] || die "no Cloudflare API token (40 characters of [A-Za-z0-9_-]) found in $CLOUDFLARE_TXT"
+    if [[ -z "$token" ]]; then
+      todo_add cloudflare-token "No Cloudflare API token (40 characters of [A-Za-z0-9_-]) found in $CLOUDFLARE_TXT: put the scoped token there, then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 07" "Section 12.3"
+      return 1
+    fi
     # The plain-text file stays for Phase 2 step 6b's read-back-then-shred, but readable by the Principal and root only.
     chown "$PRINCIPAL_USER:$PRINCIPAL_USER" "$CLOUDFLARE_TXT"; chmod 600 "$CLOUDFLARE_TXT"
     log "read the Cloudflare token from $CLOUDFLARE_TXT (now 600 $PRINCIPAL_USER; left in place for Phase 2 step 6b to verify and shred)"
@@ -236,7 +244,7 @@ _cloudflare_env() {
 
 _ddns_install() {
   apt_install jq curl
-  _cloudflare_env
+  _cloudflare_env || { warn "dynamic DNS updater not installed yet (no Cloudflare token: to-do cloudflare-token); WireGuard and ntfy continue"; return 0; }
   install -m 755 "$ATLAS_DAY1_DIR/phase1/cloudflare-ddns.sh" /usr/local/sbin/atlas-ddns
   export VPN_HOST ATLAS_ETC
   render_template "$ATLAS_DAY1_DIR/systemd/atlas-ddns.service" /etc/systemd/system/atlas-ddns.service VPN_HOST ATLAS_ETC
@@ -400,7 +408,7 @@ step_07() {
   Node public IP (per the ddns updater): $home_ip     DNS record: $VPN_HOST
   If your router's WAN address is in 100.64.0.0/10 you are behind CGNAT and this cannot pass (R11).
   1. Open the WG-Easy admin page FROM THE NODE (it is published on 127.0.0.1 only, because the UI is plain
-     http): in the RDP session's Firefox, http://127.0.0.1:51821/ ; or over SSH: ssh -L 51821:127.0.0.1:51821
+     http): in the Remote Desktop session's browser, http://127.0.0.1:51821/ ; or over SSH: ssh -L 51821:127.0.0.1:51821
      and then http://127.0.0.1:51821/ on the PC. Log in as "$admin_user" with the password in
      $ATLAS_ETC/secrets/wg-easy.env (sudo cat it). Create a client named "phone" and show its QR code.
   2. On the phone: install the WireGuard app, scan the QR code, then TURN WI-FI OFF (mobile data only)
@@ -409,13 +417,17 @@ step_07() {
      with the password in $ATLAS_ETC/secrets/ntfy-principal.env; subscribe to topic "$NTFY_TOPIC". (ntfy's login
      is plain http on the LAN address too: make it over the tunnel or on the LAN only, never from outside.)
   V5 passes as soon as a handshake from a mobile-data address is seen. If none arrives in 10 minutes, V5 is
-  recorded as FAIL (CONVENTIONS §6: required, no deferral), this step still completes, and the Phase 1 gate
+  recorded as DEFERRED with a to-do (policy v0.3.3), this step still completes, and the Phase 1 gate
   blocks Phase 2 until you re-run it (idempotent, waits again) with:
       sudo $ATLAS_ENTRY phase1 --force 07
   =================================================================================
 MSG
   # The structural failure modes (container down, wg0 missing) already died above in _wg_easy_check, so a fail here
   # is the timeout: recorded (rule §7.4), the step completes, the gate (step 8) shows the red row.
-  run_verify V5 v05-wireguard.sh "$VPN_HOST" wg-easy "$WG_IFACE" 540 "sudo $ATLAS_ENTRY phase1 --force 07" \
-    || warn "V5 recorded as FAIL (no handshake from mobile data in time, or see the verify table). The phase continues to the gate, which blocks Phase 2 until: sudo $ATLAS_ENTRY phase1 --force 07"
+  # Policy v0.3.3: V5 needs the Principal's phone; no handshake in time is a to-do, not a failure the gate holds.
+  if ! run_verify V5 v05-wireguard.sh "$VPN_HOST" wg-easy "$WG_IFACE" 540 "sudo $ATLAS_ENTRY phase1 --force 07"; then
+    record_v V5 deferred "no WireGuard handshake from mobile data yet (to-do vpn-mobile-test); WG-Easy is up on UDP $WG_PORT"
+    todo_add vpn-mobile-test "Test WireGuard from the phone on mobile data (WG-Easy admin page on the node, client 'phone', scan the QR code), then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 07 to record V5" \
+      "Section 12.2 / V5. Also reserve the node's LAN IP ($LAN_IP) for its MAC address in the router so the UDP $WG_PORT forward keeps pointing at it."
+  fi
 }

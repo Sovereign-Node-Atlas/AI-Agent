@@ -5,7 +5,8 @@
 #
 #   1. The HF token (secrets/hf-token.env) must get HTTP 200 on a file HEAD of BOTH gated repos the 3.1 pipeline
 #      needs (voice-stt.md §5.2): pyannote/speaker-diarization-3.1 (config.yaml) and pyannote/segmentation-3.0
-#      (pytorch_model.bin). 401/403 = licence not accepted -> the two URLs the Principal must visit; exit 1.
+#      (pytorch_model.bin). 401/403 = licence not accepted -> the two URLs the Principal must visit; exit 2 (deferred,
+#      policy v0.3.3: a Principal input never fails a gate). No token at all -> exit 2 as well.
 #      The bearer header is read by curl from a mode-600 file (-H @file), never placed on argv where /proc/<pid>/cmdline
 #      shows it to every local account (fix round). The token file is PARSED (awk), never sourced: CONVENTIONS §2 makes
 #      it atlas:atlas, and this script runs as root (fix round 2: no root execution of an atlas-writable file).
@@ -43,7 +44,7 @@ if [[ -r "$tokf" ]]; then
   # Parsed, not sourced (header item 1): the file is atlas-owned per §2 and this runs as root.
   HF_TOKEN="$(awk -F= '$1=="HF_TOKEN" {sub(/^[^=]*=/, ""); gsub(/["'"'"' \t\r]/, ""); print; exit}' "$tokf")"
 fi
-[[ -n "$HF_TOKEN" ]] || { echo "V6 fail: HF_TOKEN empty or $tokf unreadable (phase2-services.sh prompts for it)"; exit 1; }
+[[ -n "$HF_TOKEN" ]] || { echo "V6 deferred: no Hugging Face token yet (to-do input-hf-token); PyAnnote diarisation waits for it"; exit 2; }
 [[ "$HF_TOKEN" =~ ^hf_[A-Za-z0-9_]{20,}$ ]] || { echo "V6 fail: HF_TOKEN in $tokf does not look like a Hugging Face token (hf_...)"; exit 1; }
 # The child processes (runuser -> env -> python) inherit it from the environment: never an argv element.
 export HF_TOKEN
@@ -77,7 +78,7 @@ blocked=()
 [[ "$rseg" == 200* ]] || blocked+=("https://huggingface.co/pyannote/segmentation-3.0 (HTTP $rseg)")
 if (( ${#blocked[@]} > 0 )); then
   case "$r31$rseg" in
-    *401*|*403*) echo "V6 fail: licence not accepted for ${blocked[*]}: visit each URL with the account that owns HF_TOKEN in $tokf, click 'Agree and access repository', then re-run: sudo $entry phase2 --force 05"; exit 1 ;;
+    *401*|*403*) echo "V6 deferred: PyAnnote licence not accepted yet for ${blocked[*]} (to-do: visit each URL with the account that owns HF_TOKEN in $tokf, click 'Agree and access repository', then re-run: sudo $entry phase2 --force 05)"; exit 2 ;;
     *) echo "V6 fail: huggingface.co unreachable or the token is invalid: ${blocked[*]} (proxy up? huggingface.co and .hf.co allowlisted?)"; exit 1 ;;
   esac
 fi

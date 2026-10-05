@@ -867,7 +867,7 @@ step_05() {
   # V6: recorded pass/fail, never fatal here (the Phase 2 gate blocks on a fail; the message names the licence URLs).
   # 3.1 only (header item 5): a refusal of the 3.1 id is a fail whose message carries the community-pipeline diagnostic.
   run_verify V6 v06-pyannote.sh "$PYANNOTE_VENV" "$VOICE_HF_HOME" "$PYANNOTE_PIPELINE" "$PYANNOTE_FALLBACK_PIPELINE" \
-    || warn "V6 recorded as fail: accept the PyAnnote licences named in the verify table with the HF_TOKEN account (or act on the pipeline diagnostic in its message), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
+    || warn "V6 not passed (deferred without a token, fail on a licence or pipeline problem; see the verify table), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
   _voice_pyannote_pipeline_proven
   # V7: pass ("rendered N files; Principal to listen") or deferred (reference recordings absent), per Section 17/22.
   run_verify V7 v07-voice-listen.sh "$LISTENING_DIR/v7-listening-test.json" \
