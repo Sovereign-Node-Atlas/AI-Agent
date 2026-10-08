@@ -232,10 +232,21 @@ rdp_rejects() { ! atlas_rdp_sources_check "$@" >/dev/null; }   # in this shell: 
 for v in 192.168.1.20 192.168.1.16/28 "192.168.1.20 192.168.1.30"; do
   check "atlas_rdp_sources_check accepts '$v'" atlas_rdp_sources_check 192.168.1.0/24 "$v"
 done
-for v in 192.168.1.256 192.168.01.20 192.168.1.20/33 192.168.1.20/028 192.168.1.0/024 192.168.1.0/0.0.0.255 10.0.0.5 0.0.0.0/0; do
+for v in 192.168.1.256 192.168.01.20 192.168.1.20/33 192.168.1.20/028 192.168.1.0/024 192.168.1.0/0.0.0.255 10.0.0.5 0.0.0.0/0 \
+         192.168.1.20/24 192.168.1.0/24 "192.168.1.0/25 192.168.1.128/25"; do
   check "atlas_rdp_sources_check rejects '$v'" rdp_rejects 192.168.1.0/24 "$v"
 done
 check "atlas_rdp_sources_check rejects the WireGuard bridge on a 10/8 LAN" rdp_rejects 10.0.0.0/8 10.42.42.42
+
+# _atlas_rdp_narrowed reads `ufw status` (stubbed as a function here): the subnet rule present -> not narrowed.
+ufw() { printf 'Status: active\n\nTo                         Action      From\n--                         ------      ----\n%s\n' "$UFW_RULES"; }
+UFW_RULES='3389/tcp on enp1s0           ALLOW       192.168.1.0/24             # xrdp LAN'
+( LAN_IFACE=enp1s0 LAN_CIDR=192.168.1.10/24; ! _atlas_rdp_narrowed ); rc=$?
+check "_atlas_rdp_narrowed: whole-subnet 3389 rule -> not narrowed" test "$rc" -eq 0
+UFW_RULES='3389/tcp on enp1s0           ALLOW       192.168.1.20               # xrdp LAN'
+( LAN_IFACE=enp1s0 LAN_CIDR=192.168.1.10/24; _atlas_rdp_narrowed ); rc=$?
+check "_atlas_rdp_narrowed: PC-only 3389 rule -> narrowed" test "$rc" -eq 0
+unset -f ufw
 
 # --- summary ------------------------------------------------------------------------------------------------------------
 echo

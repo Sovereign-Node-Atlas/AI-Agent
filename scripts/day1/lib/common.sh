@@ -262,7 +262,8 @@ _atlas_rdp_narrowed() {
 # atlas_rdp_sources_check LAN_CIDR "ENTRY..." — every entry must be a canonical dotted quad (octets 0..255, no leading
 # zeros) with an optional DECIMAL prefix 0..32 written without leading zeros (ufw passes the prefix unchanged to
 # iptables, which reads a leading zero as octal, and a dotted suffix as a netmask that Python would read as a hostmask),
-# must lie inside the LAN, and must not touch the WireGuard bridge network (VPN sessions arrive masqueraded as its
+# must have no host bits set (ufw would silently widen 192.168.1.20/24 to the whole /24), must lie inside the LAN
+# without covering all of it, and must not touch the WireGuard bridge network (VPN sessions arrive masqueraded as its
 # address on another interface, so a LAN rule for it never matches). Prints the offending entries and returns 1.
 atlas_rdp_sources_check() {
   python3 - "$1" "$2" "${ATLAS_WG_BRIDGE_NET:-10.42.42.0/24}" <<'PY'
@@ -277,13 +278,18 @@ for tok in sys.argv[2].split():
     if not re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}(/(0|[1-9][0-9]?))?", tok):
         bad.append(f"{tok} (write an address or address/prefix with a decimal prefix, e.g. 192.168.1.20 or 192.168.1.16/28)"); continue
     try:
-        net = ipaddress.IPv4Network(tok, strict=False)
+        net = ipaddress.IPv4Network(tok, strict=True)
     except ValueError as e:
-        bad.append(f"{tok} ({e})"); continue
+        hint = f"; write {tok.split('/')[0]} for one PC" if "host bits" in str(e) else ""
+        bad.append(f"{tok} ({e}{hint})"); continue
     if lan.version != 4 or not net.subnet_of(lan):
         bad.append(f"{tok} (not inside the LAN {lan})")
     elif net.overlaps(bridge):
         bad.append(f"{tok} (the WireGuard bridge {bridge}: VPN sessions are allowed separately)")
+if not bad:
+    nets = [ipaddress.IPv4Network(t, strict=True) for t in sys.argv[2].split()]
+    if any(lan.subnet_of(n) for n in ipaddress.collapse_addresses(nets)):
+        bad.append("together these admit the whole LAN, which narrows nothing (leave RDP_ALLOW_FROM blank for that)")
 if bad:
     print("; ".join(bad)); sys.exit(1)
 PY

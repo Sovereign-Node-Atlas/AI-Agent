@@ -699,7 +699,10 @@ _ufw_rules() {
   if [[ -x /usr/local/sbin/atlas-docker-egress ]] && systemctl is-active --quiet docker 2>/dev/null; then
     /usr/local/sbin/atlas-docker-egress >/dev/null || warn "atlas-docker-egress failed after ufw enable; run: systemctl restart atlas-docker-egress.service"
   fi
-  if [[ -n "${RDP_ALLOW_FROM:-}" ]] && todo_is_open rdp-restrict; then todo_done rdp-restrict; fi
+  if [[ -n "${RDP_ALLOW_FROM:-}" ]] && todo_is_open rdp-restrict; then
+    if _atlas_rdp_narrowed; then todo_done rdp-restrict
+    else warn "RDP_ALLOW_FROM is set but ufw still admits the whole LAN $net on 3389; the to-do rdp-restrict stays open"; fi
+  fi
   log "ufw enabled: default deny in/out/routed; LAN=$lan $net; WG bridge=$wgbr $wgnet; DNS ${ATLAS_LAN_RESOLVERS[*]} (uid dnsmasq only); time: $ntp_desc"
   ufw status verbose | sed 's/^/    /'
 }
