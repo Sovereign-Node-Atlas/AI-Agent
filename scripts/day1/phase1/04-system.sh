@@ -5,8 +5,9 @@
 # then the reboot marker and the reboot (unless --no-reboot).
 # Order matters: the proxy, the forwarder and the firewall come first so that even the system update obeys rule §7.1.
 #
-# THE ONE UNAVOIDABLE PRE-PROXY INSTALL: squid itself and dnsmasq (with jq and gettext-base for rendering their
-# configs) have to be fetched from the Ubuntu archive before the proxy exists. Nothing else in steps 1-4 installs a
+# THE UNAVOIDABLE PRE-PROXY INSTALLS: squid itself and dnsmasq (with jq and gettext-base for rendering their configs)
+# have to be fetched from the Ubuntu archive before the proxy exists; so do rsync (atlas-day1.sh) and libtss2-rc0t64
+# (step 1, systemd's TPM2 support, doc S42). Nothing else in steps 1-4 installs a
 # package before _squid_render/_ufw_rules have run (steps 1-3 only verify that the ISO-seeded tools are present).
 #
 # DNS (fix round, Section 12.5 "everything else denied and logged"): the home router's recursive resolver answers ANY

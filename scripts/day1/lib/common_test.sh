@@ -248,6 +248,26 @@ UFW_RULES='3389/tcp on enp1s0           ALLOW       192.168.1.20               #
 check "_atlas_rdp_narrowed: PC-only 3389 rule -> narrowed" test "$rc" -eq 0
 unset -f ufw
 
+# --- atlas_tpm_check (doc S42): libtss2 missing, one TPM, two TPMs, none ----------------------------------------------
+systemd-cryptenroll() {
+  case "$TPM_MODE" in
+    nolib) echo "TPM2 support is not installed." >&2; return 1 ;;
+    one)   printf 'PATH        DEVICE      DRIVER\n/dev/tpmrm0 MSFT0101:00 tpm_crb\n' ;;
+    two)   printf 'PATH        DEVICE      DRIVER\n/dev/tpmrm0 MSFT0101:00 tpm_crb\n/dev/tpmrm1 IFX0785:00 tpm_tis\n' ;;
+    none)  echo "No suitable TPM2 devices found." >&2 ;;
+  esac
+}
+for m in nolib one two none; do
+  out="$(TPM_MODE=$m ATLAS_TEST_TPM_PRESENT=1 atlas_tpm_check)" && rc=0 || rc=$?
+  case "$m" in
+    one)   check "atlas_tpm_check: one TPM -> usable" test "$rc" -eq 0 ;;
+    nolib) check "atlas_tpm_check: libtss2 missing -> names libtss2-rc0t64" grep -q 'libtss2-rc0t64' <<<"$out" ;;
+    two)   check "atlas_tpm_check: two TPMs -> refused (tpm2-device=auto needs one)" grep -q '^2 TPM device' <<<"$out" ;;
+    none)  check "atlas_tpm_check: none listed -> refused" grep -q '^0 TPM device' <<<"$out" ;;
+  esac
+done
+unset -f systemd-cryptenroll
+
 # --- summary ------------------------------------------------------------------------------------------------------------
 echo
 echo "common_test: $pass_n passed, $fail_n failed"

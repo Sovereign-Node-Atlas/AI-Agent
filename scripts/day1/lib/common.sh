@@ -232,6 +232,23 @@ print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": sys.argv[3], "t
   log "to-do $id closed"
 }
 
+# atlas_tpm_check — returns 0 when systemd sees exactly one TPM (what tpm2-device=auto needs: two tpmrm devices make it
+# refuse with ENOTUNIQ); otherwise prints the reason, with systemd-cryptenroll's own words, and returns 1. "TPM2 support
+# is not installed" means a libtss2 library is missing (systemd 259 dlopen()s libtss2-esys, -rc and -mu; doc S42).
+atlas_tpm_check() {
+  local l n
+  l="$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)"
+  if grep -qi 'support is not installed' <<<"$l"; then
+    echo "systemd's TPM2 support is not installed: it needs libtss2-esys, libtss2-rc and libtss2-mu (sudo apt-get install libtss2-rc0t64). systemd-cryptenroll says: $(tr '\n' ' ' <<<"$l")"; return 1
+  fi
+  # ATLAS_TEST_TPM_PRESENT=1 stands in for the device node in lib/common_test.sh only (like ATLAS_TEST_SECURE_BOOT).
+  [[ -c /dev/tpmrm0 || "${ATLAS_TEST_TPM_PRESENT:-}" == 1 ]] || { echo "/dev/tpmrm0 absent: enable the fTPM in the BIOS (Section 3.2) and reboot"; return 1; }
+  n="$(grep -c '^/dev/tpmrm' <<<"$l" || true)"
+  if (( n != 1 )); then
+    echo "$n TPM device(s) listed by systemd-cryptenroll --tpm2-device=list; tpm2-device=auto needs exactly one (fTPM enabled? fTPM and a discrete TPM both active?): $(tr '\n' ' ' <<<"$l")"; return 1
+  fi
+}
+
 # todo_is_open ID — true when the latest record for ID is an open to-do (so a caller closes it once, not every run).
 todo_is_open() {
   [[ -s "${ATLAS_TODO_FILE:-}" ]] || return 1

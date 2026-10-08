@@ -157,7 +157,10 @@ never prompt; never take longer than 10 minutes; safe to re-run.
 ## 7. Rules for the scripts
 
 1. **Nothing cloud.** No model inference off-node, no hosted AI, no telemetry, no analytics beacons. Every outbound
-   request goes through the allowlist proxy; the allowlist is `config/allowlist.txt` and nothing else.
+   request goes through the allowlist proxy; the allowlist is `config/allowlist.txt` and nothing else. The only
+   packages fetched before the proxy exists (from the Ubuntu archive, before the firewall closes) are rsync (the entry
+   point), libtss2-rc0t64 (Phase 1 step 1: systemd's TPM2 support needs it and the server image lacks it) and squid,
+   dnsmasq, jq and gettext-base (step 4, to build the proxy itself).
 2. **Secrets** live only under `/etc/atlas/secrets/`, mode 600, owned by the one service that reads them. Never
    echoed to logs, never in `atlas.env`, never in git, never inside `/srv/atlas`, never in restic's include set.
    The one declared exception is the transient tmpfs passfile `/run/atlas-vault/pass` (root:root 600, written by the

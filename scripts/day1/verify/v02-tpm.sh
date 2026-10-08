@@ -18,9 +18,8 @@ source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
 dev="${1:-}"; mapping="${2:-atlas-data}"; osdev="${3:-}"; osnote="${4:-}"
 [[ -n "$dev" ]] || { echo "usage: v02-tpm.sh LUKS_DEVICE MAPPING_NAME [OS_LUKS_DEVICE|-] [OS_NOTE]"; exit 1; }
-[[ -c /dev/tpmrm0 ]] || { echo "/dev/tpmrm0 absent: fTPM disabled in BIOS or tpm driver missing"; exit 1; }
-listing="$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)"
-grep -q '/dev/tpmrm0' <<<"$listing" || { echo "systemd-cryptenroll --tpm2-device=list does not show /dev/tpmrm0: $listing"; exit 1; }
+# Exactly one TPM that systemd can use (lib/common.sh atlas_tpm_check: libtss2 present, /dev/tpmrm0, one device).
+tpm_why="$(atlas_tpm_check)" || { echo "V2 fail: $tpm_why"; exit 1; }
 
 # Secure Boot state: the SecureBoot EFI variable (4-byte attribute header, byte 4 is the value), then mokutil; a
 # legacy-BIOS boot has none. Same reading as phase1_secure_boot_state in phase1/01-preflight.sh (this script is

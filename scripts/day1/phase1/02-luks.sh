@@ -5,7 +5,7 @@
 # installer-made OS volume when it is LUKS.
 #
 # THE CONSOLE PAUSE (rule §7.6): one console session, at most two framed blocks. Block 1 asks for the inputs, each
-# checked on the spot (three tries) before anything changes: the OS LUKS passphrase ONCE when the installer encrypted
+# checked on the spot (three tries) before it is used and before anything irreversible: the OS LUKS passphrase ONCE when the installer encrypted
 # the OS volume and it has no TPM2 token yet, or when this step finds that its token no longer unseals (e.g. Secure
 # Boot switched on; the TPM is tried first); and the data volume's recovery key ONCE when nothing on the node can
 # authorise a header change (keyfile gone, TPM refuses, no usable on-node copy). A missing or disabled TPM stops the
@@ -41,7 +41,8 @@
 #
 # No package is installed here: cryptsetup, systemd-cryptsetup and dracut are seeded on the 26.04 Server ISO
 # (VERIFIED: the installer itself uses them for the encrypted OS volume). Their absence stops the step (step 4 brings
-# the proxy; rule §7.1). systemd-cryptenroll speaks to the TPM directly, but the INITRAMFS needs tpm2-tools: dracut's
+# the proxy; rule §7.1). systemd-cryptenroll needs the libtss2 libraries at runtime (step 1 installs the one the image
+# lacks, libtss2-rc0t64, doc S42), and the INITRAMFS needs tpm2-tools as well: dracut's
 # tpm2-tss module (dracut 110 on 26.04.1, modules.d/73tpm2-tss) has `check() { require_binaries tpm2 || return 1; }`
 # (VERIFIED from dracut-ng main), tpm2-tools (universe, ships /usr/bin/tpm2) is NOT on the 26.04.1 server image
 # (VERIFIED from its manifest), and a module named in add_dracutmodules that fails its check stops dracut ("Module
@@ -265,9 +266,7 @@ step_02() {
   # (Secure Boot switched on, firmware update): the new token is enrolled first and the old tpm2 slots wiped with the
   # new one excluded (VERIFIED in cryptenroll.c: wipe_slots(..., except_slot=slot)). A usable TPM is checked first so
   # a missing or disabled fTPM never turns into a request for a key that cannot help.
-  if ! { [[ -c /dev/tpmrm0 ]] && grep -q '/dev/tpmrm' <<<"$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)"; }; then
-    die "no usable TPM: /dev/tpmrm0 is missing or systemd-cryptenroll --tpm2-device=list does not show it (fTPM enabled in the BIOS? exactly one TPM?). Nothing was changed."
-  fi
+  local tpm_why; tpm_why="$(atlas_tpm_check)" || die "no usable TPM: $tpm_why. Nothing was changed."
   osdev="$(_luks_os_device)" || die "cannot resolve the LUKS device under / (see the message above). This is not an unencrypted install; check: findmnt /; lsblk -s \"\$(findmnt -n -o SOURCE /)\""
   osmap="$(_luks_os_mapping)"
   if [[ -z "$osdev" ]]; then
@@ -408,7 +407,7 @@ step_02() {
         rk="$(tr -d '[:space:]' <<<"$rk")"
         _luks_key_ok "$dev" "$rk" && break
         tries=$((tries + 1))
-        (( tries < 3 )) || { rk=""; die "the recovery key for $dev was not accepted three times; nothing was changed. Re-run: sudo $ATLAS_ENTRY phase1"; }
+        (( tries < 3 )) || { rk=""; die "the recovery key for $dev was not accepted three times. Nothing was revoked and no new key was shown; a re-run continues from here: sudo $ATLAS_ENTRY phase1"; }
         echo "  Not accepted, try again." >/dev/tty
       done
     fi
@@ -418,7 +417,7 @@ step_02() {
         pw=""; while [[ -z "$pw" ]]; do _luks_tty_read "  LUKS passphrase for $osmap: " pw silent; done
         _luks_key_ok "$osdev" "$pw" && break
         tries=$((tries + 1))
-        (( tries < 3 )) || { pw=""; die "the passphrase for $osmap was not accepted three times; nothing was changed. Re-run: sudo $ATLAS_ENTRY phase1"; }
+        (( tries < 3 )) || { pw=""; die "the passphrase for $osmap was not accepted three times. Nothing was revoked and no new key was shown; a re-run continues from here: sudo $ATLAS_ENTRY phase1"; }
         echo "  Not accepted, try again." >/dev/tty
       done
     fi

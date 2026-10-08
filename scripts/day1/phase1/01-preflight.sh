@@ -55,7 +55,8 @@ step_01() {
   (( mem_gib >= 180 )) || problems+=("MemTotal ${mem_gib} GiB, expected ~192 GiB (Section 2)")
 
   # --- GPU: vendor 0x1002, display class, driver amdgpu; device id logged and warned, never failed -------------
-  # pciutils is on every Ubuntu Server image; nothing is installed before the proxy exists (rule §7.1, step 4).
+  # pciutils is on every Ubuntu Server image; the only package step 1 installs before the proxy exists is
+  # libtss2-rc0t64, below (rule §7.1's declared exceptions: rsync, libtss2-rc0t64, then squid/dnsmasq in step 4).
   command -v lspci >/dev/null || die "pre-flight: lspci (pciutils) is missing; install it from the console and re-run (no package is fetched before the allowlist proxy exists)"
   local slot; slot="$(lspci -Dn -d 1002: 2>/dev/null | awk '$2 ~ /^03/ {print $1; exit}')"
   [[ -n "$slot" ]] || die "pre-flight: no AMD (0x1002) display-class PCI device found (lspci -Dn -d 1002:)"
@@ -78,10 +79,18 @@ step_01() {
   [[ -c /dev/kfd ]] || warn "pre-flight: /dev/kfd is absent (amdkfd not loaded?); Phase 4 containers need it, Phase 1 does not"
 
   # --- fTPM (V2 is recorded in step 2, after enrolment) ---------------------------------------------------------
-  [[ -c /dev/tpmrm0 ]] || die "pre-flight: /dev/tpmrm0 absent: enable fTPM in the BIOS (Section 3.2) and reboot"
-  local tpmlist; tpmlist="$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)"
-  grep -q '/dev/tpmrm0' <<<"$tpmlist" || die "pre-flight: systemd-cryptenroll --tpm2-device=list does not list /dev/tpmrm0: $tpmlist"
-  log "tpm2: $(grep '/dev/tpmrm0' <<<"$tpmlist" | head -n1)"
+  # systemd 259 dlopen()s libtss2-esys, libtss2-rc and libtss2-mu for every TPM2 operation (dlopen_tpm2, VERIFIED in
+  # src/shared/tpm2-util.c v259). The 26.04.1 server image carries esys and mu but NOT libtss2-rc0t64 (VERIFIED from its
+  # manifest; main, about 20 KB; nothing on the image depends on it), so systemd-cryptenroll answers "TPM2 support is
+  # not installed" until it is there (doc S42). It is installed here from the Ubuntu archive: a declared pre-proxy
+  # install like rsync in atlas-day1.sh and squid/dnsmasq in step 4 (the firewall does not exist yet).
+  local ldc; ldc="$(ldconfig -p 2>/dev/null || true)"
+  if ! grep -q 'libtss2-rc\.so\.0' <<<"$ldc"; then
+    log "installing libtss2-rc0t64 (systemd's TPM2 support needs it; it is not on the 26.04.1 server image)"
+    apt_install libtss2-rc0t64
+  fi
+  local tpm_why; tpm_why="$(atlas_tpm_check)" || die "pre-flight: $tpm_why"
+  log "tpm2: $(grep '^/dev/tpmrm' <<<"$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)" | head -n1)"
   [[ ! -e /etc/systemd/tpm2-pcr-public-key.pem ]] \
     || die "pre-flight: /etc/systemd/tpm2-pcr-public-key.pem exists; systemd-cryptenroll would also bind to a PCR 11 signature that GRUB boots cannot satisfy. Remove it (it belongs to UKI/systemd-boot setups) and re-run."
   # --- Secure Boot vs the PCR 7 binding. S9 fixes the TPM2 enrolment to PCR 7. With Secure Boot off, PCR 7 measures
