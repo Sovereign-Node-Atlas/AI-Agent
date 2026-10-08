@@ -4,18 +4,21 @@
 # one interactive pause ("WRITTEN DOWN"), crypttab, initramfs (dracut on 26.04). Also enrols TPM2 on the
 # installer-made OS volume when it is LUKS.
 #
-# THE CONSOLE PAUSE (rule §7.6): one console session, at most two framed blocks. Block 1 asks for the inputs: the OS
-# LUKS passphrase ONCE when the installer encrypted the OS volume and it has no TPM2 token yet, or when --force 02
-# finds that its token no longer unseals (e.g. Secure Boot switched on; the TPM is tried first); and the data volume's
-# recovery key ONCE when nothing on the node can authorise a header change (keyfile gone, TPM refuses, no on-node
-# copy). A wrong value stops the step there, before anything irreversible. Block 2 prints a NEW recovery key once and
-# waits for WRITTEN DOWN; only after that are the old recovery slots revoked, an exposed copy shredded and the
-# confirmation written, so an interrupted pause never leaves a revoked key as the only one the Principal holds (review
-# v0.3.4). If the only problem was a missing on-node copy on an encrypted OS, the typed key is restored as the copy
-# instead of being replaced. Section 3.5 wants the OS volume TPM-unlocked too; every typed secret is used for this
-# step only and never stored (except the restored copy, which is D3's design). The screen AND the terminal scrollback
-# are cleared after each block (ESC[3J), so nothing lingers in the SSH client's history. Everything else in this step
-# runs unattended.
+# THE CONSOLE PAUSE (rule §7.6): one console session, at most two framed blocks. Block 1 asks for the inputs, each
+# checked on the spot (three tries) before anything changes: the OS LUKS passphrase ONCE when the installer encrypted
+# the OS volume and it has no TPM2 token yet, or when this step finds that its token no longer unseals (e.g. Secure
+# Boot switched on; the TPM is tried first); and the data volume's recovery key ONCE when nothing on the node can
+# authorise a header change (keyfile gone, TPM refuses, no usable on-node copy). A missing or disabled TPM stops the
+# step before anything is asked. Block 2 prints a NEW recovery key once and waits for WRITTEN DOWN; only after that
+# are the old recovery slots revoked, an exposed copy shredded and the confirmation written, so an interrupted pause
+# never leaves a revoked key as the only one the Principal holds (review v0.3.4). If the only problem was a missing
+# on-node copy on an encrypted OS with exactly one recovery slot, the typed key is restored as the copy instead of
+# being replaced. Every run of this step re-seals existing TPM2 tokens to the current PCR 7 (a no-op when it is
+# unchanged), so --force 02 after switching Secure Boot on is the remedy, and so is a plain re-run of an unfinished
+# step. Section 3.5 wants the OS volume TPM-unlocked too; typed secrets are used for this step only and never stored,
+# except a key that restores the missing on-node copy (D3). The screen AND the terminal scrollback are cleared after
+# each block, also when the pause is interrupted (an EXIT/INT trap around block 2). Everything else in this step runs
+# unattended.
 #
 # WHAT STAYS ON THE NODE (D3, R16): the recovery key's on-node convenience copy ($ATLAS_LUKS_RECOVERY, root 600) when
 # the OS volume is LUKS2 (D3: "on the node and on an external USB drive"; R16 "the on-node copy is convenience only";
@@ -107,6 +110,20 @@ _luks_recovery_slots() {
 d = json.loads(sys.argv[1])
 s = sorted({int(k) for t in d.get("tokens", {}).values() if t.get("type") == "systemd-recovery" for k in t.get("keyslots", [])})
 sys.stdout.write("".join(f"{k}\n" for k in s))' "$j" 2>/dev/null || true
+}
+
+# _luks_key_ok DEVICE KEY — does KEY (a passphrase or recovery key) open DEVICE? The key goes through a pipe from the
+# printf builtin, never argv; --key-file=- takes the bytes as they are (no newline handling), the same bytes
+# systemd-cryptenroll later gets from $PASSWORD; --disable-external-tokens keeps a TPM token from answering instead.
+_luks_key_ok() {
+  printf '%s' "$2" | cryptsetup open --test-passphrase --disable-external-tokens --key-file=- "$1" >/dev/null 2>&1
+}
+
+# _luks_node_key — the in-memory or on-node recovery copy, whitespace stripped (empty when none).
+_luks_node_key() {
+  local rec="${LUKS_RECOVERY_INMEM:-}"
+  [[ -n "$rec" || ! -s "$ATLAS_LUKS_RECOVERY" ]] || rec="$(tr -d '[:space:]' <"$ATLAS_LUKS_RECOVERY")"
+  printf '%s' "$rec"
 }
 
 # _luks_enroll_try DEVICE ARGS... — the same authorisation order as _luks_enroll (keyfile, TPM, in-memory or on-node
@@ -242,11 +259,15 @@ step_02() {
 
   # --- OS volume state, decided once. Unencrypted: the data volume is still encrypted and the phase continues; the
   # to-do os-volume-encryption (step 1) stands and V2 is recorded deferred (policy v0.3.3, header). ---------------
-  local osdev osmap os_note="" need_os_enrol=0 os_reseal=0 reseal=0
-  # --force 02 re-seals both TPM2 tokens to the current PCR 7 (the secure-boot to-do's remedy: switching Secure Boot
-  # on changes PCR 7, so the old tokens no longer unseal). systemd-cryptenroll enrols the new token first and wipes the
-  # old tpm2 slots with the new one excluded (VERIFIED in cryptenroll.c: wipe_slots(..., except_slot=slot)).
-  [[ " ${ATLAS_FORCED_STEPS:-} " == *" 02 "* ]] && reseal=1
+  local osdev osmap os_note="" need_os_enrol=0 os_reseal=0
+  # Every run of this step re-seals existing TPM2 tokens to the current PCR 7 (review v0.3.4, fourth round): whether a
+  # token still unseals decides, not --force. Unchanged PCR 7: systemd 259 keeps the token as it is (no-op). Changed
+  # (Secure Boot switched on, firmware update): the new token is enrolled first and the old tpm2 slots wiped with the
+  # new one excluded (VERIFIED in cryptenroll.c: wipe_slots(..., except_slot=slot)). A usable TPM is checked first so
+  # a missing or disabled fTPM never turns into a request for a key that cannot help.
+  if ! { [[ -c /dev/tpmrm0 ]] && grep -q '/dev/tpmrm' <<<"$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)"; }; then
+    die "no usable TPM: /dev/tpmrm0 is missing or systemd-cryptenroll --tpm2-device=list does not show it (fTPM enabled in the BIOS? exactly one TPM?). Nothing was changed."
+  fi
   osdev="$(_luks_os_device)" || die "cannot resolve the LUKS device under / (see the message above). This is not an unencrypted install; check: findmnt /; lsblk -s \"\$(findmnt -n -o SOURCE /)\""
   osmap="$(_luks_os_mapping)"
   if [[ -z "$osdev" ]]; then
@@ -254,18 +275,15 @@ step_02() {
     warn "$os_note; Section 3.5 wants LUKS2 on it. The 8 TB data volume is encrypted now regardless, and the phase continues"
     todo_add os-volume-encryption "The OS volume is not encrypted: reinstall Ubuntu with the encrypted-LVM option (Section 3.5), then run Phase 1 again" \
       "Until then NO copy of the data volume's recovery key is kept on the node (it would sit on an unencrypted disk beside the volume it opens): the USB copy is the only one, keep it safe (D3, R16). V2 stays deferred."
-  elif _luks_has_token "$osdev" tpm2 && (( ! reseal )); then
-    os_note="LUKS $osmap on $osdev, TPM2 already enrolled"
-    log "OS volume: $os_note"
   elif _luks_has_token "$osdev" tpm2; then
-    # --force 02: re-seal with the TPM's own authorisation first (PCR 7 unchanged: no passphrase needed); only when
-    # the TPM refuses (Secure Boot just switched on) is the installer passphrase asked, once, in the pause below.
+    # Re-seal with the TPM's own authorisation first (PCR 7 unchanged: a no-op, no passphrase); only when the TPM
+    # refuses (Secure Boot just switched on) is the installer passphrase asked, once, in console block 1.
     if systemd-cryptenroll --unlock-tpm2-device=auto --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 "$osdev" >/dev/null 2>&1; then
-      os_note="LUKS $osmap on $osdev, TPM2 token re-sealed with the TPM's own authorisation (PCR 7 unchanged)"
+      os_note="LUKS $osmap on $osdev, TPM2 token current (checked and re-sealed with the TPM's own authorisation)"
       log "OS volume: $os_note"
     else
       need_os_enrol=1; os_reseal=1
-      log "OS volume: LUKS $osmap on $osdev: the TPM no longer unseals its token (PCR 7 changed, e.g. Secure Boot switched on); --force 02 re-seals it with the installer passphrase, asked once in the pause below"
+      log "OS volume: LUKS $osmap on $osdev: the TPM no longer unseals its token (PCR 7 changed, e.g. Secure Boot switched on); it is re-sealed with the installer passphrase, asked once in console block 1"
     fi
   else
     need_os_enrol=1
@@ -321,23 +339,35 @@ step_02() {
   fi
   (( need_new_key || need_os_enrol )) && _luks_need_tty     # fail fast: these need the console, nothing is changed yet
 
-  if ! _luks_has_token "$dev" tpm2 || (( reseal )); then
-    log "$( _luks_has_token "$dev" tpm2 && echo "re-sealing the TPM2 token on $dev to the current PCR 7 (--force 02)" || echo "enrolling TPM2 (PCR 7) on $dev" )"
-    if ! _luks_enroll_try "$dev" --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 >/dev/null 2>&1; then
-      # With the keyfile present the authorisation was fine, so the TPM itself failed: no typed key can help.
-      [[ -s "$ATLAS_LUKS_KEYFILE" ]] && die "systemd-cryptenroll --tpm2-device=auto failed on $dev (V2). Check: fTPM enabled, exactly one TPM (systemd-cryptenroll --tpm2-device=list)"
-      need_data_rec=1; data_tpm_pending=1
+  log "$( _luks_has_token "$dev" tpm2 && echo "checking the TPM2 token on $dev against the current PCR 7 (re-sealed if it changed)" || echo "enrolling TPM2 (PCR 7) on $dev" )"
+  if ! _luks_enroll_try "$dev" --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 >/dev/null 2>&1; then
+    # Authorisation known good (keyfile, or a node copy that opens the volume) means the TPM enrolment itself failed:
+    # broken machinery, and no typed key can help.
+    if [[ -s "$ATLAS_LUKS_KEYFILE" ]] || { [[ -n "$(_luks_node_key)" ]] && _luks_key_ok "$dev" "$(_luks_node_key)"; }; then
+      die "systemd-cryptenroll --tpm2-device=auto failed on $dev although it was authorised (V2). Check: fTPM enabled, exactly one TPM (systemd-cryptenroll --tpm2-device=list). Nothing was revoked."
     fi
-  else
-    log "TPM2 token already enrolled on $dev"
+    need_data_rec=1; data_tpm_pending=1
   fi
   # Recovery slots that exist now; revoked after WRITTEN DOWN when a new key replaces them (by number: LUKS2 fills the
   # first free slot, so "the newest is the highest" would be wrong once the keyfile slot is free).
   local old_slots=() sl recovery="" restore_copy=0
   mapfile -t old_slots < <(_luks_recovery_slots "$dev")
   if (( need_new_key && ! need_data_rec )); then
-    recovery="$(_luks_enroll_try "$dev" --recovery-key 2>/dev/null | tr -d '[:space:]')" || recovery=""
-    [[ -n "$recovery" ]] || need_data_rec=1       # nothing on the node authorises it: the typed key will
+    # stderr goes to a root-only file, shown only on failure: on success it carries only a banner (the key itself is
+    # on stdout, and no QR code is drawn when stderr is not a terminal).
+    local errf; errf="$(umask 077; mktemp "$ATLAS_ETC/secrets/.enroll-err.XXXXXX")"
+    recovery="$(_luks_enroll_try "$dev" --recovery-key 2>"$errf" | tr -d '[:space:]')" || recovery=""
+    if [[ -z "$recovery" ]]; then
+      local enr_err; enr_err="$(tail -n 5 "$errf" | tr '\n' ' ')"; rm -f "$errf"
+      if [[ -s "$ATLAS_LUKS_KEYFILE" ]] || { [[ -n "$(_luks_node_key)" ]] && _luks_key_ok "$dev" "$(_luks_node_key)"; }; then
+        die "systemd-cryptenroll --recovery-key failed on $dev although it was authorised: $enr_err Nothing was revoked."
+      fi
+      _luks_has_token "$dev" recovery \
+        || die "systemd-cryptenroll --recovery-key failed on $dev and no recovery key has ever been issued, so there is nothing to type: $enr_err"
+      need_data_rec=1       # nothing on the node authorises it: the recovery key the Principal holds will
+    else
+      rm -f "$errf"
+    fi
   elif (( ! need_new_key )); then
     log "recovery key already enrolled and confirmed as written down on $(cat "$ATLAS_LUKS_CONFIRMED")"
   fi
@@ -354,23 +384,43 @@ step_02() {
       if (( need_data_rec )); then
         echo "#   The 8 TB data volume needs its RECOVERY KEY (from your USB drive or your written copy): the TPM no"
         echo "#   longer unseals it (PCR 7 changed, e.g. Secure Boot switched on) and no usable copy is on this node."
-        echo "#   It is used for this step only and never stored or logged."
+        if (( need_new_key && keep_copy && ! exposed && ${#old_slots[@]} == 1 )); then
+          echo "#   It is never logged; it is kept as the node's root-only copy (D3), which was missing."
+        else
+          echo "#   It is used for this step only and never stored or logged."
+        fi
         echo "#"
       fi
       if (( need_os_enrol )); then
         echo "#   The OS volume ($osmap) is encrypted with the passphrase you typed in the Ubuntu installer."
-        (( os_reseal )) && echo "#   (--force 02: its TPM2 token no longer unseals and is re-sealed to the current firmware state.)"
+        (( os_reseal )) && echo "#   (Its TPM2 token no longer unseals, e.g. Secure Boot switched on; it is re-sealed to the current state.)"
         echo "#   It is asked ONCE so the TPM can unlock the OS at boot without a keyboard (never stored)."
         echo "#"
       fi
       echo "$line"; echo
     } >/dev/tty 2>/dev/null || die "cannot use the console: no terminal"
+    # Each value is checked here, before anything is changed, with up to three tries.
+    local tries
     if (( need_data_rec )); then
-      while [[ -z "$rk" ]]; do _luks_tty_read "  Recovery key of the 8 TB data volume: " rk silent; done
-      rk="$(tr -d '[:space:]' <<<"$rk")"
+      tries=0
+      while :; do
+        rk=""; while [[ -z "$rk" ]]; do _luks_tty_read "  Recovery key of the 8 TB data volume: " rk silent; done
+        rk="$(tr -d '[:space:]' <<<"$rk")"
+        _luks_key_ok "$dev" "$rk" && break
+        tries=$((tries + 1))
+        (( tries < 3 )) || { rk=""; die "the recovery key for $dev was not accepted three times; nothing was changed. Re-run: sudo $ATLAS_ENTRY phase1"; }
+        echo "  Not accepted, try again." >/dev/tty
+      done
     fi
     if (( need_os_enrol )); then
-      while [[ -z "$pw" ]]; do _luks_tty_read "  LUKS passphrase for $osmap: " pw silent; done
+      tries=0
+      while :; do
+        pw=""; while [[ -z "$pw" ]]; do _luks_tty_read "  LUKS passphrase for $osmap: " pw silent; done
+        _luks_key_ok "$osdev" "$pw" && break
+        tries=$((tries + 1))
+        (( tries < 3 )) || { pw=""; die "the passphrase for $osmap was not accepted three times; nothing was changed. Re-run: sudo $ATLAS_ENTRY phase1"; }
+        echo "  Not accepted, try again." >/dev/tty
+      done
     fi
     printf '\033[2J\033[3J\033[H' >/dev/tty 2>/dev/null || true
   fi
@@ -378,14 +428,16 @@ step_02() {
     # Proves the key and re-seals the TPM2 token in one call (new token enrolled first, old tpm2 slots wiped).
     if ! PASSWORD="$rk" systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 "$dev" >/dev/null; then
       rk=""
-      die "re-sealing $dev with the typed recovery key failed: the key was not accepted, or the TPM is unusable (systemd-cryptenroll --tpm2-device=list). Nothing was revoked. Re-run: sudo $ATLAS_ENTRY phase1 --force 02"
+      die "the recovery key opens $dev but the TPM2 enrolment with it failed: the TPM is the problem (systemd-cryptenroll --tpm2-device=list). Nothing was revoked."
     fi
     data_tpm_pending=0
     LUKS_RECOVERY_INMEM="$rk"          # authorises the remaining header changes of this run; cleared at the end
     log "TPM2 token on $dev $( _luks_has_token "$dev" tpm2 && echo re-sealed ) to the current PCR 7 with the typed recovery key"
-    if (( need_new_key && keep_copy && ! exposed )); then
+    if (( need_new_key && keep_copy && ! exposed && ${#old_slots[@]} == 1 )); then
       # Encrypted OS, only the copy or the confirmation was missing: the typed key is the Principal's own written/USB
-      # key, now proven, so it is restored as the on-node copy rather than replaced (their copies stay valid).
+      # key, now proven, so it is restored as the on-node copy rather than replaced (their copies stay valid). Only with
+      # exactly ONE recovery slot: a second one is the trace of an interrupted pause (a key shown but never
+      # confirmed), so that case rotates and revokes both after WRITTEN DOWN.
       restore_copy=1; need_new_key=0
     elif (( need_new_key )); then
       recovery="$(_luks_enroll_try "$dev" --recovery-key 2>/dev/null | tr -d '[:space:]')" || recovery=""
@@ -405,6 +457,9 @@ step_02() {
   if [[ -n "$recovery" ]]; then
     LUKS_RECOVERY_INMEM="$recovery"     # authorises the revocations below and the keyfile wipe later in this step
     rm -f "$ATLAS_LUKS_CONFIRMED"
+    # An interrupted pause (Ctrl-C, end of input, an error) must not leave the key on screen or in the scrollback.
+    trap 'printf "\033[2J\033[3J\033[H" >/dev/tty 2>/dev/null || true; echo "  recovery key NOT confirmed: nothing was revoked; re-run sudo $ATLAS_ENTRY phase1 to issue and confirm a new one" >/dev/tty 2>/dev/null || true' EXIT
+    trap 'exit 130' INT TERM
     {
       echo; echo "$line"; echo "#"
       echo "#   LUKS RECOVERY KEY for the 8 TB data volume (label atlas-data, UUID $uuid)"
@@ -430,6 +485,7 @@ step_02() {
     done
     # ESC[2J clears the screen, ESC[3J the scrollback (xterm/VTE/Windows Terminal honour it; `clear` alone does not).
     printf '\033[2J\033[3J\033[H' >/dev/tty 2>/dev/null || true
+    trap - EXIT INT TERM
     for sl in "${old_slots[@]}"; do
       [[ "$sl" =~ ^[0-9]+$ ]] || die "unexpected recovery slot '$sl' on $dev"
       PASSWORD="$recovery" systemd-cryptenroll "--wipe-slot=$sl" "$dev" >/dev/null \
@@ -486,8 +542,9 @@ step_02() {
 
   # --- Prove the TPM unlocks it (V2 evidence): attach through the TPM, leave it attached for step 3 -------------
   if ! cryptsetup status "$ATLAS_LUKS_MAPPING" >/dev/null 2>&1; then
-    systemd-cryptsetup attach "$ATLAS_LUKS_MAPPING" "/dev/disk/by-uuid/$uuid" none tpm2-device=auto \
-      || { record_v V2 fail "TPM2 unlock test failed on $dev (systemd-cryptsetup attach with tpm2-device=auto)"; die "TPM2 unlock test failed (V2)"; }
+    # headless=true: no password-prompt fallback, so only the TPM can make this pass.
+    systemd-cryptsetup attach "$ATLAS_LUKS_MAPPING" "/dev/disk/by-uuid/$uuid" none tpm2-device=auto,headless=true \
+      || { record_v V2 fail "TPM2 unlock test failed on $dev (systemd-cryptsetup attach, tpm2-device=auto, headless)"; die "TPM2 unlock test failed (V2). If PCR 7 changed during this run (Secure Boot or firmware), re-run: sudo $ATLAS_ENTRY phase1 --force 02"; }
     log "TPM2 unlock test passed: /dev/mapper/$ATLAS_LUKS_MAPPING is open"
   fi
 
@@ -520,7 +577,8 @@ step_02() {
   fi
   systemctl daemon-reload
 
-  if (( reseal )) && declare -F phase1_secure_boot_state >/dev/null && [[ "$(phase1_secure_boot_state)" == enabled ]] \
+  # Every run of this step (re-)seals the tokens to the current PCR 7, so with Secure Boot on they are now bound to it.
+  if declare -F phase1_secure_boot_state >/dev/null && [[ "$(phase1_secure_boot_state)" == enabled ]] \
      && todo_is_open secure-boot; then
     todo_done secure-boot
   fi

@@ -22,11 +22,12 @@
 #
 # Interactive moments (rule §7.6 names the recovery-key pause; the two further inputs below are declared here, in
 # the step headers and in the README):
-#   * step 2: the recovery key is printed once and the step waits for "WRITTEN DOWN"; in the SAME pause the OS LUKS
-#     passphrase is asked ONCE when the installer encrypted the OS volume and it has no TPM2 token yet, or when
-#     --force 02 finds that its token no longer unseals (Secure Boot switched on; the TPM is tried first), and the data
-#     volume's recovery key is asked ONCE when --force 02 must re-seal it and nothing on the node can authorise that
-#     (Section 3.5; every typed secret is used for the enrolment only, never stored);
+#   * step 2: one console session, at most two framed blocks. Block 1 asks only for what is needed, each value checked
+#     on the spot: the OS LUKS passphrase ONCE when the encrypted OS volume has no TPM2 token yet or its token no
+#     longer unseals (Secure Boot switched on; the TPM is tried first), and the data volume's recovery key ONCE when
+#     nothing on the node can authorise a header change. Block 2 prints a new recovery key once and waits for
+#     "WRITTEN DOWN"; old recovery slots are revoked only after that (Section 3.5, D3). Typed secrets are not stored,
+#     except a data-volume key that restores a missing on-node copy on an encrypted OS (D3);
 #   * step 7: when the Cloudflare token cannot list zones and no zone id is found (beside the token in CLOUDFLARE.txt,
 #     or in an existing secrets/cloudflare.env), the zone id is asked ONCE from the terminal with a 5-minute timeout
 #     (Section 22, S11); no terminal or no answer leaves it blank with a warning.
