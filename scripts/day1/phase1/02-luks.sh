@@ -13,23 +13,33 @@
 #
 # WHAT STAYS ON THE NODE (D3, R16): the recovery key's on-node convenience copy ($ATLAS_LUKS_RECOVERY, root 600),
 # always, because D3 is a closed decision ("on the node and on an external USB drive"; R16 "the on-node copy is
-# convenience only") and the OS volume it sits on is LUKS2 itself (Section 3.5; step 1 stops on an unencrypted OS
-# volume, no setting waives that: fix round 3 removed the ATLAS_ALLOW_UNENCRYPTED_OS knob, a change to 3.5/D3 is a
-# Section 23 amendment). The generated keyfile is NOT kept: it authorises the enrolments and is then wiped from the
-# LUKS header and shredded, because a second full-strength unlock secret on the OS drive is nothing the TPM path needs
-# (re-enrolment after a firmware change authorises with --unlock-tpm2-device=auto, UNVERIFIED flag from systemd 256,
-# or with the recovery key; step 3's fallback open uses the recovery copy). So the ways into the 8 TB volume are: the
-# TPM at boot, the recovery key (USB + on-node copy).
+# convenience only") and the OS volume it sits on is normally LUKS2 itself (Section 3.5). Policy v0.3.3: an
+# unencrypted OS volume (the installer's encrypted-LVM box not ticked) is the Principal's install choice, not broken
+# machinery, so step 1 records the to-do os-volume-encryption and this step still encrypts the data volume and
+# continues; the on-node recovery copy then sits on an unencrypted disk until the reinstall, which the to-do says, and
+# V2 is recorded deferred, not pass (verify/v02-tpm.sh). The generated keyfile is NOT kept: it authorises the
+# enrolments and is then wiped from the LUKS header and shredded, because a second full-strength unlock secret on the
+# OS drive is nothing the TPM path needs (re-enrolment after a firmware change authorises with
+# --unlock-tpm2-device=auto, UNVERIFIED flag from systemd 256, or with the recovery key; step 3's fallback open uses
+# the recovery copy). So the ways into the 8 TB volume are: the TPM at boot, the recovery key (USB + on-node copy).
 #
-# PCR 7 WITH SECURE BOOT OFF (fix round 3, major): D2 disables Secure Boot, so PCR 7 carries no image authority and the
-# TPM unseals to any OS booted on this hardware. D15 (2026-10-05): the Principal enables Secure Boot in the BIOS; step 1
-# records a to-do while it is off and never stops (policy v0.3.3); verify/v02-tpm.sh names the Secure Boot state in
-# every V2 row. The mask stays --tpm2-pcrs=7 (S9, adjudicated conflict 1); a stronger mask needs a Section 23 amendment.
+# PCR 7 AND SECURE BOOT: with Secure Boot off, PCR 7 carries no image authority and the TPM unseals to any OS booted
+# on this hardware. D15 (2026-10-05, supersedes D2): the Principal enables Secure Boot in the BIOS; step 1 records a
+# to-do while it is off and never stops (policy v0.3.3); verify/v02-tpm.sh names the Secure Boot state in every V2
+# row. The mask stays --tpm2-pcrs=7 (S9, adjudicated conflict 1); a stronger mask needs a Section 23 amendment.
 #
 # No package is installed here: cryptsetup, systemd-cryptsetup and dracut are seeded on the 26.04 Server ISO
-# (VERIFIED: the installer itself uses them for the encrypted OS volume); tpm2-tools is not needed because
-# systemd-cryptenroll speaks to the TPM directly. Their absence stops the step (step 4 brings the proxy; rule §7.1).
-# Facts typed literally from the platform research item 1 (VERIFIED unless marked). Defines step_02 only.
+# (VERIFIED: the installer itself uses them for the encrypted OS volume). Their absence stops the step (step 4 brings
+# the proxy; rule §7.1). systemd-cryptenroll speaks to the TPM directly, but the INITRAMFS needs tpm2-tools: dracut's
+# tpm2-tss module (dracut 110 on 26.04.1, modules.d/73tpm2-tss) has `check() { require_binaries tpm2 || return 1; }`
+# (VERIFIED from dracut-ng main), tpm2-tools (universe, ships /usr/bin/tpm2) is NOT on the 26.04.1 server image
+# (VERIFIED from its manifest), and a module named in add_dracutmodules that fails its check stops dracut ("Module
+# 'X' cannot be installed." then exit 1 in for_each_module_dir, VERIFIED from dracut-ng dracut.sh). So the
+# drop-in names tpm2-tss only once `tpm2` exists: phase1/04-system.sh installs tpm2-tools through the proxy BEFORE its
+# dist-upgrade (a new kernel's initramfs then already carries TPM support) and rebuilds every initramfs before the
+# reboot, with the helpers below. On the first run this step therefore leaves the initramfs to step 4.
+# Facts typed literally from the platform research item 1 (VERIFIED unless marked). Defines step_02 and the two
+# phase1_initramfs_* helpers step 4 calls (step files are sourced in order before each step runs).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -99,6 +109,35 @@ _luks_tty_read() {
   fi
 }
 
+# phase1_initramfs_conf — write the dracut drop-in. tpm2-tss is named only when the `tpm2` binary exists (header): a
+# drop-in naming a module whose check fails would break every later initramfs build, kernel updates included.
+phase1_initramfs_conf() {
+  local mods="crypt systemd-cryptsetup"
+  command -v tpm2 >/dev/null 2>&1 && mods+=" tpm2-tss"
+  install -d -m 755 /etc/dracut.conf.d
+  printf '# ATLAS Phase 1 (steps 2 and 4): TPM2 unlock of the OS volume in the initrd (Section 3.5).\nadd_dracutmodules+=" %s "\n' \
+    "$mods" >/etc/dracut.conf.d/90-atlas-tpm2.conf
+}
+
+# phase1_initramfs_rebuild — drop-in, then regenerate every initramfs, then check the TPM pieces are in it. Called by
+# step 2 when tpm2-tools is already present (a --force 02 after step 4) and by step 4 before its reboot. Sets
+# PHASE1_INITRD_NOTE (empty when fine) for the V2 message.
+PHASE1_INITRD_NOTE=""
+phase1_initramfs_rebuild() {
+  PHASE1_INITRD_NOTE=""
+  command -v dracut >/dev/null || die "dracut is not installed; the 26.04 Server ISO seeds it (apt-get install dracut, then re-run)"
+  command -v tpm2 >/dev/null 2>&1 || die "tpm2-tools is not installed; dracut's tpm2-tss module needs its tpm2 binary (phase1/04-system.sh installs it through the proxy)"
+  phase1_initramfs_conf
+  log "regenerating every initramfs with dracut (crypt, systemd-cryptsetup, tpm2-tss; this takes a minute or two)"
+  dracut --force --regenerate-all --quiet || die "dracut --force --regenerate-all failed; see the output above and /etc/dracut.conf.d/90-atlas-tpm2.conf"
+  if [[ -n "$(_luks_os_device)" ]] && command -v lsinitrd >/dev/null; then
+    if ! lsinitrd 2>/dev/null | grep -qE 'libcryptsetup-token-systemd-tpm2|libtss2-esys'; then
+      warn "the initrd does not list the systemd TPM2 token or libtss2; the OS volume may ask for its passphrase at the console after the reboot (keyboard at hand for Phase 1). Check: lsinitrd | grep -iE 'tpm2|tss2'"
+      PHASE1_INITRD_NOTE="initrd TPM2 support UNVERIFIED (see log)"
+    fi
+  fi
+}
+
 step_02() {
   local t missing=()
   for t in cryptsetup systemd-cryptenroll systemd-cryptsetup dracut; do command -v "$t" >/dev/null || missing+=("$t"); done
@@ -114,11 +153,15 @@ step_02() {
   [[ -b "$dev" ]] || die "DATA_DISK $DATA_DISK does not resolve to a block device"
   [[ ! -e /etc/systemd/tpm2-pcr-public-key.pem ]] || die "/etc/systemd/tpm2-pcr-public-key.pem exists (see step 1)"
 
-  # --- OS volume state, decided once (step 1 already died on an unencrypted OS volume; no waiver exists) ----------
+  # --- OS volume state, decided once. Unencrypted: the data volume is still encrypted and the phase continues; the
+  # to-do os-volume-encryption (step 1) stands and V2 is recorded deferred (policy v0.3.3, header). ---------------
   local osdev osmap os_note="" need_os_enrol=0
   osdev="$(_luks_os_device)"; osmap="$(_luks_os_mapping)"
   if [[ -z "$osdev" ]]; then
-    die "the OS volume is not encrypted (Section 3.5 requires LUKS2 on it; Section 22 presumes the encrypted-LVM install). Reinstall with the encrypted-LVM option, then re-run: sudo $ATLAS_ENTRY phase1"
+    os_note="OS volume NOT encrypted (to-do os-volume-encryption: reinstall with the encrypted-LVM option)"
+    warn "$os_note; Section 3.5 wants LUKS2 on it. The 8 TB data volume is encrypted now regardless, and the phase continues"
+    todo_add os-volume-encryption "The OS volume is not encrypted: reinstall Ubuntu with the encrypted-LVM option (Section 3.5), then run Phase 1 again" \
+      "Until then the on-node recovery-key copy ($ATLAS_LUKS_RECOVERY) sits on an unencrypted disk; keep the USB copy safe (D3, R16). V2 stays deferred."
   elif _luks_has_token "$osdev" tpm2; then
     os_note="LUKS $osmap on $osdev, TPM2 already enrolled"
     log "OS volume: $os_note"
@@ -286,26 +329,20 @@ step_02() {
   fi
   LUKS_RECOVERY_INMEM=""; recovery=""
 
-  # --- initramfs: dracut on 26.04 (VERIFIED); the TPM modules are added explicitly (hostonly default UNVERIFIED) --
-  install -d -m 755 /etc/dracut.conf.d
-  printf 'add_dracutmodules+=" crypt systemd-cryptsetup tpm2-tss "\n' >/etc/dracut.conf.d/90-atlas-tpm2.conf
-  if command -v dracut >/dev/null; then
-    log "regenerating the initramfs with dracut (this takes a minute)"
-    dracut --force --regenerate-all --quiet || die "dracut --force --regenerate-all failed"
-    if [[ -n "$osdev" ]] && command -v lsinitrd >/dev/null; then
-      if ! lsinitrd 2>/dev/null | grep -qE 'systemd-cryptsetup|libcryptsetup-token-systemd-tpm2'; then
-        warn "the initrd does not list systemd-cryptsetup/tpm2 token support; the OS volume may ask for its passphrase at the console after the step-4 reboot (keyboard is at hand for Phase 1). Check /etc/dracut.conf.d/90-atlas-tpm2.conf and 'lsinitrd | grep -i tpm2'."
-        os_note+="; initrd tpm2 support UNVERIFIED (see log)"
-      fi
-    fi
-  elif command -v update-initramfs >/dev/null; then
-    warn "dracut absent, falling back to update-initramfs -u -k all (initramfs-tools)"
-    update-initramfs -u -k all
+  # --- initramfs (header): rebuilt here only when tpm2-tools is already installed (a --force 02 after step 4);
+  # otherwise step 4 installs it through the proxy and rebuilds before the reboot. The drop-in is written either way,
+  # without tpm2-tss until `tpm2` exists, so a kernel update before then still builds a valid initramfs. -----------
+  if command -v tpm2 >/dev/null 2>&1; then
+    phase1_initramfs_rebuild
+    [[ -z "$PHASE1_INITRD_NOTE" ]] || os_note+="${os_note:+; }$PHASE1_INITRD_NOTE"
   else
-    die "neither dracut nor update-initramfs exists; cannot regenerate the initramfs"
+    phase1_initramfs_conf
+    log "initramfs: left to step 4, which installs tpm2-tools through the proxy (dracut's tpm2-tss module needs it) and rebuilds before the reboot"
   fi
   systemctl daemon-reload
 
+  # v02 exits 2 (deferred, run_verify returns 0) when the ONLY gap is the unencrypted OS volume; a real TPM2 failure
+  # on either volume is exit 1 and stays fatal here.
   run_verify V2 v02-tpm.sh "$dev" "$ATLAS_LUKS_MAPPING" "${osdev:--}" "$os_note" \
     || die "V2 failed after enrolment; see the verify table"
   log "step 2 complete: data volume $dev is LUKS2 (uuid $uuid), TPM2-unlocked as /dev/mapper/$ATLAS_LUKS_MAPPING"

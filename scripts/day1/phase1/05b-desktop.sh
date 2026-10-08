@@ -115,6 +115,54 @@ SRC
   log "Google Chrome $ver installed from dl.google.com"
 }
 
+# _xrdp_harden — 26.04 ships xrdp 0.10.1-4.1 (universe), whose 2026 CVEs (fixed upstream in 0.10.6/0.10.6.1) are
+# still "needs-triage" for resolute and absent from Ubuntu Pro's esm-apps index (doc R24). What the scripts CAN do:
+# (1) comment out every session type except [Xorg]: the packaged xrdp.ini (VERIFIED from the 0.10.1-4.1 .deb) has
+#     [Xorg], [Xvnc], [vnc-any] and [neutrinordp-any] active; vnc-any and neutrinordp-any make xrdp a proxy to any
+#     host the client names (the CVSS 9.8 CVE-2026-41252 path; upstream 0.10.6.1 comments them out too), and Xvnc needs
+#     a VNC server this node does not install;
+# (2) sesman.ini [Security]: AllowRootLogin=false (packaged: true) and AllowAlternateShell=false (packaged: commented,
+#     default true), so a client cannot ask sesman to start an arbitrary program instead of ~/.xsession;
+# (3) the firewall side lives in phase1/04-system.sh (LAN subnet and WireGuard only; RDP_ALLOW_FROM narrows the LAN
+#     side to the Principal's PC, CONVENTIONS §3).
+# Idempotent: a commented header no longer matches, so a re-run changes nothing. Dies if the result is not as intended.
+# _rdp_restrict_hint — after a passing V19, while the session is still up: if RDP_ALLOW_FROM is blank, record the
+# optional hardening to-do with the address the Principal's PC actually connected from (Section 12.5, doc R24).
+_rdp_restrict_hint() {
+  [[ -z "${RDP_ALLOW_FROM:-}" ]] || return 0
+  local peer
+  peer="$(ss -tnH state established '( sport = :3389 )' 2>/dev/null | awk '{print $4}' | sed -E 's/^\[?([^]]*)\]?:[0-9]+$/\1/' | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n1 || true)"
+  [[ -n "$peer" ]] || return 0
+  todo_add rdp-restrict "Optional hardening: limit Remote Desktop on the LAN to your Windows PC ($peer)" \
+    "Reserve $peer for the PC in the router, set RDP_ALLOW_FROM=\"$peer\" in $ATLAS_ETC/atlas.env, then apply it now without a reboot: sudo ufw allow in on $LAN_IFACE from $peer to any port 3389 proto tcp comment 'xrdp LAN' && sudo ufw delete allow in on $LAN_IFACE from $LAN_CIDR to any port 3389 proto tcp (the WireGuard path stays open). Doc R24."
+}
+
+_xrdp_harden() {
+  local ini=/etc/xrdp/xrdp.ini ses=/etc/xrdp/sesman.ini
+  [[ -f "$ini" && -f "$ses" ]] || die "$ini or $ses is missing"
+  awk '
+    /^\[[^]]+\][[:space:]]*$/ { skip = ($0 ~ /^\[(Xvnc|vnc-any|neutrinordp-any)\]/) }
+    skip && !/^[;#]/ && NF { print ";" $0; next }
+    { print }
+  ' "$ini" >"$ini.atlas.tmp"
+  cat "$ini.atlas.tmp" >"$ini"; rm -f "$ini.atlas.tmp"
+  grep -qE '^\[Xorg\]' "$ini" || die "$ini has no active [Xorg] session after hardening; the packaged layout changed"
+  ! grep -qE '^\[(Xvnc|vnc-any|neutrinordp-any)\]' "$ini" || die "$ini still has an active Xvnc/vnc-any/neutrinordp-any section"
+  grep -qE '^\[Security\]' "$ses" || die "$ses has no [Security] section; the packaged layout changed"
+  local k v
+  for k in AllowRootLogin AllowAlternateShell; do
+    v=false
+    if grep -qE "^[#;]?[[:space:]]*$k=" "$ses"; then
+      sed -i -E "s/^[#;]?[[:space:]]*$k=.*/$k=$v/" "$ses"
+    else
+      sed -i -E "/^\[Security\]/a $k=$v" "$ses"
+    fi
+    grep -qx "$k=$v" "$ses" || die "$ses: could not set $k=$v"
+  done
+  sed -i -E 's/^security_layer=.*/security_layer=tls/' "$ini"   # mstsc speaks TLS; drop plain RDP crypto
+  log "xrdp hardened: only the Xorg session type; AllowRootLogin=false, AllowAlternateShell=false; TLS security layer"
+}
+
 step_05b() {
   [[ -n "${LAN_IP:-}" ]] || die "LAN_IP is empty"
   export DEBIAN_FRONTEND=noninteractive
@@ -127,9 +175,11 @@ step_05b() {
       || die "installing XFCE/xrdp failed"
   fi
   apt_install xrdp xorgxrdp
-  adduser --quiet xrdp ssl-cert >/dev/null 2>&1 || true        # harmless; needed only if runtime_user=xrdp is enabled
-  sed -i -E 's/^AllowRootLogin=.*/AllowRootLogin=false/' /etc/xrdp/sesman.ini
-  sed -i -E 's/^security_layer=.*/security_layer=tls/' /etc/xrdp/xrdp.ini   # mstsc speaks TLS; drop plain RDP crypto
+  # The xrdp daemon reads the TLS key /etc/xrdp/key.pem (a link into ssl-cert's private dir); the package's postinst
+  # normally adds this membership. 0.10.1 has no runtime_user option and runs as root (doc R24), so this is not a
+  # privilege drop, only the documented key access.
+  adduser --quiet xrdp ssl-cert >/dev/null 2>&1 || true
+  _xrdp_harden
   # Per-user session for the Principal; no display manager means no autologin (Appendix B "no autologin").
   # phase1_write_file (04-system.sh): `install /dev/stdin` fails on re-runs with resolute's rust-coreutils install.
   # The account's real primary group, not a same-named group (fix round 3: an LDAP/`users` layout has none).
@@ -165,7 +215,9 @@ MSG
   # phase1_xrdp_bind already died if xrdp is down or not bound as intended, so a fail here is the timeout. Policy
   # v0.3.3: the Principal's RDP click is an input, so the timeout is recorded as deferred (gate: never blocks) plus a
   # to-do; the step completes and Phase 1 goes on.
-  if ! run_verify V19 v19-xrdp.sh "$PRINCIPAL_USER" 570 "sudo $ATLAS_ENTRY phase1 --force 05b" "${addrs[@]}"; then
+  if run_verify V19 v19-xrdp.sh "$PRINCIPAL_USER" 570 "sudo $ATLAS_ENTRY phase1 --force 05b" "${addrs[@]}"; then
+    _rdp_restrict_hint
+  else
     record_v V19 deferred "no RDP session seen in time (to-do rdp-test); xrdp is up and bound on ${addrs[*]}"
     todo_add rdp-test "Connect once from the Windows PC with Remote Desktop (mstsc) to $LAN_IP as user $PRINCIPAL_USER (session Xorg), then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 05b to record V19" \
       "Section 17 step 5b / V19. Chrome's policies and the xrdp binding are already in place; only the test is outstanding."

@@ -76,7 +76,10 @@ auto-detected as the largest unmounted NVMe), `CLOUDFLARE_TXT` (default `/home/$
 `WINDOWS_SHARE` (`//host/share`), `NTFY_TOPIC=atlas`, `OPENWEBUI_PORT=3000`, `ORCH_PORT=8800`,
 `LLAMA_PORT_BASE=8100` (engine N listens on 8100+N), `HF_ENDPOINT` (unset), `DOWNLOAD_MBPS=100`.
 `ATLAS_SSH_PASSWORD_AUTH` (blank; pre-flight writes `keep` itself when the Principal gave no SSH public key at its
-prompt, so password SSH stays on until the key is added, to-do `ssh-key`), `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE`
+prompt, so password SSH stays on until the key is added, to-do `ssh-key`), `RDP_ALLOW_FROM` (blank = the whole LAN
+subnet may reach xrdp; IPv4 addresses or CIDRs narrow the LAN side of port 3389 to the Principal's PC, checked by
+`load_env`, applied by Phase 1 step 4; step 5b records the optional to-do `rdp-restrict` with the address the PC
+connected from), `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE`
 (blank; `yes` records that the Principal read and accepts the Android SDK terms, Section 16.3 item 2; Phase 2 step 6
 defers the cross-build container otherwise).
 **Principal-provided keys are optional (policy v0.3.3).** `GOOGLE_ACCOUNTS`, `FAMILY_NAMES` and
@@ -108,7 +111,7 @@ Step files never define `main`; each defines `step_<id>()` and the driver calls 
 | `require_root` | exits unless EUID 0 |
 | `load_env` | installs `config/atlas.env.example` to `/etc/atlas/atlas.env` if missing (auto-detecting what it can), then sources it; dies only on blank auto-detected keys (`LAN_IFACE`, `LAN_CIDR`, `DATA_DISK`); each blank Principal key is asked once, else recorded as a to-do (§3) |
 | `ask VAR PROMPT [secret]` | one plain question on `/dev/tty`, 300 s; no terminal or no answer leaves VAR empty and the caller records a to-do instead of stopping. `ATLAS_ASK_ANSWER` is the scripted answer (tests) |
-| `todo_add ID TITLE [DETAIL]` / `todo_done ID` / `todo_list` | the live ATLAS to-do list, `/var/lib/atlas/day1/todo.jsonl` (`ATLAS_TODO_FILE`), one JSON line per event; `todo_list` prints the open items and `atlas-day1.sh status` shows it. IDs: `input-google-accounts`, `input-family-names`, `input-android-sdk-licence`, `input-windows-share`, `input-smb-cred`, `input-google-oauth-client`, `input-hf-token`, `secure-boot`, `os-volume-encryption`, `ssh-key`, `cloudflare-token`, `vpn-mobile-test`, `rdp-test`, `tool-<name>` |
+| `todo_add ID TITLE [DETAIL]` / `todo_done ID` / `todo_list` | the live ATLAS to-do list, `/var/lib/atlas/day1/todo.jsonl` (`ATLAS_TODO_FILE`), one JSON line per event; `todo_list` prints the open items and `atlas-day1.sh status` shows it. IDs: `input-google-accounts`, `input-family-names`, `input-android-sdk-licence`, `input-windows-share`, `input-smb-cred`, `input-google-oauth-client`, `input-hf-token`, `secure-boot`, `os-volume-encryption`, `ssh-key`, `cloudflare-token`, `cloudflare-zone-id`, `vpn-mobile-test`, `rdp-test`, `rdp-restrict`, `time-sync`, `tool-<name>` |
 | `run_step PHASE STEP FUNC` | idempotency: if `/var/lib/atlas/day1/done/PHASE.STEP` exists, logs "skip" and returns 0; else runs `FUNC`, and on success creates the marker. STEP is the two-digit-plus-letter id from Section 17 (`01`, `05b`, `06c`) |
 | `record_v ID RESULT MSG` | appends `{"ts","phase","id","result","msg"}` to `verify.jsonl`. RESULT ∈ `pass fail deferred info`. IDs are `V1`..`V23`, with halves `V3a`/`V3b` and `V14a`/`V14b`, plus `V10a` (the Phase 2 resident-router half of V10; V10 itself is written only by the Phase 3 load test). Two recorded-only id families are also accepted and never gate: `T-<tool>` (Phase 2 step 6 soft installs, result deferred) and `P4-wheels` (the Phase 4 wheel-index pre-flight, result info) |
 | `run_verify ID SCRIPT [ARGS]` | runs `verify/SCRIPT`, maps exit 0/1/2/3 → pass/fail/deferred/info, records its one-line stdout as MSG |
@@ -144,7 +147,7 @@ never prompt; never take longer than 10 minutes; safe to re-run.
 
 | Phase | Required (red row blocks the next phase) | Recorded, not blocking |
 |---|---|---|
-| 1 | V2, V3a, V5, V19 | V1 (info). V5/V19 are required-deferrable: a wait for the Principal's phone/PC that times out is `deferred` + to-do (`vpn-mobile-test`, `rdp-test`), a real failure is `fail` |
+| 1 | V2, V3a, V5, V19 | V1 (info). V2 is `deferred` (to-do `os-volume-encryption`) when the only gap is an unencrypted OS volume. V5/V19 are required-deferrable: a wait for the Principal's phone/PC that times out is `deferred` + to-do (`vpn-mobile-test`, `rdp-test`), a real failure is `fail` |
 | 2 | V3b, V6, V12, V13, V14a, V15, V16, V17, V18, V20, V23, and every service healthy | V7 (deferred if the reference recordings are absent), V10a (resident router; also fatal to step 4), V18 is `deferred` until the real vault is initialised (`ATLAS_VAULT_INIT=1`). V6 (no HF token or licence not accepted), V20 (no Google accounts or no OAuth client file) and V23 (no `CLOUDFLARE.txt`) are `deferred` + to-do while the Principal's input is missing |
 | 3 | V4 per engine, V10, V14b, V21 | V22 (a DeepSeek failure defers it, R19) |
 | 4 | V11 | V8, V9 (deferred on failure), per-engine pass/fail/deferred table |

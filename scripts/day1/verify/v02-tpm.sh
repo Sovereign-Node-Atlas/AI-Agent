@@ -6,11 +6,12 @@
 #   human-readable luksDump text) contains PCR 7 (adjudicated conflict 1, S9: an empty list or an unreadable binding
 #   is a FAIL, never "unknown"); the mapping MAPPING_NAME is active (which, after the Phase 1 reboot, proves the TPM
 #   unlocked it without a keyboard). OS_LUKS_DEVICE must carry a systemd-tpm2 token bound to PCR 7 as well (S9);
-#   "-" (no LUKS under "/") is a FAIL unconditionally: Section 3.5 requires LUKS2 on the OS volume and no setting
-#   waives it (fix round 3). Secure Boot (D15, decided 2026-10-05: the Principal enables it in the BIOS): while it is
+#   "-" (no LUKS under "/") is DEFERRED, exit 2, once everything about the data volume passed: Section 3.5 wants
+#   LUKS2 on the OS volume, which only a reinstall gives, so it is the Principal's to-do os-volume-encryption (policy
+#   v0.3.3), never reported as a pass and never a red row. Secure Boot (D15, decided 2026-10-05: the Principal enables it in the BIOS): while it is
 #   still off, a binding to PCR 7 alone ties the unlock to nothing an attacker's own boot medium would change, so the
 #   state is a NOTE in every V2 message and a to-do (secure-boot), never a failure (policy v0.3.3). Exit 0 pass,
-#   1 fail. Must run as root.
+#   1 fail, 2 deferred (OS volume unencrypted). Must run as root.
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
@@ -103,4 +104,5 @@ else
 fi
 sb_note="secure_boot=$sb${sb_data_note:+; $sb_data_note}"
 echo "fTPM /dev/tpmrm0 seen by systemd; $dev: tpm2 pcrs=$data_pcrs; mapping $mapping active (boot $boot); $os_msg; $sb_note"
+[[ -n "$osdev" && "$osdev" != "-" ]] || exit 2
 exit 0

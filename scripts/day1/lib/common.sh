@@ -901,6 +901,13 @@ load_env() {
       || die "load_env: GOOGLE_ACCOUNTS entry '$acct' must be email:corporate or email:estate (edit $envf)"
   done
   [[ -z "${WINDOWS_SHARE:-}" || "$WINDOWS_SHARE" =~ ^//[^/]+/.+$ ]] || die "load_env: WINDOWS_SHARE must look like //host/share, got '$WINDOWS_SHARE' (edit $envf)"
+  if [[ -n "${RDP_ALLOW_FROM:-}" ]]; then
+    local __r
+    for __r in $RDP_ALLOW_FROM; do
+      [[ "$__r" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] \
+        || die "load_env: RDP_ALLOW_FROM must be IPv4 addresses or CIDRs separated by spaces (e.g. \"192.168.1.20\"), got '$RDP_ALLOW_FROM' (edit $envf, or leave it blank for the whole LAN)"
+    done
+  fi
 
   # Auto-detected keys: detect when blank, persist, die when detection fails.
   local changed=0 v
@@ -938,6 +945,7 @@ load_env() {
   LAN_IP="$(_atlas_detect_lan_ip "$LAN_IFACE" || true)"
   export PRINCIPAL_USER TZ LAN_IFACE LAN_CIDR LAN_IP DATA_DISK CLOUDFLARE_TXT WG_IFACE WG_CIDR WG_PORT DOMAIN VPN_HOST
   export GOOGLE_ACCOUNTS WINDOWS_SHARE FAMILY_NAMES NTFY_TOPIC OPENWEBUI_PORT ORCH_PORT LLAMA_PORT_BASE DOWNLOAD_MBPS
+  export RDP_ALLOW_FROM="${RDP_ALLOW_FROM:-}"
   export BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE
   [[ -n "${HF_ENDPOINT:-}" ]] && export HF_ENDPOINT
   (( changed )) && log "load_env: auto-detected values written to $envf"

@@ -12,7 +12,7 @@
 # DNS (fix round, Section 12.5 "everything else denied and logged"): the home router's recursive resolver answers ANY
 # name, so plain "DNS to the pinned LAN resolvers" was a data channel around the allowlist (<chunk>.exfil.example
 # queries carry data out, answers carry instructions in). Now: dnsmasq listens on 127.0.0.1:53 and forwards ONLY the
-# config/allowlist.txt names (ntp.ubuntu.com included, listed there for this purpose) plus exactly two names derived
+# config/allowlist.txt names (the NTP hosts included, listed there for this purpose) plus exactly two names derived
 # from atlas.env settings, $DOMAIN and the Windows share host when it is a name, to the LAN resolvers, answering
 # NXDOMAIN for everything else (dnsmasq `address=/#/`, VERIFIED on dnsmasq 2.91 during the fix round);
 # systemd-resolved is pointed at it (global DNS=127.0.0.1, the LAN link's DHCP DNS switched off); ufw lets only the
@@ -465,12 +465,43 @@ _proxy_environment() {
   log "proxy environment installed: $ATLAS_ETC/proxy.env, environment.d, profile.d, apt.conf.d, systemd DefaultEnvironment (telemetry keys off)"
 }
 
-# _ntp_servers — the IPv4 addresses systemd-timesyncd will use, one per line: its current ServerAddress plus every
-# A record of its configured server names (ntp.ubuntu.com by default; it is resolved through dnsmasq, which forwards
-# it because config/allowlist.txt lists it for exactly this purpose). timesyncd is then pinned to exactly these
+# TIME SYNC (Section 3.1 default time source). 26.04 ships chrony, not systemd-timesyncd (VERIFIED: the 26.04.1 server
+# manifest carries chrony 4.8-2ubuntu1 and no systemd-timesyncd; ubuntu-minimal Depends on `chrony | time-daemon`).
+# Its packaged sources (/etc/chrony/sources.d/ubuntu-ntp-pools.sources, VERIFIED from the .deb) are NTS-authenticated
+# pools 1..4.ntp.ubuntu.com plus ntp-bootstrap.ubuntu.com, over UDP 123 and TCP 4460 (NTS key exchange). Pool
+# addresses rotate and an NTS-KE server may hand out a different NTP address, so pinning destinations would break
+# time; instead, exactly like squid (80/443) and dnsmasq (53), the egress is fenced by PROCESS: only uid _chrony may
+# open UDP 123 or TCP 4460 (owner match in before.rules). chronyd opens its client and NTS-KE sockets on demand AFTER
+# dropping root to _chrony (VERIFIED in chrony 4.8 main.c/ntp_io.c: default acquisitionport -1 = separate client
+# sockets per request; SYS_DropRoot precedes source setup), so the owner match sees _chrony. dnsmasq forwards
+# ntp.ubuntu.com (subdomains included) and ntp-bootstrap.ubuntu.com because config/allowlist.txt lists them.
+# A host still on systemd-timesyncd (an older or hand-changed install) keeps the earlier design below.
+_time_daemon() {
+  if command -v chronyd >/dev/null 2>&1 && id -u _chrony >/dev/null 2>&1; then echo chrony
+  elif systemctl list-unit-files systemd-timesyncd.service 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then echo timesyncd
+  else echo none; fi
+}
+
+# _time_selftest — after the firewall closed: chrony must reach a synchronised source within about two minutes.
+# Not fatal (the RTC keeps the clock right for now); a failure is a warning plus the to-do time-sync with the checks.
+_time_selftest() {
+  [[ "$(_time_daemon)" == chrony ]] || return 0
+  systemctl try-restart chrony.service >/dev/null 2>&1 || true      # retry NTS-KE now, not after its back-off
+  if timeout 150 chronyc -n waitsync 12 0 0 10 >/dev/null 2>&1; then
+    log "time sync: chrony synchronised through the firewall ($(chronyc -n tracking 2>/dev/null | awk -F': ' '/^Reference ID/ {print $2; exit}'))"
+    if [[ -s "${ATLAS_TODO_FILE:-}" ]] && grep -q '"id": "time-sync"' "$ATLAS_TODO_FILE"; then todo_done time-sync; fi
+    return 0
+  fi
+  warn "time sync: chrony is not synchronised two minutes after the firewall closed. chronyc -n sources: $(chronyc -n sources 2>&1 | tail -n +3 | tr '\n' '|')"
+  todo_add time-sync "chrony did not synchronise behind the firewall during Phase 1 step 4" \
+    "Check: chronyc -n sources; chronyc -n authdata; grep 'UFW BLOCK' /var/log/ufw.log | grep -E 'DPT=(123|4460)'. Re-test: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 04 (repeats the update and reboots)"
+}
+
+# _ntp_servers — timesyncd hosts only: the IPv4 addresses systemd-timesyncd will use, one per line: its current
+# ServerAddress plus every A record of its configured server names (ntp.ubuntu.com by default; resolved through
+# dnsmasq, which forwards it because config/allowlist.txt lists it). timesyncd is then pinned to exactly these
 # addresses (timesyncd.conf.d drop-in) so the ufw NTP rules and the client agree. UNVERIFIED: Canonical's
-# ntp.ubuntu.com addresses are treated as long-lived; if they ever change, `timedatectl timesync-status` shows the
-# failure and `--force 04` re-pins them.
+# ntp.ubuntu.com addresses are treated as long-lived; if they ever change, `--force 04` re-pins them.
 _ntp_servers() {
   local out=() a names n
   a="$(timedatectl show-timesync -p ServerAddress --value 2>/dev/null || true)"
@@ -533,15 +564,27 @@ _ufw_docker_user_base() {
 
 _ufw_rules() {
   local lan="$LAN_IFACE" net="$LAN_CIDR" wgbr="$ATLAS_WG_BRIDGE" wgnet="$ATLAS_WG_BRIDGE_NET" p r
-  # Resolvers and NTP servers are collected BEFORE the firewall closes (name resolution is still open here).
+  # Resolvers (and, on a timesyncd host, NTP servers) are collected BEFORE the firewall closes (resolution is open here).
   mapfile -t ATLAS_LAN_RESOLVERS < <(phase1_lan_resolvers)
-  local ntp=()
-  if ! mapfile -t ntp < <(_ntp_servers); then ntp=(); fi
-  if (( ${#ntp[@]} == 0 )); then
-    local gw; gw="$(ip -o route show default | awk '{print $3; exit}')"
-    warn "no NTP server address could be resolved; allowing NTP to the default gateway $gw only (UNVERIFIED that the router serves NTP)"
-    ntp=("$gw")
-  fi
+  local tdaemon ntp=() chrony_uid="" ntp_desc
+  tdaemon="$(_time_daemon)"
+  case "$tdaemon" in
+    chrony)
+      chrony_uid="$(id -u _chrony)"
+      ntp_desc="chrony (uid _chrony only: UDP 123, TCP 4460 NTS-KE)" ;;
+    timesyncd)
+      if ! mapfile -t ntp < <(_ntp_servers); then ntp=(); fi
+      if (( ${#ntp[@]} == 0 )); then
+        local gw; gw="$(ip -o route show default | awk '{print $3; exit}')"
+        warn "no NTP server address could be resolved; allowing NTP to the default gateway $gw only (UNVERIFIED that the router serves NTP)"
+        ntp=("$gw")
+      fi
+      ntp_desc="timesyncd pinned to ${ntp[*]}" ;;
+    *)
+      ntp_desc="none"
+      warn "no time daemon found (neither chrony nor systemd-timesyncd): the clock is not synchronised"
+      todo_add time-sync "No time daemon on the node (chrony expected on 26.04)" "Install it through the proxy (sudo apt-get install chrony), then: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 04" ;;
+  esac
   # Persist the resolver list for the standalone DOCKER-USER script and re-runs (network.env, never atlas.env; header).
   phase1_network_env_save LAN_DNS_SERVERS "\"${ATLAS_LAN_RESOLVERS[*]}\""
 
@@ -553,8 +596,18 @@ _ufw_rules() {
   # Inbound: LAN and the WireGuard bridge only (VPN clients appear as the container's 10.42.42.42). Exactly the
   # Section 3.6 / 12.5 set: SSH, Cockpit, Open WebUI, ntfy, xrdp. The orchestrator ($ORCH_PORT) is deliberately
   # absent: Open WebUI's Filter reaches it on loopback (Phase 2 binds it to 127.0.0.1).
+  # RDP_ALLOW_FROM (optional, CONVENTIONS §3; doc R24): when set, the LAN side of xrdp is narrowed to those addresses
+  # (the Principal's PC); the WireGuard side is unchanged. load_env has already checked the format.
+  local rdp_src=("$net")
+  [[ -n "${RDP_ALLOW_FROM:-}" ]] && read -r -a rdp_src <<<"$RDP_ALLOW_FROM"
   for p in "22:SSH" "9090:Cockpit" "$OPENWEBUI_PORT:Open WebUI" "8090:ntfy" "3389:xrdp"; do
-    ufw allow in on "$lan"  from "$net"   to any port "${p%%:*}" proto tcp comment "${p#*:} LAN" >/dev/null
+    if [[ "${p%%:*}" == 3389 ]]; then
+      for r in "${rdp_src[@]}"; do
+        ufw allow in on "$lan" from "$r" to any port 3389 proto tcp comment "xrdp LAN" >/dev/null
+      done
+    else
+      ufw allow in on "$lan" from "$net" to any port "${p%%:*}" proto tcp comment "${p#*:} LAN" >/dev/null
+    fi
     ufw allow in on "$wgbr" from "$wgnet" to any port "${p%%:*}" proto tcp comment "${p#*:} WireGuard" >/dev/null
   done
   ufw allow in on "$lan" to any port "$WG_PORT" proto udp comment 'WireGuard from anywhere' >/dev/null
@@ -564,7 +617,7 @@ _ufw_rules() {
   ufw deny  in on "$lan" to any port 3128 proto tcp comment 'squid never from the LAN' >/dev/null
   ufw allow in on docker0 to any port 3128 proto tcp comment 'squid from docker0' >/dev/null
   ufw allow in from 172.16.0.0/12 to any port 3128 proto tcp comment 'squid from compose bridges' >/dev/null
-  # Outbound: NTP to the configured servers ONLY, DHCP, the LAN itself, the Docker bridges. DNS is NOT opened here:
+  # Outbound: NTP (timesyncd hosts: to the pinned servers only; chrony: owner match in before.rules, header), DHCP, the LAN itself, the Docker bridges. DNS is NOT opened here:
   # only the dnsmasq user may reach the resolvers' port 53 (owner match in before.rules, below), and port 53 on the
   # LAN interface is DROPPED for every other uid right behind that match, BEFORE the broad "LAN" allow below is ever
   # reached (ufw-before-output runs ahead of the user rules), so no process on the host, resolved included, can ask
@@ -578,11 +631,13 @@ _ufw_rules() {
   ufw allow out on "$lan" to "$net" comment 'LAN: router, Windows share, phone on LAN (port 53 dropped in before.rules)' >/dev/null
   ufw allow out to 172.16.0.0/12 comment 'Docker bridges (published services)' >/dev/null
   ufw allow out on "$wgbr" to "$wgnet" comment 'to the wg-easy container' >/dev/null
-  # Pin timesyncd to the addresses the rules allow.
-  install -d -m 755 /etc/systemd/timesyncd.conf.d
-  printf '# ATLAS Phase 1 step 4: NTP pinned to the addresses ufw allows outbound on UDP 123.\n[Time]\nNTP=%s\nFallbackNTP=%s\n' \
-    "${ntp[*]}" "${ntp[*]}" >/etc/systemd/timesyncd.conf.d/90-atlas.conf
-  systemctl try-restart systemd-timesyncd.service >/dev/null 2>&1 || true
+  # Pin timesyncd to the addresses the rules allow (timesyncd hosts only; chrony keeps its packaged NTS sources).
+  if [[ "$tdaemon" == timesyncd ]]; then
+    install -d -m 755 /etc/systemd/timesyncd.conf.d
+    printf '# ATLAS Phase 1 step 4: NTP pinned to the addresses ufw allows outbound on UDP 123.\n[Time]\nNTP=%s\nFallbackNTP=%s\n' \
+      "${ntp[*]}" "${ntp[*]}" >/etc/systemd/timesyncd.conf.d/90-atlas.conf
+    systemctl try-restart systemd-timesyncd.service >/dev/null 2>&1 || true
+  fi
   # Owner-matched egress (before.rules, chain ufw-before-output): only the 'proxy' user (squid) may open 80/443, only
   # the 'dnsmasq' user may open 53 to the LAN resolvers, and port 53 on the LAN interface is dropped for everyone else
   # right after (the only way out on 53 is the owner match; _dns_fence_selftest proves it). ICMP: echo-request and
@@ -598,8 +653,12 @@ _ufw_rules() {
     grep -q "^-A $chain -o lo -j ACCEPT" "$f" || die "$f has no '-A $chain -o lo -j ACCEPT' anchor line; the ufw layout changed"
     tmp="$(mktemp)"
     {
-      echo "# ATLAS: only the squid proxy user may open outbound HTTP/HTTPS and only dnsmasq may reach the LAN resolvers (Section 12.5); ICMP to the LAN only (V1)"
+      echo "# ATLAS: only the squid proxy user may open outbound HTTP/HTTPS, only chrony may open NTP/NTS-KE and only dnsmasq may reach the LAN resolvers (Section 12.5); ICMP to the LAN only (V1)"
       echo "-A $chain -p tcp -m multiport --dports 80,443 -m owner --uid-owner $uid -j ACCEPT"
+      if [[ -n "$chrony_uid" ]]; then
+        echo "-A $chain -p udp --dport 123 -m owner --uid-owner $chrony_uid -j ACCEPT"
+        echo "-A $chain -p tcp --dport 4460 -m owner --uid-owner $chrony_uid -j ACCEPT"
+      fi
       if [[ "$chain" == ufw6-before-output ]]; then
         echo "-A $chain -o $lan -p udp --dport 53 -j DROP"
         echo "-A $chain -o $lan -p tcp --dport 53 -j DROP"
@@ -634,7 +693,7 @@ _ufw_rules() {
   if [[ -x /usr/local/sbin/atlas-docker-egress ]] && systemctl is-active --quiet docker 2>/dev/null; then
     /usr/local/sbin/atlas-docker-egress >/dev/null || warn "atlas-docker-egress failed after ufw enable; run: systemctl restart atlas-docker-egress.service"
   fi
-  log "ufw enabled: default deny in/out/routed; LAN=$lan $net; WG bridge=$wgbr $wgnet; DNS ${ATLAS_LAN_RESOLVERS[*]} (uid dnsmasq only); NTP ${ntp[*]}"
+  log "ufw enabled: default deny in/out/routed; LAN=$lan $net; WG bridge=$wgbr $wgnet; DNS ${ATLAS_LAN_RESOLVERS[*]} (uid dnsmasq only); time: $ntp_desc"
   ufw status verbose | sed 's/^/    /'
 }
 
@@ -688,13 +747,23 @@ _disable_beacons() {
     install -d -m 755 /etc/update-manager
     printf '[DEFAULT]\nPrompt=never\n' >/etc/update-manager/release-upgrades
   fi
+  # Purge only what can go WITHOUT taking an Ubuntu metapackage with it: on 26.04 ubuntu-server-minimal Depends on
+  # snapd (and on `chrony | time-daemon`; ubuntu-server only Recommends snapd; VERIFIED from ubuntu-meta 1.570.4), so
+  # purging snapd would remove ubuntu-server-minimal and leave its dependencies orphaned for the next autoremove. The
+  # simulation is read for both actions apt can print: `apt-get -s purge` reports "Purg <pkg>", `remove` "Remv <pkg>"
+  # (the earlier check read Remv only, never matched, and always purged).
   local purge=() p
+  _purge_takes_meta() {
+    apt-get -s purge "$1" 2>/dev/null | grep -qE '^(Purg|Remv) ubuntu-(server|minimal|standard)'
+  }
   for p in popularity-contest ubuntu-report; do
-    [[ "$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)" == "install ok installed" ]] && purge+=("$p")
+    [[ "$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)" == "install ok installed" ]] || continue
+    if _purge_takes_meta "$p"; then warn "$p is held by an Ubuntu metapackage on this image; left installed (its upload host is not on the allowlist, so squid denies it)"
+    else purge+=("$p"); fi
   done
   if [[ "$(dpkg-query -W -f='${Status}' snapd 2>/dev/null || true)" == "install ok installed" ]]; then
-    if apt-get -s purge snapd 2>/dev/null | grep -qE '^Remv (ubuntu-server|ubuntu-minimal|ubuntu-standard)'; then
-      warn "snapd is a hard dependency of the ubuntu-server metapackage on this image; masking its units instead of purging"
+    if _purge_takes_meta snapd; then
+      log "snapd is a dependency of ubuntu-server-minimal on this image; masking its units instead of purging"
       for u in snapd.service snapd.socket snapd.seeded.service snapd.autoimport.service snapd.apparmor.service \
                snapd.recovery-chooser-trigger.service snapd.system-shutdown.service snapd.snap-repair.timer; do
         systemctl disable --now "$u" >/dev/null 2>&1 || true
@@ -821,16 +890,23 @@ step_04() {
   _ufw_rules
   _proxy_selftest
   _dns_fence_selftest
+  _time_selftest
   # 3. Full system update, through the proxy, unattended (needrestart would otherwise prompt on Server).
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
   retry 3 apt-get -q update || die "apt-get update failed through the proxy"
   _ATLAS_APT_UPDATED=1
+  # tpm2-tools BEFORE the dist-upgrade (phase1/02-luks.sh header): dracut's tpm2-tss module needs its tpm2 binary, so
+  # the drop-in can name tpm2-tss from here on and a kernel update below already builds a TPM-capable initramfs.
+  declare -F phase1_initramfs_rebuild >/dev/null || die "phase1_initramfs_rebuild is not defined: step 4 must be run by phase1-platform.sh"
+  apt_install tpm2-tools
+  phase1_initramfs_conf
   log "apt dist-upgrade (this can take several minutes)"
   retry 2 apt-get -y -q -o Dpkg::Options::=--force-confold dist-upgrade || die "apt-get dist-upgrade failed"
   apt-get -y -q autoremove >/dev/null || true
   _disable_beacons
-  # 4. Kernel parameters (V3).
+  # 4. Kernel parameters (V3), then every initramfs rebuilt with the TPM2 pieces before the reboot (Section 3.5).
   _grub_params
+  phase1_initramfs_rebuild
   # 5. SSH and Cockpit (Section 3.6).
   _cockpit_install
   systemctl enable cockpit.socket >/dev/null

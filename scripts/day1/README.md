@@ -43,6 +43,7 @@ step 5b installs XFCE, xrdp and Google Chrome, and you reach the desktop from th
 | `/home/<you>/CLOUDFLARE.txt` with the `Zone:DNS:Edit` token for `sovereign-node.link` (40 characters, anywhere in the file; optional `Zone ID: <32 hex>` line) | Phase 1 step 7 looks for the file; the zone id is asked once if the token cannot list zones | Dynamic DNS and V23 deferred, to-do `cloudflare-token` |
 | WireGuard test from your phone on mobile data (WireGuard and ntfy apps installed) | Phase 1 step 7 waits 10 minutes | V5 deferred, to-do `vpn-mobile-test` |
 | One Remote Desktop connection from the Windows PC | Phase 1 step 5b waits 10 minutes | V19 deferred, to-do `rdp-test` |
+| Your Windows PC's address, to limit Remote Desktop on the LAN to that PC (`RDP_ALLOW_FROM`) | Never asked: after a successful test, step 5b records the to-do `rdp-restrict` with the address your PC used and the two commands that apply it | The whole LAN subnet may reach Remote Desktop, as before |
 | Hugging Face token (read scope) with the licences accepted for `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0`, `black-forest-labs/FLUX.1-dev`, `stabilityai/stable-audio-open-1.0` | Phase 2 start, hidden input | PyAnnote (V6) and the gated Phase 4 engines deferred, to-do `input-hf-token` |
 | Google OAuth client JSON (Desktop-app type) at `/srv/atlas/staging/inbox/google-oauth-client.json`, then one sign-in per account | Phase 2 step 6c | V20 deferred, to-do `input-google-oauth-client` |
 | Voice references `alaric.*` / `gideon.*` (WAV, MP3 or M4A) in `/srv/atlas/staging/inbox/voice-references/` | Phase 2 step 5 | V7 deferred |
@@ -64,6 +65,7 @@ GOOGLE_ACCOUNTS="you@company.com:corporate you@gmail.com:estate"
 FAMILY_NAMES="Surname Givenname"
 BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE=yes   # after reading https://developer.android.com/studio/terms (Section 16.3 item 2)
 WINDOWS_SHARE=                             # blank on Day 1 (above)
+RDP_ALLOW_FROM=                            # optional: your PC's reserved address, e.g. "192.168.1.20" (blank = whole LAN)
 ```
 
 The HF token is typed at the Phase 2 prompt (hidden input) and stored at `/etc/atlas/secrets/hf-token.env`; it never
@@ -249,10 +251,14 @@ its computed hash as UNVERIFIED.
 **phase1-platform.sh / phase1/01-preflight.sh** — no UNVERIFIED marks beyond the Secure Boot decision above.
 
 **phase1/02-luks.sh** — 20, 67: `--unlock-tpm2-device=auto` (systemd 256+) for re-enrolment. 242: crypttab
-`tpm2-device=auto` / `x-initrd.attach` spelling. 289, 298: dracut hostonly default; TPM2 modules added explicitly.
+`tpm2-device=auto` / `x-initrd.attach` spelling. VERIFIED since v0.3.4: dracut's tpm2-tss module needs the `tpm2`
+binary (tpm2-tools, universe, not on the server image), so the drop-in names that module only once step 4 has
+installed tpm2-tools through the proxy; step 4 rebuilds every initramfs before the reboot.
 
-**phase1/04-system.sh** — 387, 391: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). 471, 542:
-Canonical NTP pool addresses / router NTP fallback.
+**phase1/04-system.sh** — 387, 391: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). Time sync
+(VERIFIED since v0.3.4): 26.04 runs chrony with NTS (1..4.ntp.ubuntu.com, ntp-bootstrap.ubuntu.com, UDP 123 and TCP
+4460), opened for uid `_chrony` only; the pinned-address and router fallback apply only to a host still on
+systemd-timesyncd. A chrony that does not synchronise within two minutes is a warning and the to-do `time-sync`.
 
 **phase1/05b-desktop.sh** — the Google apt repository recipe for Chrome (key URL `dl.google.com/linux/linux_signing_key.pub`,
 suite `stable main`); fails loudly on a non-armoured key. Chrome's managed policy path `/etc/opt/chrome/policies/managed/`
