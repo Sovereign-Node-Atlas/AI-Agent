@@ -683,18 +683,20 @@ _tools_radiance() {
     tmp="$(mktemp -d)"
     unzip -oq "$zip" -d "$tmp" || die "unzip $zip failed"
     rm -rf /opt/radiance.new && mkdir -p /opt/radiance.new
-    # UNVERIFIED inner layout (services-tools.md §4.4): a radiance-*-Linux.tar.gz with bin/ lib/ man/, else bin/ directly.
-    local inner
+    # Layout VERIFIED 2026-10-08 against the pinned zip (sha256 above): it holds radiance-6.0.c1700d56cc-Linux.tar.gz,
+    # whose files sit under radiance-6.0.c1700d56cc-Linux/usr/local/radiance/{bin,lib,man}. The earlier
+    # --strip-components=1 left rtrace three levels down and stopped step 6 (doc S43). So: unpack the inner tarball (if
+    # any) into a staging dir, find bin/rtrace at whatever depth, and install the tree that holds it, so RAYPATH
+    # /opt/radiance/lib matches and a release with a different depth still works.
+    local inner root="$tmp" rt
     inner="$(find "$tmp" -maxdepth 2 -name 'radiance-*-Linux.tar.gz' | head -n1 || true)"
     if [[ -n "$inner" ]]; then
-      tar --no-same-owner --no-same-permissions -xzf "$inner" --strip-components=1 -C /opt/radiance.new || die "tar of $inner failed"
-    elif [[ -d "$tmp/bin" ]]; then
-      cp -a "$tmp"/. /opt/radiance.new/
-    else
-      local sub; sub="$(find "$tmp" -maxdepth 2 -type d -name bin | head -n1 || true)"
-      [[ -n "$sub" ]] || { rm -rf "$tmp"; die "Radiance zip has neither an inner tar.gz nor a bin/ directory (contents: $(find "$tmp" -maxdepth 2 | head -n 10 | tr '\n' ' '))"; }
-      cp -a "$(dirname "$sub")"/. /opt/radiance.new/
+      root="$tmp/x"; mkdir -p "$root"
+      tar --no-same-owner --no-same-permissions -xzf "$inner" -C "$root" || { rm -rf "$tmp"; die "tar of $inner failed"; }
     fi
+    rt="$(find "$root" -path '*/bin/rtrace' -type f | head -n1 || true)"
+    [[ -n "$rt" ]] || { rm -rf "$tmp"; die "Radiance archive has no bin/rtrace (contents: $(find "$tmp" -maxdepth 3 | head -n 10 | tr '\n' ' '))"; }
+    cp -a "$(dirname "$(dirname "$rt")")"/. /opt/radiance.new/
     rm -rf "$tmp"
     [[ -x /opt/radiance.new/bin/rtrace ]] || die "no bin/rtrace after extracting Radiance"
     _tools_root_only /opt/radiance.new
