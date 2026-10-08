@@ -8,7 +8,7 @@
 | Supersedes | v0.3.3 (2026-10-05); v0.3.2 (2026-10-05); v0.3.1 (2026-09-27); v0.3 (2026-09-21); v0.2.1 and v0.2 (2026-09-21); v0.1 (2026-09-18) |
 | Scope | Everything agreed in the design conversation, through the Principal's completed confirmation workbook and the September hardware change |
 | Purpose | A single consolidated statement of the framework, followed by an alignment audit: contradictions resolved, risks, and what Day 1 must prove before anything is trusted |
-| Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21. Nothing has been executed. The Day 1 scripts under `scripts/day1/` are written against this document; the fact-checking that preceded them corrected the baseline in the places listed in Section 23. D15, reopened by the build, was closed by the Principal on 2026-10-05 as option (a): Secure Boot enabled. Policy v0.3.3 (the Principal, 2026-10-05): a missing input from the Principal never stops a phase; the scripts ask once, defer the item and keep a to-do list for the live ATLAS. On 2026-10-08 the Principal re-confirmed Ubuntu Server after a sourced comparison with Fedora 44 KDE Plasma (C27: "stability is key to a good AI node"); the comparison also found five script defects, fixed in v0.3.4 (Section 23, S32 to S38). |
+| Status of this document | **Closed build baseline.** Every decision confirmed, every resolution accepted, every risk acknowledged, every pre-execution item ticked in the workbook returned 2026-09-21; the risks added since (R22 to R25) were acknowledged by the Principal on 2026-10-08. Nothing has been executed. The Day 1 scripts under `scripts/day1/` are written against this document; the fact-checking that preceded them corrected the baseline in the places listed in Section 23. D15, reopened by the build, was closed by the Principal on 2026-10-05 as option (a): Secure Boot enabled. Policy v0.3.3 (the Principal, 2026-10-05): a missing input from the Principal never stops a phase; the scripts ask once, defer the item and keep a to-do list for the live ATLAS. On 2026-10-08 the Principal re-confirmed Ubuntu Server after a sourced comparison with Fedora 44 KDE Plasma (C27: "stability is key to a good AI node"); the comparison also found five script defects, fixed in v0.3.4 (Section 23, S32 to S38). |
 
 ## How to read this document
 
@@ -1083,7 +1083,7 @@ Nothing runs until every box is ticked. **All boxes were ticked in the workbook 
 - [x] C21 through C26, new in v0.2, **accepted** in the returned workbook: the Ubuntu and amd64v3 rejections, the quantisation rise, the closed reserve list, the vision consolidation, and the residency-versus-generation reading.
 - [x] R9, R16, R19, R20 and R21 **acknowledged** in the returned workbook: two changed wording in v0.2, three were new.
 - [x] C27, new in v0.3.4: Ubuntu Server 26.04.1 kept over Fedora 44 KDE Plasma. **Decided by the Principal on 2026-10-08.**
-- [ ] R22 to R25 to be acknowledged in the workbook (R22 and R23 new in v0.3.2, R24 and R25 new in v0.3.4).
+- [x] R22 to R25 **acknowledged** by the Principal on 2026-10-08 (R22 and R23 new in v0.3.2, R24 and R25 new in v0.3.4).
 
 ---
 
