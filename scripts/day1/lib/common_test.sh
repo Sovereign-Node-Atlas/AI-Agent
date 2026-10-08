@@ -261,7 +261,7 @@ for m in nolib one two none; do
   out="$(TPM_MODE=$m ATLAS_TEST_TPM_PRESENT=1 atlas_tpm_check)" && rc=0 || rc=$?
   case "$m" in
     one)   check "atlas_tpm_check: one TPM -> usable" test "$rc" -eq 0 ;;
-    nolib) check "atlas_tpm_check: libtss2 missing -> names libtss2-rc0t64" grep -q 'libtss2-rc0t64' <<<"$out" ;;
+    nolib) check "atlas_tpm_check: libtss2 missing -> names every package" grep -q 'libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-rc0t64 libtss2-tcti-device0t64' <<<"$out" ;;
     two)   check "atlas_tpm_check: two TPMs -> refused (tpm2-device=auto needs one)" grep -q '^2 TPM device' <<<"$out" ;;
     none)  check "atlas_tpm_check: none listed -> refused" grep -q '^0 TPM device' <<<"$out" ;;
   esac

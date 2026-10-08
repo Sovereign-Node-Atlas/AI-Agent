@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# phase1/01-preflight.sh — Phase 1 step 1 (Section 17): pre-flight using only what a bare host has.
+# phase1/01-preflight.sh — Phase 1 step 1 (Section 17): pre-flight using what a bare host has, plus systemd's TPM2
+# libraries from the archive when the image lacks them (doc S42; the one pre-proxy install of this step).
 # Confirms Ubuntu Server 26.04 (resolute), kernel 7.x, both NVMe drives, fTPM (for V2 in step 2), the AMD GPU from
 # lspci and /sys/class/drm, and records V1 (network) as info. Never touches rocminfo: the gfx1151 confirmation is the
 # Phase 4 container self-test (V11, Section 3.4). Adjudicated conflict 6: no hard fail on the PCI device id.
@@ -57,7 +58,7 @@ step_01() {
   # --- GPU: vendor 0x1002, display class, driver amdgpu; device id logged and warned, never failed -------------
   # pciutils is on every Ubuntu Server image; the only package step 1 installs before the proxy exists is
   # libtss2-rc0t64, below (rule §7.1's declared exceptions: rsync, libtss2-rc0t64, then squid/dnsmasq in step 4).
-  command -v lspci >/dev/null || die "pre-flight: lspci (pciutils) is missing; install it from the console and re-run (no package is fetched before the allowlist proxy exists)"
+  command -v lspci >/dev/null || die "pre-flight: lspci (pciutils) is missing; install it from the console and re-run (step 1 fetches only systemd's TPM2 libraries before the allowlist proxy exists)"
   local slot; slot="$(lspci -Dn -d 1002: 2>/dev/null | awk '$2 ~ /^03/ {print $1; exit}')"
   [[ -n "$slot" ]] || die "pre-flight: no AMD (0x1002) display-class PCI device found (lspci -Dn -d 1002:)"
   log "gpu: $(lspci -nn -s "$slot")"
@@ -82,12 +83,18 @@ step_01() {
   # systemd 259 dlopen()s libtss2-esys, libtss2-rc and libtss2-mu for every TPM2 operation (dlopen_tpm2, VERIFIED in
   # src/shared/tpm2-util.c v259). The 26.04.1 server image carries esys and mu but NOT libtss2-rc0t64 (VERIFIED from its
   # manifest; main, about 20 KB; nothing on the image depends on it), so systemd-cryptenroll answers "TPM2 support is
-  # not installed" until it is there (doc S42). It is installed here from the Ubuntu archive: a declared pre-proxy
+  # not installed" until it is there (doc S42). Step 2's enrolment also dlopen()s libtss2-tcti-device (tpm2_context_new). It is installed here from the Ubuntu archive: a declared pre-proxy
   # install like rsync in atlas-day1.sh and squid/dnsmasq in step 4 (the firewall does not exist yet).
-  local ldc; ldc="$(ldconfig -p 2>/dev/null || true)"
-  if ! grep -q 'libtss2-rc\.so\.0' <<<"$ldc"; then
-    log "installing libtss2-rc0t64 (systemd's TPM2 support needs it; it is not on the 26.04.1 server image)"
-    apt_install libtss2-rc0t64
+  # On the default server install, libtss2-esys and -mu (and the device TCTI step 2's enrolment loads) arrive only
+  # through fwupd, a Recommends of ubuntu-server; a minimized install may lack them too (review v0.3.4). So every
+  # library systemd needs is checked, and whatever is missing is installed in one go (apt_install skips the rest).
+  local ldc so missing_tss=0; ldc="$(ldconfig -p 2>/dev/null || true)"
+  for so in libtss2-esys.so.0 libtss2-rc.so.0 libtss2-mu.so.0 libtss2-tcti-device.so.0; do
+    grep -qF "$so" <<<"$ldc" || missing_tss=1
+  done
+  if (( missing_tss )); then
+    log "installing systemd's TPM2 libraries (libtss2-rc0t64 is not on the 26.04.1 server image; esys/mu/tcti-device come only with fwupd)"
+    apt_install libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-rc0t64 libtss2-tcti-device0t64
   fi
   local tpm_why; tpm_why="$(atlas_tpm_check)" || die "pre-flight: $tpm_why"
   log "tpm2: $(grep '^/dev/tpmrm' <<<"$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)" | head -n1)"

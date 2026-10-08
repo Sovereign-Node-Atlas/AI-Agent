@@ -82,6 +82,7 @@ Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
 SRC
     _ATLAS_APT_UPDATED=0
+    apt_wait_idle
     if retry 3 apt-get -q update \
        && retry 2 apt-get install -y -q -o Dpkg::Options::=--force-confold docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
       log "Docker CE installed from download.docker.com ($codename/stable)"

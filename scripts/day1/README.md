@@ -291,8 +291,10 @@ not asserted). 281: which large-v3-turbo id speaches' registry offers. 401, 490:
 **phase2/06-tools.sh** — 122: Blender `--offline-mode` on 4.5. 128: Bonsai import pattern. 152, 405, 432, 441:
 extensions.blender.org API and Bonsai zip name; repo id for `--repo`. 158, 166, 244: tool tarball URLs without vendor
 hashes (hash FIXED at first download). 282: package names on 26.04. 354, 371: Blender 4.5.x patch level and sha256
-sidecar. 388, 394: Blender `use_online_access` preference name. 577: Radiance tarball layout. 621, 641: OpenStudio's
-24.04 build / .deb on 26.04. 823: strict JDK/MinGW apt pins (bump when the archive moves).
+sidecar. 388, 394: Blender `use_online_access` preference name. 621, 641: OpenStudio's 24.04 build / .deb on 26.04.
+823: strict JDK/MinGW apt pins (bump when the archive moves). VERIFIED since v0.3.4 (S43): the pinned Radiance zip and
+OpenStudio tarball nest their trees (`.../usr/local/radiance/{bin,lib,man}`, `.../usr/local/openstudio-3.11.0/`); the
+step finds `bin/rtrace` and `bin/openstudio` at whatever depth and installs those trees; RAYPATH is `.:/opt/radiance/lib`.
 
 **phase2/06b-cloudflare-token.sh** — 29, 130: `/user/tokens/verify` endpoint name.
 

@@ -239,7 +239,7 @@ atlas_tpm_check() {
   local l n
   l="$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)"
   if grep -qi 'support is not installed' <<<"$l"; then
-    echo "systemd's TPM2 support is not installed: it needs libtss2-esys, libtss2-rc and libtss2-mu (sudo apt-get install libtss2-rc0t64). systemd-cryptenroll says: $(tr '\n' ' ' <<<"$l")"; return 1
+    echo "systemd's TPM2 support is not installed: it needs libtss2-esys, libtss2-rc and libtss2-mu (sudo apt-get install libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-rc0t64 libtss2-tcti-device0t64). systemd-cryptenroll says: $(tr '\n' ' ' <<<"$l")"; return 1
   fi
   # ATLAS_TEST_TPM_PRESENT=1 stands in for the device node in lib/common_test.sh only (like ATLAS_TEST_SECURE_BOOT).
   [[ -c /dev/tpmrm0 || "${ATLAS_TEST_TPM_PRESENT:-}" == 1 ]] || { echo "/dev/tpmrm0 absent: enable the fTPM in the BIOS (Section 3.2) and reboot"; return 1; }
@@ -519,6 +519,32 @@ retry() {
 _ATLAS_APT_UPDATED="${_ATLAS_APT_UPDATED:-0}"
 
 # apt_install PKG... — non-interactive, idempotent (dpkg-query), apt index refreshed once per process, 3 retries.
+# apt_wait_idle — wait (up to 15 minutes) while another apt/dpkg run holds apt's locks: apt-daily and
+# apt-daily-upgrade (unattended-upgrades) commonly run minutes after a fresh boot. DPkg::Lock::Timeout covers only the
+# dpkg lock, and `apt-get update` never waits for the lists lock, so this check runs before every update and install
+# (review v0.3.4: step 1 now installs before step 4 writes its lock-timeout config). Busy = a process has one of the
+# lock files open (fuser, psmisc, on the server image) or one of the two units is still running (a oneshot unit is
+# "activating" while it runs, which `systemctl is-active` does not count, so ActiveState is read directly).
+_apt_busy() {
+  if command -v fuser >/dev/null 2>&1 \
+     && fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null; then
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || return 1
+  local st; st="$(systemctl show -p ActiveState --value apt-daily.service apt-daily-upgrade.service 2>/dev/null || true)"
+  grep -qE '^(activating|active|deactivating|reloading)$' <<<"$st"
+}
+apt_wait_idle() {
+  local w=0
+  while _apt_busy; do
+    if (( w >= 900 )); then
+      die "another apt run (apt-daily / unattended-upgrades?) still holds apt's locks after 900 s. Wait for it to finish (systemctl status apt-daily-upgrade.service), then re-run"
+    fi
+    if (( w % 60 == 0 )); then log "apt: waiting for another apt run (apt-daily / unattended-upgrades) to finish (${w}s so far, up to 900s)"; fi
+    sleep 5; w=$((w + 5))
+  done
+}
+
 apt_install() {
   local pkg missing=()
   for pkg in "$@"; do
@@ -533,12 +559,19 @@ apt_install() {
   fi
   export DEBIAN_FRONTEND=noninteractive
   proxy_env
+  apt_wait_idle
   if [[ "$_ATLAS_APT_UPDATED" != "1" ]]; then
-    retry 3 apt-get -q update || die "apt-get update failed (is the allowlist proxy up and .ubuntu.com allowlisted?)"
+    if [[ -s "$ATLAS_ETC/proxy.env" ]]; then
+      retry 3 apt-get -q update || die "apt-get update failed (is the allowlist proxy up and the Ubuntu archive allowlisted?)"
+    else
+      # Before step 4 there is no proxy yet: the cause is the network or the archive, never the allowlist.
+      retry 3 apt-get -q update || die "apt-get update failed before the proxy exists: check the node's network and that archive.ubuntu.com is reachable, then re-run"
+    fi
     _ATLAS_APT_UPDATED=1
   fi
+  apt_wait_idle
   log "apt_install: installing ${missing[*]}"
-  retry 3 apt-get install -y -q -o Dpkg::Options::=--force-confold "${missing[@]}" \
+  retry 3 apt-get install -y -q -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold "${missing[@]}" \
     || die "apt_install: failed to install ${missing[*]}"
 }
 

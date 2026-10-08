@@ -686,15 +686,15 @@ _tools_radiance() {
     # Layout VERIFIED 2026-10-08 against the pinned zip (sha256 above): it holds radiance-6.0.c1700d56cc-Linux.tar.gz,
     # whose files sit under radiance-6.0.c1700d56cc-Linux/usr/local/radiance/{bin,lib,man}. The earlier
     # --strip-components=1 left rtrace three levels down and stopped step 6 (doc S43). So: unpack the inner tarball (if
-    # any) into a staging dir, find bin/rtrace at whatever depth, and install the tree that holds it, so RAYPATH
-    # /opt/radiance/lib matches and a release with a different depth still works.
+    # any) into a staging dir, find bin/rtrace at whatever depth, and install the tree that holds it, so /opt/radiance/lib
+    # is the library RAYPATH names and a release with a different depth still works.
     local inner root="$tmp" rt
     inner="$(find "$tmp" -maxdepth 2 -name 'radiance-*-Linux.tar.gz' | head -n1 || true)"
     if [[ -n "$inner" ]]; then
       root="$tmp/x"; mkdir -p "$root"
       tar --no-same-owner --no-same-permissions -xzf "$inner" -C "$root" || { rm -rf "$tmp"; die "tar of $inner failed"; }
     fi
-    rt="$(find "$root" -path '*/bin/rtrace' -type f | head -n1 || true)"
+    rt="$(find "$root" -path '*/bin/rtrace' -type f -print -quit)"
     [[ -n "$rt" ]] || { rm -rf "$tmp"; die "Radiance archive has no bin/rtrace (contents: $(find "$tmp" -maxdepth 3 | head -n 10 | tr '\n' ' '))"; }
     cp -a "$(dirname "$(dirname "$rt")")"/. /opt/radiance.new/
     rm -rf "$tmp"
@@ -707,14 +707,16 @@ _tools_radiance() {
   # Radiance ships ~200 generically named tools (total, cnt, lam, histo, ...) that must not shadow system commands for
   # root or the Principal; the orchestrator uses RADIANCE_BIN from tools.env explicitly.
   cat >/etc/profile.d/radiance.sh <<'EOT'
-export PATH=$PATH:/opt/radiance/bin RAYPATH=/opt/radiance/lib
+export PATH=$PATH:/opt/radiance/bin RAYPATH=.:/opt/radiance/lib
 EOT
   local out
-  out="$(RAYPATH=/opt/radiance/lib "$bin" -version 2>&1)" || die "rtrace -version failed: ${out: -300}"
+  out="$(RAYPATH=.:/opt/radiance/lib "$bin" -version 2>&1)" || die "rtrace -version failed: ${out: -300}"
   out="${out%%$'\n'*}"
   log "smoke rtrace -version: $out"
   _tools_kv RADIANCE_BIN /opt/radiance/bin
-  _tools_kv RAYPATH /opt/radiance/lib
+  # Radiance's documented form: the current directory first (a scene's own .cal/BSDF files by relative name), then the
+  # library; without the leading "." those files are not found (Radiance's compiled default is ":/usr/local/lib/ray").
+  _tools_kv RAYPATH .:/opt/radiance/lib
 }
 
 # --- 5. EnergyPlus 26.1.0 and OpenStudio 3.11.0 ------------------------------------------------------------------------
@@ -754,11 +756,22 @@ _tools_openstudio() {
       bin="$(command -v openstudio)"
     else
       warn "the OpenStudio 24.04 .deb did not install cleanly on 26.04; using the tar.gz under /opt/openstudio"
-      apt-get -y -q remove openstudio >/dev/null 2>&1 || true
-      local tgz="$TOOLS_STAGING/OpenStudio-3.11.0-Ubuntu-24.04-x86_64.tar.gz"
+      apt-get -y -q purge openstudio-3.11.0 >/dev/null 2>&1 || true   # the .deb's package name (not "openstudio")
+      local tgz="$TOOLS_STAGING/OpenStudio-3.11.0-Ubuntu-24.04-x86_64.tar.gz" stage os
       _tools_dl "$OPENSTUDIO_TGZ_URL" "$tgz" "$OPENSTUDIO_TGZ_SHA256"
-      _tools_extract_tar "$tgz" /opt/openstudio.new
-      [[ -x /opt/openstudio.new/bin/openstudio ]] || die "no bin/openstudio in the OpenStudio tarball (layout changed?)"
+      # Layout VERIFIED 2026-10-08 against the pinned tarball (sha256 above): bin/openstudio sits at
+      # OpenStudio-3.11.0+241b8abb4d-Ubuntu-24.04-x86_64/usr/local/openstudio-3.11.0/bin/openstudio, so a one-level
+      # strip left it three levels down, as with Radiance (doc S43). The tree (about 1.3 GB, bin/ finds ../lib,
+      # ../Ruby and ../EnergyPlus relative to itself) is unpacked on /opt, not the /tmp tmpfs, and moved as a whole.
+      rm -rf /opt/openstudio.new /opt/openstudio.unpack.*
+      stage="$(mktemp -d /opt/openstudio.unpack.XXXXXX)"
+      tar --no-same-owner --no-same-permissions -xzf "$tgz" -C "$stage" || { rm -rf "$stage"; die "tar of $tgz failed"; }
+      os="$(find "$stage" -path '*/bin/openstudio' -type f -print -quit)"
+      [[ -n "$os" ]] || { rm -rf "$stage"; die "no bin/openstudio in the OpenStudio tarball (layout changed?)"; }
+      mv "$(dirname "$(dirname "$os")")" /opt/openstudio.new
+      rm -rf "$stage"
+      _tools_root_only /opt/openstudio.new
+      [[ -x /opt/openstudio.new/bin/openstudio ]] || { rm -rf /opt/openstudio.new; die "no bin/openstudio after unpacking OpenStudio"; }
       rm -rf /opt/openstudio && mv /opt/openstudio.new /opt/openstudio
       bin=/opt/openstudio/bin/openstudio
     fi

@@ -6,9 +6,10 @@
 # Order matters: the proxy, the forwarder and the firewall come first so that even the system update obeys rule §7.1.
 #
 # THE UNAVOIDABLE PRE-PROXY INSTALLS: squid itself and dnsmasq (with jq and gettext-base for rendering their configs)
-# have to be fetched from the Ubuntu archive before the proxy exists; so do rsync (atlas-day1.sh) and libtss2-rc0t64
+# have to be fetched from the Ubuntu archive before the proxy exists; so do rsync (atlas-day1.sh) and systemd's libtss2
 # (step 1, systemd's TPM2 support, doc S42). Nothing else in steps 1-4 installs a
-# package before _squid_render/_ufw_rules have run (steps 1-3 only verify that the ISO-seeded tools are present).
+# package before _squid_render/_ufw_rules have run (steps 1-3 only verify the ISO-seeded tools, except that step 1
+# installs systemd's TPM2 libraries when the image lacks them, doc S42).
 #
 # DNS (fix round, Section 12.5 "everything else denied and logged"): the home router's recursive resolver answers ANY
 # name, so plain "DNS to the pinned LAN resolvers" was a data channel around the allowlist (<chunk>.exfil.example
@@ -870,6 +871,7 @@ _cockpit_install() {
   export DEBIAN_FRONTEND=noninteractive
   if [[ "$(dpkg-query -W -f='${Status}' cockpit-ws 2>/dev/null || true)" != "install ok installed" ]]; then
     proxy_env
+    apt_wait_idle
     if [[ "$_ATLAS_APT_UPDATED" != "1" ]]; then retry 3 apt-get -q update || die "apt-get update failed"; _ATLAS_APT_UPDATED=1; fi
     retry 3 apt-get install -y -q --no-install-recommends -o Dpkg::Options::=--force-confold cockpit-ws cockpit-system cockpit-bridge \
       || die "installing Cockpit (cockpit-ws cockpit-system cockpit-bridge, no recommends) failed"
@@ -885,12 +887,13 @@ _cockpit_install() {
 step_04() {
   [[ -n "${LAN_IP:-}" ]] || die "LAN_IP could not be derived from $LAN_IFACE (no IPv4 address?)"
   # Minutes after a fresh install boots, apt-daily/unattended-upgrades commonly hold the dpkg lock; apt-get gives up
-  # at once by default (DPkg::Lock::Timeout 0). This config applies to every apt-get in every phase, lib/common.sh's
-  # apt_install included, without editing it.
+  # at once by default (DPkg::Lock::Timeout 0). This config covers the plain apt-get calls from here on (dist-upgrade
+  # included); apt_install and every update call also wait first in apt_wait_idle (lib/common.sh), which also covers
+  # the lists lock this setting does not, and step 1's install that runs before this file exists.
   install -d -m 755 /etc/apt/apt.conf.d
   printf '// ATLAS Phase 1 step 4: wait for a held dpkg lock (apt-daily on a fresh boot) instead of failing at once.\nDPkg::Lock::Timeout "300";\n' \
     >/etc/apt/apt.conf.d/90atlas-lock-timeout
-  # The one unavoidable pre-proxy install (header): squid, dnsmasq and their rendering tools. ufw, curl and
+  # The unavoidable pre-proxy install of this step (header): squid, dnsmasq and their rendering tools. ufw, curl and
   # ca-certificates are on the Server ISO and cost nothing to list; apt_install skips what is present.
   apt_install ufw squid jq curl ca-certificates gettext-base
 
@@ -907,6 +910,7 @@ step_04() {
   _time_selftest
   # 3. Full system update, through the proxy, unattended (needrestart would otherwise prompt on Server).
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+  apt_wait_idle
   retry 3 apt-get -q update || die "apt-get update failed through the proxy"
   _ATLAS_APT_UPDATED=1
   # tpm2-tools BEFORE the dist-upgrade (phase1/02-luks.sh header): dracut's tpm2-tss module needs its tpm2 binary, so

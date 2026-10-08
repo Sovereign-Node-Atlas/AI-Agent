@@ -106,6 +106,7 @@ SRC
     || echo 'repo_add_once="false"' >>/etc/default/google-chrome
   _ATLAS_APT_UPDATED=0
   export DEBIAN_FRONTEND=noninteractive
+  apt_wait_idle
   retry 3 apt-get -q update || die "apt-get update failed after adding the Google Chrome repository"
   apt-cache policy google-chrome-stable | grep -q 'dl.google.com' \
     || die "apt does not offer google-chrome-stable from dl.google.com (apt-cache policy google-chrome-stable); check the repository recipe in phase1/05b-desktop.sh"
@@ -176,6 +177,7 @@ step_05b() {
   # --no-install-recommends keeps display managers out; package set VERIFIED on packages.ubuntu.com/resolute.
   proxy_env
   if [[ "$(dpkg-query -W -f='${Status}' xfce4 2>/dev/null || true)" != "install ok installed" ]]; then
+    apt_wait_idle
     if [[ "$_ATLAS_APT_UPDATED" != "1" ]]; then retry 3 apt-get -q update || die "apt-get update failed"; _ATLAS_APT_UPDATED=1; fi
     retry 3 apt-get install -y -q --no-install-recommends -o Dpkg::Options::=--force-confold \
       xfce4 xfce4-goodies xfce4-terminal dbus-x11 xorg xrdp xorgxrdp \
