@@ -39,23 +39,34 @@ exit 4
 SH
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
-die() { echo "DIE: $*"; return 99; }
+die() { echo "DIE: $*"; exit 99; }      # exits: every call that may die runs in a subshell below
 log() { :; }; warn() { :; }
 # shellcheck source=/dev/null
-source <(sed -n '/^_luks_has_token() {/,/^}/p; /^_luks_os_mapping() {/,/^}/p; /^_luks_os_device() {/,/^}/p; /^phase1_crypttab_tpm2() {/,/^}/p' "$REPO/phase1/02-luks.sh" | sed "s#/etc/crypttab#$T/etc/crypttab#g")
+# extract FILE NAME... — print each named top-level function once (a one-line "f() { ...; }" ends on its own line).
+extract() {
+  local f="$1"; shift
+  awk -v names=" $* " '
+    !on && match($0, /^[A-Za-z_][A-Za-z0-9_]*\(\) \{/) {
+      n = substr($0, 1, index($0, "(") - 1)
+      if (index(names, " " n " ")) { on = 1; print; if ($0 ~ /\}[[:space:]]*$/) on = 0; next }
+    }
+    on { print; if ($0 ~ /^\}/) on = 0 }' "$f"
+}
+# shellcheck source=/dev/null
+source <(extract "$REPO/phase1/02-luks.sh" _luks_has_token _luks_is_blockdev _luks_os_mapping _luks_os_device phase1_crypttab_tpm2 \
+  | sed "s#/etc/crypttab#$T/etc/crypttab#g")
 export ATLAS_LUKS_MAPPING=atlas-data   # read by phase1_crypttab_tpm2 (sourced above)
+# Block devices are stubbed: CS_DEV names a fake device that _luks_is_blockdev accepts, so the cases always run.
+_luks_is_blockdev() { [[ -n "$1" && "$1" == "${FAKE_BLOCKDEV:-}" ]]; }
+FAKE_BLOCKDEV=/dev/fake-nvme0n1p3
 
 LSBLK_MODE=lvm-crypt; export LSBLK_MODE
 ok "mapping on encrypted LVM (tree output avoided)" "$(_luks_os_mapping)" "dm_crypt-0"
-CS_MODE=ok; CS_DEV=/dev/null; export CS_MODE CS_DEV   # /dev/null is not a block device
+CS_MODE=ok; CS_DEV=/dev/not-a-block-device; export CS_MODE CS_DEV
 out="$(_luks_os_device 2>/dev/null)"; rc=$?
 ok "unresolvable device returns 1, never 'unencrypted'" "$rc:$out" "1:"
-CS_DEV=""; for d in /dev/loop0 /dev/sda /dev/vda /dev/nvme0n1; do [[ -b "$d" ]] && { CS_DEV="$d"; break; }; done; export CS_DEV
-if [[ -b "$CS_DEV" ]]; then
-  ok "resolved device on encrypted LVM" "$(_luks_os_device)" "$CS_DEV"
-else
-  echo "SKIP resolved-device case: no block device in this container"
-fi
+CS_DEV="$FAKE_BLOCKDEV"
+ok "resolved device on encrypted LVM" "$(_luks_os_device)" "$FAKE_BLOCKDEV"
 LSBLK_MODE=plain
 out="$(_luks_os_device)"; rc=$?
 ok "unencrypted root: empty, rc 0" "$rc:$out" "0:"
@@ -67,23 +78,26 @@ dm_crypt-0 UUID=os-uuid none luks,discard,x-initrd.attach
 atlas-data UUID=data-uuid none nofail,headless=true,discard
 other UUID=z none luks
 CT
-LSBLK_MODE=lvm-crypt; CS_MODE=ok
-if [[ -b "$CS_DEV" ]]; then
-  phase1_crypttab_tpm2; cp "$T/etc/crypttab" "$T/once"; phase1_crypttab_tpm2
-  ok "crypttab idempotent" "$(cmp -s "$T/etc/crypttab" "$T/once" && echo same)" "same"
-  ok "data line" "$(grep '^atlas-data' "$T/etc/crypttab")" "atlas-data UUID=data-uuid none nofail,headless=true,discard,tpm2-device=auto"
-  ok "OS line" "$(grep '^dm_crypt-0' "$T/etc/crypttab")" "dm_crypt-0 UUID=os-uuid none luks,discard,x-initrd.attach,tpm2-device=auto"
-  ok "other line untouched" "$(grep '^other' "$T/etc/crypttab")" "other UUID=z none luks"
-  ok "comment untouched" "$(head -n1 "$T/etc/crypttab")" "# comment atlas-data UUID=x none nofail"
-fi
+cp "$T/etc/crypttab" "$T/orig"
+LSBLK_MODE=lvm-crypt; CS_MODE=ok; CS_DEV=/dev/not-a-block-device
+out="$( ( phase1_crypttab_tpm2 ) 2>&1 )"; rc=$?
+ok "unresolvable OS device: step stops" "$rc" "99"
+ok "unresolvable OS device: crypttab unchanged" "$(cmp -s "$T/etc/crypttab" "$T/orig" && echo same)" "same"
+CS_DEV="$FAKE_BLOCKDEV"
+( phase1_crypttab_tpm2 ) >/dev/null; cp "$T/etc/crypttab" "$T/once"; ( phase1_crypttab_tpm2 ) >/dev/null
+ok "crypttab idempotent" "$(cmp -s "$T/etc/crypttab" "$T/once" && echo same)" "same"
+ok "data line" "$(grep '^atlas-data' "$T/etc/crypttab")" "atlas-data UUID=data-uuid none nofail,headless=true,discard,tpm2-device=auto"
+ok "OS line" "$(grep '^dm_crypt-0' "$T/etc/crypttab")" "dm_crypt-0 UUID=os-uuid none luks,discard,x-initrd.attach,tpm2-device=auto"
+ok "other line untouched" "$(grep '^other' "$T/etc/crypttab")" "other UUID=z none luks"
+ok "comment untouched" "$(head -n1 "$T/etc/crypttab")" "# comment atlas-data UUID=x none nofail"
 LSBLK_MODE=plain
 printf 'atlas-data UUID=d none nofail\n' >"$T/etc/crypttab"
-phase1_crypttab_tpm2
+( phase1_crypttab_tpm2 ) >/dev/null
 ok "unencrypted root: data line only" "$(cat "$T/etc/crypttab")" "atlas-data UUID=d none nofail,tpm2-device=auto"
 
 # todo_is_open (lib/common.sh)
 # shellcheck source=/dev/null
-source <(sed -n '/^todo_is_open() {/,/^}/p' "$REPO/lib/common.sh")
+source <(extract "$REPO/lib/common.sh" todo_is_open)
 ATLAS_TODO_FILE="$T/state/todo.jsonl"
 todo_is_open rdp-restrict; ok "no file -> closed" "$?" "1"
 printf '{"id": "rdp-restrict", "done": false}\n' >"$ATLAS_TODO_FILE"

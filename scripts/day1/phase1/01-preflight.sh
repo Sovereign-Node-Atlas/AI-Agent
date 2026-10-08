@@ -44,7 +44,7 @@ step_01() {
   log "kernel: $kver"
   [[ "$kver" == 7.* ]] || die "pre-flight: kernel $kver, but Section 3.1 requires the 7.x kernel that ships with 26.04 (amdgpu for gfx1151)"
   [[ "$kver" == 7.0.* ]] || warn "pre-flight: kernel $kver is not 7.0.x; the GRUB parameters were validated for 7.0 (V3a will tell)"
-  if ! dpkg-query -W dracut >/dev/null 2>&1; then
+  if ! command -v dracut >/dev/null 2>&1; then     # the same test step 2 makes (02-luks.sh), so the two always agree
     warn "pre-flight: dracut is not installed (26.04's initramfs tool, seeded on the Server ISO). Step 2 needs it and installs nothing before the proxy exists: install it from the console now (sudo apt-get install dracut), or step 2 will stop"
   fi
   command -v sudo >/dev/null && log "sudo provider: $(sudo --version 2>/dev/null | head -n1 || echo unknown) (26.04 ships sudo-rs; the scripts never use sudo -E)"

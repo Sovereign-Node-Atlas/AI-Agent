@@ -43,7 +43,7 @@ step 5b installs XFCE, xrdp and Google Chrome, and you reach the desktop from th
 | `/home/<you>/CLOUDFLARE.txt` with the `Zone:DNS:Edit` token for `sovereign-node.link` (40 characters, anywhere in the file; optional `Zone ID: <32 hex>` line) | Phase 1 step 7 looks for the file; the zone id is asked once if the token cannot list zones | Dynamic DNS and V23 deferred, to-do `cloudflare-token` |
 | WireGuard test from your phone on mobile data (WireGuard and ntfy apps installed) | Phase 1 step 7 waits 10 minutes | V5 deferred, to-do `vpn-mobile-test` |
 | One Remote Desktop connection from the Windows PC | Phase 1 step 5b waits 10 minutes | V19 deferred, to-do `rdp-test` |
-| Your Windows PC's address, to limit Remote Desktop on the LAN to that PC (`RDP_ALLOW_FROM`) | Never asked: after a successful test, step 5b records the to-do `rdp-restrict` with the address your PC used and the two commands that apply it | The whole LAN subnet may reach Remote Desktop, as before |
+| Your Windows PC's address, to limit Remote Desktop on the LAN to that PC (`RDP_ALLOW_FROM`) | Never asked: after a successful test from the LAN (a test over WireGuard records nothing), step 5b records the to-do `rdp-restrict` with the address your PC used and the two commands that apply it; it closes once the firewall no longer admits the whole subnet | The whole LAN subnet may reach Remote Desktop, as before |
 | Hugging Face token (read scope) with the licences accepted for `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0`, `black-forest-labs/FLUX.1-dev`, `stabilityai/stable-audio-open-1.0` | Phase 2 start, hidden input | PyAnnote (V6) and the gated Phase 4 engines deferred, to-do `input-hf-token` |
 | Google OAuth client JSON (Desktop-app type) at `/srv/atlas/staging/inbox/google-oauth-client.json`, then one sign-in per account | Phase 2 step 6c | V20 deferred, to-do `input-google-oauth-client` |
 | Voice references `alaric.*` / `gideon.*` (WAV, MP3 or M4A) in `/srv/atlas/staging/inbox/voice-references/` | Phase 2 step 5 | V7 deferred |
@@ -114,7 +114,7 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   timers; the Windows share automount (skipped on Day 1); the gocryptfs vault; gate.
 - **Day 1 close-out, before Phase 3 starts downloading:** copy the recovery material to the USB drive and store it
   away from the node, not beside it (Section 22, R16; D3): `/etc/atlas/secrets/restic.pass` (`sudo cat` it; shown once
-  in Phase 2 step 7), the LUKS recovery key shown in Phase 1 step 2 (on-node copy under `/etc/atlas/secrets/`), and the
+  in Phase 2 step 7), the LUKS recovery key shown in Phase 1 step 2 (on-node copy under `/etc/atlas/secrets/` only when the OS volume is encrypted; otherwise your written copy is the only other one), and the
   vault passphrase you chose (plus the gocryptfs master key shown once) if you initialised the vault (§3). A fire or
   burglary that takes the node takes anything beside it; the USB copy is the one that survives.
 - **Phase 3 — core LLM pull** (download-bound): the seven GGUF engines at their fixed quantisations, sha256 from the
@@ -136,7 +136,7 @@ recovery key, because it is shown once.
 |---|---|---|
 | 1 / 1 | Your SSH public key, one pasted line (the step prints the PowerShell command that shows it). | 5 minutes |
 | 1 / start | `GOOGLE_ACCOUNTS`, `FAMILY_NAMES`, the Android SDK terms (`load_env`, once each). | 5 minutes each |
-| 1 / 2 | The LUKS recovery key is shown on the console once; type `WRITTEN DOWN` to continue (the screen is wiped). In the same pause, if the installer encrypted the OS volume and it has no TPM2 token yet, the OS LUKS passphrase is asked once for the enrolment (never stored). | Until you answer |
+| 1 / 2 | The LUKS recovery key is shown on the console once; type `WRITTEN DOWN` to continue (the screen is wiped). In the same pause the OS LUKS passphrase is asked once when the installer encrypted the OS volume and it has no TPM2 token yet, or when `--force 02` finds the token no longer unseals (Secure Boot switched on); and the data volume's recovery key is asked once when `--force 02` must re-seal it and no copy is on the node. Never stored. | Until you answer |
 | 1 / 7 | Only when the Cloudflare token cannot list zones and no `Zone ID:` line or `CF_ZONE_ID` exists: the zone id, once. | 5 minutes |
 | 2 / start | The Hugging Face token (hidden input), only when `/etc/atlas/secrets/hf-token.env` is absent. | 5 minutes |
 | 2 / 6b | The zone id again, only if step 7 was skipped and the token still cannot list zones. | 5 minutes |

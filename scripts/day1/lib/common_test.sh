@@ -227,6 +227,16 @@ printf 'HTTPS_PROXY=http://127.0.0.1:3128\n' >"$ATLAS_ETC/proxy.env"
     && [ "${HF_HUB_ENABLE_HF_TRANSFER:-}" = 0 ] && [ -n "${NO_PROXY:-}" ] && env | grep -q '^https_proxy=http://127.0.0.1:3128$' ); rc=$?
 check "proxy_env: proxy.env exported (both cases, in the environment)" test "$rc" -eq 0
 
+# --- atlas_rdp_sources_check (RDP_ALLOW_FROM, doc S41): ufw/iptables-safe forms inside the LAN, never the WG bridge --
+rdp_rejects() { ! atlas_rdp_sources_check "$@" >/dev/null; }   # in this shell: the function is not exported
+for v in 192.168.1.20 192.168.1.16/28 "192.168.1.20 192.168.1.30"; do
+  check "atlas_rdp_sources_check accepts '$v'" atlas_rdp_sources_check 192.168.1.0/24 "$v"
+done
+for v in 192.168.1.256 192.168.01.20 192.168.1.20/33 192.168.1.20/028 192.168.1.0/024 192.168.1.0/0.0.0.255 10.0.0.5 0.0.0.0/0; do
+  check "atlas_rdp_sources_check rejects '$v'" rdp_rejects 192.168.1.0/24 "$v"
+done
+check "atlas_rdp_sources_check rejects the WireGuard bridge on a 10/8 LAN" rdp_rejects 10.0.0.0/8 10.42.42.42
+
 # --- summary ------------------------------------------------------------------------------------------------------------
 echo
 echo "common_test: $pass_n passed, $fail_n failed"

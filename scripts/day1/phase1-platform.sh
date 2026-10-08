@@ -22,9 +22,11 @@
 #
 # Interactive moments (rule §7.6 names the recovery-key pause; the two further inputs below are declared here, in
 # the step headers and in the README):
-#   * step 2: the recovery key is printed once and the step waits for "WRITTEN DOWN"; in the SAME pause, when the
-#     installer encrypted the OS volume and it has no TPM2 token yet, the OS LUKS passphrase is asked ONCE so the TPM
-#     can unlock the OS at boot (Section 3.5; used for the enrolment only, never stored);
+#   * step 2: the recovery key is printed once and the step waits for "WRITTEN DOWN"; in the SAME pause the OS LUKS
+#     passphrase is asked ONCE when the installer encrypted the OS volume and it has no TPM2 token yet, or when
+#     --force 02 finds that its token no longer unseals (Secure Boot switched on; the TPM is tried first), and the data
+#     volume's recovery key is asked ONCE when --force 02 must re-seal it and nothing on the node can authorise that
+#     (Section 3.5; every typed secret is used for the enrolment only, never stored);
 #   * step 7: when the Cloudflare token cannot list zones and no zone id is found (beside the token in CLOUDFLARE.txt,
 #     or in an existing secrets/cloudflare.env), the zone id is asked ONCE from the terminal with a 5-minute timeout
 #     (Section 22, S11); no terminal or no answer leaves it blank with a warning.
@@ -33,8 +35,8 @@
 # Waits that are not prompts: steps 5b and 7 WAIT up to 10 minutes each for the Principal's RDP session and phone
 # handshake. A timeout records V19/V5 as DEFERRED with a to-do (policy v0.3.3: the Principal's input never stops a phase), the step
 # still completes, the gate never blocks on deferred, and `--force 05b` / `--force 07` re-runs the wait later.
-# An unencrypted OS volume (Section 3.5) is a warning plus to-do os-volume-encryption, not a stop; the on-node recovery
-# copy of D3 is always written. Secure Boot (D15, 2026-10-05): the Principal enables it in the BIOS; while it is off
+# An unencrypted OS volume (Section 3.5) is a warning plus to-do os-volume-encryption, not a stop; while it is
+# unencrypted no on-node recovery copy is kept (the written and USB copies are the only ones, doc S33). Secure Boot (D15, 2026-10-05): the Principal enables it in the BIOS; while it is off
 # the S9 PCR 7 binding unseals to any OS booted on the hardware, so step 1 warns, every V2 row notes the state and
 # to-do secure-boot stays open (see phase1/01-preflight.sh). No acknowledgement key exists any more.
 # Phase-1-owned settings file: /etc/atlas/network.env (LAN_DNS_SERVERS, written by step 4, read by step 7,

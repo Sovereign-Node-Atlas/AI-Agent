@@ -249,24 +249,41 @@ sys.exit(0 if state else 1)
 PY
 }
 
-# atlas_rdp_sources_check LAN_CIDR "ENTRY..." — every entry must be an IPv4 address or CIDR that ufw accepts (no octet
-# above 255, no leading zeros, prefix 0..32: Python's ipaddress applies the same rules as ufw's inet_pton check) and
-# must lie inside the LAN. Prints the offending entries and returns 1 otherwise.
+# _atlas_rdp_narrowed — true when ufw is active and no 3389 rule on LAN_IFACE admits the whole LAN subnet any more.
+_atlas_rdp_narrowed() {
+  command -v ufw >/dev/null 2>&1 || return 1
+  local st net
+  st="$(ufw status 2>/dev/null)" || return 1
+  [[ "$st" == *"Status: active"* ]] || return 1
+  net="$(python3 -c 'import ipaddress, sys; print(ipaddress.ip_network(sys.argv[1], strict=False))' "$LAN_CIDR" 2>/dev/null)" || return 1
+  ! grep -qE "^3389/tcp on ${LAN_IFACE}[[:space:]]+ALLOW( IN)?[[:space:]]+${net//./\\.}([[:space:]]|\$)" <<<"$st"
+}
+
+# atlas_rdp_sources_check LAN_CIDR "ENTRY..." — every entry must be a canonical dotted quad (octets 0..255, no leading
+# zeros) with an optional DECIMAL prefix 0..32 written without leading zeros (ufw passes the prefix unchanged to
+# iptables, which reads a leading zero as octal, and a dotted suffix as a netmask that Python would read as a hostmask),
+# must lie inside the LAN, and must not touch the WireGuard bridge network (VPN sessions arrive masqueraded as its
+# address on another interface, so a LAN rule for it never matches). Prints the offending entries and returns 1.
 atlas_rdp_sources_check() {
-  python3 - "$1" "$2" <<'PY'
-import ipaddress, sys
+  python3 - "$1" "$2" "${ATLAS_WG_BRIDGE_NET:-10.42.42.0/24}" <<'PY'
+import ipaddress, re, sys
 try:
     lan = ipaddress.ip_network(sys.argv[1], strict=False)
 except ValueError as e:
     print(f"LAN_CIDR {sys.argv[1]!r} is not a network ({e})"); sys.exit(1)
+bridge = ipaddress.ip_network(sys.argv[3], strict=False)
 bad = []
 for tok in sys.argv[2].split():
+    if not re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}(/(0|[1-9][0-9]?))?", tok):
+        bad.append(f"{tok} (write an address or address/prefix with a decimal prefix, e.g. 192.168.1.20 or 192.168.1.16/28)"); continue
     try:
         net = ipaddress.IPv4Network(tok, strict=False)
     except ValueError as e:
         bad.append(f"{tok} ({e})"); continue
     if lan.version != 4 or not net.subnet_of(lan):
         bad.append(f"{tok} (not inside the LAN {lan})")
+    elif net.overlaps(bridge):
+        bad.append(f"{tok} (the WireGuard bridge {bridge}: VPN sessions are allowed separately)")
 if bad:
     print("; ".join(bad)); sys.exit(1)
 PY
@@ -974,7 +991,9 @@ load_env() {
     local __bad
     __bad="$(atlas_rdp_sources_check "$LAN_CIDR" "$RDP_ALLOW_FROM")" \
       || die "load_env: RDP_ALLOW_FROM must be IPv4 addresses or CIDRs inside the LAN $LAN_CIDR, separated by spaces (e.g. \"192.168.1.20\"): $__bad. Edit $envf, or leave it blank for the whole LAN"
-    if todo_is_open rdp-restrict; then todo_done rdp-restrict; fi
+    # Close the to-do only once the firewall really is narrowed (the key alone changes nothing until the to-do's ufw
+    # commands or a --force 04 apply it).
+    if todo_is_open rdp-restrict && _atlas_rdp_narrowed; then todo_done rdp-restrict; fi
   fi
   if [[ -z "${CLOUDFLARE_TXT:-}" ]]; then
     CLOUDFLARE_TXT="/home/$PRINCIPAL_USER/CLOUDFLARE.txt"; ensure_kv "$envf" CLOUDFLARE_TXT "$CLOUDFLARE_TXT"; changed=1

@@ -27,7 +27,7 @@ step_03() {
       else
         # Interactive `cryptsetup open` prompts for the key: never pass it on the command line (the shell history
         # would keep it, rule §7.2).
-        die "cannot open $dev: the TPM refused and the on-node recovery copy $rf is missing (D3 writes it in step 2; --force 02 restores it). Open it with the USB recovery key at the interactive prompt, never on the command line:  cryptsetup open $dev $mapping   then re-run: sudo $ATLAS_ENTRY phase1"
+        die "cannot open $dev: the TPM refused and the on-node recovery copy $rf is missing (step 2 writes it only when the OS volume is encrypted; there --force 02 restores it). Open it with the USB recovery key at the interactive prompt, never on the command line:  cryptsetup open $dev $mapping   then re-run: sudo $ATLAS_ENTRY phase1"
       fi
     fi
   fi
