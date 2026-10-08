@@ -45,7 +45,7 @@ step_01() {
   [[ "$kver" == 7.* ]] || die "pre-flight: kernel $kver, but Section 3.1 requires the 7.x kernel that ships with 26.04 (amdgpu for gfx1151)"
   [[ "$kver" == 7.0.* ]] || warn "pre-flight: kernel $kver is not 7.0.x; the GRUB parameters were validated for 7.0 (V3a will tell)"
   if ! dpkg-query -W dracut >/dev/null 2>&1; then
-    warn "pre-flight: dracut is not installed yet (26.04's initramfs tool); step 2 installs it"
+    warn "pre-flight: dracut is not installed (26.04's initramfs tool, seeded on the Server ISO). Step 2 needs it and installs nothing before the proxy exists: install it from the console now (sudo apt-get install dracut), or step 2 will stop"
   fi
   command -v sudo >/dev/null && log "sudo provider: $(sudo --version 2>/dev/null | head -n1 || echo unknown) (26.04 ships sudo-rs; the scripts never use sudo -E)"
 
@@ -106,7 +106,8 @@ step_01() {
   local data_dev root_src root_disk
   data_dev="$(readlink -f "$DATA_DISK")"
   root_src="$(findmnt -n -o SOURCE / )"
-  root_disk="$(lsblk -sno NAME "$root_src" 2>/dev/null | tail -n1)"
+  # List mode (-l): with NAME shown, lsblk draws tree prefixes into pipes, which made this "    └─nvme0n1" before.
+  root_disk="$(lsblk -lnso NAME,TYPE "$root_src" 2>/dev/null | awk '$2=="disk" {print $1; exit}')"
   log "data disk: $DATA_DISK -> $data_dev; root on /dev/${root_disk:-?} ($root_src)"
   [[ -n "$root_disk" && "$data_dev" != "/dev/$root_disk" ]] || die "pre-flight: DATA_DISK $DATA_DISK is the root disk; refusing"
   [[ "$(lsblk -dn -o TYPE "$data_dev")" == disk ]] || die "pre-flight: DATA_DISK $data_dev is not a whole disk"
@@ -125,7 +126,7 @@ step_01() {
   # precondition is an install with the encrypted-LVM option. No step offers a waiver (fix round 3): only a Section 23
   # amendment by the Principal could change 3.5 or D3, and the scripts follow the document. Checked on "/" itself,
   # not on any crypt mapping (an already-open atlas-data mapping must not count).
-  if lsblk -sno TYPE "$root_src" 2>/dev/null | grep -qx crypt; then
+  if grep -qx crypt <<<"$(lsblk -lnso TYPE "$root_src" 2>/dev/null || true)"; then
     log "OS volume: LUKS present (installer choice, Section 3.5)"
   else
     # Policy v0.3.3: a to-do, not a stop. The 8 TB data volume (everything ATLAS stores) is encrypted by step 2

@@ -77,9 +77,10 @@ auto-detected as the largest unmounted NVMe), `CLOUDFLARE_TXT` (default `/home/$
 `LLAMA_PORT_BASE=8100` (engine N listens on 8100+N), `HF_ENDPOINT` (unset), `DOWNLOAD_MBPS=100`.
 `ATLAS_SSH_PASSWORD_AUTH` (blank; pre-flight writes `keep` itself when the Principal gave no SSH public key at its
 prompt, so password SSH stays on until the key is added, to-do `ssh-key`), `RDP_ALLOW_FROM` (blank = the whole LAN
-subnet may reach xrdp; IPv4 addresses or CIDRs narrow the LAN side of port 3389 to the Principal's PC, checked by
-`load_env`, applied by Phase 1 step 4; step 5b records the optional to-do `rdp-restrict` with the address the PC
-connected from), `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE`
+subnet may reach xrdp; IPv4 addresses or CIDRs inside `LAN_CIDR` narrow the LAN side of port 3389 to the Principal's
+PC, checked by `load_env` with ufw's own rules (`atlas_rdp_sources_check`) and again by step 4 before it resets ufw;
+step 5b records the optional to-do `rdp-restrict` with the LAN address the PC connected from, closed by `load_env`
+once the key is set), `BUILDFARM_ACCEPT_ANDROID_SDK_LICENCE`
 (blank; `yes` records that the Principal read and accepts the Android SDK terms, Section 16.3 item 2; Phase 2 step 6
 defers the cross-build container otherwise).
 **Principal-provided keys are optional (policy v0.3.3).** `GOOGLE_ACCOUNTS`, `FAMILY_NAMES` and

@@ -232,6 +232,46 @@ print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": sys.argv[3], "t
   log "to-do $id closed"
 }
 
+# todo_is_open ID — true when the latest record for ID is an open to-do (so a caller closes it once, not every run).
+todo_is_open() {
+  [[ -s "${ATLAS_TODO_FILE:-}" ]] || return 1
+  python3 - "$ATLAS_TODO_FILE" "$1" <<'PY'
+import json, sys
+state = None
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if r.get("id") == sys.argv[2]:
+        state = not r.get("done")
+sys.exit(0 if state else 1)
+PY
+}
+
+# atlas_rdp_sources_check LAN_CIDR "ENTRY..." — every entry must be an IPv4 address or CIDR that ufw accepts (no octet
+# above 255, no leading zeros, prefix 0..32: Python's ipaddress applies the same rules as ufw's inet_pton check) and
+# must lie inside the LAN. Prints the offending entries and returns 1 otherwise.
+atlas_rdp_sources_check() {
+  python3 - "$1" "$2" <<'PY'
+import ipaddress, sys
+try:
+    lan = ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError as e:
+    print(f"LAN_CIDR {sys.argv[1]!r} is not a network ({e})"); sys.exit(1)
+bad = []
+for tok in sys.argv[2].split():
+    try:
+        net = ipaddress.IPv4Network(tok, strict=False)
+    except ValueError as e:
+        bad.append(f"{tok} ({e})"); continue
+    if lan.version != 4 or not net.subnet_of(lan):
+        bad.append(f"{tok} (not inside the LAN {lan})")
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+PY
+}
+
 # todo_list — the open items, latest record per ID, as a table (atlas-day1.sh status; the Phase gates print it too).
 todo_list() {
   [[ -s "${ATLAS_TODO_FILE:-}" ]] || { echo "  (no to-do items)"; return 0; }
@@ -901,13 +941,6 @@ load_env() {
       || die "load_env: GOOGLE_ACCOUNTS entry '$acct' must be email:corporate or email:estate (edit $envf)"
   done
   [[ -z "${WINDOWS_SHARE:-}" || "$WINDOWS_SHARE" =~ ^//[^/]+/.+$ ]] || die "load_env: WINDOWS_SHARE must look like //host/share, got '$WINDOWS_SHARE' (edit $envf)"
-  if [[ -n "${RDP_ALLOW_FROM:-}" ]]; then
-    local __r
-    for __r in $RDP_ALLOW_FROM; do
-      [[ "$__r" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] \
-        || die "load_env: RDP_ALLOW_FROM must be IPv4 addresses or CIDRs separated by spaces (e.g. \"192.168.1.20\"), got '$RDP_ALLOW_FROM' (edit $envf, or leave it blank for the whole LAN)"
-    done
-  fi
 
   # Auto-detected keys: detect when blank, persist, die when detection fails.
   local changed=0 v
@@ -935,6 +968,14 @@ load_env() {
     DATA_DISK="$v"; ensure_kv "$envf" DATA_DISK "$v"; changed=1
   fi
   [[ -e "$DATA_DISK" ]] || die "load_env: DATA_DISK=$DATA_DISK does not exist"
+  # RDP_ALLOW_FROM (optional): checked here, after LAN_CIDR is known, with the same rules ufw applies plus "inside the
+  # LAN", because step 4 resets ufw before adding rules and a value ufw rejects there would leave the node unfiltered.
+  if [[ -n "${RDP_ALLOW_FROM:-}" ]]; then
+    local __bad
+    __bad="$(atlas_rdp_sources_check "$LAN_CIDR" "$RDP_ALLOW_FROM")" \
+      || die "load_env: RDP_ALLOW_FROM must be IPv4 addresses or CIDRs inside the LAN $LAN_CIDR, separated by spaces (e.g. \"192.168.1.20\"): $__bad. Edit $envf, or leave it blank for the whole LAN"
+    if todo_is_open rdp-restrict; then todo_done rdp-restrict; fi
+  fi
   if [[ -z "${CLOUDFLARE_TXT:-}" ]]; then
     CLOUDFLARE_TXT="/home/$PRINCIPAL_USER/CLOUDFLARE.txt"; ensure_kv "$envf" CLOUDFLARE_TXT "$CLOUDFLARE_TXT"; changed=1
   fi

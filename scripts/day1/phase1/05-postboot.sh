@@ -29,9 +29,15 @@ step_05() {
     record_v V2 fail "after reboot: /dev/mapper/$mapping not unlocked by the TPM and $ATLAS_SRV not mounted (journalctl -u systemd-cryptsetup@*)"
     die "the data volume did not auto-unlock after the reboot (V2 fail). Unlock it with the recovery key to investigate: cryptsetup open $dev $mapping"
   fi
-  local osdev="" os_note; declare -F _luks_os_device >/dev/null && osdev="$(_luks_os_device)"
-  if [[ -n "$osdev" ]]; then os_note="auto-unlocked at boot"
-  else os_note="OS volume UNENCRYPTED (Section 3.5)"; fi   # v02 records "-" as a fail unconditionally (no waiver exists)
+  local osdev="" os_note initrd_note=""
+  if declare -F _luks_os_device >/dev/null; then
+    osdev="$(_luks_os_device)" || die "cannot resolve the LUKS device under / (see the message above)"
+  fi
+  [[ -s "$ATLAS_STATE/initrd-tpm2.note" ]] && initrd_note="$(head -n1 "$ATLAS_STATE/initrd-tpm2.note")"
+  # Step 4's initrd check travels across the reboot in initrd-tpm2.note. Whether the console asked for the OS
+  # passphrase this boot is not observable from here, so the row states what was checked, not "auto-unlocked".
+  if [[ -n "$osdev" ]]; then os_note="OS volume up after the reboot; ${initrd_note:-initrd TPM2 support not checked}"
+  else os_note="OS volume UNENCRYPTED (Section 3.5)"; fi   # v02 exits 2 (deferred, to-do os-volume-encryption) for "-"; run_verify returns 0
   run_verify V2 v02-tpm.sh "$dev" "$mapping" "${osdev:--}" "$os_note" \
     || die "V2 failed post-reboot"
 

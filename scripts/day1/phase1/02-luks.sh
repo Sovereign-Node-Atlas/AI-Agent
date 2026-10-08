@@ -35,9 +35,11 @@
 # (VERIFIED from dracut-ng main), tpm2-tools (universe, ships /usr/bin/tpm2) is NOT on the 26.04.1 server image
 # (VERIFIED from its manifest), and a module named in add_dracutmodules that fails its check stops dracut ("Module
 # 'X' cannot be installed." then exit 1 in for_each_module_dir, VERIFIED from dracut-ng dracut.sh). So the
-# drop-in names tpm2-tss only once `tpm2` exists: phase1/04-system.sh installs tpm2-tools through the proxy BEFORE its
-# dist-upgrade (a new kernel's initramfs then already carries TPM support) and rebuilds every initramfs before the
-# reboot, with the helpers below. On the first run this step therefore leaves the initramfs to step 4.
+# drop-in names tpm2-tss, and crypttab carries tpm2-device=, only once `tpm2` exists (in dracut's default hostonly mode
+# a tpm2-device= in crypttab alone pulls tpm2-tss in, review v0.3.4): phase1/04-system.sh installs tpm2-tools through
+# the proxy BEFORE its dist-upgrade, adds the crypttab option, writes the drop-in (a new kernel's initramfs then
+# already carries TPM support) and rebuilds every initramfs before the reboot, with the helpers below. On the first
+# run this step therefore leaves the initramfs to step 4.
 # Facts typed literally from the platform research item 1 (VERIFIED unless marked). Defines step_02 and the two
 # phase1_initramfs_* helpers step 4 calls (step files are sourced in order before each step runs).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
@@ -60,17 +62,25 @@ _luks_has_token() {
   [[ "$d" == *"systemd-$2"* ]]
 }
 
-# _luks_os_device — print the LUKS device backing "/" (empty when the OS volume is not encrypted).
-_luks_os_device() {
-  local src crypt_name
-  src="$(findmnt -n -o SOURCE /)"
-  crypt_name="$(lsblk -sno NAME,TYPE "$src" 2>/dev/null | awk '$2=="crypt" {print $1; exit}')"
-  [[ -n "$crypt_name" ]] || return 0
-  cryptsetup status "$crypt_name" 2>/dev/null | awk '/device:/ {print $2; exit}'
-}
+# _luks_os_mapping — the crypt mapping under "/" (empty = "/" has no crypt layer). List mode (-l) is essential:
+# lsblk draws tree prefixes ("└─", "`-") into pipes whenever NAME is shown, and the encrypted-LVM install puts "/" on
+# an LV above the crypt mapping, so tree mode yields "└─dm_crypt-0" (review v0.3.4, reproduced). -s lists the
+# dependencies of SOURCE in order, so the first crypt line is the mapping that carries "/".
 _luks_os_mapping() {
   local src; src="$(findmnt -n -o SOURCE /)"
-  lsblk -sno NAME,TYPE "$src" 2>/dev/null | awk '$2=="crypt" {print $1; exit}'
+  lsblk -lnso NAME,TYPE "$src" 2>/dev/null | awk '$2=="crypt" {print $1; exit}' || true
+}
+
+# _luks_os_device — the LUKS device backing "/": prints nothing when "/" has no crypt layer; returns 1 with a message
+# on stderr when a crypt layer exists but its device cannot be resolved, so a caller never takes "encrypted" for
+# "unencrypted" (the unencrypted branch records a reinstall to-do and skips the OS enrolment).
+_luks_os_device() {
+  local map dev
+  map="$(_luks_os_mapping)"
+  [[ -n "$map" ]] || return 0
+  dev="$(cryptsetup status "$map" 2>/dev/null | awk '$1=="device:" {print $2; exit}')" || true
+  [[ -b "$dev" ]] || { echo "\"/\" is on the crypt mapping '$map' but 'cryptsetup status $map' names no backing device" >&2; return 1; }
+  printf '%s\n' "$dev"
 }
 
 # _luks_enroll DEVICE ARGS... — run systemd-cryptenroll ARGS DEVICE with whatever authorises a header change: the
@@ -119,9 +129,32 @@ phase1_initramfs_conf() {
     "$mods" >/etc/dracut.conf.d/90-atlas-tpm2.conf
 }
 
-# phase1_initramfs_rebuild — drop-in, then regenerate every initramfs, then check the TPM pieces are in it. Called by
-# step 2 when tpm2-tools is already present (a --force 02 after step 4) and by step 4 before its reboot. Sets
-# PHASE1_INITRD_NOTE (empty when fine) for the V2 message.
+# phase1_crypttab_tpm2 — add tpm2-device=auto to the crypttab lines of the data volume and (when it carries a TPM2
+# token) the OS volume. Until tpm2-tools exists the lines are written WITHOUT it: in dracut's default hostonly mode the
+# systemd-cryptsetup module pulls in tpm2-tss as soon as /etc/crypttab mentions tpm2-device= (71systemd-cryptsetup
+# depends()), tpm2-tss's check fails without the tpm2 binary, and every initramfs build stops, including the kernel
+# postinst of an unattended upgrade between step 2 and step 4 (review v0.3.4). Step 4 calls this right after
+# installing tpm2-tools; step 2 writes the option directly when tpm2-tools is already there. Idempotent.
+phase1_crypttab_tpm2() {
+  [[ -f /etc/crypttab ]] || return 0
+  local names=("$ATLAS_LUKS_MAPPING") osdev osmap
+  osdev="$(_luks_os_device)" || die "cannot resolve the LUKS device under / (see the message above); not touching crypttab"
+  osmap="$(_luks_os_mapping)"
+  if [[ -n "$osdev" && -n "$osmap" ]] && _luks_has_token "$osdev" tpm2; then names+=("$osmap"); fi
+  awk -v list="${names[*]}" 'BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    $0 !~ /^[[:space:]]*#/ && ($1 in want) && NF >= 3 {
+      opts = (NF >= 4) ? $4 : "luks"
+      if (opts !~ /(^|,)tpm2-device=/) opts = opts ",tpm2-device=auto"
+      print $1, $2, $3, opts; next }
+    { print }' /etc/crypttab >/etc/crypttab.atlas.tmp
+  cat /etc/crypttab.atlas.tmp >/etc/crypttab && rm -f /etc/crypttab.atlas.tmp
+  log "crypttab: tpm2-device=auto on ${names[*]}"
+}
+
+# phase1_initramfs_rebuild — drop-in, then regenerate every initramfs, then check each image for the TPM pieces.
+# Called by step 2 when tpm2-tools is already present (a --force 02 after step 4) and by step 4 before its reboot.
+# Sets PHASE1_INITRD_NOTE and persists it in $ATLAS_STATE/initrd-tpm2.note, which step 5 puts into the post-reboot
+# V2 row (the reboot comes before anyone reads this step's log).
 PHASE1_INITRD_NOTE=""
 phase1_initramfs_rebuild() {
   PHASE1_INITRD_NOTE=""
@@ -130,12 +163,25 @@ phase1_initramfs_rebuild() {
   phase1_initramfs_conf
   log "regenerating every initramfs with dracut (crypt, systemd-cryptsetup, tpm2-tss; this takes a minute or two)"
   dracut --force --regenerate-all --quiet || die "dracut --force --regenerate-all failed; see the output above and /etc/dracut.conf.d/90-atlas-tpm2.conf"
-  if [[ -n "$(_luks_os_device)" ]] && command -v lsinitrd >/dev/null; then
-    if ! lsinitrd 2>/dev/null | grep -qE 'libcryptsetup-token-systemd-tpm2|libtss2-esys'; then
-      warn "the initrd does not list the systemd TPM2 token or libtss2; the OS volume may ask for its passphrase at the console after the reboot (keyboard at hand for Phase 1). Check: lsinitrd | grep -iE 'tpm2|tss2'"
-      PHASE1_INITRD_NOTE="initrd TPM2 support UNVERIFIED (see log)"
+  local osd; osd="$(_luks_os_device)" || die "cannot resolve the LUKS device under / (see the message above)"
+  if [[ -n "$osd" ]] && command -v lsinitrd >/dev/null; then
+    # Capture first, match second: `lsinitrd | grep -q` under pipefail fails exactly when grep matches early
+    # (lsinitrd gets SIGPIPE). Every image is checked, not only the running kernel's: GRUB boots the newest.
+    local img out missing=()
+    for img in /boot/initrd.img-*; do
+      [[ -f "$img" ]] || continue
+      out="$(lsinitrd "$img" 2>/dev/null || true)"
+      grep -qE 'libcryptsetup-token-systemd-tpm2|libtss2-esys' <<<"$out" || missing+=("${img##*/}")
+    done
+    if (( ${#missing[@]} > 0 )); then
+      warn "initrd without the systemd TPM2 token or libtss2: ${missing[*]}; the OS volume may ask for its passphrase at the console after the reboot (keyboard at hand for Phase 1). Check: lsinitrd /boot/<image> | grep -iE 'tpm2|tss2'"
+      PHASE1_INITRD_NOTE="initrd TPM2 support UNVERIFIED (${missing[*]})"
+    else
+      PHASE1_INITRD_NOTE="initrd TPM2 support checked in every image"
     fi
   fi
+  _atlas_state_init
+  printf '%s\n' "$PHASE1_INITRD_NOTE" >"$ATLAS_STATE/initrd-tpm2.note"
 }
 
 step_02() {
@@ -155,16 +201,24 @@ step_02() {
 
   # --- OS volume state, decided once. Unencrypted: the data volume is still encrypted and the phase continues; the
   # to-do os-volume-encryption (step 1) stands and V2 is recorded deferred (policy v0.3.3, header). ---------------
-  local osdev osmap os_note="" need_os_enrol=0
-  osdev="$(_luks_os_device)"; osmap="$(_luks_os_mapping)"
+  local osdev osmap os_note="" need_os_enrol=0 os_reseal=0 reseal=0
+  # --force 02 re-seals both TPM2 tokens to the current PCR 7 (the secure-boot to-do's remedy: switching Secure Boot
+  # on changes PCR 7, so the old tokens no longer unseal). systemd-cryptenroll enrols the new token first and wipes the
+  # old tpm2 slots with the new one excluded (VERIFIED in cryptenroll.c: wipe_slots(..., except_slot=slot)).
+  [[ " ${ATLAS_FORCED_STEPS:-} " == *" 02 "* ]] && reseal=1
+  osdev="$(_luks_os_device)" || die "cannot resolve the LUKS device under / (see the message above). This is not an unencrypted install; check: findmnt /; lsblk -s \"\$(findmnt -n -o SOURCE /)\""
+  osmap="$(_luks_os_mapping)"
   if [[ -z "$osdev" ]]; then
     os_note="OS volume NOT encrypted (to-do os-volume-encryption: reinstall with the encrypted-LVM option)"
     warn "$os_note; Section 3.5 wants LUKS2 on it. The 8 TB data volume is encrypted now regardless, and the phase continues"
     todo_add os-volume-encryption "The OS volume is not encrypted: reinstall Ubuntu with the encrypted-LVM option (Section 3.5), then run Phase 1 again" \
-      "Until then the on-node recovery-key copy ($ATLAS_LUKS_RECOVERY) sits on an unencrypted disk; keep the USB copy safe (D3, R16). V2 stays deferred."
-  elif _luks_has_token "$osdev" tpm2; then
+      "Until then NO copy of the data volume's recovery key is kept on the node (it would sit on an unencrypted disk beside the volume it opens): the USB copy is the only one, keep it safe (D3, R16). V2 stays deferred."
+  elif _luks_has_token "$osdev" tpm2 && (( ! reseal )); then
     os_note="LUKS $osmap on $osdev, TPM2 already enrolled"
     log "OS volume: $os_note"
+  elif _luks_has_token "$osdev" tpm2; then
+    need_os_enrol=1; os_reseal=1
+    log "OS volume: LUKS $osmap on $osdev: --force 02 re-seals its TPM2 token to the current PCR 7 (the installer passphrase is asked once, in the pause below)"
   else
     need_os_enrol=1
     log "OS volume: LUKS $osmap on $osdev without a TPM2 token: will enrol (the installer passphrase is asked once, in the pause below)"
@@ -204,15 +258,28 @@ step_02() {
   [[ -e "/dev/disk/by-uuid/$uuid" ]] || die "/dev/disk/by-uuid/$uuid did not appear (udevadm settle; udevadm trigger --subsystem-match=block)"
 
   # --- TPM2 enrolment (PCR 7) and recovery key --------------------------------------------------------------------
-  if _luks_has_token "$dev" tpm2; then
+  if _luks_has_token "$dev" tpm2 && (( reseal )); then
+    log "re-sealing the TPM2 token on $dev to the current PCR 7 (--force 02)"
+    _luks_enroll "$dev" --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 \
+      || die "re-sealing the TPM2 token on $dev failed (V2). The old token is still there; authorise with the USB recovery key as the message above says, then re-run --force 02"
+  elif _luks_has_token "$dev" tpm2; then
     log "TPM2 token already enrolled on $dev"
   else
     log "enrolling TPM2 (PCR 7) on $dev"
     _luks_enroll "$dev" --tpm2-device=auto --tpm2-pcrs=7 \
       || die "systemd-cryptenroll --tpm2-device=auto failed on $dev (V2). Check: fTPM enabled, exactly one TPM (systemd-cryptenroll --tpm2-device=list)"
   fi
+  # D3's on-node convenience copy presumes an encrypted OS volume. On an unencrypted one it is NOT written (and an
+  # earlier copy is shredded): a plaintext key beside the volume it opens would void the data volume's encryption
+  # against theft (review v0.3.4); the USB copy is then the only one, which the pause and the to-do say.
+  local keep_copy=1
+  [[ -n "$osdev" ]] || keep_copy=0
+  if (( ! keep_copy )) && [[ -e "$ATLAS_LUKS_RECOVERY" ]]; then
+    shred -u "$ATLAS_LUKS_RECOVERY"
+    warn "shredded the on-node recovery copy: the OS volume is not encrypted (to-do os-volume-encryption); the USB copy is the only one"
+  fi
   local recovery="" show_key=0
-  if _luks_has_token "$dev" recovery && [[ -e "$ATLAS_LUKS_CONFIRMED" && -s "$ATLAS_LUKS_RECOVERY" ]]; then
+  if _luks_has_token "$dev" recovery && [[ -e "$ATLAS_LUKS_CONFIRMED" ]] && { (( ! keep_copy )) || [[ -s "$ATLAS_LUKS_RECOVERY" ]]; }; then
     log "recovery key already enrolled and confirmed as written down on $(cat "$ATLAS_LUKS_CONFIRMED")"
   else
     if _luks_has_token "$dev" recovery; then
@@ -222,10 +289,13 @@ step_02() {
     recovery="$(_luks_enroll "$dev" --recovery-key 2>/dev/null | tr -d '[:space:]')"
     [[ -n "$recovery" ]] || die "systemd-cryptenroll --recovery-key printed nothing"
     LUKS_RECOVERY_INMEM="$recovery"       # authorises the keyfile wipe below on this run; cleared at the end of the step
-    # D3: the on-node convenience copy is always written (root 600, on the LUKS2 OS volume); the USB copy is the one
-    # that matters (R16).
-    ( umask 077; printf '%s\n' "$recovery" >"$ATLAS_LUKS_RECOVERY" )
-    log "recovery key enrolled; on-node copy at $ATLAS_LUKS_RECOVERY (root, 600; D3 convenience copy)"
+    # D3: the on-node convenience copy (root 600) on the LUKS2 OS volume only; the USB copy is the one that matters (R16).
+    if (( keep_copy )); then
+      ( umask 077; printf '%s\n' "$recovery" >"$ATLAS_LUKS_RECOVERY" )
+      log "recovery key enrolled; on-node copy at $ATLAS_LUKS_RECOVERY (root, 600; D3 convenience copy)"
+    else
+      log "recovery key enrolled; no on-node copy (the OS volume is not encrypted): the USB copy is the only one"
+    fi
     rm -f "$ATLAS_LUKS_CONFIRMED"
     show_key=1
   fi
@@ -246,13 +316,19 @@ step_02() {
         echo "#"
         echo "#       $recovery"
         echo "#"
-        echo "#   On-node convenience copy (root only, D3): $ATLAS_LUKS_RECOVERY"
-        echo "#   The USB copy is the one that matters (R16): a fire or burglary that takes the node takes this copy too."
+        if (( keep_copy )); then
+          echo "#   On-node convenience copy (root only, D3): $ATLAS_LUKS_RECOVERY"
+          echo "#   The USB copy is the one that matters (R16): a fire or burglary that takes the node takes this copy too."
+        else
+          echo "#   NO copy is kept on the node: its OS disk is not encrypted (to-do os-volume-encryption)."
+          echo "#   Your written copy and the USB drive are the ONLY copies (R16). Without them a TPM change locks the data."
+        fi
         echo "#   The screen and this terminal's scrollback are erased once you confirm; the key is never logged."
         echo "#"
       fi
       if (( need_os_enrol )); then
         echo "#   The OS volume ($osmap) is encrypted with the passphrase you typed in the Ubuntu installer."
+        (( os_reseal )) && echo "#   (--force 02: its TPM2 token is re-sealed to the current firmware state, e.g. Secure Boot now on.)"
         echo "#   You will be asked for it ONCE below so the TPM can unlock the OS at boot without a keyboard"
         echo "#   (it is used for the enrolment only and never stored)."
         echo "#"
@@ -277,7 +353,9 @@ step_02() {
   # --- OS volume enrolment with the passphrase from the pause ($PASSWORD is systemd-cryptenroll's documented
   # passphrase source; nothing touches disk or /dev/shm) ---------------------------------------------------------
   if (( need_os_enrol )); then
-    if ! PASSWORD="$pw" systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$osdev"; then
+    local wipe=()
+    (( os_reseal )) && wipe=(--wipe-slot=tpm2)
+    if ! PASSWORD="$pw" systemd-cryptenroll "${wipe[@]}" --tpm2-device=auto --tpm2-pcrs=7 "$osdev"; then
       pw=""
       die "TPM2 enrolment on the OS volume failed (wrong passphrase?). Re-run: sudo $ATLAS_ENTRY phase1 --force 02 (the recovery key is not printed again)"
     fi
@@ -286,19 +364,21 @@ step_02() {
     # installer's exact line for 26.04.1 (curtin names the mapping after the storage id, e.g. dm_crypt-0); parsed,
     # never hard-coded. The passphrase slot stays as the OS recovery path.
     if grep -qE "^[[:space:]]*${osmap}[[:space:]]" /etc/crypttab; then
-      awk -v m="$osmap" 'BEGIN{OFS=" "} $1==m && $0 !~ /^#/ {
-          opts=(NF>=4)?$4:"luks"; if (opts !~ /tpm2-device=/) opts=opts",tpm2-device=auto"; if (opts !~ /x-initrd.attach/) opts=opts",x-initrd.attach";
+      local tpm=0; command -v tpm2 >/dev/null 2>&1 && tpm=1   # phase1_crypttab_tpm2 header: tpm2-device= waits for tpm2-tools
+      awk -v m="$osmap" -v tpm="$tpm" 'BEGIN{OFS=" "} $1==m && $0 !~ /^#/ {
+          opts=(NF>=4)?$4:"luks"; if (tpm && opts !~ /tpm2-device=/) opts=opts",tpm2-device=auto"; if (opts !~ /x-initrd.attach/) opts=opts",x-initrd.attach";
           print $1,$2,"none",opts; next } {print}' /etc/crypttab >/etc/crypttab.atlas.tmp
       cat /etc/crypttab.atlas.tmp >/etc/crypttab && rm -f /etc/crypttab.atlas.tmp
-      log "crypttab: $osmap now unlocks via tpm2-device=auto: $(grep -E "^[[:space:]]*${osmap}[[:space:]]" /etc/crypttab)"
+      log "crypttab: $osmap: $(grep -E "^[[:space:]]*${osmap}[[:space:]]" /etc/crypttab)$( (( tpm )) || echo ' (tpm2-device=auto is added by step 4 once tpm2-tools is installed)')"
     else
       die "no /etc/crypttab line for $osmap; cannot make the OS volume TPM-unlock at boot (add it by hand and re-run)"
     fi
-    os_note="LUKS $osmap on $osdev, TPM2 enrolled now (passphrase slot kept as recovery)"
+    os_note="LUKS $osmap on $osdev, TPM2 $( (( os_reseal )) && echo re-sealed || echo enrolled ) now (passphrase slot kept as recovery)"
   fi
 
   # --- crypttab for the data volume (unlocked in the main system, nofail so boot never waits on it) ------------
-  local ct_line="$ATLAS_LUKS_MAPPING UUID=$uuid none tpm2-device=auto,nofail,headless=true,discard"
+  local ct_tpm=""; command -v tpm2 >/dev/null 2>&1 && ct_tpm="tpm2-device=auto,"   # phase1_crypttab_tpm2 header
+  local ct_line="$ATLAS_LUKS_MAPPING UUID=$uuid none ${ct_tpm}nofail,headless=true,discard"
   if grep -qE "^[[:space:]]*${ATLAS_LUKS_MAPPING}[[:space:]]" /etc/crypttab 2>/dev/null; then
     sed -i -E "s|^[[:space:]]*${ATLAS_LUKS_MAPPING}[[:space:]].*\$|$ct_line|" /etc/crypttab
   else
@@ -330,8 +410,9 @@ step_02() {
   LUKS_RECOVERY_INMEM=""; recovery=""
 
   # --- initramfs (header): rebuilt here only when tpm2-tools is already installed (a --force 02 after step 4);
-  # otherwise step 4 installs it through the proxy and rebuilds before the reboot. The drop-in is written either way,
-  # without tpm2-tss until `tpm2` exists, so a kernel update before then still builds a valid initramfs. -----------
+  # otherwise step 4 installs it through the proxy, adds tpm2-device= to crypttab and rebuilds before the reboot.
+  # Until then neither the drop-in nor crypttab mentions TPM2 (phase1_crypttab_tpm2 header), so an initramfs build in
+  # between (an unattended kernel update) still succeeds. ----------------------------------------------------------
   if command -v tpm2 >/dev/null 2>&1; then
     phase1_initramfs_rebuild
     [[ -z "$PHASE1_INITRD_NOTE" ]] || os_note+="${os_note:+; }$PHASE1_INITRD_NOTE"

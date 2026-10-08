@@ -489,7 +489,7 @@ _time_selftest() {
   systemctl try-restart chrony.service >/dev/null 2>&1 || true      # retry NTS-KE now, not after its back-off
   if timeout 150 chronyc -n waitsync 12 0 0 10 >/dev/null 2>&1; then
     log "time sync: chrony synchronised through the firewall ($(chronyc -n tracking 2>/dev/null | awk -F': ' '/^Reference ID/ {print $2; exit}'))"
-    if [[ -s "${ATLAS_TODO_FILE:-}" ]] && grep -q '"id": "time-sync"' "$ATLAS_TODO_FILE"; then todo_done time-sync; fi
+    if todo_is_open time-sync; then todo_done time-sync; fi
     return 0
   fi
   warn "time sync: chrony is not synchronised two minutes after the firewall closed. chronyc -n sources: $(chronyc -n sources 2>&1 | tail -n +3 | tr '\n' '|')"
@@ -588,6 +588,12 @@ _ufw_rules() {
   # Persist the resolver list for the standalone DOCKER-USER script and re-runs (network.env, never atlas.env; header).
   phase1_network_env_save LAN_DNS_SERVERS "\"${ATLAS_LAN_RESOLVERS[*]}\""
 
+  # Backstop (review v0.3.4): `ufw --force reset` disables the firewall, so every value the rules below need must be
+  # proven acceptable BEFORE it; a bad RDP_ALLOW_FROM must stop here with the firewall still as it was.
+  if [[ -n "${RDP_ALLOW_FROM:-}" ]]; then
+    local rdp_bad; rdp_bad="$(atlas_rdp_sources_check "$net" "$RDP_ALLOW_FROM")" \
+      || die "RDP_ALLOW_FROM is not usable: $rdp_bad. Fix it in $ATLAS_ETC/atlas.env (or leave it blank); the firewall was not touched"
+  fi
   ufw --force reset >/dev/null
   ufw default deny incoming >/dev/null
   ufw default deny outgoing >/dev/null
@@ -752,13 +758,15 @@ _disable_beacons() {
   # purging snapd would remove ubuntu-server-minimal and leave its dependencies orphaned for the next autoremove. The
   # simulation is read for both actions apt can print: `apt-get -s purge` reports "Purg <pkg>", `remove` "Remv <pkg>"
   # (the earlier check read Remv only, never matched, and always purged).
-  local purge=() p
+  local purge=() kept=() p
   _purge_takes_meta() {
     apt-get -s purge "$1" 2>/dev/null | grep -qE '^(Purg|Remv) ubuntu-(server|minimal|standard)'
   }
   for p in popularity-contest ubuntu-report; do
     [[ "$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)" == "install ok installed" ]] || continue
-    if _purge_takes_meta "$p"; then warn "$p is held by an Ubuntu metapackage on this image; left installed (its upload host is not on the allowlist, so squid denies it)"
+    if _purge_takes_meta "$p"; then
+      warn "$p is held by an Ubuntu metapackage on this image; left installed (its upload host is not on the allowlist, so squid denies it)"
+      kept+=("$p (left installed)")
     else purge+=("$p"); fi
   done
   if [[ "$(dpkg-query -W -f='${Status}' snapd 2>/dev/null || true)" == "install ok installed" ]]; then
@@ -769,6 +777,7 @@ _disable_beacons() {
         systemctl disable --now "$u" >/dev/null 2>&1 || true
       done
       systemctl mask snapd.service snapd.socket >/dev/null 2>&1 || true
+      kept+=("snapd (masked)")
     else
       purge+=(snapd)
     fi
@@ -777,7 +786,7 @@ _disable_beacons() {
     log "purging ${purge[*]}"
     apt-get -y -q purge "${purge[@]}" >/dev/null || warn "apt-get purge ${purge[*]} failed; check 'apt-get purge ${purge[*]}' by hand"
   fi
-  log "beacons off (rule §7.1): motd-news, apt-news, Pro timers, apport/whoopsie (masked), fwupd-refresh, release-upgrade prompt; purged/masked: ${purge[*]:-none}; unattended security updates left at the distro default (through the proxy)"
+  log "beacons off (rule §7.1): motd-news, apt-news, Pro timers, apport/whoopsie (masked), fwupd-refresh, release-upgrade prompt; purged: ${purge[*]:-none}; masked/kept: ${kept[*]:-none}; unattended security updates left at the distro default (through the proxy)"
 }
 
 _grub_params() {
@@ -896,9 +905,11 @@ step_04() {
   retry 3 apt-get -q update || die "apt-get update failed through the proxy"
   _ATLAS_APT_UPDATED=1
   # tpm2-tools BEFORE the dist-upgrade (phase1/02-luks.sh header): dracut's tpm2-tss module needs its tpm2 binary, so
-  # the drop-in can name tpm2-tss from here on and a kernel update below already builds a TPM-capable initramfs.
+  # crypttab gets tpm2-device= and the drop-in names tpm2-tss from here on, and a kernel update below already builds a
+  # TPM-capable initramfs.
   declare -F phase1_initramfs_rebuild >/dev/null || die "phase1_initramfs_rebuild is not defined: step 4 must be run by phase1-platform.sh"
   apt_install tpm2-tools
+  phase1_crypttab_tpm2
   phase1_initramfs_conf
   log "apt dist-upgrade (this can take several minutes)"
   retry 2 apt-get -y -q -o Dpkg::Options::=--force-confold dist-upgrade || die "apt-get dist-upgrade failed"

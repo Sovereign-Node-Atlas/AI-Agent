@@ -118,9 +118,10 @@ SRC
 # _xrdp_harden — 26.04 ships xrdp 0.10.1-4.1 (universe), whose 2026 CVEs (fixed upstream in 0.10.6/0.10.6.1) are
 # still "needs-triage" for resolute and absent from Ubuntu Pro's esm-apps index (doc R24). What the scripts CAN do:
 # (1) comment out every session type except [Xorg]: the packaged xrdp.ini (VERIFIED from the 0.10.1-4.1 .deb) has
-#     [Xorg], [Xvnc], [vnc-any] and [neutrinordp-any] active; vnc-any and neutrinordp-any make xrdp a proxy to any
-#     host the client names (the CVSS 9.8 CVE-2026-41252 path; upstream 0.10.6.1 comments them out too), and Xvnc needs
-#     a VNC server this node does not install;
+#     [Xorg], [Xvnc], [vnc-any] and [neutrinordp-any] active. vnc-any makes xrdp a proxy to any VNC host the client
+#     names, which is the CVSS 9.8 CVE-2026-41252 path (upstream 0.10.6.1 comments vnc-any out); neutrinordp-any is the
+#     same idea for RDP, and its module is not even shipped in Ubuntu's package, so it is switched off for
+#     completeness; Xvnc needs a VNC server this node does not install;
 # (2) sesman.ini [Security]: AllowRootLogin=false (packaged: true) and AllowAlternateShell=false (packaged: commented,
 #     default true), so a client cannot ask sesman to start an arbitrary program instead of ~/.xsession;
 # (3) the firewall side lives in phase1/04-system.sh (LAN subnet and WireGuard only; RDP_ALLOW_FROM narrows the LAN
@@ -128,10 +129,16 @@ SRC
 # Idempotent: a commented header no longer matches, so a re-run changes nothing. Dies if the result is not as intended.
 # _rdp_restrict_hint — after a passing V19, while the session is still up: if RDP_ALLOW_FROM is blank, record the
 # optional hardening to-do with the address the Principal's PC actually connected from (Section 12.5, doc R24).
+# Only a peer INSIDE the LAN qualifies: a session over WireGuard arrives masqueraded as the bridge address and would
+# produce a rule that never matches plus a delete that locks the PC out of LAN RDP (review v0.3.4).
 _rdp_restrict_hint() {
   [[ -z "${RDP_ALLOW_FROM:-}" ]] || return 0
-  local peer
-  peer="$(ss -tnH state established '( sport = :3389 )' 2>/dev/null | awk '{print $4}' | sed -E 's/^\[?([^]]*)\]?:[0-9]+$/\1/' | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n1 || true)"
+  local peers=() a peer=""
+  mapfile -t peers < <(ss -tnH state established '( sport = :3389 )' 2>/dev/null | awk '{print $4}' \
+    | sed -E 's/^\[?([^]]*)\]?:[0-9]+$/\1/' | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u || true)
+  for a in "${peers[@]}"; do
+    if atlas_rdp_sources_check "$LAN_CIDR" "$a" >/dev/null; then peer="$a"; break; fi
+  done
   [[ -n "$peer" ]] || return 0
   todo_add rdp-restrict "Optional hardening: limit Remote Desktop on the LAN to your Windows PC ($peer)" \
     "Reserve $peer for the PC in the router, set RDP_ALLOW_FROM=\"$peer\" in $ATLAS_ETC/atlas.env, then apply it now without a reboot: sudo ufw allow in on $LAN_IFACE from $peer to any port 3389 proto tcp comment 'xrdp LAN' && sudo ufw delete allow in on $LAN_IFACE from $LAN_CIDR to any port 3389 proto tcp (the WireGuard path stays open). Doc R24."
@@ -175,9 +182,9 @@ step_05b() {
       || die "installing XFCE/xrdp failed"
   fi
   apt_install xrdp xorgxrdp
-  # The xrdp daemon reads the TLS key /etc/xrdp/key.pem (a link into ssl-cert's private dir); the package's postinst
-  # normally adds this membership. 0.10.1 has no runtime_user option and runs as root (doc R24), so this is not a
-  # privilege drop, only the documented key access.
+  # The TLS key /etc/xrdp/key.pem links into ssl-cert's private dir. The packaged postinst does not add this
+  # membership (README.Debian suggests it). xrdp 0.10.1 runs as root (no runtime_user option; doc R24), so it is not
+  # needed today; it is kept for a later release that drops privileges.
   adduser --quiet xrdp ssl-cert >/dev/null 2>&1 || true
   _xrdp_harden
   # Per-user session for the Principal; no display manager means no autologin (Appendix B "no autologin").

@@ -250,10 +250,11 @@ its computed hash as UNVERIFIED.
 
 **phase1-platform.sh / phase1/01-preflight.sh** — no UNVERIFIED marks beyond the Secure Boot decision above.
 
-**phase1/02-luks.sh** — 20, 67: `--unlock-tpm2-device=auto` (systemd 256+) for re-enrolment. 242: crypttab
+**phase1/02-luks.sh** — 23, 87: `--unlock-tpm2-device=auto` (systemd 256+) for re-enrolment. 363: crypttab
 `tpm2-device=auto` / `x-initrd.attach` spelling. VERIFIED since v0.3.4: dracut's tpm2-tss module needs the `tpm2`
-binary (tpm2-tools, universe, not on the server image), so the drop-in names that module only once step 4 has
-installed tpm2-tools through the proxy; step 4 rebuilds every initramfs before the reboot.
+binary (tpm2-tools, universe, not on the server image), and in dracut's default hostonly mode a `tpm2-device=` in
+crypttab alone pulls that module in. So neither the drop-in nor crypttab mentions TPM2 until step 4 has installed
+tpm2-tools through the proxy; step 4 then adds both, rebuilds every initramfs and checks each image before the reboot.
 
 **phase1/04-system.sh** — 387, 391: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). Time sync
 (VERIFIED since v0.3.4): 26.04 runs chrony with NTS (1..4.ntp.ubuntu.com, ntp-bootstrap.ubuntu.com, UDP 123 and TCP
@@ -380,7 +381,7 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 ## 7. Developing
 
 `bash -n` and `shellcheck -x` on every `.sh`, `python3 -m py_compile` on every `.py`, `ruff check orchestrator phase2
-phase3 phase4 tools`, `bash lib/common_test.sh`, and the package tests (Python 3.12+):
+phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), and the package tests (Python 3.12+):
 
 ```
 cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest
