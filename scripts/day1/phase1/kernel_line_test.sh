@@ -212,6 +212,20 @@ reset_case 7.0.0-38-generic "${GA[@]}" linux-generic-hwe-26.04
 echo linux-generic-hwe-26.04 >"$T/held"
 phase1_kernel_line_report >/dev/null; ok "held HWE beside GA: not GA" "$?" "1"
 
+# 12e. A hold is the Principal's: held GA metapackages beside HWE ones, or held HWE metapackages, are never changed (apt
+#      refuses to, and apt_install would die): no apt call, the to-do instead, naming apt-mark unhold.
+reset_case 7.0.0-38-generic "${GA[@]}" linux-generic-hwe-26.04 linux-image-generic-hwe-26.04
+printf '%s\n' linux-generic linux-image-generic linux-headers-generic >"$T/held"
+strict _kernel_line
+ok "held GA beside HWE: no apt call" "$(wc -l <"$T/apt.log")" "0"
+ok "held GA beside HWE: to-do" "$(cat "$T/todo")" "kernel-line"
+ok "held GA beside HWE: names the hold" "$(grep -c 'held with apt-mark, left to the Principal: linux-generic linux-headers-generic linux-image-generic' "$T/out")" "1"
+reset_case 7.0.0-38-generic "${HWE[@]}"
+echo linux-generic-hwe-26.04 >"$T/held"
+strict _kernel_line
+ok "held HWE: no apt call" "$(wc -l <"$T/apt.log")" "0"
+ok "held HWE: to-do" "$(cat "$T/todo")" "kernel-line"
+
 # 12. A to-do left open by an earlier run closes once the switch succeeds.
 reset_case 7.0.0-38-generic "${HWE[@]}"
 echo kernel-line >"$T/todo"

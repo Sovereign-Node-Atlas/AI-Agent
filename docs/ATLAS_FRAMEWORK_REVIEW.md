@@ -75,7 +75,7 @@ Sections 1–17 are the consolidated framework. Sections 18–22 are the audit. 
 | GPU | Radeon 8065S, 40 CUs, RDNA 3.5, **ROCm target gfx1151, confirmed by the Principal** | Runs all inference. Same identifier as the previous machine, so every community ROCm, Vulkan and llama.cpp finding carries over unchanged |
 | NPU | XDNA 2, up to 55 TOPS | Not used. Zero design dependency (re-checked 2026-10-09, watch-list W-NPU in 3.7). The 26.04 kernel already ships the NPU driver (`amdxdna`) and its firmware, so the NPU may show up as `/dev/accel/accel0`; that is harmless, no container is given it, and step 5 records what the node shows. Linux NPU software now exists (FastFlowLM, maintained by AMD, with an Ubuntu 26.04 package), so v0.3.4's "Windows-first" no longer holds, but it does not fit ATLAS today (3.7) |
 | Memory | 192 GB LPDDR5X-8533, soldered | 273 GB/s. Decode speed = bandwidth ÷ active weight bytes. Not upgradeable |
-| GPU-addressable memory | ~180 GB on Linux via GTT, of which **~170 GB is free for engines** once the resident set is subtracted | **VERIFY V3.** The reason to buy this machine, and what makes Q8 quantisation and a 155 GB Apex engine possible |
+| GPU-addressable memory | All of MemTotal on Linux via GTT, about 183 to 184 GiB expected, of which **about 164 GiB is free for engines** once the GPU resident set and the 12 GiB host reserve are subtracted (4.1; v0.3.4 said ~180 GB and ~170 GB) | **VERIFY V3.** The reason to buy this machine, and what makes Q8 quantisation and a 155 GB Apex engine possible |
 | Power | 45–120 W configurable TDP | Principal is adding external cooling (R10) |
 | Expansion | USB4 ports with external GPU dock support; a third M.2 slot unused | A CUDA-locked tool (NVIDIA Modulus/PhysicsNeMo) would need an NVIDIA card via the dock |
 | Network | **Wi-Fi only by Principal's choice** | Wired 10GbE not used. V1 is informational, not a gate. Affects Phase 3 and 4 download time, not the VPN or the port forward |
@@ -198,18 +198,18 @@ Platform changes reviewed and deliberately left out, each with the event that wo
 | Kokoro, Whisper Large-v3-Turbo, PyAnnote | 3 GB | Always loaded |
 | Orchestrator, Celery workers, Redis, Sentinel, ntfy, WG-Easy | 1–2 GB | |
 | **Always-resident subtotal** | **~17 GB** | |
-| **Usable for engines** | **~170 GB** | GTT pool (~180 GB) minus the resident set above. The Arbiter computes it in GiB as the smaller of the GTT total and MemTotal (kernel 7.0.0-38 reports the requested 192 GiB, more than the node has; S47) minus the GPU-side resident set it measures (the three small models, about 6 to 8 GiB) minus a fixed 12 GiB reserve for the CPU-side rows above, which the GPU memory counter never sees (v0.3.5, S44). MemTotal is expected near 183 to 184 GiB (192 GiB less the UMA carve-out, the kernel's page map and the 4 GiB kdump reserves for crash dumps; V3a records the real figure), which puts the budget near 164 GiB; the Apex engine's largest KV-ladder rung (160.3 GiB, S2) needs MemTotal of about 178 to 180 GiB under this rule. Every figure in the table below is measured against this budget, not against the raw 192 GB. **VERIFY V3** on first boot before anything depends on it |
+| **Usable for engines** | **~164 GiB (expected)** | The memory pool minus the resident set above (v0.3.4 said ~180 GB minus ~17 GB, ~170 GB). The Arbiter computes it in GiB as the smaller of the GTT total and MemTotal (kernel 7.0.0-38 reports the requested 192 GiB, more than the node has; S47) minus the GPU-side resident set it measures (the three small models, about 6 to 8 GiB) minus a fixed 12 GiB reserve for the CPU-side rows above, which the GPU memory counter never sees (v0.3.5, S44). MemTotal is expected near 183 to 184 GiB (192 GiB less the UMA carve-out, the kernel's page map and the 4 GiB kdump reserves for crash dumps; V3a records the real figure), which puts the budget near 164 GiB; the Apex engine's largest KV-ladder rung (160.3 GiB, S2) needs MemTotal of about 178 to 180 GiB under this rule. Every figure in the table below is measured against this budget, not against the raw 192 GB. **VERIFY V3** on first boot before anything depends on it |
 
 **What fits together, at the adopted quantisations:**
 
 | Combination | Total | Verdict |
 |---|---|---|
-| gpt-oss-120b + Qwen2.5-VL-72B, both resident | 142 GB | ~28 GB for both caches. The everyday pairing: text and vision with no swap between them. The vision engine runs at 2 slots rather than 8 while co-resident (Section 4.3) |
-| gpt-oss-120b + gpt-oss-120b abliterated | 126 GB | ~44 GB for both caches |
-| Nemotron `Q8_0` alone | 120–123 GB | Comfortable, ~47 GB for cache |
-| Qwen3.5-122B `Q8_0` alone | 130 GB | Comfortable, ~40 GB for cache |
+| gpt-oss-120b + Qwen2.5-VL-72B, both resident | 142 GB | ~22 GiB for both caches (the projected pair, caches included, is 157.7 GiB). The everyday pairing: text and vision with no swap between them. The vision engine runs at 2 slots rather than 8 while co-resident (Section 4.3) |
+| gpt-oss-120b + gpt-oss-120b abliterated | 126 GB | ~38 GiB for both caches |
+| Nemotron `Q8_0` alone | 120–123 GB | Comfortable, ~41 GiB for cache |
+| Qwen3.5-122B `Q8_0` alone | 130 GB | Comfortable, ~34 GiB for cache |
 | Nemotron `Q8_0` + gpt-oss-120b, Ren and Arthur together | 186 GB | **Does not fit.** Accepted by the Principal: hemispheres swap rather than co-reside. Nemotron at `Q6_K` (~95 GB) would restore it if ever wanted |
-| DeepSeek V4 Flash `UD-Q4_K_XL` | 155 GB | Runs alone. The Arbiter unloads any co-resident engine first. ~10–15 GB margin, so its context is capped accordingly |
+| DeepSeek V4 Flash `UD-Q4_K_XL` | 155 GB | Runs alone. The Arbiter unloads any co-resident engine first. About 8 to 10 GiB margin, so its context is capped accordingly; every rung of its KV ladder (at most 160.3 GiB projected, S2) fits the budget |
 
 ### 4.2 Engine Arbiter — NEW, hard requirement
 
@@ -236,12 +236,12 @@ Nothing in the earlier brief named the component that enforces the residency and
 | Flash Attention | On | Prerequisite for cache quantisation |
 | KV cache type, Arthur's engines (Nemotron, Qwen3.5) | `q8_0` | Precision-sensitive audit and legal work |
 | KV cache type, Ren's engines (gpt-oss, abliterated) | `q4_0` | More headroom for prose and multi-branch Deep Think |
-| KV cache type, Apex engine (DeepSeek V4 Flash) | `q4_0` **as the target, proven by ladder** (Section 23): Phase 3 loads f16, then `q8_0`, then `q4_0`, running a coherence prompt at each rung, and keeps the lowest coherent setting; K and V types must be identical on this architecture | Only ~10–15 GB of margin remains at 155 GB of weights; quantised KV on `deepseek4` produced garbage output in July–August 2026 (llama.cpp #25382, #26423, fix unmerged), so the setting is measured, not assumed |
+| KV cache type, Apex engine (DeepSeek V4 Flash) | `q4_0` **as the target, proven by ladder** (Section 23): Phase 3 loads f16, then `q8_0`, then `q4_0`, running a coherence prompt at each rung, and keeps the lowest coherent setting; K and V types must be identical on this architecture | Only about 8 to 10 GiB of margin remains at 155 GB of weights (v0.3.5 budget, S44); quantised KV on `deepseek4` produced garbage output in July–August 2026 (llama.cpp #25382, #26423, fix unmerged), so the setting is measured, not assumed |
 | KV cache type, vision engine (Qwen2.5-VL-72B) | `q8_0` | Document and drawing reads are precision-sensitive |
 | Per-model quantisation check | Day 1 verification script | **VERIFY V4**: unsupported architectures silently fall back to full precision |
 | Context size | Explicit per model, never the default | Default contexts are small and silently truncate agent history |
 | Context shift with `n_keep` | On, **passed explicitly as `--context-shift --keep <n>`** on every launch line (it is off by default in current llama-server); `n_keep` covers system prompt + persona directive + router state | Anchors never evicted; generation never hard-stops |
-| Parallel slots | 8, except where noted, **always passed explicitly** (`--parallel` defaults to auto). `--ctx-size` is the total pool across slots, so 32k per slot means `--ctx-size 262144`; the Apex engine runs `--parallel 1` | KV cost at 32k × 8 slots: gpt-oss < 20 GB, Nemotron < 10 GB, Qwen3.5 < 15 GB. The vision engine runs 2 slots while co-resident with gpt-oss, keeping the pair inside the ~28 GB of cache the 142 GB combination leaves |
+| Parallel slots | 8, except where noted, **always passed explicitly** (`--parallel` defaults to auto). `--ctx-size` is the total pool across slots, so 32k per slot means `--ctx-size 262144`; the Apex engine runs `--parallel 1` | KV cost at 32k × 8 slots: gpt-oss < 20 GB, Nemotron < 10 GB, Qwen3.5 < 15 GB. The vision engine runs 2 slots while co-resident with gpt-oss, keeping the pair inside the ~22 GiB of cache the 142 GB combination leaves |
 | Hard pre-flight | Engine Arbiter | The actual OOM backstop |
 | Long-document recall | Vector Cortex retrieval, never KV tricks | Context shift keeps anchors and recency; it does not recall a mid-document fact once evicted |
 
@@ -281,7 +281,7 @@ Decode speed follows bytes read per token, not parameter count: 13B active at 4-
 
 **Why the two gpt-oss engines stay at MXFP4.** Their expert weights were released natively in MXFP4. There is no higher-precision original to return to; a `Q8` build would upcast the same 4-bit values, adding 60 GB and halving the speed for no accuracy. MXFP4 is this model's full-quality form.
 
-**Why DeepSeek V4 Flash is Q4 and not Q8.** Its experts, about 96% of the weights, ship natively low-bit, so `UD-Q4_K_XL` and `UD-Q8_K_XL` carry bit-identical experts and differ only in the remaining 4% of tensors, at a cost of 7 GB. `UD-Q8_K_XL` is about 162 GB against the 155 GB of Q4. Both fit the ~170 GB budget, but Q8 leaves roughly 8 GB for the KV cache where Q4 leaves about 15, halving the working context on an engine whose context is already the tightest in the set. Q4 is the adopted setting; Q8 is logged as a post-Day-1 experiment, not a dependency.
+**Why DeepSeek V4 Flash is Q4 and not Q8.** Its experts, about 96% of the weights, ship natively low-bit, so `UD-Q4_K_XL` and `UD-Q8_K_XL` carry bit-identical experts and differ only in the remaining 4% of tensors, at a cost of 7 GB. `UD-Q8_K_XL` is about 162 GB against the 155 GB of Q4. Against the ~164 GiB budget (v0.3.5, S44) Q8 would leave about 2 GiB for the KV cache where Q4 leaves about 9, so Q8 is not a practical setting on this node: it would cut the working context of an engine whose context is already the tightest in the set to almost nothing. Q4 is the adopted setting; Q8 is logged as a post-Day-1 experiment, not a dependency.
 
 **Sixth engine, Phase 3, confirmed included (D12):** Meditron-70B, dense, `Q8_0`, ~74 GB, ~3 tok/s. Secondary cross-check for Minerva only. **RESOLVED (C5):** it runs through llama.cpp like the others, not through the PyTorch layer.
 
@@ -1188,7 +1188,7 @@ Open WebUI Filter  --relay-->  Orchestrator
 
 **llama-server, Arthur's engines (Nemotron `Q8_0`, Qwen3.5 `Q8_0`) and the vision engine (Qwen2.5-VL-72B `Q8_0`):** `-fa on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 262144 --parallel 8 --context-shift --keep <n_keep> --slot-save-path /srv/atlas/data/slots --host 127.0.0.1` (ctx-size is the total pool: 32k × 8 slots)
 
-**llama-server, Ren's engines (gpt-oss MXFP4 and its abliterated twin) and the Apex engine (DeepSeek V4 Flash `UD-Q4_K_XL`):** same with `--cache-type-k q4_0 --cache-type-v q4_0`. The Apex engine runs `--parallel 1`, a reduced `--ctx-size` (only 10 to 15 GB remain beside 155 GB of weights), and whichever cache type the Phase 3 ladder proved coherent (Section 4.3). Build: llama.cpp tag `v0.4.1`, `-DGGML_VULKAN=ON -DLLAMA_BUILD_IS_DEV=OFF -DLLAMA_OPENSSL=ON -DLLAMA_USE_PREBUILT_UI=OFF`.
+**llama-server, Ren's engines (gpt-oss MXFP4 and its abliterated twin) and the Apex engine (DeepSeek V4 Flash `UD-Q4_K_XL`):** same with `--cache-type-k q4_0 --cache-type-v q4_0`. The Apex engine runs `--parallel 1`, a reduced `--ctx-size` (only about 8 to 10 GiB remain beside 155 GB of weights, S44), and whichever cache type the Phase 3 ladder proved coherent (Section 4.3). Build: llama.cpp tag `v0.4.1`, `-DGGML_VULKAN=ON -DLLAMA_BUILD_IS_DEV=OFF -DLLAMA_OPENSSL=ON -DLLAMA_USE_PREBUILT_UI=OFF`.
 
 **Desktop:** XFCE with xrdp bound to the LAN and WireGuard interfaces, no autologin, session started on demand.
 
