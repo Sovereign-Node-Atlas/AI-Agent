@@ -3,7 +3,7 @@
 Subcommands and who calls them:
   init-db              phase2/02-orchestrator.sh step 7: create ATLAS_DB_PATH (idempotent)
   engines list         the engines.json table with ports and unit state
-  arbiter status       live GTT counters, unit states, the last ledger decisions
+  arbiter status       live GTT counters, the host reserve beside MemAvailable (S44), unit states, last decisions
   vault-session-test   V18 helper: `atlas-admin vault-session-test --file PATH [--idle-seconds N]` (contract in
                        phase2/README-contracts.md, called by verify/v18-vault.sh); the implementation is
                        atlas.vault.vault_session_test(idle_seconds, file=...) (another writer), imported lazily
@@ -37,7 +37,15 @@ from pathlib import Path
 from typing import Any
 
 from atlas.arbiter import GIB, MAX_RESIDENT, ArbiterError, SysfsMemoryProbe
-from atlas.config import ConfigError, EngineSpec, Settings, load_config, load_domain_cards, load_engines
+from atlas.config import (
+    ConfigError,
+    EngineSpec,
+    Settings,
+    load_config,
+    load_domain_cards,
+    load_engines,
+    parse_env_file,
+)
 from atlas.engines import EngineControlError, SystemdEngineController
 from atlas.ledger import Ledger, new_task_id
 
@@ -156,11 +164,22 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     engines = load_engines(settings.config_dir, settings.llama_port_base)
     controller = SystemdEngineController(engines=engines)
     probe = SysfsMemoryProbe()
-    out: dict[str, Any] = {"engines": {}, "gtt": {}, "decisions": []}
+    out: dict[str, Any] = {"engines": {}, "gtt": {}, "host": {}, "decisions": []}
     try:
         out["gtt"] = {"total_bytes": probe.gtt_total_bytes(), "used_bytes": probe.gtt_used_bytes()}
     except Exception as exc:
         out["gtt"] = {"error": str(exc)}
+    # Section 4.1 (S44): the reserve the Arbiter keeps for CPU-side memory, beside what the host uses right now. The
+    # service reads ATLAS_ARBITER_HEADROOM_GIB from orchestrator.env (its EnvironmentFile), which a shell does not
+    # carry, so that file is read here too (unreadable: the process environment and atlas.env decide, as before).
+    try:
+        unit_env = {**parse_env_file(settings.etc_dir / "orchestrator.env"), **os.environ}
+        out["host"] = {"headroom_bytes": Settings.from_env(unit_env).arbiter_headroom_bytes}
+    except ConfigError as exc:
+        out["host"] = {"headroom_bytes": settings.arbiter_headroom_bytes, "error": str(exc)}
+    meminfo = probe.host_meminfo()
+    if meminfo is not None:
+        out["host"].update(mem_total_bytes=meminfo[0], mem_available_bytes=meminfo[1])
     active: list[EngineSpec] = []
     for spec in engines.values():
         state = _unit_state(controller, spec.key, spec)
@@ -180,6 +199,14 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
         print(f"gtt: {gtt['error']}")
     else:
         print(f"gtt: used {gtt['used_bytes'] / GIB:.2f} GiB of {gtt['total_bytes'] / GIB:.2f} GiB")
+    host = out["host"]
+    line = f"host: Arbiter headroom {host['headroom_bytes'] / GIB:.0f} GiB (ATLAS_ARBITER_HEADROOM_GIB)"
+    if "error" in host:
+        line += f" [orchestrator.env: {host['error']}]"
+    if "mem_total_bytes" in host:
+        line += (f"; MemAvailable {host['mem_available_bytes'] / GIB:.2f} GiB of MemTotal "
+                 f"{host['mem_total_bytes'] / GIB:.2f} GiB")
+    print(line)
     print("engine units:")
     for key, state in out["engines"].items():
         print(f"  {key:<26} {state}")

@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 
 from atlas.config import (
+    ARBITER_HEADROOM_RANGE_GIB,
+    DEFAULT_ARBITER_HEADROOM_GIB,
     ENGINE_KEYS,
     KV_CLASSES,
     SETTINGS_EXTRA_KEYS,
@@ -49,6 +51,26 @@ def test_settings_from_env_reads_atlas_env_and_process_env(config_dir: Path, mon
     monkeypatch.setenv("LLAMA_PORT_BASE", "abc")
     with pytest.raises(ConfigError):
         Settings.from_env()
+
+
+def test_settings_arbiter_headroom_default_override_and_bounds(tmp_path: Path) -> None:
+    """Section 4.1 (S44): the host reserve defaults to 16 GiB, ATLAS_ARBITER_HEADROOM_GIB overrides it in whole GiB, and
+    a value that is not a number or leaves the bounded range stops the orchestrator instead of being guessed."""
+    base = {"ATLAS_ETC": str(tmp_path)}
+    assert DEFAULT_ARBITER_HEADROOM_GIB == 16
+    assert Settings.from_env(base).arbiter_headroom_bytes == 16 * 1024**3
+    assert Settings.from_env({**base, "ATLAS_ARBITER_HEADROOM_GIB": ""}).arbiter_headroom_bytes == 16 * 1024**3
+    assert Settings.from_env({**base, "ATLAS_ARBITER_HEADROOM_GIB": " 24 "}).arbiter_headroom_bytes == 24 * 1024**3
+    lo, hi = ARBITER_HEADROOM_RANGE_GIB
+    assert Settings.from_env({**base, "ATLAS_ARBITER_HEADROOM_GIB": str(lo)}).arbiter_headroom_bytes == lo * 1024**3
+    assert Settings.from_env({**base, "ATLAS_ARBITER_HEADROOM_GIB": str(hi)}).arbiter_headroom_bytes == hi * 1024**3
+    for bad in ("abc", "12.5", "-1", "0", str(lo - 1), str(hi + 1)):
+        with pytest.raises(ConfigError, match="ATLAS_ARBITER_HEADROOM_GIB"):
+            Settings.from_env({**base, "ATLAS_ARBITER_HEADROOM_GIB": bad})
+    # atlas.env is the documented fallback for every setting; the process environment wins over it.
+    (tmp_path / "atlas.env").write_text("ATLAS_ARBITER_HEADROOM_GIB=20\n")
+    assert Settings.from_env(base).arbiter_headroom_bytes == 20 * 1024**3
+    assert Settings.from_env({**base, "ATLAS_ARBITER_HEADROOM_GIB": "18"}).arbiter_headroom_bytes == 18 * 1024**3
 
 
 def test_parse_env_file(tmp_path: Path) -> None:

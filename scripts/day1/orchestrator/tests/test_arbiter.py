@@ -7,6 +7,7 @@ the Section 4.3 model in atlas.arbiter.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -25,6 +26,7 @@ from atlas.arbiter import (
     Decision,
     ReleaseTimeout,
     StubProbe,
+    SysfsMemoryProbe,
     UnknownEngine,
     build_arbiter,
     kv_estimate_bytes,
@@ -281,6 +283,108 @@ def test_projection_follows_the_unit_env_file(engines: dict[str, EngineSpec], tm
     assert read_unit_profile(tmp_path / "nope.env") is None
     # No env file for an engine: engines.json projection, with a warning (systemctl start fails until it is rendered).
     assert arb2.unit_profile("nemotron-3-super") is None
+
+
+def test_headroom_reserves_the_cpu_side_and_host_use_is_observed_not_budgeted(
+        engines: dict[str, EngineSpec], caplog: pytest.LogCaptureFixture) -> None:
+    """Section 4.1 (S44): mem_info_gtt_used never shows CPU processes, so the budget keeps `headroom_bytes` back for
+    them. /proc/meminfo is read at each measurement and reported (status, one WARNING when CPU-side use outgrows the
+    reserve), but never subtracted, so a transient CPU job cannot change a grant."""
+    probe = StubProbe(total_bytes=RESIDENT_SET + 186 * GIB, used_bytes=RESIDENT_SET,
+                      mem_total_bytes=RESIDENT_SET + 186 * GIB, mem_available_bytes=RESIDENT_SET + 186 * GIB)
+    controller = StubController(engines=engines, probe=probe)
+    clock = FakeClock()
+    arb = Arbiter(engines, controller, probe, headroom_bytes=16 * GIB, poll_interval_s=1.0, clock=clock,
+                  sleep=clock.sleep)
+    # CPU side at 12 GiB (MemTotal - MemAvailable - GTT resident set): inside the reserve, no warning.
+    probe.mem_available_bytes = 186 * GIB - 12 * GIB
+    with caplog.at_level(logging.WARNING, logger="atlas.arbiter"):
+        arb.measure_resident_set()
+    assert arb.budget_bytes == 170 * GIB
+    st = arb.status()
+    assert st["headroom_bytes"] == 16 * GIB and st["host_used_bytes"] == 12 * GIB and st["budget_bytes"] == 170 * GIB
+    assert "headroom" not in caplog.text
+    # The Apex engine (157.8 GiB projected) still fits the reserved budget on its own.
+    assert arb.projected_footprint(APEX_KEY).total_bytes <= arb.budget_bytes
+    # CPU side grows to 20 GiB: reported and warned once, budget unchanged; a second re-measure does not repeat it.
+    probe.mem_available_bytes = 186 * GIB - 20 * GIB
+    with caplog.at_level(logging.WARNING, logger="atlas.arbiter"):
+        arb.measure_resident_set()
+        arb.measure_resident_set()
+    assert arb.budget_bytes == 170 * GIB and arb.status()["host_used_bytes"] == 20 * GIB
+    assert caplog.text.count("ATLAS_ARBITER_HEADROOM_GIB") == 1
+    # Back inside the reserve, then over again: warned again (a new episode, not a repeat).
+    probe.mem_available_bytes = 186 * GIB - 10 * GIB
+    arb.measure_resident_set()
+    probe.mem_available_bytes = 186 * GIB - 30 * GIB
+    with caplog.at_level(logging.WARNING, logger="atlas.arbiter"):
+        arb.measure_resident_set()
+    assert caplog.text.count("ATLAS_ARBITER_HEADROOM_GIB") == 2
+    # A probe that cannot read the host reports None, never 0.
+    probe.mem_total_bytes = None
+    arb.measure_resident_set()
+    assert arb.status()["host_used_bytes"] is None
+
+
+def test_sysfs_probe_reads_memtotal_and_memavailable(tmp_path: Path) -> None:
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:       196083712 kB\nMemFree:         1000 kB\nMemAvailable:   180000000 kB\n")
+    probe = SysfsMemoryProbe(drm_root=tmp_path, meminfo=meminfo)
+    assert probe.host_meminfo() == (196083712 * 1024, 180000000 * 1024)
+    meminfo.write_text("MemTotal:       196083712 kB\nMemFree:         1000 kB\n")
+    assert probe.host_meminfo() is None
+    assert SysfsMemoryProbe(drm_root=tmp_path, meminfo=tmp_path / "absent").host_meminfo() is None
+
+
+def test_build_arbiter_takes_the_headroom_from_settings(engines: dict[str, EngineSpec], tmp_path: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production wiring (S44): build_arbiter reserves Settings.arbiter_headroom_bytes; an explicit argument wins."""
+    monkeypatch.setenv("ATLAS_ENGINES_ENV_DIR", str(tmp_path))
+    monkeypatch.delenv("ATLAS_ARBITER_HEADROOM_GIB", raising=False)
+    assert build_arbiter(engines).headroom_bytes == 16 * GIB
+    monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "20")
+    assert build_arbiter(engines).headroom_bytes == 20 * GIB
+    assert build_arbiter(engines, headroom_bytes=0).headroom_bytes == 0
+
+
+def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path, tmp_path: Path,
+                                                               monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    """`atlas-admin arbiter status` from a shell (S44): the unit reads ATLAS_ARBITER_HEADROOM_GIB from orchestrator.env,
+    so the CLI reads that file too; the process environment still wins, and a bad value is shown, not fatal."""
+    from atlas import admin
+
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    (etc / "orchestrator.env").write_text("ATLAS_ARBITER_HEADROOM_GIB=20\n")
+    monkeypatch.setenv("ATLAS_ETC", str(etc))
+    monkeypatch.setenv("ATLAS_DB_PATH", str(tmp_path / "absent.sqlite3"))  # no ledger: nothing is opened
+
+    class Probe:
+        def gtt_total_bytes(self) -> int:
+            return 187 * GIB
+
+        def gtt_used_bytes(self) -> int:
+            return 6 * GIB
+
+        def host_meminfo(self) -> tuple[int, int] | None:
+            return 187 * GIB, 165 * GIB
+
+    monkeypatch.setattr(admin, "SysfsMemoryProbe", Probe)
+    monkeypatch.setattr(admin, "_unit_state", lambda *a, **k: "inactive")
+    assert admin.main(["arbiter", "status", "--json"]) == 0
+    host = json.loads(capsys.readouterr().out)["host"]
+    assert host == {"headroom_bytes": 20 * GIB, "mem_total_bytes": 187 * GIB, "mem_available_bytes": 165 * GIB}
+    assert admin.main(["arbiter", "status"]) == 0
+    assert "host: Arbiter headroom 20 GiB" in capsys.readouterr().out
+    monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "24")
+    assert admin.main(["arbiter", "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["host"]["headroom_bytes"] == 24 * GIB
+    monkeypatch.delenv("ATLAS_ARBITER_HEADROOM_GIB")
+    (etc / "orchestrator.env").write_text("ATLAS_ARBITER_HEADROOM_GIB=2\n")
+    assert admin.main(["arbiter", "status", "--json"]) == 0
+    host = json.loads(capsys.readouterr().out)["host"]
+    assert host["headroom_bytes"] == 16 * GIB and "outside 4..64" in host["error"]
 
 
 def test_build_arbiter_wires_the_engines_env_dir_from_settings(engines: dict[str, EngineSpec], tmp_path: Path,

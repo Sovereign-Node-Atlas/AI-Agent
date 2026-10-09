@@ -4,9 +4,31 @@
 # /proc/cmdline, the live module parameters, 196608 MiB with tolerance), that
 # vulkaninfo shows the GPU as RADV GFX1151, that /tmp is tmpfs and swap is off, and that the TPM unlocked the data
 # volume without a keyboard (V2 re-recorded post-reboot). The llama-cli half of V3 belongs to the Phase 2 gate.
+# Two read-only records follow (v0.3.5): the kernel line (Section 3.3, S45; closes or raises the to-do kernel-line) and
+# what the unused XDNA 2 NPU shows (3.7 W-NPU).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+}
+
+# _npu_record — Section 2, 3.7 W-NPU (v0.3.5): what the XDNA 2 NPU shows on this kernel; read-only, never a stop.
+# ATLAS does not use the NPU and no container is given /dev/accel. The line settles the one fact the 2026-10-09 review
+# could not take from a primary source: the NPU's PCI revision (the in-tree amdxdna driver of 7.0 binds 1022:17f0 at
+# revisions 0x10, 0x11 and 0x20 only, so another revision simply stays unbound, which is harmless here).
+_npu_record() {
+  local slot dev rev drv accel errs
+  slot="$({ lspci -Dn -d 1022:17f0 2>/dev/null || true; } | awk '{print $1; exit}')"
+  if [[ -z "$slot" ]]; then
+    log "npu: no 1022:17f0 device on the PCI bus (switched off in the BIOS, or another id); ATLAS does not use it (3.7 W-NPU)"
+    return 0
+  fi
+  dev="/sys/bus/pci/devices/$slot"
+  rev="$(cat "$dev/revision" 2>/dev/null || echo unknown)"
+  drv=none; [[ -L "$dev/driver" ]] && drv="$(basename "$(readlink "$dev/driver")")"
+  accel="$({ find /dev/accel -mindepth 1 -maxdepth 1 -name 'accel*' -printf '%f\n' 2>/dev/null || true; } | sort | paste -sd' ')"
+  errs="$({ dmesg 2>/dev/null || true; } | { grep -i amdxdna || true; } | { grep -iE 'error|fail|unknown' || true; } | head -n3 | tr '\n' ' ')"
+  log "npu: $slot 1022:17f0 revision $rev, driver $drv, /dev/accel: ${accel:-none} (not used by ATLAS, given to no container; 3.7 W-NPU)"
+  [[ -z "$errs" ]] || warn "npu: amdxdna reported: ${errs}(no ATLAS action: the NPU is unused and kernel updates carry the fixes; 3.7 W-NPU)"
 }
 
 step_05() {
@@ -49,5 +71,16 @@ step_05() {
     log "dmesg: amdgpu.gttsize deprecation warning present (expected on kernel 7.x; ttm.pages_limit is the parameter of record)"
   fi
   run_verify V3a v03a-gtt.sh 196608 || die "V3a failed: the kernel parameters (gttsize, ttm.pages_limit, lockup_timeout), the GTT pool or the RADV device string do not match (see the verify table; cat /proc/cmdline; cat /sys/module/amdgpu/parameters/lockup_timeout; dmesg | grep -i gtt)"
+  # Kernel line after the reboot (Section 3.3, S45): read-only. Step 4's to-do closes here once the line is GA 7.0.
+  declare -F phase1_kernel_line_report >/dev/null || die "phase1_kernel_line_report is not defined: step 5 must be run by phase1-platform.sh"
+  local kl
+  if kl="$(phase1_kernel_line_report)"; then
+    log "kernel line: GA 7.0 (Section 3.3): $kl"
+    if todo_is_open kernel-line; then todo_done kernel-line; fi
+  else
+    warn "kernel line: not the GA 7.0 line of Section 3.3: $kl"
+    todo_is_open kernel-line || phase1_kernel_line_todo "$kl"
+  fi
+  _npu_record
   log "step 5 complete: GTT pool $(gpu_gtt_total_mb) MiB, vulkaninfo sees RADV GFX1151"
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # phase1/04-system.sh — Phase 1 step 4 (Sections 3.3, 3.6, 12.5, 17; Appendix B): allowlist proxy (squid) and the
 # proxy environment, the allowlisting DNS forwarder (dnsmasq) the host resolves through, ufw default-deny in AND out,
-# full system update through the proxy, Canonical's beacons off, GRUB kernel parameters (V3), SSH hardening, Cockpit,
-# then the reboot marker and the reboot (unless --no-reboot).
+# full system update through the proxy (held on the GA 7.0 kernel line, S45), Canonical's beacons off, GRUB kernel
+# parameters (V3), SSH hardening, Cockpit, then the reboot marker and the reboot (unless --no-reboot).
 # Order matters: the proxy, the forwarder and the firewall come first so that even the system update obeys rule §7.1.
 #
 # THE UNAVOIDABLE PRE-PROXY INSTALLS: squid itself and dnsmasq (with jq and gettext-base for rendering their configs)
@@ -38,6 +38,8 @@
 #   phase1_listen_addrs ADDR...        bind SSH and Cockpit to exactly these addresses (step 7 adds the WG bridge)
 #   phase1_reload_allowlist [FILE]     re-render squid + dnsmasq from the allowlist and reload both (driver option)
 #   _squid_render                      also called by step 6 once the docker0 gateway is known (second http_port)
+#   phase1_kernel_line_report          one line on the kernel line; 0 when it is GA 7.0 (step 5 records it, S45)
+#   phase1_kernel_line_todo REPORT     the to-do kernel-line, raised by step 4 or step 5
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -795,6 +797,86 @@ _disable_beacons() {
   log "beacons off (rule §7.1): motd-news, apt-news, Pro timers, apport/whoopsie (masked), fwupd-refresh, release-upgrade prompt; purged: ${purge[*]:-none}; masked/kept: ${kept[*]:-none}; unattended security updates left at the distro default (through the proxy)"
 }
 
+# --- Kernel line (Section 3.3, 3.7 W-KERNEL; v0.3.5, S45) -------------------------------------------------------------
+# The node stays on the 26.04 GA kernel line: `linux-generic`, the 7.0 series for the life of the release, the kernel the
+# Section 3.3 parameters were validated on. The HWE metapackages (linux-*-hwe-26.04*) would move it to the 26.10 kernel
+# (7.3) with 26.04.2 and to a new series about every six months after, without anyone choosing it. Until that roll the
+# HWE metapackage pulls the very same 7.0 image as GA, so swapping the metapackages changes nothing that runs; step 4
+# does it in exactly that case (running kernel 7.0.x-generic, every installed image 7.0.x-generic), and only when apt's
+# simulation of the purge removes nothing but the HWE metapackages. Anything else (an image outside 7.0, an OEM kernel
+# `linux-oem-26.04*` or an -oem uname, a purge that would take more) means booting or removing a kernel, so it is the
+# to-do `kernel-line` for the Principal, never automatic (policy v0.3.3: the phase continues).
+ATLAS_KERNEL_GA_METAS=(linux-generic linux-image-generic linux-headers-generic)
+
+# _kl_installed PATTERN... — installed package names matching dpkg-query patterns, one per line, sorted.
+_kl_installed() {
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' "$@" 2>/dev/null | awk '$1 == "ii" {print $2}' | LC_ALL=C sort -u
+}
+
+# phase1_kernel_line_report — one line describing the kernel line; returns 0 when it is the GA 7.0 line exactly as
+# Section 3.3 wants it (running 7.0.x-generic, linux-generic installed, no HWE or OEM metapackage, every installed
+# kernel image 7.0.x-generic), 1 otherwise. Read-only; step 5 records it after the reboot.
+phase1_kernel_line_report() {
+  local run ga hwe oem img bad=0
+  run="$(uname -r)"
+  ga="$(_kl_installed "${ATLAS_KERNEL_GA_METAS[@]}" | paste -sd' ')"
+  hwe="$(_kl_installed 'linux-*-hwe-26.04*' | paste -sd' ')"
+  oem="$(_kl_installed 'linux-oem-26.04*' 'linux-*-oem-26.04*' 'oem-*-meta' | paste -sd' ')"
+  img="$(_kl_installed 'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*' | sed -E 's/^linux-image-(unsigned-)?//' | sort -uV | paste -sd' ')"
+  [[ "$run" =~ ^7\.0\.[0-9]+-[0-9]+-generic$ ]] || bad=1
+  [[ " $ga " == *" linux-generic "* ]] || bad=1
+  [[ -z "$hwe" && -z "$oem" ]] || bad=1
+  local i; for i in $img; do [[ "$i" =~ ^7\.0\.[0-9]+-[0-9]+-generic$ ]] || bad=1; done
+  echo "running $run; GA metapackages: ${ga:-none}; HWE: ${hwe:-none}; OEM: ${oem:-none}; images: ${img:-none}"
+  return "$bad"
+}
+
+# phase1_kernel_line_todo REPORT — the to-do both step 4 and step 5 raise when the line is not GA 7.0.
+phase1_kernel_line_todo() {
+  todo_add kernel-line "Kernel line is not the GA 7.0 line of Section 3.3: decide whether to move the node to linux-generic (7.0)" \
+    "Section 3.3, 3.7 W-KERNEL. Found: $1. Leaving an OEM kernel, or an image outside the 7.0 series, means installing linux-generic, rebooting into the 7.0.x-generic entry and only then purging the other kernel and its metapackage; then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 05"
+}
+
+# _kernel_line — step 4, after apt-get update and before the dist-upgrade (header above).
+_kernel_line() {
+  local report hwe=() img=() p purge_out extra
+  if report="$(phase1_kernel_line_report)"; then
+    log "kernel line: GA 7.0 (Section 3.3): $report"
+    return 0
+  fi
+  mapfile -t hwe < <(_kl_installed 'linux-*-hwe-26.04*')
+  mapfile -t img < <(_kl_installed 'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*')
+  local safe=1
+  [[ "$(uname -r)" =~ ^7\.0\.[0-9]+-[0-9]+-generic$ ]] || safe=0
+  (( ${#hwe[@]} > 0 )) || safe=0
+  [[ -z "$(_kl_installed 'linux-oem-26.04*' 'linux-*-oem-26.04*' 'oem-*-meta')" ]] || safe=0
+  for p in "${img[@]}"; do [[ "$p" =~ ^linux-image-(unsigned-)?7\.0\.[0-9]+-[0-9]+-generic$ ]] || safe=0; done
+  if (( ! safe )); then
+    warn "kernel line: not the GA 7.0 line and not the one case step 4 changes by itself: $report"
+    phase1_kernel_line_todo "$report"
+    return 0
+  fi
+  # The one automatic case: HWE metapackages over the GA 7.0 image. GA metapackage first, so the image always has a
+  # metapackage holding it; then the purge, simulated first: every package it would remove must be an HWE metapackage.
+  log "kernel line: HWE metapackages on the GA 7.0 image (${hwe[*]}); switching to linux-generic so 26.04.2 does not move the node to 7.3 (Section 3.3, S45)"
+  apt_install linux-generic
+  purge_out="$(apt-get -s purge "${hwe[@]}" 2>&1)" || { warn "kernel line: apt-get -s purge ${hwe[*]} failed: $(tail -n2 <<<"$purge_out" | tr '\n' ' ')"; phase1_kernel_line_todo "$report"; return 0; }
+  extra="$(awk '$1 == "Purg" || $1 == "Remv" {print $2}' <<<"$purge_out" | grep -vxF -f <(printf '%s\n' "${hwe[@]}") || true)"
+  if [[ -n "$extra" ]]; then
+    warn "kernel line: purging the HWE metapackages would also remove: $(paste -sd' ' <<<"$extra"); left as they are"
+    phase1_kernel_line_todo "$report"
+    return 0
+  fi
+  apt-get -y -q purge "${hwe[@]}" >/dev/null || { warn "kernel line: apt-get purge ${hwe[*]} failed"; phase1_kernel_line_todo "$report"; return 0; }
+  if report="$(phase1_kernel_line_report)"; then
+    log "kernel line: now GA 7.0 (Section 3.3): $report"
+    if todo_is_open kernel-line; then todo_done kernel-line; fi
+  else
+    warn "kernel line: still not the GA 7.0 line after the switch: $report"
+    phase1_kernel_line_todo "$report"
+  fi
+}
+
 _grub_params() {
   # Section 3.3 / Appendix B: the three parameters in ATLAS_GRUB_PARAMS, all gated by V3a (header).
   # A drop-in under /etc/default/grub.d/ is sourced by grub-mkconfig after /etc/default/grub (VERIFIED), so the
@@ -920,6 +1002,8 @@ step_04() {
   apt_install tpm2-tools
   phase1_crypttab_tpm2
   phase1_initramfs_conf
+  # The GA kernel line before the upgrade, so the dist-upgrade follows linux-generic (Section 3.3, S45).
+  _kernel_line
   log "apt dist-upgrade (this can take several minutes)"
   retry 2 apt-get -y -q -o Dpkg::Options::=--force-confold dist-upgrade || die "apt-get dist-upgrade failed"
   apt-get -y -q autoremove >/dev/null || true

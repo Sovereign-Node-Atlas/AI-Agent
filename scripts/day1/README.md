@@ -173,7 +173,7 @@ real vault and records V18.
 | Phase 3 results | `/var/lib/atlas/day1/phase3/results/<engine>.json`; model manifests `/srv/atlas/data/manifests/`, `/srv/atlas/models/<key>/MANIFEST.json` |
 | Phase 4 results | `/var/lib/atlas/day1/phase4/<key>.json`; logs `/var/lib/atlas/day1/logs/phase4-<key>.log`; samples `/srv/atlas/workspace/phase4-samples/<key>/`; venv freezes `/srv/atlas/engines/manifests/<key>/freeze.txt` |
 | Reports | `/var/lib/atlas/day1/reports/ATLAS_BUILD_BASELINE-<timestamp>.xlsx` (the repo copy is never touched) |
-| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps |
+| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44). `atlas-admin arbiter status` shows it beside MemAvailable; restart `atlas-orchestrator` after changing it |
 | Secrets | `/etc/atlas/secrets/` (root:atlas 710; every file 600, owned by its one reader): `hf-token.env`, `cloudflare.env`, `ntfy.env`, `smb.cred`, `restic.pass`, `redis.env`, `openwebui.env`, `wg-easy.env`, `google/` |
 | The scripts the node runs | `/opt/atlas/day1/` (a mirror of this directory) |
 
@@ -383,7 +383,7 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 ## 7. Developing
 
 `bash -n` and `shellcheck -x` on every `.sh`, `python3 -m py_compile` on every `.py`, `ruff check orchestrator phase2
-phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), and the package tests (Python 3.12+):
+phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), and the package tests (Python 3.12+):
 
 ```
 cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest

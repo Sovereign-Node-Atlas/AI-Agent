@@ -21,9 +21,16 @@ Rule map (the numbers are Section 4.2's):
      not fit.
   9  Every decision is logged (structured line) and written to ledger.arbiter_decisions with the task id.
 
-Budget (Section 4.1): budget = GTT total - resident set, where the resident set is what the counter shows before any
-engine is loaded (Ubuntu, XFCE, Docker, Open WebUI, the three resident small models, Kokoro/Whisper/PyAnnote, ...),
-measured at startup by `measure_resident_set()` (V3 makes this ~170 GB).
+Budget (Section 4.1): budget = GTT total - resident set - headroom. The resident set is what mem_info_gtt_used shows
+before any engine is loaded, measured by `measure_resident_set()` at startup and again whenever nothing is resident:
+GPU buffer objects only, i.e. the three resident small models and whatever else sits on the iGPU. CPU processes (Ubuntu,
+XFCE, Docker, Open WebUI, ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) share the same unified RAM but
+never appear on that counter, so `headroom_bytes` reserves them (v0.3.5, S44: Settings.arbiter_headroom_bytes, default
+config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set by build_arbiter; the constructor's 0 is for the stub tests only).
+Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - gtt_used is the CPU-side use
+at that moment, shown in status() as host_used_bytes and logged at WARNING when it exceeds the headroom (the reserve
+is then too small for this node: raise ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from, so a
+transient CPU job cannot shrink the budget between two identical requests.
 
 Phase 4 engines (Section 15.2, CONVENTIONS.md §8 class `phase4`). build_arbiter() merges config/phase4-engines.json into
 the Arbiter's engine map so Phase 4 step 5 (POST /arbiter/register) records each container engine's measured footprint
@@ -167,6 +174,10 @@ class MemoryProbe(Protocol):
 
     def gtt_total_bytes(self) -> int: ...
 
+    def host_meminfo(self) -> tuple[int, int] | None:
+        """(MemTotal, MemAvailable) in bytes, or None when the probe cannot tell (observed only, module docstring)."""
+        ...
+
 
 def process_rss_bytes(pid: int, proc_root: Path = Path("/proc")) -> int | None:
     """VmRSS of a live process in bytes, None once /proc/<pid> is gone: the release counter of a class-external (CPU)
@@ -187,8 +198,9 @@ def process_rss_bytes(pid: int, proc_root: Path = Path("/proc")) -> int | None:
 class SysfsMemoryProbe:
     """/sys/class/drm/card*/device/mem_info_gtt_{used,total} in bytes (research §5.2, VERIFIED; lib/common.sh twin)."""
 
-    def __init__(self, drm_root: Path = Path("/sys/class/drm")) -> None:
+    def __init__(self, drm_root: Path = Path("/sys/class/drm"), meminfo: Path = Path("/proc/meminfo")) -> None:
         self.drm_root = drm_root
+        self.meminfo = meminfo
         self._device: Path | None = None
 
     def device_dir(self) -> Path:
@@ -220,19 +232,43 @@ class SysfsMemoryProbe:
     def gtt_total_bytes(self) -> int:
         return self._read("mem_info_gtt_total")
 
+    def host_meminfo(self) -> tuple[int, int] | None:
+        """MemTotal and MemAvailable from /proc/meminfo (kB there), or None if either is missing or unreadable."""
+        try:
+            text = self.meminfo.read_text(encoding="ascii", errors="replace")
+        except OSError:
+            return None
+        kb: dict[str, int] = {}
+        for line in text.splitlines():
+            name, _, rest = line.partition(":")
+            parts = rest.split()
+            if name in ("MemTotal", "MemAvailable") and parts and parts[0].isdigit():
+                kb[name] = int(parts[0])
+        if "MemTotal" not in kb or "MemAvailable" not in kb:
+            return None
+        return kb["MemTotal"] * 1024, kb["MemAvailable"] * 1024
+
 
 class StubProbe:
-    """Test double with settable counters (bytes)."""
+    """Test double with settable counters (bytes). host_meminfo() answers only when both host figures are set."""
 
-    def __init__(self, total_bytes: int, used_bytes: int = 0) -> None:
+    def __init__(self, total_bytes: int, used_bytes: int = 0, *, mem_total_bytes: int | None = None,
+                 mem_available_bytes: int | None = None) -> None:
         self.total_bytes = total_bytes
         self.used_bytes = used_bytes
+        self.mem_total_bytes = mem_total_bytes
+        self.mem_available_bytes = mem_available_bytes
 
     def gtt_used_bytes(self) -> int:
         return self.used_bytes
 
     def gtt_total_bytes(self) -> int:
         return self.total_bytes
+
+    def host_meminfo(self) -> tuple[int, int] | None:
+        if self.mem_total_bytes is None or self.mem_available_bytes is None:
+            return None
+        return self.mem_total_bytes, self.mem_available_bytes
 
 
 @dataclass(frozen=True)
@@ -399,7 +435,9 @@ class Arbiter:
         self.release_timeout_s = release_timeout_s  # research §6.3: time-box 60 s
         self.release_tolerance_bytes = release_tolerance_bytes  # research §6.3: within ~1 GiB of the baseline
         self.poll_interval_s = poll_interval_s
-        self.headroom_bytes = headroom_bytes
+        self.headroom_bytes = headroom_bytes  # the host reserve (module docstring "Budget"); build_arbiter sets it
+        self._host_used_bytes: int | None = None  # CPU-side use at the last measurement (observed, never budgeted)
+        self._host_over = False  # WARNING once when host use first exceeds the headroom, not on every re-measure
         # $ATLAS_ENGINES_ENV_DIR (Settings.engines_env_dir): the unit env files the projection follows when present.
         self.engines_env_dir = engines_env_dir
         self._clock = clock
@@ -433,9 +471,29 @@ class Arbiter:
             if self.resident:
                 raise ArbiterError("measure_resident_set() must run before any engine is resident")
             self._resident_set_bytes = self.probe.gtt_used_bytes()
-            log.info("arbiter resident_set_gib=%.2f gtt_total_gib=%.2f budget_gib=%.2f",
-                     self._resident_set_bytes / GIB, self.probe.gtt_total_bytes() / GIB, self.budget_bytes / GIB)
+            self._observe_host()
+            host = "n/a" if self._host_used_bytes is None else f"{self._host_used_bytes / GIB:.2f}"
+            log.info("arbiter resident_set_gib=%.2f gtt_total_gib=%.2f headroom_gib=%.2f budget_gib=%.2f "
+                     "host_used_gib=%s", self._resident_set_bytes / GIB, self.probe.gtt_total_bytes() / GIB,
+                     self.headroom_bytes / GIB, self.budget_bytes / GIB, host)
             return self._resident_set_bytes
+
+    def _observe_host(self) -> None:
+        """CPU-side memory use beside the GTT resident set: MemTotal - MemAvailable - gtt_used (TTM pages backing GTT
+        objects are not reclaimable, so they sit inside MemTotal - MemAvailable). Observed only (module docstring)."""
+        host = self.probe.host_meminfo()
+        if host is None:
+            self._host_used_bytes = None
+            return
+        mem_total, mem_available = host
+        self._host_used_bytes = max(0, mem_total - mem_available - (self._resident_set_bytes or 0))
+        over = self._host_used_bytes > self.headroom_bytes
+        if over and not self._host_over:
+            log.warning("arbiter: CPU-side memory in use is %.2f GiB, above the %.2f GiB headroom the budget reserves "
+                        "for it (Section 4.1); engines may be granted memory the host needs. Raise "
+                        "ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env and restart atlas-orchestrator",
+                        self._host_used_bytes / GIB, self.headroom_bytes / GIB)
+        self._host_over = over
 
     @property
     def resident_set_bytes(self) -> int:
@@ -1081,6 +1139,8 @@ class Arbiter:
                 "gtt_total_bytes": self.probe.gtt_total_bytes(),
                 "gtt_used_bytes": self.probe.gtt_used_bytes(),
                 "resident_set_bytes": self._resident_set_bytes,
+                "headroom_bytes": self.headroom_bytes,
+                "host_used_bytes": self._host_used_bytes,
                 "budget_bytes": self.budget_bytes if self._resident_set_bytes is not None else None,
                 "charged_bytes": self.charged_bytes,
                 "free_bytes": self.free_bytes if self._resident_set_bytes is not None else None,
@@ -1150,6 +1210,7 @@ def build_arbiter(engines: dict[str, EngineSpec], *, ledger: Ledger | None = Non
     clash = sorted(set(phase4_engines) & set(engines))
     if clash:
         raise ConfigError(f"phase4-engines.json reuses engines.json keys {clash} (CONVENTIONS.md §8 names must agree)")
+    kw.setdefault("headroom_bytes", settings.arbiter_headroom_bytes)  # Section 4.1 host reserve (v0.3.5, S44)
     return Arbiter({**engines, **phase4_engines}, SystemdEngineController(engines=engines), SysfsMemoryProbe(),
                    ledger=ledger, engines_env_dir=engines_env_dir, **kw)
 

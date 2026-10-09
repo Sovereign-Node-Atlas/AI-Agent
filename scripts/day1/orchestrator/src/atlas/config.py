@@ -30,6 +30,19 @@ DEFAULT_CONFIG_DIR = Path("/opt/atlas/day1/config")
 DEFAULT_ETC_DIR = Path("/etc/atlas")
 DEFAULT_DB_PATH = Path("/srv/atlas/data/orchestrator/atlas.sqlite3")
 DEFAULT_LLAMA_PORT_BASE = 8100
+# Section 4.1 (v0.3.5, S44): memory the Engine Arbiter never budgets to an engine. Its resident set is read from
+# mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/Docker/
+# Cockpit 4 GB, Open WebUI/ChromaDB/graph store ~3 GB, Kokoro/Whisper/PyAnnote 3 GB, orchestrator/Celery/Redis/
+# Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it. Without a reserve the budget is the whole GTT pool less the
+# GPU resident set, roughly 12-16 GiB more than the ~170 GB the section intends, on a node with no swap. 16 GiB = those
+# ~12 GB plus transient CPU work (Celery CPU workers, Docling, the Phase 2 tools) and kernel overhead. The Apex engine
+# (157.8 GiB projected) still fits while the GTT total (amdgpu caps it at MemTotal, V3a) is at least 157.8 + 16 + the
+# GPU resident set (6-8 GiB), i.e. about 180-182 GiB; a 192 GiB node with the minimal UMA carve-out (3.2) should show
+# about 187 GiB (an estimate; V3a records the real figure). Below that the Apex load is refused with the numbers in its
+# reason (V22), and a smaller reserve is the Principal's call. ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env
+# overrides it (whole GiB, within ARBITER_HEADROOM_RANGE_GIB).
+DEFAULT_ARBITER_HEADROOM_GIB = 16
+ARBITER_HEADROOM_RANGE_GIB: tuple[int, int] = (4, 64)  # 4 = the OS row of 4.1 alone; 64 would refuse the Apex engine
 
 # CONVENTIONS.md §8: the names that must agree across every file.
 ENGINE_KEYS: tuple[str, ...] = (
@@ -137,6 +150,8 @@ class Settings:
     # An allowlisted subset of the merged environment, copied by name. Never the whole environment: the units inherit
     # proxy.env, memory.env and every later *.env, and asdict()/vars() of this object must not dump them.
     extra: dict[str, str] = field(default_factory=dict, repr=False)
+    # The Arbiter's host reserve in bytes (DEFAULT_ARBITER_HEADROOM_GIB above; ATLAS_ARBITER_HEADROOM_GIB overrides).
+    arbiter_headroom_bytes: int = DEFAULT_ARBITER_HEADROOM_GIB * 1024**3
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -154,6 +169,16 @@ class Settings:
             raise ConfigError(f"LLAMA_PORT_BASE={merged.get('LLAMA_PORT_BASE')!r} is not an integer") from exc
         names = tuple(n for n in merged.get("FAMILY_NAMES", "").replace(",", " ").split() if n)
         extra = {k: merged[k] for k in SETTINGS_EXTRA_KEYS if merged.get(k)}
+        headroom_raw = (merged.get("ATLAS_ARBITER_HEADROOM_GIB") or "").strip()
+        headroom_gib = DEFAULT_ARBITER_HEADROOM_GIB
+        if headroom_raw:
+            lo, hi = ARBITER_HEADROOM_RANGE_GIB
+            try:
+                headroom_gib = int(headroom_raw)
+            except ValueError as exc:
+                raise ConfigError(f"ATLAS_ARBITER_HEADROOM_GIB={headroom_raw!r} is not a whole number of GiB") from exc
+            if not lo <= headroom_gib <= hi:
+                raise ConfigError(f"ATLAS_ARBITER_HEADROOM_GIB={headroom_gib} is outside {lo}..{hi} GiB (Section 4.1)")
         return cls(
             config_dir=cfg,
             etc_dir=etc_dir,
@@ -162,6 +187,7 @@ class Settings:
             llama_port_base=port_base,
             family_names=names,
             extra=extra,
+            arbiter_headroom_bytes=headroom_gib * 1024**3,
         )
 
 

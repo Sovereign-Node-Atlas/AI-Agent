@@ -27,7 +27,7 @@ def config_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
     # (`set -a; source /etc/atlas/orchestrator.env`) and the Phase 2 driver export TZ, NTFY_*, ORCH_HOST, *_TOKEN_FILE,
     # ATLAS_DB_PATH...; scrub every key the settings would copy so the fixture file alone decides (fix round).
     for key in ("CONFIG_DIR", "FAMILY_NAMES", "LLAMA_PORT_BASE", "ATLAS_ENGINES_ENV_DIR", "ATLAS_DB_PATH",
-                *SETTINGS_EXTRA_KEYS):
+                "ATLAS_ARBITER_HEADROOM_GIB", *SETTINGS_EXTRA_KEYS):
         monkeypatch.delenv(key, raising=False)
     return CONFIG_DIR
 
