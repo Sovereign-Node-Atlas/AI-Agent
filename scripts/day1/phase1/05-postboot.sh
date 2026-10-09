@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # phase1/05-postboot.sh — Phase 1 step 5 (Sections 3.3, 17, 21): after the reboot, prove that the kernel accepted the
 # GRUB parameters (all three of Section 3.3, lockup_timeout included) and that the GTT pool matches them (V3a:
-# /proc/cmdline, the live module parameters, 196608 MiB with tolerance), that
+# /proc/cmdline, the live module parameters, 196608 MiB or MemTotal once the kernel caps the pool, S47), that
 # vulkaninfo shows the GPU as RADV GFX1151, that /tmp is tmpfs and swap is off, and that the TPM unlocked the data
 # volume without a keyboard (V2 re-recorded post-reboot). The llama-cli half of V3 belongs to the Phase 2 gate.
 # Two read-only records follow (v0.3.5): the kernel line (Section 3.3, S45; closes or raises the to-do kernel-line) and

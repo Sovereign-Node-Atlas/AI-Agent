@@ -326,11 +326,50 @@ def test_headroom_reserves_the_cpu_side_and_host_use_is_observed_not_budgeted(
     assert arb.status()["host_used_bytes"] is None
 
 
+def test_pool_is_capped_at_memtotal_and_gpu_page_counters_are_preferred(engines: dict[str, EngineSpec]) -> None:
+    """S47: kernel 7.0.0-38 reports the requested 192 GiB as the GTT total on a node with less RAM; the budget must
+    start from MemTotal then, or the excess silently eats the host reserve. GPUActive + GPUReclaim, where the kernel
+    has them, are the GPU's real pages and replace gtt_used in the CPU-side estimate."""
+    gtt_total, mem_total, resident = 192 * GIB, 187 * GIB, 6 * GIB
+    probe = StubProbe(total_bytes=gtt_total, used_bytes=resident, mem_total_bytes=mem_total,
+                      mem_available_bytes=mem_total - resident - 12 * GIB)
+    controller = StubController(engines=engines, probe=probe)
+    clock = FakeClock()
+    arb = Arbiter(engines, controller, probe, headroom_bytes=16 * GIB, poll_interval_s=1.0, clock=clock,
+                  sleep=clock.sleep)
+    arb.measure_resident_set()
+    assert arb.pool_bytes == mem_total
+    assert arb.budget_bytes == mem_total - resident - 16 * GIB  # 165 GiB, not 170
+    st = arb.status()
+    assert st["gtt_total_bytes"] == gtt_total and st["mem_total_bytes"] == mem_total and st["pool_bytes"] == mem_total
+    assert st["host_used_bytes"] == 12 * GIB
+    # The Apex engine (157.8 GiB projected) still fits on this node.
+    assert arb.projected_footprint(APEX_KEY).total_bytes <= arb.budget_bytes
+    # A kernel that caps the GTT total itself (7.0.0-39+): the smaller figure wins either way.
+    probe.total_bytes = 186 * GIB
+    assert arb.pool_bytes == 186 * GIB
+    # GPU page counters present: pooled pages after an unload are the GPU's, not the CPU side's.
+    probe.total_bytes = gtt_total
+    probe.gpu_pages_bytes = resident + 3 * GIB  # 3 GiB pooled by TTM after a free; gtt_used no longer shows it
+    probe.mem_available_bytes = mem_total - resident - 3 * GIB - 12 * GIB
+    arb.measure_resident_set()
+    assert arb.status()["host_used_bytes"] == 12 * GIB
+    # No host figures at all (a probe without /proc/meminfo): the GTT total alone, as before.
+    probe2 = StubProbe(total_bytes=gtt_total, used_bytes=resident)
+    arb2 = Arbiter(engines, StubController(engines=engines, probe=probe2), probe2, headroom_bytes=16 * GIB)
+    arb2.measure_resident_set()
+    assert arb2.pool_bytes == gtt_total and arb2.status()["mem_total_bytes"] is None
+
+
 def test_sysfs_probe_reads_memtotal_and_memavailable(tmp_path: Path) -> None:
     meminfo = tmp_path / "meminfo"
     meminfo.write_text("MemTotal:       196083712 kB\nMemFree:         1000 kB\nMemAvailable:   180000000 kB\n")
     probe = SysfsMemoryProbe(drm_root=tmp_path, meminfo=meminfo)
-    assert probe.host_meminfo() == (196083712 * 1024, 180000000 * 1024)
+    assert probe.host_meminfo() == (196083712 * 1024, 180000000 * 1024, None)  # a kernel without the GPU fields
+    # Ubuntu 7.0.0-38 / mainline v7.1 add GPUActive and GPUReclaim (TTM pool pages in use / pooled after a free).
+    meminfo.write_text("MemTotal:       196083712 kB\nMemAvailable:   180000000 kB\nGPUActive:       6000000 kB\n"
+                       "GPUReclaim:       10000 kB\n")
+    assert probe.host_meminfo() == (196083712 * 1024, 180000000 * 1024, 6010000 * 1024)
     meminfo.write_text("MemTotal:       196083712 kB\nMemFree:         1000 kB\n")
     assert probe.host_meminfo() is None
     assert SysfsMemoryProbe(drm_root=tmp_path, meminfo=tmp_path / "absent").host_meminfo() is None
@@ -367,14 +406,15 @@ def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path,
         def gtt_used_bytes(self) -> int:
             return 6 * GIB
 
-        def host_meminfo(self) -> tuple[int, int] | None:
-            return 187 * GIB, 165 * GIB
+        def host_meminfo(self) -> tuple[int, int, int | None] | None:
+            return 187 * GIB, 165 * GIB, 6 * GIB
 
     monkeypatch.setattr(admin, "SysfsMemoryProbe", Probe)
     monkeypatch.setattr(admin, "_unit_state", lambda *a, **k: "inactive")
     assert admin.main(["arbiter", "status", "--json"]) == 0
     host = json.loads(capsys.readouterr().out)["host"]
-    assert host == {"headroom_bytes": 20 * GIB, "mem_total_bytes": 187 * GIB, "mem_available_bytes": 165 * GIB}
+    assert host == {"headroom_bytes": 20 * GIB, "mem_total_bytes": 187 * GIB, "mem_available_bytes": 165 * GIB,
+                    "gpu_pages_bytes": 6 * GIB}
     assert admin.main(["arbiter", "status"]) == 0
     assert "host: Arbiter headroom 20 GiB" in capsys.readouterr().out
     monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "24")

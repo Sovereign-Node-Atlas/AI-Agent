@@ -21,16 +21,20 @@ Rule map (the numbers are Section 4.2's):
      not fit.
   9  Every decision is logged (structured line) and written to ledger.arbiter_decisions with the task id.
 
-Budget (Section 4.1): budget = GTT total - resident set - headroom. The resident set is what mem_info_gtt_used shows
-before any engine is loaded, measured by `measure_resident_set()` at startup and again whenever nothing is resident:
-GPU buffer objects only, i.e. the three resident small models and whatever else sits on the iGPU. CPU processes (Ubuntu,
-XFCE, Docker, Open WebUI, ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) share the same unified RAM but
-never appear on that counter, so `headroom_bytes` reserves them (v0.3.5, S44: Settings.arbiter_headroom_bytes, default
+Budget (Section 4.1): budget = pool - resident set - headroom, where pool = min(GTT total, MemTotal). Kernel 7.0.0-38
+reports the requested 192 GiB as the GTT total even though the node has less RAM; 7.0.0-39 and later cap it at MemTotal
+themselves (S47), and MemTotal is the real limit either way. The resident set is what mem_info_gtt_used shows before any
+engine is loaded, measured by `measure_resident_set()` at startup and again whenever nothing is resident: GPU buffer
+objects, i.e. the three resident small models and whatever else sits on the iGPU. Ordinary CPU memory (Ubuntu, XFCE,
+Docker, Open WebUI, ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but does
+not appear on that counter (only memory a process hands the GPU through userptr or a dma-buf import does), so
+`headroom_bytes` reserves it (v0.3.5, S44: Settings.arbiter_headroom_bytes, default
 config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set by build_arbiter; the constructor's 0 is for the stub tests only).
-Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - gtt_used is the CPU-side use
-at that moment, shown in status() as host_used_bytes and logged at WARNING when it exceeds the headroom (the reserve
-is then too small for this node: raise ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from, so a
-transient CPU job cannot shrink the budget between two identical requests.
+Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - (GPUActive + GPUReclaim where
+the kernel reports them, else gtt_used) is the CPU-side use at that moment, shown in status() as host_used_bytes and
+logged at WARNING when it exceeds the headroom (the reserve is then too small for this node: raise
+ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from, so a transient CPU job cannot shrink the budget
+between two identical requests.
 
 Phase 4 engines (Section 15.2, CONVENTIONS.md §8 class `phase4`). build_arbiter() merges config/phase4-engines.json into
 the Arbiter's engine map so Phase 4 step 5 (POST /arbiter/register) records each container engine's measured footprint
@@ -174,8 +178,8 @@ class MemoryProbe(Protocol):
 
     def gtt_total_bytes(self) -> int: ...
 
-    def host_meminfo(self) -> tuple[int, int] | None:
-        """(MemTotal, MemAvailable) in bytes, or None when the probe cannot tell (observed only, module docstring)."""
+    def host_meminfo(self) -> tuple[int, int, int | None] | None:
+        """(MemTotal, MemAvailable, GPUActive + GPUReclaim or None) in bytes, or None when the probe cannot tell."""
         ...
 
 
@@ -232,8 +236,10 @@ class SysfsMemoryProbe:
     def gtt_total_bytes(self) -> int:
         return self._read("mem_info_gtt_total")
 
-    def host_meminfo(self) -> tuple[int, int] | None:
-        """MemTotal and MemAvailable from /proc/meminfo (kB there), or None if either is missing or unreadable."""
+    def host_meminfo(self) -> tuple[int, int, int | None] | None:
+        """MemTotal, MemAvailable and, where the kernel has them, GPUActive + GPUReclaim from /proc/meminfo (kB there);
+        None if MemTotal or MemAvailable is missing or the file is unreadable. The GPU fields are the TTM pool pages,
+        in use or pooled after a free (Ubuntu 7.0.0-38 and mainline v7.1 onward; absent before)."""
         try:
             text = self.meminfo.read_text(encoding="ascii", errors="replace")
         except OSError:
@@ -242,22 +248,24 @@ class SysfsMemoryProbe:
         for line in text.splitlines():
             name, _, rest = line.partition(":")
             parts = rest.split()
-            if name in ("MemTotal", "MemAvailable") and parts and parts[0].isdigit():
+            if name in ("MemTotal", "MemAvailable", "GPUActive", "GPUReclaim") and parts and parts[0].isdigit():
                 kb[name] = int(parts[0])
         if "MemTotal" not in kb or "MemAvailable" not in kb:
             return None
-        return kb["MemTotal"] * 1024, kb["MemAvailable"] * 1024
+        gpu = (kb["GPUActive"] + kb.get("GPUReclaim", 0)) * 1024 if "GPUActive" in kb else None
+        return kb["MemTotal"] * 1024, kb["MemAvailable"] * 1024, gpu
 
 
 class StubProbe:
     """Test double with settable counters (bytes). host_meminfo() answers only when both host figures are set."""
 
     def __init__(self, total_bytes: int, used_bytes: int = 0, *, mem_total_bytes: int | None = None,
-                 mem_available_bytes: int | None = None) -> None:
+                 mem_available_bytes: int | None = None, gpu_pages_bytes: int | None = None) -> None:
         self.total_bytes = total_bytes
         self.used_bytes = used_bytes
         self.mem_total_bytes = mem_total_bytes
         self.mem_available_bytes = mem_available_bytes
+        self.gpu_pages_bytes = gpu_pages_bytes
 
     def gtt_used_bytes(self) -> int:
         return self.used_bytes
@@ -265,10 +273,10 @@ class StubProbe:
     def gtt_total_bytes(self) -> int:
         return self.total_bytes
 
-    def host_meminfo(self) -> tuple[int, int] | None:
+    def host_meminfo(self) -> tuple[int, int, int | None] | None:
         if self.mem_total_bytes is None or self.mem_available_bytes is None:
             return None
-        return self.mem_total_bytes, self.mem_available_bytes
+        return self.mem_total_bytes, self.mem_available_bytes, self.gpu_pages_bytes
 
 
 @dataclass(frozen=True)
@@ -437,6 +445,7 @@ class Arbiter:
         self.poll_interval_s = poll_interval_s
         self.headroom_bytes = headroom_bytes  # the host reserve (module docstring "Budget"); build_arbiter sets it
         self._host_used_bytes: int | None = None  # CPU-side use at the last measurement (observed, never budgeted)
+        self._mem_total_bytes: int | None = None  # MemTotal: caps the pool when the GTT total exceeds it (7.0.0-38)
         self._host_over = False  # WARNING once when host use first exceeds the headroom, not on every re-measure
         # $ATLAS_ENGINES_ENV_DIR (Settings.engines_env_dir): the unit env files the projection follows when present.
         self.engines_env_dir = engines_env_dir
@@ -473,20 +482,25 @@ class Arbiter:
             self._resident_set_bytes = self.probe.gtt_used_bytes()
             self._observe_host()
             host = "n/a" if self._host_used_bytes is None else f"{self._host_used_bytes / GIB:.2f}"
-            log.info("arbiter resident_set_gib=%.2f gtt_total_gib=%.2f headroom_gib=%.2f budget_gib=%.2f "
-                     "host_used_gib=%s", self._resident_set_bytes / GIB, self.probe.gtt_total_bytes() / GIB,
-                     self.headroom_bytes / GIB, self.budget_bytes / GIB, host)
+            log.info("arbiter resident_set_gib=%.2f gtt_total_gib=%.2f pool_gib=%.2f headroom_gib=%.2f "
+                     "budget_gib=%.2f host_used_gib=%s", self._resident_set_bytes / GIB,
+                     self.probe.gtt_total_bytes() / GIB, self.pool_bytes / GIB, self.headroom_bytes / GIB,
+                     self.budget_bytes / GIB, host)
             return self._resident_set_bytes
 
     def _observe_host(self) -> None:
-        """CPU-side memory use beside the GTT resident set: MemTotal - MemAvailable - gtt_used (TTM pages backing GTT
-        objects are not reclaimable, so they sit inside MemTotal - MemAvailable). Observed only (module docstring)."""
+        """Records MemTotal (it caps the pool) and the CPU-side use beside the GPU's pages: TTM pages backing GTT
+        objects are not reclaimable, so they sit inside MemTotal - MemAvailable and are taken out again (observed)."""
         host = self.probe.host_meminfo()
         if host is None:
             self._host_used_bytes = None
             return
-        mem_total, mem_available = host
-        self._host_used_bytes = max(0, mem_total - mem_available - (self._resident_set_bytes or 0))
+        mem_total, mem_available, gpu_pages = host
+        self._mem_total_bytes = mem_total
+        # GPUActive + GPUReclaim (the TTM pool pages) when the kernel reports them; else the GTT counter, which counts
+        # BO sizes and misses pages TTM keeps pooled after a free, so it over-states CPU use slightly after an unload.
+        gpu = gpu_pages if gpu_pages is not None else (self._resident_set_bytes or 0)
+        self._host_used_bytes = max(0, mem_total - mem_available - gpu)
         over = self._host_used_bytes > self.headroom_bytes
         if over and not self._host_over:
             log.warning("arbiter: CPU-side memory in use is %.2f GiB, above the %.2f GiB headroom the budget reserves "
@@ -502,8 +516,15 @@ class Arbiter:
         return self._resident_set_bytes
 
     @property
+    def pool_bytes(self) -> int:
+        """The memory engines and the resident set share: the GTT total, but never more than MemTotal. Kernel 7.0.0-38
+        reports the requested 192 GiB even though the node has less (S47); 7.0.0-39 and later cap it themselves."""
+        total = self.probe.gtt_total_bytes()
+        return total if self._mem_total_bytes is None else min(total, self._mem_total_bytes)
+
+    @property
     def budget_bytes(self) -> int:
-        return max(0, self.probe.gtt_total_bytes() - self.resident_set_bytes - self.headroom_bytes)
+        return max(0, self.pool_bytes - self.resident_set_bytes - self.headroom_bytes)
 
     @property
     def charged_bytes(self) -> int:
@@ -1139,6 +1160,8 @@ class Arbiter:
                 "gtt_total_bytes": self.probe.gtt_total_bytes(),
                 "gtt_used_bytes": self.probe.gtt_used_bytes(),
                 "resident_set_bytes": self._resident_set_bytes,
+                "mem_total_bytes": self._mem_total_bytes,
+                "pool_bytes": self.pool_bytes,
                 "headroom_bytes": self.headroom_bytes,
                 "host_used_bytes": self._host_used_bytes,
                 "budget_bytes": self.budget_bytes if self._resident_set_bytes is not None else None,

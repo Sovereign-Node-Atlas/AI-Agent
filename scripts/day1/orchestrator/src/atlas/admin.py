@@ -180,6 +180,8 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     meminfo = probe.host_meminfo()
     if meminfo is not None:
         out["host"].update(mem_total_bytes=meminfo[0], mem_available_bytes=meminfo[1])
+        if meminfo[2] is not None:
+            out["host"]["gpu_pages_bytes"] = meminfo[2]
     active: list[EngineSpec] = []
     for spec in engines.values():
         state = _unit_state(controller, spec.key, spec)

@@ -6,11 +6,14 @@
 # marketing name; conflict 8: the amdgpu.gttsize deprecation warning is expected). All three parameters are gated:
 # Appendix B and Section 3.3 list them together, and S8 added lockup_timeout precisely so that V22 cannot fail "for a
 # kernel reason", so a cmdline without it (hand edit, distro GRUB rewrite) must turn V3a red, not pass.
-# GTT pool expectation (fix round 3): amdgpu clamps the requested gttsize to physical RAM (platform research item 6,
-# VERIFIED on amdgpu_ttm.c v7.0), and on a 192 GiB machine MemTotal is always below 196608 MiB by the firmware
-# reservation plus the BIOS UMA frame-buffer carveout, so the pool is compared with min(EXPECTED, MemTotal) at 1 %
-# tolerance, the way the kernel computes it. A MemTotal far below EXPECTED is not a kernel-parameter fault: the message
-# then points at the BIOS carveout (Section 3.2 wants it at the minimum so the GTT pool, not VRAM, holds the models).
+# GTT pool expectation (v0.3.5, S47, corrects fix round 3): whether amdgpu caps the pool at physical RAM depends on the
+# kernel build. Mainline v7.0 and Ubuntu 7.0.0-38 do NOT cap it: mem_info_gtt_total is the requested 196608 MiB
+# whatever MemTotal is (amdgpu_ttm_init, VERIFIED in the 7.0.0-38.38 source). Ubuntu 7.0.0-39 (upstream 5e70f6804b4d,
+# "drm/amdgpu: cap GTT size to physical RAM on APUs"; in mainline from v7.2) caps it at MemTotal and logs "Capping GTT
+# to <N>M". Either is a correctly applied parameter, so the pool passes when it equals EXPECTED or MemTotal (1 % below,
+# 1 MiB above, as before); anything else (the ~50 % TTM default, a typo) fails. On a 192 GiB machine MemTotal sits
+# below 196608 MiB by the firmware reservation plus the BIOS UMA frame-buffer carveout; when it is far below, the
+# message points at the carveout (Section 3.2 wants it at the minimum so the GTT pool, not VRAM, holds the models).
 # The three parameters themselves are checked separately against the literal values.
 # Usage: v03a-gtt.sh [EXPECTED_GTT_MIB]   (default 196608 = 192 GiB)
 export ATLAS_LOG_TO_STDERR=1
@@ -33,13 +36,18 @@ lockup="$(tr -d '[:space:]' </sys/module/amdgpu/parameters/lockup_timeout 2>/dev
 [[ "$lockup" == "$lockup_want" ]] || fails+=("amdgpu.lockup_timeout live=$lockup (want $lockup_want)")
 
 ram_mib=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 ))
-want=$(( expected < ram_mib ? expected : ram_mib ))
+capped="$(dmesg 2>/dev/null | grep -o 'Capping GTT to [0-9]*M' | tail -n1 || true)"
 total=""
 hint=""
+pool=""
+_v3a_near() { (( $1 >= $2 - $2 / 100 && $1 <= $2 + 1 )); }   # 1 % below, 1 MiB above
 if total="$(gpu_gtt_total_mb 2>/dev/null)"; then
-  low=$(( want - want / 100 ))
-  if (( total < low || total > want + 1 )); then
-    fails+=("mem_info_gtt_total=${total} MiB outside [$low, $(( want + 1 ))] (want=min(expected $expected, MemTotal $ram_mib))")
+  if _v3a_near "$total" "$expected"; then
+    pool="uncapped (the requested size; kernels without the APU cap, e.g. 7.0.0-38)"
+  elif _v3a_near "$total" "$ram_mib"; then
+    pool="capped at MemTotal (${capped:-no 'Capping GTT' line in dmesg}; 7.0.0-39 and later)"
+  else
+    fails+=("mem_info_gtt_total=${total} MiB is neither the requested $expected MiB nor MemTotal $ram_mib MiB (1 % below, 1 MiB above)")
   fi
 else
   fails+=("no AMD GPU under /sys/class/drm or mem_info_gtt_total unreadable")
@@ -61,7 +69,7 @@ else
 fi
 grep -qi 'GFX1151' <<<"$vk" || fails+=("vulkaninfo does not report RADV GFX1151: $vk")
 
-summary="gtt_total=${total:-?} MiB (expected $expected, MemTotal $ram_mib MiB, want $want); ttm.pages_limit=$pages; amdgpu.gttsize=$gttparam; lockup_timeout=$lockup; dmesg='${ready:-no GTT ready line}' deprecation_warn=$deprec; vulkan='$vk'$hint"
+summary="gtt_total=${total:-?} MiB, ${pool:-not matched} (requested $expected, MemTotal $ram_mib MiB); ttm.pages_limit=$pages; amdgpu.gttsize=$gttparam; lockup_timeout=$lockup; dmesg='${ready:-no GTT ready line}' deprecation_warn=$deprec; vulkan='$vk'$hint"
 if (( ${#fails[@]} > 0 )); then
   echo "V3a fail: ${fails[*]}; $summary"
   exit 1

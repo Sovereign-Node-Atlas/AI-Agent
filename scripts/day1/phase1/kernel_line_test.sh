@@ -14,14 +14,23 @@ ok() { if [[ "$2" == "$3" ]]; then echo "PASS $1"; pass=$((pass+1)); else echo "
 extract() { awk -v n="$2" '$0 ~ "^"n"\\(\\) \\{" {on=1} on{print} on && /^\}/{exit}' "$1"; }
 
 # Installed packages, one per line, in $T/pkgs; extra lines a purge simulation would print, in $T/purge_extra.
+# A format asking for ${source:Package} gets a third column: the source named for the package in $T/src ("pkg src"
+# lines), linux-meta otherwise (every kernel metapackage of the archive comes from linux-meta).
 cat >"$T/bin/dpkg-query" <<'SH'
 #!/bin/bash
-pats=(); for a in "$@"; do case "$a" in -W|-f=*) ;; *) pats+=("$a") ;; esac; done
+pats=(); src=0
+for a in "$@"; do case "$a" in -W) ;; -f=*) [[ "$a" == *source:Package* ]] && src=1 ;; *) pats+=("$a") ;; esac; done
 while read -r p; do
   [[ -n "$p" ]] || continue
   for g in "${pats[@]}"; do
     # shellcheck disable=SC2053  # glob match on purpose, as dpkg-query does
-    if [[ "$p" == $g ]]; then printf 'ii  %s\n' "$p"; break; fi
+    if [[ "$p" == $g ]]; then
+      if (( src )); then
+        s="$(awk -v p="$p" '$1 == p {print $2; exit}' "$KL_T/src" 2>/dev/null)"
+        printf 'ii  %s %s\n' "$p" "${s:-linux-meta}"
+      else printf 'ii  %s\n' "$p"; fi
+      break
+    fi
   done
 done <"$KL_T/pkgs"
 SH
@@ -63,13 +72,13 @@ todo_done() { echo "done $1" >>"$T/todo"; }
 todo_is_open() { [[ -s "$T/todo" ]] && grep -qx "$1" "$T/todo" && ! grep -qx "done $1" "$T/todo"; }
 apt_install() { echo "apt_install $*" >>"$T/apt.log"; local p; for p in "$@"; do grep -qxF -- "$p" "$T/pkgs" || echo "$p" >>"$T/pkgs"; done; }
 # shellcheck source=/dev/null
-source <(grep -E '^ATLAS_KERNEL_GA_METAS=' "$REPO/phase1/04-system.sh"
+source <(grep -E '^ATLAS_KERNEL_(GA_METAS|HWE_GLOBS|OEM_GLOBS)=' "$REPO/phase1/04-system.sh"
          for f in _kl_installed phase1_kernel_line_report phase1_kernel_line_todo _kernel_line; do
            extract "$REPO/phase1/04-system.sh" "$f"; done
          extract "$REPO/phase1/05-postboot.sh" _npu_record | sed -e "s#/sys/bus/pci/devices#$T/sys#g" -e "s#find /dev/accel #find $T/accel #")
 
 reset_case() {  # reset_case UNAME PACKAGE...
-  : >"$T/out"; : >"$T/apt.log"; : >"$T/todo"; : >"$T/purge_extra"
+  : >"$T/out"; : >"$T/apt.log"; : >"$T/todo"; : >"$T/purge_extra"; : >"$T/src"
   printf '%s\n' "$1" >"$T/uname"; shift
   printf '%s\n' "$@" >"$T/pkgs"
 }
@@ -159,6 +168,27 @@ phase1_kernel_line_report >/dev/null; ok "OEM enablement meta: report rc" "$?" "
 _kernel_line
 ok "OEM enablement meta: no apt call" "$(wc -l <"$T/apt.log")" "0"
 ok "OEM enablement meta: to-do" "$(cat "$T/todo")" "kernel-line"
+
+# 12a. A system upgraded from 24.04 carries the 24.04 transitionals (linux-meta, Depending on the -hwe-26.04 ones):
+#      purged together with them.
+reset_case 7.0.0-38-generic "${HWE[@]}" linux-generic-hwe-24.04 linux-image-generic-hwe-24.04 linux-oem-24.04c
+_kernel_line
+ok "24.04 transitionals: all purged" "$(grep -cE 'hwe|oem' "$T/pkgs")" "0"
+ok "24.04 transitionals: no to-do" "$(wc -l <"$T/todo")" "0"
+
+# 12b. A metapackage that matches the HWE globs but is not Ubuntu's linux-meta: never purged here.
+reset_case 7.0.0-38-generic "${HWE[@]}" linux-nvidia-hwe-24.04
+echo "linux-nvidia-hwe-24.04 linux-meta-nvidia" >"$T/src"
+_kernel_line
+ok "foreign source: no apt call" "$(wc -l <"$T/apt.log")" "0"
+ok "foreign source: named" "$(grep -c 'never purged here: linux-nvidia-hwe-24.04' "$T/out")" "1"
+ok "foreign source: to-do" "$(cat "$T/todo")" "kernel-line"
+
+# 12c. The OEM 7.0 metapackage family and a platform hwe-*-meta count as OEM.
+reset_case 7.0.0-38-generic "${GA[@]}" linux-oem-7.0
+phase1_kernel_line_report >/dev/null; ok "linux-oem-7.0: not GA" "$?" "1"
+reset_case 7.0.0-38-generic "${GA[@]}" hwe-dgx-gb10-meta
+ok "hwe-*-meta: reported as OEM" "$(phase1_kernel_line_report | grep -c 'OEM: hwe-dgx-gb10-meta;')" "1"
 
 # 12. A to-do left open by an earlier run closes once the switch succeeds.
 reset_case 7.0.0-38-generic "${HWE[@]}"

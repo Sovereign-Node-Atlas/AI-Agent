@@ -259,7 +259,7 @@ tpm2-tools through the proxy; step 4 then adds both, rebuilds every initramfs an
 **phase1/04-system.sh** — 387, 391: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). Time sync
 (VERIFIED since v0.3.4): 26.04 runs chrony with NTS (1..4.ntp.ubuntu.com, ntp-bootstrap.ubuntu.com, UDP 123 and TCP
 4460), opened for uid `_chrony` only; the pinned-address and router fallback apply only to a host still on
-systemd-timesyncd. A chrony that does not synchronise within two minutes is a warning and the to-do `time-sync`.
+systemd-timesyncd. A chrony that does not synchronise within two minutes is a warning and the to-do `time-sync`. Kernel line (VERIFIED since v0.3.5, archive indices and the 26.04.1 server ISO): the ISO installs `linux-generic`; step 4 holds that line, swaps HWE metapackages over the same 7.0 image itself, and leaves anything else (OEM or platform metapackages, an image outside 7.0, a metapackage not from `linux-meta`) to the to-do `kernel-line`.
 
 **phase1/05b-desktop.sh** — the Google apt repository recipe for Chrome (key URL `dl.google.com/linux/linux_signing_key.pub`,
 suite `stable main`); fails loudly on a non-armoured key. Chrome's managed policy path `/etc/opt/chrome/policies/managed/`
@@ -363,6 +363,8 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 **systemd/atlas-orchestrator.service** — 40: docker client needs under the hardening. **systemd/llama-server@.service**
 — 86: whether Mesa/RADV needs AF_UNIX (kept).
 
+**verify/v03a-gtt.sh** — VERIFIED since v0.3.5: kernel 7.0.0-38 reports the requested 196608 MiB GTT pool whatever MemTotal is, and 7.0.0-39 caps it at MemTotal; both pass (S47).
+
 **verify/v06-pyannote.sh** — 17: whether current pyannote loads the legacy 3.1 pipeline (a fail blocks the gate).
 **verify/v17-sandbox.sh** — 14: exit 137 convention. **verify/v23-cloudflare-token.sh** — 89: `/user/tokens/verify`.
 
@@ -383,7 +385,7 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 ## 7. Developing
 
 `bash -n` and `shellcheck -x` on every `.sh`, `python3 -m py_compile` on every `.py`, `ruff check orchestrator phase2
-phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), and the package tests (Python 3.12+):
+phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47), and the package tests (Python 3.12+):
 
 ```
 cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest

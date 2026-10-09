@@ -33,14 +33,15 @@ DEFAULT_LLAMA_PORT_BASE = 8100
 # Section 4.1 (v0.3.5, S44): memory the Engine Arbiter never budgets to an engine. Its resident set is read from
 # mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/Docker/
 # Cockpit 4 GB, Open WebUI/ChromaDB/graph store ~3 GB, Kokoro/Whisper/PyAnnote 3 GB, orchestrator/Celery/Redis/
-# Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it. Without a reserve the budget is the whole GTT pool less the
-# GPU resident set, roughly 12-16 GiB more than the ~170 GB the section intends, on a node with no swap. 16 GiB = those
+# Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it. Without a reserve the budget is the whole pool less the GPU
+# resident set, roughly 12-16 GiB more than the ~170 GB the section intends, on a node with no swap. 16 GiB = those
 # ~12 GB plus transient CPU work (Celery CPU workers, Docling, the Phase 2 tools) and kernel overhead. The Apex engine
-# (157.8 GiB projected) still fits while the GTT total (amdgpu caps it at MemTotal, V3a) is at least 157.8 + 16 + the
-# GPU resident set (6-8 GiB), i.e. about 180-182 GiB; a 192 GiB node with the minimal UMA carve-out (3.2) should show
-# about 187 GiB (an estimate; V3a records the real figure). Below that the Apex load is refused with the numbers in its
-# reason (V22), and a smaller reserve is the Principal's call. ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env
-# overrides it (whole GiB, within ARBITER_HEADROOM_RANGE_GIB).
+# (157.8 GiB projected) still fits while the pool (the smaller of the GTT total and MemTotal: kernel 7.0.0-38 reports
+# the requested 192 GiB, S47) is at least 157.8 + 16 + the GPU resident set (6-8 GiB), i.e. about 180-182 GiB; a
+# 192 GiB node with the minimal UMA carve-out (3.2) should show about 187 GiB (an estimate; V3a records the real
+# figure). Below that the Apex load is refused with the numbers in its reason (V22), and a smaller reserve is the
+# Principal's call. ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env overrides it (whole GiB, within
+# ARBITER_HEADROOM_RANGE_GIB).
 DEFAULT_ARBITER_HEADROOM_GIB = 16
 ARBITER_HEADROOM_RANGE_GIB: tuple[int, int] = (4, 64)  # 4 = the OS row of 4.1 alone; 64 would refuse the Apex engine
 

@@ -806,7 +806,16 @@ _disable_beacons() {
 # simulation of the purge removes nothing but the HWE metapackages. Anything else (an image outside 7.0, an OEM kernel
 # `linux-oem-26.04*` or an -oem uname, a purge that would take more) means booting or removing a kernel, so it is the
 # to-do `kernel-line` for the Principal, never automatic (policy v0.3.3: the phase continues).
+# Names VERIFIED against the resolute archive indices (2026-10-09). The 26.04.1 server ISO itself installs linux-generic
+# (its install-sources.yaml: `kernel: default: linux-generic`), so on a fresh install this is a check, not a change;
+# but the 26.04 installer now also runs the OEM lookup on Server (`oem: install: auto`, subiquity 26.04), so a platform
+# metapackage matching this machine at install time would bring its own kernel, and a 26.04.2+ ISO may default to HWE.
+# HWE: the -hwe-26.04 metapackages and the 24.04 transitionals an upgraded system carries (linux-*-hwe-24.04*,
+# linux-oem-24.04*: they Depend on the -hwe-26.04 ones). OEM: linux-oem-26.04*, linux-oem-7.0 and their image/headers
+# metapackages, plus the platform metapackages `ubuntu-drivers list-oem` installs (oem-*-meta, hwe-*-meta).
 ATLAS_KERNEL_GA_METAS=(linux-generic linux-image-generic linux-headers-generic)
+ATLAS_KERNEL_HWE_GLOBS=('linux-*-hwe-26.04*' 'linux-*-hwe-24.04*' 'linux-oem-24.04*' 'linux-*-oem-24.04*')
+ATLAS_KERNEL_OEM_GLOBS=('linux-oem-26.04*' 'linux-*-oem-26.04*' 'linux-oem-7.0' 'linux-*-oem-7.0' 'oem-*-meta' 'hwe-*-meta')
 
 # _kl_installed PATTERN... — installed package names matching dpkg-query patterns, one per line, sorted.
 _kl_installed() {
@@ -820,8 +829,8 @@ phase1_kernel_line_report() {
   local run ga hwe oem img bad=0
   run="$(uname -r)"
   ga="$(_kl_installed "${ATLAS_KERNEL_GA_METAS[@]}" | paste -sd' ')"
-  hwe="$(_kl_installed 'linux-*-hwe-26.04*' | paste -sd' ')"
-  oem="$(_kl_installed 'linux-oem-26.04*' 'linux-*-oem-26.04*' 'oem-*-meta' | paste -sd' ')"
+  hwe="$(_kl_installed "${ATLAS_KERNEL_HWE_GLOBS[@]}" | paste -sd' ')"
+  oem="$(_kl_installed "${ATLAS_KERNEL_OEM_GLOBS[@]}" | paste -sd' ')"
   img="$(_kl_installed 'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*' | sed -E 's/^linux-image-(unsigned-)?//' | sort -uV | paste -sd' ')"
   [[ "$run" =~ ^7\.0\.[0-9]+-[0-9]+-generic$ ]] || bad=1
   [[ " $ga " == *" linux-generic "* ]] || bad=1
@@ -834,7 +843,7 @@ phase1_kernel_line_report() {
 # phase1_kernel_line_todo REPORT — the to-do both step 4 and step 5 raise when the line is not GA 7.0.
 phase1_kernel_line_todo() {
   todo_add kernel-line "Kernel line is not the GA 7.0 line of Section 3.3: decide whether to move the node to linux-generic (7.0)" \
-    "Section 3.3, 3.7 W-KERNEL. Found: $1. Leaving an OEM kernel, or an image outside the 7.0 series, means installing linux-generic, rebooting into the 7.0.x-generic entry and only then purging the other kernel and its metapackage; then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 05"
+    "Section 3.3, 3.7 W-KERNEL. Found: $1. To move: install linux-generic; GRUB boots the highest version first and an OEM image (7.0.0-10NN-oem) sorts above every 7.0.0-NN-generic one, so put GRUB_FLAVOUR_ORDER=\"generic\" in a file of its own under /etc/default/grub.d/, run update-grub and reboot into the -generic kernel; only then purge the other metapackages and that kernel's versioned linux-image/-modules/-main-modules-zfs/-headers packages (never with --autoremove), run update-grub, and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 05"
 }
 
 # _kernel_line — step 4, after apt-get update and before the dist-upgrade (header above).
@@ -844,12 +853,16 @@ _kernel_line() {
     log "kernel line: GA 7.0 (Section 3.3): $report"
     return 0
   fi
-  mapfile -t hwe < <(_kl_installed 'linux-*-hwe-26.04*')
+  mapfile -t hwe < <(_kl_installed "${ATLAS_KERNEL_HWE_GLOBS[@]}")
   mapfile -t img < <(_kl_installed 'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*')
-  local safe=1
+  local safe=1 foreign
   [[ "$(uname -r)" =~ ^7\.0\.[0-9]+-[0-9]+-generic$ ]] || safe=0
   (( ${#hwe[@]} > 0 )) || safe=0
-  [[ -z "$(_kl_installed 'linux-oem-26.04*' 'linux-*-oem-26.04*' 'oem-*-meta')" ]] || safe=0
+  [[ -z "$(_kl_installed "${ATLAS_KERNEL_OEM_GLOBS[@]}")" ]] || safe=0
+  # Only Ubuntu's own kernel metapackages (source linux-meta) are ever purged; e.g. linux-nvidia-hwe-24.04 is not one.
+  foreign="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${source:Package}\n' "${ATLAS_KERNEL_HWE_GLOBS[@]}" 2>/dev/null \
+             | awk '$1 == "ii" && $3 != "linux-meta" {print $2}' | paste -sd' ')"
+  [[ -z "$foreign" ]] || { warn "kernel line: not from Ubuntu's linux-meta, never purged here: $foreign"; safe=0; }
   for p in "${img[@]}"; do [[ "$p" =~ ^linux-image-(unsigned-)?7\.0\.[0-9]+-[0-9]+-generic$ ]] || safe=0; done
   if (( ! safe )); then
     warn "kernel line: not the GA 7.0 line and not the one case step 4 changes by itself: $report"
