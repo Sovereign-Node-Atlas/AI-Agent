@@ -56,8 +56,9 @@ step_01() {
   (( mem_gib >= 180 )) || problems+=("MemTotal ${mem_gib} GiB, expected ~192 GiB (Section 2)")
 
   # --- GPU: vendor 0x1002, display class, driver amdgpu; device id logged and warned, never failed -------------
-  # pciutils is on every Ubuntu Server image; the only package step 1 installs before the proxy exists is
-  # libtss2-rc0t64, below (rule §7.1's declared exceptions: rsync, libtss2-rc0t64, then squid/dnsmasq in step 4).
+  # pciutils is on every Ubuntu Server image; the only packages step 1 installs before the proxy exists are systemd's
+  # TPM2 libraries, below (libtss2-rc0t64 on the stock image; on a minimized install also libtss2-esys, -mu and
+  # -tcti-device with their libtss2 dependencies): rule §7.1's declared exceptions are rsync, this set, then squid/dnsmasq.
   command -v lspci >/dev/null || die "pre-flight: lspci (pciutils) is missing; install it from the console and re-run (step 1 fetches only systemd's TPM2 libraries before the allowlist proxy exists)"
   local slot; slot="$(lspci -Dn -d 1002: 2>/dev/null | awk '$2 ~ /^03/ {print $1; exit}')"
   [[ -n "$slot" ]] || die "pre-flight: no AMD (0x1002) display-class PCI device found (lspci -Dn -d 1002:)"

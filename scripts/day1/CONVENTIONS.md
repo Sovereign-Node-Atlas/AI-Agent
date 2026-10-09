@@ -160,7 +160,7 @@ never prompt; never take longer than 10 minutes; safe to re-run.
    request goes through the allowlist proxy; the allowlist is `config/allowlist.txt` and nothing else. The only
    packages fetched before the proxy exists (from the Ubuntu archive, before the firewall closes) are rsync (the entry
    point), systemd's TPM2 libraries (Phase 1 step 1: libtss2-rc0t64, which the server image lacks, plus libtss2-esys,
-   -mu and -tcti-device when a minimized install lacks those too) and squid,
+   -mu and -tcti-device with their libtss2 dependencies when a minimized install lacks those too) and squid,
    dnsmasq, jq and gettext-base (step 4, to build the proxy itself).
 2. **Secrets** live only under `/etc/atlas/secrets/`, mode 600, owned by the one service that reads them. Never
    echoed to logs, never in `atlas.env`, never in git, never inside `/srv/atlas`, never in restic's include set.
