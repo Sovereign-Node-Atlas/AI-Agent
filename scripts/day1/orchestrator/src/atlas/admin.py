@@ -172,11 +172,10 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     # Section 4.1 (S44): the reserve the Arbiter keeps for CPU-side memory, beside what the host uses right now. The
     # service reads ATLAS_ARBITER_HEADROOM_GIB from orchestrator.env (its EnvironmentFile), which a shell does not
     # carry, so that file is read here too (unreadable: the process environment and atlas.env decide, as before).
-    try:
-        unit_env = {**parse_env_file(settings.etc_dir / "orchestrator.env"), **os.environ}
-        out["host"] = {"headroom_bytes": Settings.from_env(unit_env).arbiter_headroom_bytes}
-    except ConfigError as exc:
-        out["host"] = {"headroom_bytes": settings.arbiter_headroom_bytes, "error": str(exc)}
+    unit = Settings.from_env({**parse_env_file(settings.etc_dir / "orchestrator.env"), **os.environ})
+    out["host"] = {"headroom_bytes": unit.arbiter_headroom_bytes}
+    if unit.arbiter_headroom_error:  # the orchestrator refuses to start with it (build_arbiter)
+        out["host"]["error"] = unit.arbiter_headroom_error
     meminfo = probe.host_meminfo()
     if meminfo is not None:
         out["host"].update(mem_total_bytes=meminfo[0], mem_available_bytes=meminfo[1])

@@ -33,7 +33,7 @@ from atlas.arbiter import (
     process_rss_bytes,
     read_unit_profile,
 )
-from atlas.config import EngineSpec, load_phase4_engines
+from atlas.config import ConfigError, EngineSpec, load_phase4_engines
 from atlas.engines import EngineControlError, EngineError, StubController
 from atlas.ledger import Ledger
 
@@ -361,6 +361,26 @@ def test_pool_is_capped_at_memtotal_and_gpu_page_counters_are_preferred(engines:
     assert arb2.pool_bytes == gtt_total and arb2.status()["mem_total_bytes"] is None
 
 
+def test_default_reserve_keeps_every_apex_ladder_rung_on_the_expected_node(engines: dict[str, EngineSpec]) -> None:
+    """Review v0.3.5: the S2 KV ladder's f16 rung (ctx 16384) is the Apex fallback when quantised KV is incoherent, so
+    the default reserve must leave room for it, the q8_0 rung and the everyday pair on the node Section 4.1 expects:
+    MemTotal ~183.5 GiB (192 GiB less the UMA carve-out, the page map and kdump's 4 GiB crashkernel), resident 8 GiB."""
+    from atlas.config import DEFAULT_ARBITER_HEADROOM_GIB
+
+    mem_total, resident = int(183.5 * GIB), 8 * GIB
+    probe = StubProbe(total_bytes=192 * GIB, used_bytes=resident, mem_total_bytes=mem_total,
+                      mem_available_bytes=mem_total - resident - 10 * GIB)
+    arb = Arbiter(engines, StubController(engines=engines, probe=probe), probe,
+                  headroom_bytes=DEFAULT_ARBITER_HEADROOM_GIB * GIB)
+    arb.measure_resident_set()
+    rungs = {kv: arb.projected_footprint(APEX_KEY, ctx=ctx, parallel=1, kv_class=kv).total_bytes
+             for kv, ctx in (("f16", 16384), ("q8_0", 32768), ("q4_0", 32768))}
+    assert max(rungs.values()) <= arb.budget_bytes, {k: v / GIB for k, v in rungs.items()}
+    pair = arb.projected_footprint("gpt-oss-120b").total_bytes + arb.projected_footprint(
+        "qwen2.5-vl-72b", coresident=True).total_bytes
+    assert pair <= arb.budget_bytes
+
+
 def test_sysfs_probe_reads_memtotal_and_memavailable(tmp_path: Path) -> None:
     meminfo = tmp_path / "meminfo"
     meminfo.write_text("MemTotal:       196083712 kB\nMemFree:         1000 kB\nMemAvailable:   180000000 kB\n")
@@ -380,10 +400,14 @@ def test_build_arbiter_takes_the_headroom_from_settings(engines: dict[str, Engin
     """Production wiring (S44): build_arbiter reserves Settings.arbiter_headroom_bytes; an explicit argument wins."""
     monkeypatch.setenv("ATLAS_ENGINES_ENV_DIR", str(tmp_path))
     monkeypatch.delenv("ATLAS_ARBITER_HEADROOM_GIB", raising=False)
-    assert build_arbiter(engines).headroom_bytes == 16 * GIB
+    assert build_arbiter(engines).headroom_bytes == 12 * GIB
     monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "20")
     assert build_arbiter(engines).headroom_bytes == 20 * GIB
     assert build_arbiter(engines, headroom_bytes=0).headroom_bytes == 0
+    # A bad override stops the Arbiter's construction (the orchestrator start), loudly, and nothing else.
+    monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "3")
+    with pytest.raises(ConfigError, match=r"outside 4\.\.64"):
+        build_arbiter(engines)
 
 
 def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path, tmp_path: Path,
@@ -424,7 +448,7 @@ def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path,
     (etc / "orchestrator.env").write_text("ATLAS_ARBITER_HEADROOM_GIB=2\n")
     assert admin.main(["arbiter", "status", "--json"]) == 0
     host = json.loads(capsys.readouterr().out)["host"]
-    assert host["headroom_bytes"] == 16 * GIB and "outside 4..64" in host["error"]
+    assert host["headroom_bytes"] == 12 * GIB and "outside 4..64" in host["error"]
 
 
 def test_build_arbiter_wires_the_engines_env_dir_from_settings(engines: dict[str, EngineSpec], tmp_path: Path,

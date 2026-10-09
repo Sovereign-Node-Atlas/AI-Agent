@@ -33,16 +33,19 @@ DEFAULT_LLAMA_PORT_BASE = 8100
 # Section 4.1 (v0.3.5, S44): memory the Engine Arbiter never budgets to an engine. Its resident set is read from
 # mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/Docker/
 # Cockpit 4 GB, Open WebUI/ChromaDB/graph store ~3 GB, Kokoro/Whisper/PyAnnote 3 GB, orchestrator/Celery/Redis/
-# Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it. Without a reserve the budget is the whole pool less the GPU
-# resident set, roughly 12-16 GiB more than the ~170 GB the section intends, on a node with no swap. 16 GiB = those
-# ~12 GB plus transient CPU work (Celery CPU workers, Docling, the Phase 2 tools) and kernel overhead. The Apex engine
-# (157.8 GiB projected) still fits while the pool (the smaller of the GTT total and MemTotal: kernel 7.0.0-38 reports
-# the requested 192 GiB, S47) is at least 157.8 + 16 + the GPU resident set (6-8 GiB), i.e. about 180-182 GiB; a
-# 192 GiB node with the minimal UMA carve-out (3.2) should show about 187 GiB (an estimate; V3a records the real
-# figure). Below that the Apex load is refused with the numbers in its reason (V22), and a smaller reserve is the
-# Principal's call. ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env overrides it (whole GiB, within
-# ARBITER_HEADROOM_RANGE_GIB).
-DEFAULT_ARBITER_HEADROOM_GIB = 16
+# Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it, and without a reserve they were budgeted to engines on a node
+# with no swap. 12 GiB matches those rows, the always-resident set of 4.1 less its GPU part; measured CPU-side use is
+# logged against it at every measurement, so a node that needs more says so (raise the override then).
+# Why not more: the Phase 3 KV ladder of the Apex engine (S2) projects 160.0 GiB at f16 (ctx 16384), 160.3 at q8_0 and
+# 157.8 at q4_0, and the f16 rung is the fallback when quantised KV is incoherent. It fits only while pool - GPU
+# resident set (6-8 GiB) - reserve >= 160.3 GiB, i.e. pool >= ~178-180 GiB at 12 GiB. The pool is min(GTT total,
+# MemTotal) (S47), and MemTotal on this node is expected near 183-184 GiB: 192 GiB less the UMA carve-out (3.2), the
+# kernel's page map (~3 GiB) and the 4 GiB kdump-tools reserves by default for crash dumps (crashkernel= on the GRUB
+# line, review v0.3.5; an estimate until V3a records the real figure). A 16 GiB reserve would refuse the f16 and q8_0
+# rungs on such a node. ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env overrides it (whole GiB, within
+# ARBITER_HEADROOM_RANGE_GIB); a bad value stops only the Arbiter's construction (build_arbiter), never another reader
+# of the settings (the backup freeze, Sentinel, Celery tasks).
+DEFAULT_ARBITER_HEADROOM_GIB = 12
 ARBITER_HEADROOM_RANGE_GIB: tuple[int, int] = (4, 64)  # 4 = the OS row of 4.1 alone; 64 would refuse the Apex engine
 
 # CONVENTIONS.md §8: the names that must agree across every file.
@@ -152,7 +155,9 @@ class Settings:
     # proxy.env, memory.env and every later *.env, and asdict()/vars() of this object must not dump them.
     extra: dict[str, str] = field(default_factory=dict, repr=False)
     # The Arbiter's host reserve in bytes (DEFAULT_ARBITER_HEADROOM_GIB above; ATLAS_ARBITER_HEADROOM_GIB overrides).
+    # A bad override leaves the default here and its reason in arbiter_headroom_error, which build_arbiter raises.
     arbiter_headroom_bytes: int = DEFAULT_ARBITER_HEADROOM_GIB * 1024**3
+    arbiter_headroom_error: str | None = None
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -171,15 +176,15 @@ class Settings:
         names = tuple(n for n in merged.get("FAMILY_NAMES", "").replace(",", " ").split() if n)
         extra = {k: merged[k] for k in SETTINGS_EXTRA_KEYS if merged.get(k)}
         headroom_raw = (merged.get("ATLAS_ARBITER_HEADROOM_GIB") or "").strip()
-        headroom_gib = DEFAULT_ARBITER_HEADROOM_GIB
+        headroom_gib, headroom_error = DEFAULT_ARBITER_HEADROOM_GIB, None
         if headroom_raw:
             lo, hi = ARBITER_HEADROOM_RANGE_GIB
-            try:
+            if not re.fullmatch(r"[0-9]+", headroom_raw):
+                headroom_error = f"ATLAS_ARBITER_HEADROOM_GIB={headroom_raw!r} is not a whole number of GiB"
+            elif not lo <= int(headroom_raw) <= hi:
+                headroom_error = f"ATLAS_ARBITER_HEADROOM_GIB={headroom_raw} is outside {lo}..{hi} GiB (Section 4.1)"
+            else:
                 headroom_gib = int(headroom_raw)
-            except ValueError as exc:
-                raise ConfigError(f"ATLAS_ARBITER_HEADROOM_GIB={headroom_raw!r} is not a whole number of GiB") from exc
-            if not lo <= headroom_gib <= hi:
-                raise ConfigError(f"ATLAS_ARBITER_HEADROOM_GIB={headroom_gib} is outside {lo}..{hi} GiB (Section 4.1)")
         return cls(
             config_dir=cfg,
             etc_dir=etc_dir,
@@ -189,6 +194,7 @@ class Settings:
             family_names=names,
             extra=extra,
             arbiter_headroom_bytes=headroom_gib * 1024**3,
+            arbiter_headroom_error=headroom_error,
         )
 
 

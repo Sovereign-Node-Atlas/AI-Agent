@@ -817,9 +817,13 @@ ATLAS_KERNEL_GA_METAS=(linux-generic linux-image-generic linux-headers-generic)
 ATLAS_KERNEL_HWE_GLOBS=('linux-*-hwe-26.04*' 'linux-*-hwe-24.04*' 'linux-oem-24.04*' 'linux-*-oem-24.04*')
 ATLAS_KERNEL_OEM_GLOBS=('linux-oem-26.04*' 'linux-*-oem-26.04*' 'linux-oem-7.0' 'linux-*-oem-7.0' 'oem-*-meta' 'hwe-*-meta')
 
-# _kl_installed PATTERN... — installed package names matching dpkg-query patterns, one per line, sorted.
+# _kl_installed PATTERN... — installed package names matching dpkg-query patterns, one per line, sorted. "Installed"
+# is the status letter (the second of db:Status-Abbrev), not the selection, so held packages ("hi") count; "rc" and
+# "un" do not. dpkg-query exits 1 when any one pattern matches nothing, which under pipefail and the ERR trap would
+# abort the step (review v0.3.5), so that status is swallowed: no match is an empty answer, not an error.
 _kl_installed() {
-  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' "$@" 2>/dev/null | awk '$1 == "ii" {print $2}' | LC_ALL=C sort -u
+  { dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' "$@" 2>/dev/null || true; } \
+    | awk '$1 ~ /^.[^nc]/ {print $2}' | LC_ALL=C sort -u
 }
 
 # phase1_kernel_line_report — one line describing the kernel line; returns 0 when it is the GA 7.0 line exactly as
@@ -843,7 +847,7 @@ phase1_kernel_line_report() {
 # phase1_kernel_line_todo REPORT — the to-do both step 4 and step 5 raise when the line is not GA 7.0.
 phase1_kernel_line_todo() {
   todo_add kernel-line "Kernel line is not the GA 7.0 line of Section 3.3: decide whether to move the node to linux-generic (7.0)" \
-    "Section 3.3, 3.7 W-KERNEL. Found: $1. To move: install linux-generic; GRUB boots the highest version first and an OEM image (7.0.0-10NN-oem) sorts above every 7.0.0-NN-generic one, so put GRUB_FLAVOUR_ORDER=\"generic\" in a file of its own under /etc/default/grub.d/, run update-grub and reboot into the -generic kernel; only then purge the other metapackages and that kernel's versioned linux-image/-modules/-main-modules-zfs/-headers packages (never with --autoremove), run update-grub, and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 05"
+    "Section 3.3, 3.7 W-KERNEL. Found: $1. To move: install linux-generic first. Then boot a 7.0.0-NN-generic kernel: GRUB starts the highest version, and an OEM image (7.0.0-10NN-oem) sorts above every -generic one, so for OEM put GRUB_FLAVOUR_ORDER=\"generic\" in its own file /etc/default/grub.d/NN-name.cfg (only *.cfg files are read) and run update-grub; a newer -generic image (7.3) still sorts first, so pick the 7.0.0-NN-generic entry once under GRUB's Advanced options (or grub-reboot). Only while running 7.0.0-NN-generic: purge the other metapackages and the other kernel's versioned linux-image/-modules/-main-modules-zfs/-headers packages (never the running kernel, never with --autoremove), run update-grub, reboot, and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 05"
 }
 
 # _kernel_line — step 4, after apt-get update and before the dist-upgrade (header above).
@@ -860,8 +864,8 @@ _kernel_line() {
   (( ${#hwe[@]} > 0 )) || safe=0
   [[ -z "$(_kl_installed "${ATLAS_KERNEL_OEM_GLOBS[@]}")" ]] || safe=0
   # Only Ubuntu's own kernel metapackages (source linux-meta) are ever purged; e.g. linux-nvidia-hwe-24.04 is not one.
-  foreign="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${source:Package}\n' "${ATLAS_KERNEL_HWE_GLOBS[@]}" 2>/dev/null \
-             | awk '$1 == "ii" && $3 != "linux-meta" {print $2}' | paste -sd' ')"
+  foreign="$({ dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${source:Package}\n' "${ATLAS_KERNEL_HWE_GLOBS[@]}" 2>/dev/null || true; } \
+             | awk '$1 ~ /^.[^nc]/ && $3 != "linux-meta" {print $2}' | paste -sd' ')"
   [[ -z "$foreign" ]] || { warn "kernel line: not from Ubuntu's linux-meta, never purged here: $foreign"; safe=0; }
   for p in "${img[@]}"; do [[ "$p" =~ ^linux-image-(unsigned-)?7\.0\.[0-9]+-[0-9]+-generic$ ]] || safe=0; done
   if (( ! safe )); then

@@ -29,7 +29,7 @@ objects, i.e. the three resident small models and whatever else sits on the iGPU
 Docker, Open WebUI, ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but does
 not appear on that counter (only memory a process hands the GPU through userptr or a dma-buf import does), so
 `headroom_bytes` reserves it (v0.3.5, S44: Settings.arbiter_headroom_bytes, default
-config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set by build_arbiter; the constructor's 0 is for the stub tests only).
+config.DEFAULT_ARBITER_HEADROOM_GIB = 12 GiB, set by build_arbiter; the constructor's 0 is for the stub tests only).
 Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - (GPUActive + GPUReclaim where
 the kernel reports them, else gtt_used) is the CPU-side use at that moment, shown in status() as host_used_bytes and
 logged at WARNING when it exceeds the headroom (the reserve is then too small for this node: raise
@@ -1233,7 +1233,10 @@ def build_arbiter(engines: dict[str, EngineSpec], *, ledger: Ledger | None = Non
     clash = sorted(set(phase4_engines) & set(engines))
     if clash:
         raise ConfigError(f"phase4-engines.json reuses engines.json keys {clash} (CONVENTIONS.md §8 names must agree)")
-    kw.setdefault("headroom_bytes", settings.arbiter_headroom_bytes)  # Section 4.1 host reserve (v0.3.5, S44)
+    if "headroom_bytes" not in kw:  # Section 4.1 host reserve (v0.3.5, S44); a bad override stops the Arbiter only
+        if settings.arbiter_headroom_error:
+            raise ConfigError(settings.arbiter_headroom_error)
+        kw["headroom_bytes"] = settings.arbiter_headroom_bytes
     return Arbiter({**engines, **phase4_engines}, SystemdEngineController(engines=engines), SysfsMemoryProbe(),
                    ledger=ledger, engines_env_dir=engines_env_dir, **kw)
 
