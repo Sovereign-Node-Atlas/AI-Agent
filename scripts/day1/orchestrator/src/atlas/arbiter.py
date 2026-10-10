@@ -23,20 +23,24 @@ Rule map (the numbers are Section 4.2's):
 
 Budget (Section 4.1): budget = pool - resident set - headroom, where pool = min(GTT total, MemTotal). Kernel 7.0.0-38
 reports the requested 192 GiB as the GTT total even though the node has less RAM; 7.0.0-39 and later cap it at MemTotal
-themselves (S47), and MemTotal is the real limit either way. The resident set is what mem_info_gtt_used shows before any
-engine is loaded, measured by `measure_resident_set()` at startup and again whenever nothing is resident: GPU buffer
-objects, i.e. the three resident small models and whatever else sits on the iGPU. Ordinary CPU memory (Ubuntu, XFCE,
-Docker, Open WebUI, ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but does
-not appear on that counter (only memory a process hands the GPU through userptr or a dma-buf import does), so
-`headroom_bytes` reserves it (v0.3.5, S44: Settings.arbiter_headroom_bytes, default
-config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set by build_arbiter; the constructor's 0 is for the stub tests only).
-At 16 GiB every Apex KV-ladder rung fits only because Phase 1 step 4 drops kdump's 4.25 GiB crash-kernel reservation
-from MemTotal (S48; config.py has the numbers), and V3a fails when that reservation survives.
+themselves (S47), and MemTotal is the real limit either way because Phase 1 step 4 puts kho=off on the kernel line
+(S49): Ubuntu's 7.0 kernel has kexec handover on by default, and it then keeps about 13 GiB of MemTotal (INFERRED) as
+CMA scratch that TTM/GTT pages can never use, so the pool would overstate what engines can get by that much; V3a fails
+while any of it is set aside. The resident set is what mem_info_gtt_used shows before any engine is loaded, measured
+by `measure_resident_set()` at startup and again whenever nothing is resident: GPU buffer objects, i.e. the three
+resident small models and whatever else sits on the iGPU. Ordinary CPU memory (Ubuntu, XFCE, Docker, Open WebUI,
+ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but does not appear on that
+counter (only memory a process hands the GPU through userptr or a dma-buf import does), so `headroom_bytes` reserves it
+(v0.3.5, S44: Settings.arbiter_headroom_bytes, default config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set by
+build_arbiter; the constructor's 0 is for the stub tests only).
+At 16 GiB every Apex KV-ladder rung fits; at the larger GPU resident set (about 7-8 GiB) the f16 and q8_0 rungs fit only
+because Phase 1 step 4 drops kdump's 4.25 GiB crash-kernel reservation from MemTotal (S48; config.py has the numbers),
+and V3a fails when that reservation survives.
 Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - (GPUActive + GPUReclaim where
-the kernel reports them, else gtt_used) is the CPU-side use at that moment, shown in status() as host_used_bytes and
-logged at WARNING when it exceeds the headroom (the reserve is then too small for this node: raise
-ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from, so a transient CPU job cannot shrink the budget
-between two identical requests.
+the kernel reports them, else gtt_used) is the CPU-side use at that moment (`host_used_bytes()`, which `atlas-admin
+arbiter status` prints too), shown in status() as host_used_bytes and logged at WARNING when it exceeds the headroom
+(the reserve is then too small for this node: raise ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from,
+so a transient CPU job cannot shrink the budget between two identical requests.
 
 Phase 4 engines (Section 15.2, CONVENTIONS.md §8 class `phase4`). build_arbiter() merges config/phase4-engines.json into
 the Arbiter's engine map so Phase 4 step 5 (POST /arbiter/register) records each container engine's measured footprint
@@ -131,7 +135,8 @@ APEX_KEY = "deepseek-v4-flash"  # CONVENTIONS.md §8 arbiter class `apex`
 #       are charged the full pool, which over-states the SWA half (its cells are the window, not n_ctx).
 #   nemotron-3-super, qwen3.5-122b: hybrid models whose attention layers are a minority; the per-token figure is backed
 #       out of Section 4.3's bounds ("Nemotron < 10 GB, Qwen3.5 < 15 GB at 32k x 8 slots" at q8_0). UNVERIFIED.
-#   deepseek-v4-flash: ~10 GB of f16 cache at the 32768 cap (engines.json known_issue; Section 4.3 "10-15 GB margin").
+#   deepseek-v4-flash: ~10 GB of f16 cache at the 32768 cap (engines.json known_issue; Section 4.3 gives the Apex
+#       engine "about 8 to 10 GiB of margin" at 155 GB of weights, v0.3.5).
 #       Four sub-caches; the compressor states are f32 and are inside the figure. UNVERIFIED.
 #   qwen2.5-vl-72b, meditron-70b: dense GQA, 80 layers x 8 KV heads x 128 head dim (Qwen2.5-72B / Llama-2-70B configs,
 #       UNVERIFIED from memory) = 327,680 B/token at f16.
@@ -183,6 +188,17 @@ class MemoryProbe(Protocol):
     def host_meminfo(self) -> tuple[int, int, int | None] | None:
         """(MemTotal, MemAvailable, GPUActive + GPUReclaim or None) in bytes, or None when the probe cannot tell."""
         ...
+
+
+def host_used_bytes(mem_total: int, mem_available: int, gpu_pages: int | None, gtt_used: int) -> int:
+    """CPU-side memory in use (Section 4.1, S44), the figure the Arbiter warns on when it exceeds its headroom:
+    MemTotal - MemAvailable less the GPU's pages, which are not reclaimable and so sit inside that difference. The
+    GPU's pages are GPUActive + GPUReclaim (the TTM pool pages) when the kernel reports them; else the GTT counter read
+    at the same moment, which counts BO sizes and misses pages TTM keeps pooled after a free, so it over-states CPU use
+    slightly after an unload. Never below 0. One rule for the Arbiter (`_observe_host`) and `atlas-admin arbiter
+    status`."""
+    gpu = gpu_pages if gpu_pages is not None else gtt_used
+    return max(0, mem_total - mem_available - gpu)
 
 
 def process_rss_bytes(pid: int, proc_root: Path = Path("/proc")) -> int | None:
@@ -499,10 +515,9 @@ class Arbiter:
             return
         mem_total, mem_available, gpu_pages = host
         self._mem_total_bytes = mem_total
-        # GPUActive + GPUReclaim (the TTM pool pages) when the kernel reports them; else the GTT counter, which counts
-        # BO sizes and misses pages TTM keeps pooled after a free, so it over-states CPU use slightly after an unload.
-        gpu = gpu_pages if gpu_pages is not None else (self._resident_set_bytes or 0)
-        self._host_used_bytes = max(0, mem_total - mem_available - gpu)
+        # GPUActive + GPUReclaim when the kernel reports them; else the GTT counter, which measure_resident_set() has
+        # just read into the resident set (nothing is resident then).
+        self._host_used_bytes = host_used_bytes(mem_total, mem_available, gpu_pages, self._resident_set_bytes or 0)
         over = self._host_used_bytes > self.headroom_bytes
         if over and not self._host_over:
             log.warning("arbiter: CPU-side memory in use is %.2f GiB, above the %.2f GiB headroom the budget reserves "
@@ -520,7 +535,9 @@ class Arbiter:
     @property
     def pool_bytes(self) -> int:
         """The memory engines and the resident set share: the GTT total, but never more than MemTotal. Kernel 7.0.0-38
-        reports the requested 192 GiB even though the node has less (S47); 7.0.0-39 and later cap it themselves."""
+        reports the requested 192 GiB even though the node has less (S47); 7.0.0-39 and later cap it themselves.
+        All of MemTotal can back GTT pages only with kexec handover off (kho=off, S49, gated by V3a): its CMA scratch,
+        about 13 GiB inside MemTotal when it is on, is memory TTM never gets."""
         total = self.probe.gtt_total_bytes()
         return total if self._mem_total_bytes is None else min(total, self._mem_total_bytes)
 

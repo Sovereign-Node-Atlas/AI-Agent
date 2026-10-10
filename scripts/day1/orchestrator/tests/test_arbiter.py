@@ -1,6 +1,8 @@
 """V14a: the Engine Arbiter against stub footprints (Section 4.2 rules 1-9, Section 21 V14, Phase 2 gate).
 
-Numbers: GTT total 192 GiB (amdgpu.gttsize=196608, Appendix B), resident set 22 GiB -> budget 170 GiB (Section 4.1).
+Stub numbers (make()): GTT total 192 GiB (amdgpu.gttsize=196608, Appendix B), resident set 22 GiB, no host reserve ->
+budget 170 GiB. That is a test figure, not Section 4.1's: v0.3.5 expects ~164 GiB (163 to 166) after the 16 GiB reserve,
+and the tests that set the reserve assert those figures.
 Footprints are engines.json's Section 5.1 figures read as GiB (EngineSpec.footprint_bytes, the upper bound), KV from
 the Section 4.3 model in atlas.arbiter.
 """
@@ -29,6 +31,7 @@ from atlas.arbiter import (
     SysfsMemoryProbe,
     UnknownEngine,
     build_arbiter,
+    host_used_bytes,
     kv_estimate_bytes,
     process_rss_bytes,
     read_unit_profile,
@@ -103,13 +106,16 @@ def test_kv_estimate_uses_the_total_pool_not_per_slot(engines: dict[str, EngineS
 
 
 def test_everyday_pairing_fits_and_ren_plus_arthur_does_not(engines: dict[str, EngineSpec]) -> None:
-    """Section 4.1: gpt-oss + Qwen2.5-VL (2 slots) fits ~170 GB; Nemotron + gpt-oss (186 GB) does not."""
+    """Section 4.1: gpt-oss + Qwen2.5-VL (2 slots, 157.7 GiB projected) fits the budget; Nemotron + gpt-oss (186 GB of
+    weights) does not. Checked at the stubs' 170 GiB and at 163 GiB, the low end of the ~164 GiB Section 4.1 expects."""
     arb, _, _, _ = make(engines)
     ren = arb.projected_footprint("gpt-oss-120b").total_bytes
     vision = arb.projected_footprint("qwen2.5-vl-72b", coresident=True).total_bytes
     arthur = arb.projected_footprint("nemotron-3-super").total_bytes
     assert ren + vision <= arb.budget_bytes
     assert ren + arthur > arb.budget_bytes
+    low, _, _, _ = make(engines, budget_gib=163.0)
+    assert ren + vision <= low.budget_bytes < ren + arthur
     assert arb.projected_footprint("qwen2.5-vl-72b", coresident=True).parallel == 2
     assert arb.projected_footprint("qwen2.5-vl-72b", coresident=True).ctx == 65536
 
@@ -428,11 +434,19 @@ def test_build_arbiter_takes_the_headroom_from_settings(engines: dict[str, Engin
         build_arbiter(engines)
 
 
+def test_host_used_bytes_prefers_the_gpu_page_counters_and_never_goes_negative() -> None:
+    """S44: the one rule for the CPU-side figure (the Arbiter's warning and atlas-admin arbiter status)."""
+    assert host_used_bytes(187 * GIB, 165 * GIB, 6 * GIB, 9 * GIB) == 16 * GIB  # GPUActive + GPUReclaim win
+    assert host_used_bytes(187 * GIB, 165 * GIB, None, 9 * GIB) == 13 * GIB  # else the GTT counter
+    assert host_used_bytes(187 * GIB, 180 * GIB, None, 9 * GIB) == 0  # clamped, never negative
+
+
 def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path, tmp_path: Path,
                                                                monkeypatch: pytest.MonkeyPatch,
                                                                capsys: pytest.CaptureFixture[str]) -> None:
     """`atlas-admin arbiter status` from a shell (S44): the unit reads ATLAS_ARBITER_HEADROOM_GIB from orchestrator.env,
-    so the CLI reads that file too; the process environment still wins, and a bad value is shown, not fatal."""
+    so the CLI reads that file too; the process environment still wins, and a bad value is shown, not fatal. Beside the
+    headroom it shows the CPU-side use the Arbiter warns on, by the Arbiter's own rule (arbiter.host_used_bytes)."""
     from atlas import admin
 
     etc = tmp_path / "etc"
@@ -442,23 +456,50 @@ def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path,
     monkeypatch.setenv("ATLAS_DB_PATH", str(tmp_path / "absent.sqlite3"))  # no ledger: nothing is opened
 
     class Probe:
+        gpu_pages: int | None = 6 * GIB
+        gtt_error = False
+
         def gtt_total_bytes(self) -> int:
+            if self.gtt_error:
+                raise ArbiterError("no AMD GPU (vendor 0x1002) under /sys/class/drm; is amdgpu bound?")
             return 187 * GIB
 
         def gtt_used_bytes(self) -> int:
             return 6 * GIB
 
         def host_meminfo(self) -> tuple[int, int, int | None] | None:
-            return 187 * GIB, 165 * GIB, 6 * GIB
+            return 187 * GIB, 165 * GIB, self.gpu_pages
 
     monkeypatch.setattr(admin, "SysfsMemoryProbe", Probe)
     monkeypatch.setattr(admin, "_unit_state", lambda *a, **k: "inactive")
     assert admin.main(["arbiter", "status", "--json"]) == 0
     host = json.loads(capsys.readouterr().out)["host"]
+    # CPU-side use: MemTotal 187 - MemAvailable 165 - GPU pages 6 = 16 GiB.
     assert host == {"headroom_bytes": 20 * GIB, "mem_total_bytes": 187 * GIB, "mem_available_bytes": 165 * GIB,
-                    "gpu_pages_bytes": 6 * GIB}
+                    "gpu_pages_bytes": 6 * GIB, "host_used_bytes": 16 * GIB}
     assert admin.main(["arbiter", "status"]) == 0
-    assert "host: Arbiter headroom 20 GiB" in capsys.readouterr().out
+    text = capsys.readouterr().out
+    assert ("host: Arbiter headroom 20 GiB (ATLAS_ARBITER_HEADROOM_GIB); CPU-side use 16.00 GiB (MemTotal - "
+            "MemAvailable - (GPUActive + GPUReclaim)); MemAvailable 165.00 GiB of MemTotal 187.00 GiB") in text
+    # The same figure the Arbiter computes for the same counters.
+    assert host["host_used_bytes"] == host_used_bytes(187 * GIB, 165 * GIB, 6 * GIB, 6 * GIB)
+    # A kernel without GPUActive: the GTT counter stands in, as in the Arbiter; above the headroom it says so.
+    Probe.gpu_pages = None
+    monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "12")
+    assert admin.main(["arbiter", "status", "--json"]) == 0
+    host = json.loads(capsys.readouterr().out)["host"]
+    assert host["host_used_bytes"] == 16 * GIB and "gpu_pages_bytes" not in host
+    assert admin.main(["arbiter", "status"]) == 0
+    assert "CPU-side use 16.00 GiB (MemTotal - MemAvailable - GTT used, ABOVE the headroom)" in capsys.readouterr().out
+    # Neither GPU figure readable: no CPU-side figure rather than a wrong one.
+    Probe.gtt_error = True
+    assert admin.main(["arbiter", "status", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out["gtt"] and "host_used_bytes" not in out["host"]
+    assert admin.main(["arbiter", "status"]) == 0
+    assert "CPU-side use" not in capsys.readouterr().out
+    Probe.gpu_pages, Probe.gtt_error = 6 * GIB, False
+    monkeypatch.delenv("ATLAS_ARBITER_HEADROOM_GIB")
     monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "24")
     assert admin.main(["arbiter", "status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["host"]["headroom_bytes"] == 24 * GIB

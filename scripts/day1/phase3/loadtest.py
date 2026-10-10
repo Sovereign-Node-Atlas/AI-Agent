@@ -174,10 +174,19 @@ N_PREDICT = 128
 QUEUED_RETRY_S = 15.0  # re-POST interval after an Arbiter "queued" answer (its own load_wait_s is the real queue)
 SETTLE_DELTA_BYTES = 256 * 1024 * 1024  # two GTT readings 10 s apart closer than this = the counter has settled
 GENERATION_IDLE_WAIT_S = 600.0  # Section 4.2 rule 3 belt: how long a direct request waits for the generation slot
-RESIDENCY_CACHE_BYTES = 28 * GB  # Section 4.1/4.3: "~28 GB for both caches" beside the 142 GB pair
+# V21 cache allowance above the pair's weights (residency_bounds). This window counts the weights as decimal GB
+# (142e9 bytes); Section 4.1 (v0.3.5) gives "~22 GiB for both caches" against the weights read as GiB under its
+# ~164 GiB budget, which is ~34 GB of room in this window's units. 28 GB (the v0.3.4 figure) is kept: with the slack
+# below the uncapped bound is 180e9 bytes, above any budget of 163 to 166 GiB (175.0e9 to 178.2e9), so the live budget
+# cap decides; 22 GiB here (175.6e9 uncapped) would set the bound below most of that range and fail a pair the Arbiter
+# granted inside its budget.
+RESIDENCY_CACHE_BYTES = 28 * GB
 RESIDENCY_SLACK_BYTES = 10 * GB  # allocator overhead on top of the caches before the delta is out of tolerance
 RESIDENCY_LOW_FACTOR = 0.85  # less than this fraction of the weights on the counter = the pair is not resident
-DEFAULT_BUDGET_BYTES = 170 * GB  # Section 4.1 engine budget, used only when /arbiter/status carries no budget_bytes
+# Fallback only, when /arbiter/status carries no budget_bytes (the Arbiter has not measured its resident set, and then
+# it grants nothing). 170e9 bytes = 158.3 GiB, the v0.3.4 "~170 GB" figure, below the ~164 GiB Section 4.1 now
+# expects: the stricter bound, kept rather than raised to a figure this script cannot measure.
+DEFAULT_BUDGET_BYTES = 170 * GB
 TASK_ID = "phase3-loadtest"
 UNIT_PREFIX = "llama-server@"
 P3_CLASSES = {"core", "apex", "vision", "crosscheck"}
@@ -1889,8 +1898,9 @@ def queue_proof(a: dict[str, Any], b: dict[str, Any], solo_second_s: float) -> t
 def residency_bounds(weights_bytes: int, budget_bytes: int) -> tuple[int, int]:
     """Pure V21 window for the GTT delta of the resident pair (Section 17 step 3 "confirm both hold at ~142 GB"):
     at least RESIDENCY_LOW_FACTOR of the weights (less means one engine is not really resident), at most the weights
-    plus the ~28 GB of both caches (Section 4.1/4.3) plus allocator slack, CAPPED at the live engine budget: a pair
-    that overflowed the ~170 GB budget can never pass the residency half of V21."""
+    plus the cache allowance (RESIDENCY_CACHE_BYTES; Section 4.1 expects ~22 GiB for both caches) plus allocator slack,
+    CAPPED at the live engine budget: a pair that overflowed the Arbiter's budget (~164 GiB expected, Section 4.1) can
+    never pass the residency half of V21."""
     low = int(RESIDENCY_LOW_FACTOR * weights_bytes)
     high = min(weights_bytes + RESIDENCY_CACHE_BYTES + RESIDENCY_SLACK_BYTES, int(budget_bytes))
     return low, high
@@ -1911,7 +1921,7 @@ def pick_probe_key(ctx: Ctx, exclude: Sequence[str]) -> str:
 def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: dict[str, Any],
                           loaded: list[str]) -> tuple[bool, str]:
     """Section 21 V14, real engines: the Arbiter refuses an over-budget load and downgrades a Deep Think depth when
-    the projected footprint exceeds budget. On a healthy node every engine fits the ~170 GB budget alone (Section
+    the projected footprint exceeds budget. On a healthy node every engine fits the ~164 GiB budget alone (Section
     4.1) and the Arbiter EVICTS to make room rather than refusing, so an honest over-budget projection is produced
     the way the Arbiter itself reads it: the probe engine's unit env file (phase2/engine-env.py, root) is rendered
     with a ctx_size override doubled until /internal/deep-think/plan says the standard tier no longer fits; then
@@ -2060,7 +2070,7 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     venv = ctx.render(vision_key, [("coresident", "true")], [])  # parallel_coresident / ctx_size_coresident
     if venv.get("ATLAS_CORESIDENT") != "1":
         raise Infra(f"engine-env.py did not render {vision_key} with ATLAS_CORESIDENT=1")
-    # Section 4.3: the vision engine runs 2 slots while co-resident "keeping the pair inside the ~28 GB of cache the
+    # Section 4.3: the vision engine runs 2 slots while co-resident "keeping the pair inside the ~22 GiB of cache the
     # 142 GB combination leaves". The rendered profile must BE engines.json's parallel_coresident / ctx_size_coresident
     # before anything is loaded, or the delta accepted below would be an 8-slot profile's.
     want_par, want_ctx = vspec.get("parallel_coresident"), vspec.get("ctx_size_coresident")
@@ -2102,10 +2112,10 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     weights = int((float(tspec["footprint_gb"]) + float(vspec["footprint_gb"])) * GB)  # Section 4.1: 63 + 79 = 142 GB
     low, high = residency_bounds(weights, budget)
     residency_ok = low <= delta <= high
-    mem_msg = (f"GTT delta {fmt_gb(delta)} for {text_key}+{vision_key} (weights {fmt_gb(weights)} + ~28 GB for both "
-               f"caches expected; accepted {fmt_gb(low)}-{fmt_gb(high)}, the upper bound capped at the Arbiter's "
-               f"budget {fmt_gb(budget)}; used {fmt_gb(used)}, baseline {fmt_gb(baseline)}, vision at parallel "
-               f"{venv['ATLAS_PARALLEL']}, ctx {venv['ATLAS_CTX_SIZE']})")
+    mem_msg = (f"GTT delta {fmt_gb(delta)} for {text_key}+{vision_key} (weights {fmt_gb(weights)} + both caches, "
+               f"~22 GiB expected by Section 4.1; accepted {fmt_gb(low)}-{fmt_gb(high)}, the upper bound capped at the "
+               f"Arbiter's budget {fmt_gb(budget)}; used {fmt_gb(used)}, baseline {fmt_gb(baseline)}, vision at "
+               f"parallel {venv['ATLAS_PARALLEL']}, ctx {venv['ATLAS_CTX_SIZE']})")
     out.update({"gtt_used_bytes": used, "gtt_delta_bytes": delta, "weights_bytes": weights, "budget_bytes": budget,
                 "accepted_low_bytes": low, "accepted_high_bytes": high, "residency_ok": residency_ok})
     log(f"coresident: {'OK' if residency_ok else 'OUT OF TOLERANCE'}: {mem_msg}")

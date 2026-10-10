@@ -22,11 +22,25 @@
 # kdump-tools' value on this machine; and no "Crash kernel" region in /proc/iomem), when the cmdline does not carry
 # exactly one panic= word, panic=10, when the live kernel.panic is not 10 (a sysctl override, or a value the kernel
 # rejected), or when kernel.panic_on_oops is not 0 (kdump-config sets it to 1 after loading a crash kernel). A surviving
-# reservation is a failure, not a note: with the Arbiter's 16 GiB host reserve it would refuse the Apex engine's f16 and
-# q8_0 KV-ladder rungs (Section 4.1, S2). /sys/kernel/kexec_crash_size unreadable (missing in a kernel without
-# CONFIG_CRASH_DUMP; -EBUSY while the kexec lock is held) is read as no reservation only when /proc/iomem shows no
-# "Crash kernel" region either. panic= words are counted on /proc/cmdline split at whitespace, so a quoted value that
-# contains " panic=" would be reported too: a false alarm that says what it saw, never a silent pass.
+# reservation is a failure, not a note: it comes out of MemTotal, and at the larger GPU resident set (about 7-8 GiB) the
+# Arbiter's 16 GiB host reserve would then refuse the Apex engine's f16 and q8_0 KV-ladder rungs (Section 4.1, S2).
+# /sys/kernel/kexec_crash_size unreadable (missing in a kernel without CONFIG_CRASH_DUMP; -EBUSY while the kexec lock
+# is held) is read as no reservation only when /proc/iomem shows no "Crash kernel" region either. panic= words are
+# counted on /proc/cmdline split at whitespace, so a quoted value that contains " panic=" would be reported too: a false
+# alarm that says what it saw, never a silent pass.
+# Kexec handover (S49; the same drop-in appends kho=off): Ubuntu's 7.0 kernel has it on by default
+# (CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y, VERIFIED). At boot it then sets aside scratch memory, about 13 GiB here
+# (INFERRED), and frees it to the page allocator as MIGRATE_CMA pageblocks: they stay inside MemTotal, but TTM/GTT pages
+# can never use them, so the Arbiter's pool, the smaller of the GTT total and MemTotal, would overstate what engines can
+# use. V3a fails unless the cmdline carries exactly one kho= word and it is the literal kho=off (counted like panic=;
+# kho_scratch= is another parameter and is not counted), and unless no CMA is set aside at all. The scratch is read from
+# the zone 'cma' lines of /proc/zoneinfo (pages of 4 KiB; the scratch adds to them, VERIFIED mm/mm_init.c and
+# mm/vmstat.c v7.0), less CmaTotal, which counts named CMA areas only and never the scratch; CmaFree is only the free
+# part of all CMA, but a non-zero CmaFree with CmaTotal 0 is scratch too (on a boot that is itself a kexec handover the
+# zone counters miss it). A named CMA area (cma=, hugetlb_cma=, numa_cma=, cma_pernuma=, crashkernel=...,cma) fails as
+# well: GTT pages cannot use it either, and on this node's kernel config none exists unless the cmdline asks for one,
+# so all three counters are 0 once kho=off holds. No 'cma' line at all means /proc/zoneinfo is unreadable or its format
+# changed: "cannot tell", a failure. The awk sums stay in pages; bytes are computed in bash.
 # Usage: v03a-gtt.sh [EXPECTED_GTT_MIB]   (default 196608 = 192 GiB)
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
@@ -72,11 +86,42 @@ crash_iomem="$({ grep -c 'Crash kernel' /proc/iomem 2>/dev/null || true; } | hea
 [[ "$crash_iomem" =~ ^[0-9]+$ ]] || crash_iomem="unreadable"
 crash_note=""
 if [[ "$crash_size" =~ ^[0-9]+$ && "$crash_size" != 0 ]] || [[ "$crash_iomem" =~ ^[0-9]+$ && "$crash_iomem" != 0 ]]; then
-  fails+=("crash-kernel memory is reserved: kexec_crash_size=$crash_size bytes, $crash_iomem 'Crash kernel' region(s) in /proc/iomem (crashkernel= reached the kernel: journalctl -k -b | grep -i crashkernel; with the 16 GiB Arbiter reserve the Apex f16 and q8_0 rungs no longer fit)")
+  fails+=("crash-kernel memory is reserved: kexec_crash_size=$crash_size bytes, $crash_iomem 'Crash kernel' region(s) in /proc/iomem (crashkernel= reached the kernel: journalctl -k -b | grep -i crashkernel; it comes out of MemTotal, so at the larger GPU resident set, about 7-8 GiB, the 16 GiB Arbiter reserve refuses the Apex f16 and q8_0 rungs)")
 elif [[ "$crash_size" == unreadable && "$crash_iomem" == unreadable ]]; then
   fails+=("cannot tell whether crash-kernel memory is reserved: /sys/kernel/kexec_crash_size and /proc/iomem are both unreadable")
 elif [[ "$crash_size" == unreadable ]]; then
   crash_note=" (kexec_crash_size unreadable, /proc/iomem decided)"
+fi
+
+# S49: kexec handover off (header). Exactly one kho= word, the literal kho=off (the kernel would also take 0, n, no ...).
+khos=()
+for w in "${words[@]}"; do
+  if [[ "$w" =~ ^\"?kho= ]]; then khos+=("$w"); fi
+done
+if (( ${#khos[@]} == 0 )); then
+  fails+=("cmdline lacks kho=off ($grubd)")
+elif (( ${#khos[@]} > 1 )) || [[ "${khos[0]}" != "kho=off" ]]; then
+  fails+=("cmdline carries '${khos[*]}', want exactly one kho=off ($grubd)")
+fi
+zone_cma="$(awk '$1 == "cma" && $2 ~ /^[0-9]+$/ {s += $2; n++} END {if (n) print s}' /proc/zoneinfo 2>/dev/null || true)"
+[[ "$zone_cma" =~ ^[0-9]+$ ]] || zone_cma="unreadable"
+cma_total_kb="$(awk '$1 == "CmaTotal:" {print $2}' /proc/meminfo 2>/dev/null || true)"
+[[ "$cma_total_kb" =~ ^[0-9]+$ ]] || cma_total_kb=0   # no line: a kernel without CONFIG_CMA, so no CMA at all
+cma_free_kb="$(awk '$1 == "CmaFree:" {print $2}' /proc/meminfo 2>/dev/null || true)"
+[[ "$cma_free_kb" =~ ^[0-9]+$ ]] || cma_free_kb=0
+kho_mib="?"
+if [[ "$zone_cma" == unreadable ]]; then
+  fails+=("cannot tell whether kexec handover scratch is set aside: /proc/zoneinfo is unreadable or has no 'cma' lines")
+else
+  kho_bytes=$(( zone_cma * 4096 - cma_total_kb * 1024 ))
+  (( kho_bytes > 0 )) || kho_bytes=0
+  kho_mib=$(( kho_bytes / 1048576 ))
+  if (( kho_bytes > 0 )) || (( cma_total_kb == 0 && cma_free_kb > 0 )); then
+    fails+=("kexec handover scratch is still set aside: ${kho_mib} MiB of CMA pageblocks (zone 'cma' pages in /proc/zoneinfo less CmaTotal; CmaTotal ${cma_total_kb} kB, CmaFree ${cma_free_kb} kB). GTT/TTM pages can never use CMA, so the Arbiter's pool (the smaller of the GTT total and MemTotal) overstates usable memory by that much and the Apex f16 and q8_0 rungs can fail with a Vulkan out-of-memory in Phase 3 (S49). kho=off did not take effect: grep -o '[^ ]*kho[^ ]*' /proc/cmdline; journalctl -k -b | grep -E 'KHO:|Malformed early option'; ls /sys/kernel/debug/kho ($grubd)")
+  fi
+  if (( cma_total_kb > 0 )); then
+    fails+=("a named CMA area holds ${cma_total_kb} kB (CmaTotal; ls /sys/kernel/mm/cma), set by cma=, hugetlb_cma=, numa_cma=, cma_pernuma= or crashkernel=...,cma on /proc/cmdline; GTT pages cannot use it either (S49; $grubd)")
+  fi
 fi
 
 ram_mib=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 ))
@@ -113,7 +158,7 @@ else
 fi
 grep -qi 'GFX1151' <<<"$vk" || fails+=("vulkaninfo does not report RADV GFX1151: $vk")
 
-summary="gtt_total=${total:-?} MiB, ${pool:-not matched} (requested $expected, MemTotal $ram_mib MiB); ttm.pages_limit=$pages; amdgpu.gttsize=$gttparam; lockup_timeout=$lockup; crash kernel: kexec_crash_size=$crash_size, iomem regions=$crash_iomem$crash_note; panic: cmdline '${panics[*]:-none}', kernel.panic=$panic_live, panic_on_oops=$oops_live; dmesg='${ready:-no GTT ready line}' deprecation_warn=$deprec; vulkan='$vk'$hint"
+summary="gtt_total=${total:-?} MiB, ${pool:-not matched} (requested $expected, MemTotal $ram_mib MiB); ttm.pages_limit=$pages; amdgpu.gttsize=$gttparam; lockup_timeout=$lockup; crash kernel: kexec_crash_size=$crash_size, iomem regions=$crash_iomem$crash_note; panic: cmdline '${panics[*]:-none}', kernel.panic=$panic_live, panic_on_oops=$oops_live; kho: cmdline '${khos[*]:-none}', CMA ${zone_cma} pages (KHO scratch ${kho_mib} MiB), CmaTotal ${cma_total_kb} kB, CmaFree ${cma_free_kb} kB; dmesg='${ready:-no GTT ready line}' deprecation_warn=$deprec; vulkan='$vk'$hint"
 if (( ${#fails[@]} > 0 )); then
   echo "V3a fail: ${fails[*]}; $summary"
   exit 1

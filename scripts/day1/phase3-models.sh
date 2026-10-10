@@ -43,7 +43,7 @@
 #       path, and, when a SIGKILL/OOM/power cut skipped that, loudly at the start of the next invocation (--status
 #       included). loadtest.py also waits for the orchestrator's generation slot before each direct request.
 #   03  two-residency: gpt-oss-120b + qwen2.5-vl-72b (vision at parallel_coresident / ctx_size_coresident, asserted on
-#       the rendered env), ~142 GB of weights plus ~28 GB of caches on the GTT counter with the upper bound capped at
+#       the rendered env), ~142 GB of weights plus their caches (~22 GiB, Section 4.1) on the GTT counter, capped at
 #       the Arbiter's live budget, two generation requests through the orchestrator (/internal/v1/chat/completions),
 #       the second proven to start after the first finished (V21); then, with the pair resident, the Arbiter's refusal
 #       of an over-budget load and its Deep Think downgrade against the real engine set (V14b, Section 21 V14). A

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# phase1/crash_params_test.sh — regression test (option (c) of 2026-10-10, doc S48) for phase1/04-system.sh's
-# crash-kernel and panic changes: the GRUB drop-in that _grub_crash_dropin renders (zzz-atlas-crash.cfg), _grub_params
-# with its post-update-grub checks, and _kdump_off; plus phase1/05-postboot.sh's _panic_log_record.
+# phase1/crash_params_test.sh — regression test (option (c) of 2026-10-10, doc S48, and kho=off, S49) for
+# phase1/04-system.sh's crash-kernel, panic and kexec handover changes: the GRUB drop-in that _grub_crash_dropin renders
+# (zzz-atlas-crash.cfg), _grub_params with its post-update-grub checks and its scratch record (_kho_scratch_note), and
+# _kdump_off; plus phase1/05-postboot.sh's _panic_log_record.
 # The drop-in is sourced the way grub-mkconfig sources it: by dash, under `set -e`, through grub-mkconfig's own sourcing
 # loop copied verbatim (grub2-common 2.14-2ubuntu2.1, /usr/sbin/grub-mkconfig lines 1-2 and 160-169), after the stock
 # 26.04 /etc/default/grub lines, curtin's 50-curtin-settings.cfg, the 90-atlas.cfg _grub_params writes and the REAL
@@ -144,18 +145,19 @@ apt_wait_idle() { :; }
 # _grub_crash_dropin is taken unchanged: the test sources exactly what step 4 writes.
 relocate() { sed -e 's#/etc/default/#${CP_ROOT}/etc/default/#g' -e 's#/boot/grub/#${CP_ROOT}/boot/grub/#g' \
                  -e 's#/sys/kernel/#${CP_ROOT}/sys/kernel/#g' -e 's#/sys/module/#${CP_ROOT}/sys/module/#g' \
-                 -e 's#/sys/fs/pstore#${CP_ROOT}/sys/fs/pstore#g' -e 's#/var/lib/systemd/pstore#${CP_ROOT}/var/pstore#g'; }
+                 -e 's#/sys/fs/pstore#${CP_ROOT}/sys/fs/pstore#g' -e 's#/var/lib/systemd/pstore#${CP_ROOT}/var/pstore#g' \
+                 -e 's#/proc/zoneinfo#${CP_ROOT}/proc/zoneinfo#g' -e 's#/proc/meminfo#${CP_ROOT}/proc/meminfo#g'; }
 # shellcheck source=/dev/null
 source <(grep -E '^(export ATLAS_GRUB_PARAMS|ATLAS_GRUB_CRASH_DROPIN)=' "$REPO/phase1/04-system.sh"
          extract "$REPO/phase1/04-system.sh" _grub_crash_dropin
-         for f in _kdump_off _grub_params; do extract "$REPO/phase1/04-system.sh" "$f" | relocate; done
+         for f in _kdump_off _grub_params _kho_scratch_note; do extract "$REPO/phase1/04-system.sh" "$f" | relocate; done
          extract "$REPO/phase1/05-postboot.sh" _panic_log_record | relocate
          extract "$REPO/lib/common.sh" ensure_kv)
 P="$ATLAS_GRUB_PARAMS"
 DROPIN_NAME="${ATLAS_GRUB_CRASH_DROPIN##*/}"   # the production name: its byte order is part of what is tested (1j)
 [[ "$ATLAS_GRUB_CRASH_DROPIN" == "/etc/default/grub.d/$DROPIN_NAME" && "$DROPIN_NAME" == *.cfg ]] \
   || { echo "FAIL ATLAS_GRUB_CRASH_DROPIN='$ATLAS_GRUB_CRASH_DROPIN' is not a *.cfg under /etc/default/grub.d"; exit 1; }
-for f in _grub_crash_dropin _kdump_off _grub_params _panic_log_record ensure_kv; do
+for f in _grub_crash_dropin _kdump_off _grub_params _kho_scratch_note _panic_log_record ensure_kv; do
   declare -F "$f" >/dev/null || { echo "FAIL could not extract $f"; exit 1; }
 done
 
@@ -169,7 +171,7 @@ strict() {
 n=0
 new_root() {  # new_root — a fresh node tree for one case; sets CP_ROOT and ATLAS_GRUB_CRASH_DROPIN
   n=$((n + 1)); CP_ROOT="$T/c$n"
-  mkdir -p "$CP_ROOT/etc/default/grub.d" "$CP_ROOT/boot/grub" "$CP_ROOT/sys/kernel"
+  mkdir -p "$CP_ROOT/etc/default/grub.d" "$CP_ROOT/boot/grub" "$CP_ROOT/sys/kernel" "$CP_ROOT/proc"
   : >"$CP_ROOT/out"; : >"$CP_ROOT/calls"
   ATLAS_GRUB_CRASH_DROPIN="$CP_ROOT/etc/default/grub.d/$DROPIN_NAME"
 }
@@ -187,18 +189,21 @@ first_linux() { grep -m1 -E '^[[:space:]]*linux[[:space:]]' "$CP_ROOT/boot/grub/
 recovery_linux() { grep -E '^[[:space:]]*linux[[:space:]].* recovery ' "$CP_ROOT/boot/grub/grub.cfg"; }
 
 # --- 1. The drop-in through _grub_params and the grub-mkconfig harness ---------------------------------------------
-# 1a. The node as installed: stock GRUB line, curtin's drop-in, kdump-tools.cfg. crashkernel= gone, panic=10 last.
+# 1a. The node as installed: stock GRUB line, curtin's drop-in, kdump-tools.cfg. crashkernel= gone, panic=10 kho=off last.
 grub_case "quiet splash" ""
 ok "stock: _grub_params exits 0, no ERR trap" "$(strict _grub_params)" "0:"
-ok "stock: GRUB_CMDLINE_LINUX_DEFAULT" "$(result DEFAULT)" "quiet splash $P panic=10"
+ok "stock: GRUB_CMDLINE_LINUX_DEFAULT" "$(result DEFAULT)" "quiet splash $P panic=10 kho=off"
 ok "stock: GRUB_CMDLINE_LINUX" "$(result LINUX)" ""
 ok "stock: no crashkernel= anywhere in grub.cfg" "$(grep -c 'crashkernel=' "$CP_ROOT/boot/grub/grub.cfg")" "0"
-ok "stock: normal and advanced lines end in panic=10" "$(grep -cE '^[[:space:]]*linux[[:space:]].* panic=10$' "$CP_ROOT/boot/grub/grub.cfg")" "2"
+ok "stock: normal and advanced lines end in panic=10 kho=off" "$(grep -cE '^[[:space:]]*linux[[:space:]].* panic=10 kho=off$' "$CP_ROOT/boot/grub/grub.cfg")" "2"
 ok "stock: recovery line has no panic= (kernel default, console attended)" "$(recovery_linux | grep -c 'panic=')" "0"
-for p in $P panic=10; do
+ok "stock: recovery line has no kho= (no engine runs there)" "$(recovery_linux | grep -c 'kho=')" "0"
+for p in $P panic=10 kho=off; do
   ok "stock: $p exactly once on the first kernel line" "$(first_linux | tr -s '[:space:]' '\n' | grep -cxF -- "$p")" "1"
 done
-ok "stock: one log line naming panic=10" "$(grep -c "^LOG: GRUB: $P panic=10, no crashkernel=" "$CP_ROOT/out")" "1"
+ok "stock: one log line naming panic=10 kho=off" "$(grep -c "^LOG: GRUB: $P panic=10 kho=off, no crashkernel=" "$CP_ROOT/out")" "1"
+ok "stock: the log line says the scratch could not be read (no /proc/zoneinfo here)" \
+   "$(grep -c "^LOG: GRUB: .*; kexec handover scratch on this boot: unreadable (no 'cma' lines in .*/proc/zoneinfo)$" "$CP_ROOT/out")" "1"
 ok "stock: kdump-tools.cfg left untouched (a dpkg conffile)" "$(cat "$CP_ROOT/etc/default/grub.d/kdump-tools.cfg")" "$KDUMP_CFG"
 ok "stock: /etc/default/grub left untouched" "$(grep -c "^GRUB_CMDLINE_LINUX_DEFAULT='quiet splash'\$" "$CP_ROOT/etc/default/grub")" "1"
 # 1b. Rerun (rule §7.3): the same files, byte for byte, and the same kernel line.
@@ -213,43 +218,43 @@ ok "rerun: the drop-in is the rendered one" "$(cmp -s "$ATLAS_GRUB_CRASH_DROPIN"
 # 1c. kdump-tools not installed: same line.
 grub_case "quiet splash" "" none
 ok "no kdump-tools.cfg: exits 0" "$(strict _grub_params)" "0:"
-ok "no kdump-tools.cfg: DEFAULT" "$(result DEFAULT)" "quiet splash $P panic=10"
+ok "no kdump-tools.cfg: DEFAULT" "$(result DEFAULT)" "quiet splash $P panic=10 kho=off"
 
 # 1d. crashkernel= in both variables (a hand edit), with ,high / ,low forms: all gone, other words kept.
 grub_case "quiet crashkernel=512M splash" "crashkernel=1G-:256M,high foo=1 crashkernel=72M,low"
 ok "crashkernel in both: exits 0" "$(strict _grub_params)" "0:"
 ok "crashkernel in both: LINUX" "$(result LINUX)" "foo=1"
-ok "crashkernel in both: DEFAULT" "$(words "$(result DEFAULT)")" "quiet splash $P panic=10"
+ok "crashkernel in both: DEFAULT" "$(words "$(result DEFAULT)")" "quiet splash $P panic=10 kho=off"
 
 # 1e. panic=0 and panic=5 already present: removed; panic=10 is the only panic= word.
 grub_case "panic=0 quiet" "panic=5"
 ok "panic=0/panic=5 present: exits 0" "$(strict _grub_params)" "0:"
 ok "panic=0/panic=5 present: LINUX" "$(result LINUX)" ""
-ok "panic=0/panic=5 present: DEFAULT" "$(result DEFAULT)" "quiet $P panic=10"
+ok "panic=0/panic=5 present: DEFAULT" "$(result DEFAULT)" "quiet $P panic=10 kho=off"
 
 # 1f. Words that merely contain "panic" stay: oops=panic, panic_on_warn=1, nopanic, xpanic=3.
 grub_case "quiet nopanic xpanic=3" "oops=panic panic_on_warn=1"
 ok "oops=panic etc.: exits 0" "$(strict _grub_params)" "0:"
 ok "oops=panic etc.: LINUX kept" "$(result LINUX)" "oops=panic panic_on_warn=1"
-ok "oops=panic etc.: DEFAULT kept" "$(result DEFAULT)" "quiet nopanic xpanic=3 $P panic=10"
+ok "oops=panic etc.: DEFAULT kept" "$(result DEFAULT)" "quiet nopanic xpanic=3 $P panic=10 kho=off"
 
 # 1g. Extra spaces and tabs around the words: whole words removed, no leading or trailing blank left.
 grub_case $'  quiet\t\tsplash   panic=3  ' $'\t crashkernel=256M   a=1 '
 ok "spaces and tabs: exits 0" "$(strict _grub_params)" "0:"
 ok "spaces and tabs: LINUX" "$(result LINUX)" "a=1"
-ok "spaces and tabs: DEFAULT words" "$(words "$(result DEFAULT)")" "quiet splash $P panic=10"
+ok "spaces and tabs: DEFAULT words" "$(words "$(result DEFAULT)")" "quiet splash $P panic=10 kho=off"
 ok "spaces and tabs: no blank at either end" "$(result DEFAULT | grep -cE '^[[:space:]]|[[:space:]]$')" "0"
 
 # 1h. A quoted value with spaces is one word to the kernel (kernel/params.c next_arg) and stays whole.
 grub_case 'quiet dyndbg="module amdgpu +p"' 'foo="a b"'
 ok "quoted values: exits 0" "$(strict _grub_params)" "0:"
 ok "quoted values: LINUX" "$(result LINUX)" 'foo="a b"'
-ok "quoted values: DEFAULT" "$(result DEFAULT)" "quiet dyndbg=\"module amdgpu +p\" $P panic=10"
+ok "quoted values: DEFAULT" "$(result DEFAULT)" "quiet dyndbg=\"module amdgpu +p\" $P panic=10 kho=off"
 
 # 1i. An empty /etc/default/grub (both variables start unset; step 4 needs the file itself, which grub ships).
 grub_case "" ""; : >"$CP_ROOT/etc/default/grub"
 ok "empty /etc/default/grub: exits 0" "$(strict _grub_params)" "0:"
-ok "empty /etc/default/grub: DEFAULT" "$(result DEFAULT)" "$P panic=10"
+ok "empty /etc/default/grub: DEFAULT" "$(result DEFAULT)" "$P panic=10 kho=off"
 ok "empty /etc/default/grub: LINUX" "$(result LINUX)" ""
 
 # 1j. zz-kdump-tools.cfg (the DGX crashkernel package's name) sorts before zzz-atlas-crash.cfg in dash's glob: stripped.
@@ -285,6 +290,64 @@ printf 'X=1\n[ -n "" ] && X=2\n' >"$CP_ROOT/etc/default/grub.d/60-broken.cfg"
 r="$(strict _grub_params)"
 ok "broken drop-in: update-grub failure stops step 4" "${r%%:*}:$(grep -c '^DIE: update-grub failed' "$CP_ROOT/out")" "99:1"
 
+# 1o. S49: kho= words in both variables (kho=on in LINUX, kho=1 and a quoted "kho=y" in DEFAULT): all gone, kho=off is
+#     the one kho= word, last on the normal and advanced lines; kho_scratch= stays (another parameter, inert with kho=off).
+grub_case 'quiet kho=1 "kho=y" kho_scratch=16M,512M,256M splash' 'kho=on foo=1'
+ok "kho= in both: exits 0" "$(strict _grub_params)" "0:"
+ok "kho= in both: LINUX" "$(result LINUX)" "foo=1"
+ok "kho= in both: DEFAULT" "$(words "$(result DEFAULT)")" "quiet kho_scratch=16M,512M,256M splash $P panic=10 kho=off"
+ok "kho= in both: kho= exactly once on the first kernel line" "$(first_linux | tr -s '[:space:]' '\n' | grep -c '^"\{0,1\}kho=')" "1"
+ok "kho= in both: recovery line has no kho=" "$(recovery_linux | grep -c 'kho=')" "0"
+
+# 1p. A drop-in sorting AFTER ours adds kho=on (the kernel would take it, the last valid kho=): step 4 stops.
+grub_case "quiet splash" ""
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT kho=on"\n' >"$CP_ROOT/etc/default/grub.d/zzzz-local.cfg"
+r="$(strict _grub_params)"
+ok "later kho=on drop-in: dies naming both tokens" "${r%%:*}:$(grep -c "carries the kho tokens 'kho=off kho=on', expected exactly one kho=off (S49" "$CP_ROOT/out")" "99:1"
+
+# 1p2. The same with a quoted "kho=on" and a quoted "panic=5" (the kernel's next_arg strips the quotes, so each still
+#      wins): step 4 stops on each, naming the quoted token.
+grub_case "quiet splash" ""
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT \\"kho=on\\""\n' >"$CP_ROOT/etc/default/grub.d/zzzz-local.cfg"
+r="$(strict _grub_params)"
+ok "later quoted kho=on drop-in: dies naming both tokens" "${r%%:*}:$(grep -c "carries the kho tokens 'kho=off \"kho=on\"'" "$CP_ROOT/out")" "99:1"
+grub_case "quiet splash" ""
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT \\"panic=5\\""\n' >"$CP_ROOT/etc/default/grub.d/zzzz-local.cfg"
+r="$(strict _grub_params)"
+ok "later quoted panic=5 drop-in: dies naming both tokens" "${r%%:*}:$(grep -c "carries the panic tokens 'panic=10 \"panic=5\"'" "$CP_ROOT/out")" "99:1"
+
+# 1q. A drop-in sorting after ours takes kho=off away again: step 4 stops ("none").
+grub_case "quiet splash" ""
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT%% kho=off}"\n' >"$CP_ROOT/etc/default/grub.d/zzzz-local.cfg"
+r="$(strict _grub_params)"
+ok "later drop-in drops kho=off: dies" "${r%%:*}:$(grep -c "carries the kho tokens 'none', expected exactly one kho=off" "$CP_ROOT/out")" "99:1"
+ok "later drop-in drops kho=off: says where to look" "$(grep -c "kho=off .*look for a drop-in sorting after it" "$CP_ROOT/out")" "1"
+
+# 1r. A quoted value that contains " kho=" stays whole in the drop-in (the kernel reads it as one word), but step 4's
+#     whitespace split counts it: a loud false alarm, never a silent pass (as for panic=).
+grub_case "quiet splash" 'foo="a kho=on"'
+r="$(strict _grub_params)"
+ok "kho= inside a quoted value: kept by the drop-in, step 4 stops" \
+   "${r%%:*}:$(result LINUX):$(grep -c "carries the kho tokens 'kho=on\" kho=off'" "$CP_ROOT/out")" '99:foo="a kho=on":1'
+
+# 1s. The scratch record: this boot's zone cma pages less CmaTotal, in MiB (3407872 pages = 13312 MiB); a named CMA area
+#     alone (zone pages = CmaTotal) is no scratch.
+grub_case "quiet splash" ""
+printf 'Node 0, zone    DMA32\n        managed  450000\n        cma      131072\n      nr_free_cma  9\nNode 0, zone   Normal\n        managed  48000000\n        cma      3276800\n' >"$CP_ROOT/proc/zoneinfo"
+printf 'MemTotal:       196608000 kB\nCmaTotal:              0 kB\nCmaFree:        12520000 kB\n' >"$CP_ROOT/proc/meminfo"
+ok "scratch record: exits 0" "$(strict _grub_params)" "0:"
+ok "scratch record: 13312 MiB logged" \
+   "$(grep -c '^LOG: GRUB: .*; kexec handover scratch on this boot: 13312 MiB of CMA (zone cma 3407872 pages, CmaTotal 0 kB), usable by GTT once kho=off applies$' "$CP_ROOT/out")" "1"
+grub_case "quiet splash" ""
+printf 'Node 0, zone    DMA32\n        cma      131072\nNode 0, zone   Normal\n        cma      0\n' >"$CP_ROOT/proc/zoneinfo"
+printf 'CmaTotal:         524288 kB\n' >"$CP_ROOT/proc/meminfo"
+ok "scratch record, named area only: 0 MiB" "$(strict _grub_params):$(grep -c 'scratch on this boot: 0 MiB of CMA (zone cma 131072 pages, CmaTotal 524288 kB)' "$CP_ROOT/out")" "0::1"
+
+grub_case "quiet splash" ""
+printf 'Node 0, zone   Normal\n        managed  48000000\n      nr_free_cma  0\n' >"$CP_ROOT/proc/zoneinfo"
+ok "scratch record, zoneinfo without cma lines: unreadable" \
+   "$(strict _grub_params):$(grep -c "scratch on this boot: unreadable (no 'cma' lines in .*/proc/zoneinfo)" "$CP_ROOT/out")" "0::1"
+
 # --- 2. The drop-in on its own, under dash and set -e ---------------------------------------------------------------
 new_root
 _grub_crash_dropin >"$CP_ROOT/zzz.cfg"
@@ -298,20 +361,25 @@ GRUB_CMDLINE_LINUX_DEFAULT="$2"; GRUB_CMDLINE_LINUX="$3"
 printf '%s|%s\n' "$GRUB_CMDLINE_LINUX_DEFAULT" "$GRUB_CMDLINE_LINUX"
 SH
 src() { dash "$CP_ROOT/source.sh" "$CP_ROOT/zzz.cfg" "$1" "$2"; }
-ok "alone: empty variables" "$(src "" "")" "panic=10|"
-ok "alone: quoted value containing ' panic=' kept whole" "$(src 'foo="a panic=3 b" q' '')" 'foo="a panic=3 b" q panic=10|'
-ok "alone: quoted panic words removed" "$(src '"panic=5" panic="7" "panic=6"x z' '')" "z panic=10|"
+ok "alone: empty variables" "$(src "" "")" "panic=10 kho=off|"
+ok "alone: quoted value containing ' panic=' kept whole" "$(src 'foo="a panic=3 b" q' '')" 'foo="a panic=3 b" q panic=10 kho=off|'
+ok "alone: quoted panic words removed" "$(src '"panic=5" panic="7" "panic=6"x z' '')" "z panic=10 kho=off|"
+ok "alone: kho= words removed from both variables, quoted or not" \
+   "$(src 'kho=1 a "kho=on" kho="y" "kho=0"x' 'kho=on b kho=')" "a panic=10 kho=off|b"
+ok "alone: kho_scratch=, liveupdate=, a bare kho and a quoted value containing ' kho=' kept" \
+   "$(src 'kho_scratch=16M,512M,256M foo="a kho=on" kho' 'liveupdate=on xkho=1')" \
+   'kho_scratch=16M,512M,256M foo="a kho=on" kho panic=10 kho=off|liveupdate=on xkho=1'
 ok "alone: crashkernel inside a quoted value left (the substring check catches it)" \
-   "$(src 'bar="x crashkernel=1 y"' '')" 'bar="x crashkernel=1 y" panic=10|'
-ok "alone: sourced twice, one panic=10" \
+   "$(src 'bar="x crashkernel=1 y"' '')" 'bar="x crashkernel=1 y" panic=10 kho=off|'
+ok "alone: sourced twice, one panic=10 and one kho=off" \
    "$(dash -c 'set -e; GRUB_CMDLINE_LINUX_DEFAULT="a panic=1"; . "$1"; . "$1"; printf %s "$GRUB_CMDLINE_LINUX_DEFAULT"' sh "$CP_ROOT/zzz.cfg")" \
-   "a panic=10"
+   "a panic=10 kho=off"
 ok "alone: same under POSIXLY_CORRECT (no GNU sed escapes)" \
-   "$(POSIXLY_CORRECT=1 src 'dyndbg="m a +p" "panic=5" crashkernel=4G b' 'panic=1 x')" 'dyndbg="m a +p" b panic=10|x'
+   "$(POSIXLY_CORRECT=1 src 'dyndbg="m a +p" "panic=5" crashkernel=4G kho=on b' 'panic=1 x "kho=1"')" 'dyndbg="m a +p" b panic=10 kho=off|x'
 ok "alone: same under bash (grub-efi-amd64's postinst sources grub.d with bash -e)" \
-   "$(bash "$CP_ROOT/source.sh" "$CP_ROOT/zzz.cfg" 'q crashkernel=1 panic=2' 'panic=3')" "q panic=10|"
+   "$(bash "$CP_ROOT/source.sh" "$CP_ROOT/zzz.cfg" 'q crashkernel=1 panic=2 kho=y' 'panic=3 kho=1')" "q panic=10 kho=off|"
 ok "alone: under set -u too" \
-   "$(dash -c 'set -eu; . "$1"; printf %s "$GRUB_CMDLINE_LINUX_DEFAULT|$GRUB_CMDLINE_LINUX"' sh "$CP_ROOT/zzz.cfg")" "panic=10|"
+   "$(dash -c 'set -eu; . "$1"; printf %s "$GRUB_CMDLINE_LINUX_DEFAULT|$GRUB_CMDLINE_LINUX"' sh "$CP_ROOT/zzz.cfg")" "panic=10 kho=off|"
 # Nothing leaks into grub-mkconfig's shell but the two variables: same variables otherwise, same shell options.
 cat >"$CP_ROOT/leak.sh" <<'SH'
 set -e
@@ -334,7 +402,7 @@ ok "harness: a last '[ -n \"\" ] && X=2' aborts" "$neg_rc" "1"
 neg x "X=\$(printf 'a\\n' | grep -v a)"
 ok "harness: X=\$(... | grep -v ...) with no output aborts" "$neg_rc" "1"
 neg "${DROPIN_NAME%.cfg}" "$(_grub_crash_dropin)"
-ok "harness: the rendered drop-in alone succeeds" "$neg_rc:$(result DEFAULT)" "0:panic=10"
+ok "harness: the rendered drop-in alone succeeds" "$neg_rc:$(result DEFAULT)" "0:panic=10 kho=off"
 
 # --- 3. _kdump_off -------------------------------------------------------------------------------------------------
 kd_case() {  # kd_case STATUS UNIT [loaded] [crash_size] — STATUS "" means not installed

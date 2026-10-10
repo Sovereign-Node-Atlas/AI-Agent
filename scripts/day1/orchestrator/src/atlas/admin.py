@@ -3,7 +3,8 @@
 Subcommands and who calls them:
   init-db              phase2/02-orchestrator.sh step 7: create ATLAS_DB_PATH (idempotent)
   engines list         the engines.json table with ports and unit state
-  arbiter status       live GTT counters, the host reserve beside MemAvailable (S44), unit states, last decisions
+  arbiter status       live GTT counters, the host reserve beside the CPU-side use the Arbiter warns on and MemAvailable
+                       (S44), unit states, last decisions
   vault-session-test   V18 helper: `atlas-admin vault-session-test --file PATH [--idle-seconds N]` (contract in
                        phase2/README-contracts.md, called by verify/v18-vault.sh); the implementation is
                        atlas.vault.vault_session_test(idle_seconds, file=...) (another writer), imported lazily
@@ -36,7 +37,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from atlas.arbiter import GIB, MAX_RESIDENT, ArbiterError, SysfsMemoryProbe
+from atlas.arbiter import GIB, MAX_RESIDENT, ArbiterError, SysfsMemoryProbe, host_used_bytes
 from atlas.config import (
     ConfigError,
     EngineSpec,
@@ -181,6 +182,11 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
         out["host"].update(mem_total_bytes=meminfo[0], mem_available_bytes=meminfo[1])
         if meminfo[2] is not None:
             out["host"]["gpu_pages_bytes"] = meminfo[2]
+        # The CPU-side use the Arbiter compares with the headroom, by its own rule (arbiter.host_used_bytes): the GPU's
+        # pages from GPUActive + GPUReclaim, else from the GTT counter read above. Without either it is not shown.
+        if meminfo[2] is not None or "used_bytes" in out["gtt"]:
+            out["host"]["host_used_bytes"] = host_used_bytes(meminfo[0], meminfo[1], meminfo[2],
+                                                             out["gtt"].get("used_bytes", 0))
     active: list[EngineSpec] = []
     for spec in engines.values():
         state = _unit_state(controller, spec.key, spec)
@@ -204,6 +210,10 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     line = f"host: Arbiter headroom {host['headroom_bytes'] / GIB:.0f} GiB (ATLAS_ARBITER_HEADROOM_GIB)"
     if "error" in host:
         line += f" [orchestrator.env: {host['error']}]"
+    if "host_used_bytes" in host:
+        gpu_from = "(GPUActive + GPUReclaim)" if "gpu_pages_bytes" in host else "GTT used"
+        line += (f"; CPU-side use {host['host_used_bytes'] / GIB:.2f} GiB (MemTotal - MemAvailable - {gpu_from}"
+                 f"{', ABOVE the headroom' if host['host_used_bytes'] > host['headroom_bytes'] else ''})")
     if "mem_total_bytes" in host:
         line += (f"; MemAvailable {host['mem_available_bytes'] / GIB:.2f} GiB of MemTotal "
                  f"{host['mem_total_bytes'] / GIB:.2f} GiB")

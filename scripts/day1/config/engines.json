@@ -164,7 +164,7 @@
       "ctx_size": 32768,
       "ctx_per_slot": 32768,
       "ctx_size_f16_cap": 16384,
-      "ctx_size_f16_cap_note": "UNVERIFIED (fix round): the f16 rung runs at half the q4_0 pool because f16 KV is ~3.5x the bytes of q4_0 per token; q4_0 at 32768 is what the 10-15 GB margin of Section 4.3 / Appendix B is written for, so f16 at 16384 costs ~1.75x that and stays inside the margin. Phase 3 measures the real llama_kv_cache sizes; lower this if the f16 rung OOMs.",
+      "ctx_size_f16_cap_note": "UNVERIFIED (fix round): the f16 rung runs at half the q4_0 pool because f16 KV is ~3.5x the bytes of q4_0 per token; q4_0 at 32768 is what the margin of Section 4.3 / Appendix B (about 8 to 10 GiB beside 155 GB of weights, v0.3.5) is written for, so f16 at 16384 costs ~1.75x that (~5 GiB of KV by the Arbiter's model) and stays inside the margin. Phase 3 measures the real llama_kv_cache sizes; lower this if the f16 rung OOMs.",
       "parallel": 1,
       "n_keep": 4096,
       "extra_args": ["--jinja", "--temp", "1.0", "--top-p", "1.0", "--min-p", "0", "-b", "2048", "-ub", "512"],
@@ -173,7 +173,7 @@
       "kv_proof_lines": 4,
       "min_llama_cpp_tag": "b9840",
       "known_issue": "Quantised KV on deepseek4 disputed (issues #25382, #26423; PR #25391 unmerged): Phase 3 ladders f16 -> q8_0 -> q4_0 (Section 4.3 / Section 23 S2, kv_ladder_rule) with a coherence prompt at each rung and keeps the LOWEST coherent rung reached: the descent stops at the first rung that fails to load or is incoherent and the previous winner stands. V4 records '<type> applied and coherent' for that winner; a q8_0 or f16 winner is written to overrides.json. An f16-only result caps ctx_size at ctx_size_f16_cap (16384), records V4 deferred and V22 pass with a note (S2); no coherent rung defers both (R19). --parallel MUST be explicit (issue #26654). Kernel 7.x DeviceLost needs amdgpu.lockup_timeout=10000,60000,10000,10000 (issue #25664, Phase 1 GRUB).",
-      "notes": "The 0731 checkpoint supersedes the April preview (research conflict b). Four llama_kv_cache lines (raw, CSA, HCA, indexer) plus f32 compressor states. The optional DSpark drafter at the repo root is NOT pulled on Day 1. Slots and context are the closed baseline, not a deviation: Section 4.3 / Appendix B / Section 23 S3: --parallel 1, reduced --ctx-size (32768: only 10-15 GB remain beside 155 GB of weights, Section 4.1, 4.3, Appendix B; the auto slot count OOMs on this architecture, S3)."
+      "notes": "The 0731 checkpoint supersedes the April preview (research conflict b). Four llama_kv_cache lines (raw, CSA, HCA, indexer) plus f32 compressor states. The optional DSpark drafter at the repo root is NOT pulled on Day 1. Slots and context are the closed baseline, not a deviation: Section 4.3 / Appendix B / Section 23 S3: --parallel 1, reduced --ctx-size (32768: only about 8 to 10 GiB remain beside 155 GB of weights, Section 4.1, 4.3, Appendix B; the auto slot count OOMs on this architecture, S3)."
     },
     {
       "key": "qwen2.5-vl-72b",

@@ -3,7 +3,8 @@
 # proxy environment, the allowlisting DNS forwarder (dnsmasq) the host resolves through, ufw default-deny in AND out,
 # full system update through the proxy (held on the GA 7.0 kernel line, S45), Canonical's beacons off, kdump switched
 # off and its crash-kernel reservation dropped from the kernel line with panic=10 added (option (c) of 2026-10-10, S48),
-# GRUB kernel parameters (V3), SSH hardening, Cockpit, then the reboot marker and the reboot (unless --no-reboot).
+# kexec handover switched off with kho=off (S49), GRUB kernel parameters (V3), SSH hardening, Cockpit, then the reboot
+# marker and the reboot (unless --no-reboot).
 # Order matters: the proxy, the forwarder and the firewall come first so that even the system update obeys rule §7.1.
 #
 # THE UNAVOIDABLE PRE-PROXY INSTALLS: squid itself and dnsmasq (with jq and gettext-base for rendering their configs)
@@ -57,10 +58,11 @@ export ATLAS_NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.
 # the kernel 7.x GPU watchdog S8 added so that V22 (DeepSeek V4 DeviceLost, llama.cpp issue #25664) cannot fail for a
 # kernel reason, which is exactly why a cmdline without it must fail V3a rather than pass.
 export ATLAS_GRUB_PARAMS="amdgpu.gttsize=196608 ttm.pages_limit=50331648 amdgpu.lockup_timeout=10000,60000,10000,10000"
-# Option (c), S48 (Section 3.3, 4.1, Appendix B): the crash-kernel drop-in. It is sourced LAST by grub-mkconfig, removes
-# every crashkernel= and panic= token and appends panic=10, so it is the one authority over both. panic=10 is therefore
-# NOT in ATLAS_GRUB_PARAMS: 90-atlas.cfg is sourced before kdump-tools.cfg and any later drop-in, so it cannot have the
-# last word, and its substring guards below would mangle a hand-typed panic=100. V3a checks the same literal panic=10.
+# Option (c), S48, and S49 (Section 3.3, 4.1, Appendix B): the crash-kernel drop-in. It is sourced LAST by grub-mkconfig,
+# removes every crashkernel=, panic= and kho= token and appends panic=10 kho=off, so it is the one authority over all
+# three. panic=10 and kho=off are therefore NOT in ATLAS_GRUB_PARAMS: 90-atlas.cfg is sourced before kdump-tools.cfg and
+# any later drop-in, so it cannot have the last word (the kernel takes the last kho= it can parse), and its substring
+# guards below would mangle a hand-typed panic=100. V3a checks the same literal panic=10 and kho=off.
 ATLAS_GRUB_CRASH_DROPIN="/etc/default/grub.d/zzz-atlas-crash.cfg"
 # Hosts rule §7.1 forbids outright, enforced at render time (Section 16.3 item 6: a one-line edit must not open them).
 ATLAS_ALLOWLIST_NEVER=(api.openai.com api.anthropic.com generativelanguage.googleapis.com aiplatform.googleapis.com
@@ -861,6 +863,8 @@ _kernel_line() {
   local report hwe=() img=() p purge_out extra
   if report="$(phase1_kernel_line_report)"; then
     log "kernel line: GA 7.0 (Section 3.3): $report"
+    # A to-do an earlier run raised closes here too (the Principal moved the line by hand and re-ran step 4).
+    if todo_is_open kernel-line; then todo_done kernel-line; fi
     return 0
   fi
   mapfile -t hwe < <(_kl_installed "${ATLAS_KERNEL_HWE_GLOBS[@]}")
@@ -927,6 +931,17 @@ _kernel_line() {
 # Known residue, left on purpose: /etc/kernel/postinst.d/kdump-tools still builds a capture initrd under /var/lib/kdump
 # at every kernel install (it checks only for mkinitramfs); deleting that conffile would cause the same dpkg prompt.
 # Never `dpkg-reconfigure kdump-tools` after this: in reconfigure mode its config script reads the file back into debconf.
+# Kexec handover off (S49, the Principal's decision of 2026-10-10; Sections 3.3, 4.1). Ubuntu's 7.0 kernel is built with
+# CONFIG_KEXEC_HANDOVER=y and CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y (VERIFIED, 7.0.0-38 and -39 configs). At every cold
+# boot kho_reserve_scratch (v7.0 kernel/liveupdate/kexec_handover.c) sets aside scratch areas of 200 % of the early
+# kernel memblock reservations (lowmem + global) plus 200 % of node 0's, and kho_init hands them to the page allocator
+# as MIGRATE_CMA (VERIFIED). They stay inside MemTotal, but TTM/GTT pages (GFP_USER | GFP_HIGHUSER, no __GFP_MOVABLE)
+# never get CMA, so the Arbiter's pool, min(GTT total, MemTotal), would overstate what engines can use by about 13 GiB
+# here (12.8-13.8, the ~3 GiB page map dominating; INFERRED): enough for the Apex f16 and q8_0 rungs to fail with a
+# Vulkan out-of-memory in Phase 3. CmaTotal does not count it (named CMA areas only); the zone 'cma' lines of
+# /proc/zoneinfo do. ATLAS never uses kexec handover or live update (LUO is off by default and needs KHO; kdump's crash
+# images skip KHO anyway), so the drop-in ends the line with kho=off: kho_reserve_scratch and kho_init return at once,
+# nothing is set aside or marked CMA, and MemTotal (unchanged) is all usable by GTT again. V3a fails while any is.
 
 # _grub_crash_dropin — print the content of $ATLAS_GRUB_CRASH_DROPIN. grub-mkconfig sources /etc/default/grub, then
 # /etc/default/grub.d/*.cfg in the byte order of dash's own glob sort (strcmp, whatever the locale): 50-curtin-settings,
@@ -938,20 +953,24 @@ _kernel_line() {
 # zz-update-grub and every kernel install; tested), no globbing of command-line words, and it sets nothing but the two
 # variables (its helper is unset). Tokens are cut out whole, following the kernel's own rule that a double quote
 # toggles quoting anywhere in a word (kernel/params.c next_arg): oops=panic, panic_on_warn=1 and a quoted value that
-# merely contains " panic=" stay. The last line appends panic=10 to GRUB_CMDLINE_LINUX_DEFAULT, so on every normal entry
-# (10_linux: GRUB_CMDLINE_LINUX then _DEFAULT) panic=10 is the one panic= token whatever /etc/default/grub or another
-# drop-in says; recovery entries (GRUB_CMDLINE_LINUX_RECOVERY + GRUB_CMDLINE_LINUX) get no panic= and keep the kernel's
-# wait-forever default, which suits a boot with someone at the console.
+# merely contains " panic=" stay. kho= words go the same way (S49), quoted or not; kho_scratch= and liveupdate= stay
+# (the pattern needs '=' right after "kho"), and with kho=off both are inert. The last line appends panic=10 kho=off to
+# GRUB_CMDLINE_LINUX_DEFAULT, so on every normal entry (10_linux: GRUB_CMDLINE_LINUX then _DEFAULT) they are the one
+# panic= and the one kho= token whatever /etc/default/grub or another drop-in says; recovery entries
+# (GRUB_CMDLINE_LINUX_RECOVERY + GRUB_CMDLINE_LINUX) get neither: they keep the kernel's wait-forever panic default,
+# which suits a boot with someone at the console, and no engine runs there, so the handover scratch does not matter.
 _grub_crash_dropin() {
   cat <<'CFG'
-# A.T.L.A.S. Phase 1 step 4, option (c) of 2026-10-10 (S48; Section 3.3, 4.1, Appendix B). Written by the Day 1 scripts.
-# Sourced last by grub-mkconfig: removes every crashkernel= and panic= word from both kernel-line variables (kdump-tools.cfg
-# would reserve 4.25 GiB for a crash kernel that cannot unlock this node's disks), then appends panic=10 so a kernel panic
-# restarts the node after 10 seconds and the TPM unlocks the disks unattended. V3a gates both. POSIX sh only; ends in ':'.
-_atlas_crash_sed='s/^(([^"]*"[^"]*")*[^"]*)[[:space:]]+("(crashkernel|panic)=[^"]*("([^[:space:]"]|"[^"]*"|"[^"]*$)*)?|(crashkernel|panic)=([^[:space:]"]|"[^"]*"|"[^"]*$)*)/\1/'
+# A.T.L.A.S. Phase 1 step 4, option (c) of 2026-10-10 and kho=off (S48, S49; Section 3.3, 4.1, Appendix B). Written by
+# the Day 1 scripts. Sourced last by grub-mkconfig: removes every crashkernel=, panic= and kho= word from both kernel-line
+# variables (kdump-tools.cfg would reserve 4.25 GiB for a crash kernel that cannot unlock this node's disks), then
+# appends panic=10, so a kernel panic restarts the node after 10 seconds and the TPM unlocks the disks unattended, and
+# kho=off, so the kernel sets aside no kexec handover scratch (about 13 GiB of CMA that GTT pages cannot use).
+# V3a gates all three. POSIX sh only; ends in ':'.
+_atlas_crash_sed='s/^(([^"]*"[^"]*")*[^"]*)[[:space:]]+("(crashkernel|panic|kho)=[^"]*("([^[:space:]"]|"[^"]*"|"[^"]*$)*)?|(crashkernel|panic|kho)=([^[:space:]"]|"[^"]*"|"[^"]*$)*)/\1/'
 GRUB_CMDLINE_LINUX=$(printf '%s\n' "${GRUB_CMDLINE_LINUX-}" | sed -E -e 's/^/ /' -e ':a' -e "$_atlas_crash_sed" -e 'ta' -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//')
 GRUB_CMDLINE_LINUX_DEFAULT=$(printf '%s\n' "${GRUB_CMDLINE_LINUX_DEFAULT-}" | sed -E -e 's/^/ /' -e ':a' -e "$_atlas_crash_sed" -e 'ta' -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//')
-GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+$GRUB_CMDLINE_LINUX_DEFAULT }panic=10"
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+$GRUB_CMDLINE_LINUX_DEFAULT }panic=10 kho=off"
 unset _atlas_crash_sed
 :
 CFG
@@ -1023,7 +1042,7 @@ _grub_params() {
   # Section 3.3 / Appendix B: the three parameters in ATLAS_GRUB_PARAMS, all gated by V3a (header).
   # A drop-in under /etc/default/grub.d/ is sourced by grub-mkconfig after /etc/default/grub (VERIFIED), so the
   # variable is extended without editing the distro file, and rewriting the whole drop-in makes it idempotent.
-  # The crash drop-in (S48, _grub_crash_dropin) is written in the same pass, before the one update-grub.
+  # The crash drop-in (S48, S49, _grub_crash_dropin) is written in the same pass, before the one update-grub.
   local all="$ATLAS_GRUB_PARAMS"
   install -d -m 755 /etc/default/grub.d
   {
@@ -1052,7 +1071,7 @@ _grub_params() {
   # kernel/crash_reserve.c, VERIFIED), even inside another word or a quoted value the drop-in rightly leaves alone.
   local ck
   ck="$({ grep -n -F -- 'crashkernel=' /boot/grub/grub.cfg || true; } | cut -d: -f1 | paste -sd' ')"
-  [[ -z "$ck" ]] || die "/boot/grub/grub.cfg still carries crashkernel= (lines $ck) after update-grub, so the kernel would keep reserving crash-kernel memory (4.25 GiB with kdump-tools' value) and the Arbiter's 16 GiB reserve would refuse the Apex f16 and q8_0 rungs. Look for a drop-in that sorts after $(basename "$ATLAS_GRUB_CRASH_DROPIN") (ls /etc/default/grub.d), a crashkernel= inside another word or a quoted value, or an entry in /etc/grub.d/40_custom"
+  [[ -z "$ck" ]] || die "/boot/grub/grub.cfg still carries crashkernel= (lines $ck) after update-grub, so the kernel would keep reserving crash-kernel memory out of MemTotal (4.25 GiB with kdump-tools' value), and at the larger GPU resident set (about 7-8 GiB) the Arbiter's 16 GiB reserve would then refuse the Apex f16 and q8_0 rungs. Look for a drop-in that sorts after $(basename "$ATLAS_GRUB_CRASH_DROPIN") (ls /etc/default/grub.d), a crashkernel= inside another word or a quoted value, or an entry in /etc/grub.d/40_custom"
   # S48: the default entry's kernel line carries exactly one panic= token, and it is panic=10 (the kernel uses the last
   # one; one token keeps V3a's reading unambiguous). Whole words here, so oops=panic and panic_on_warn= never count;
   # words split at whitespace, so a quoted value containing " panic=" stops the step too (loud, never a silent pass).
@@ -1060,7 +1079,34 @@ _grub_params() {
   panics="$({ grep -m1 -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg || true; } \
             | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^"?panic=/) print $i}' | paste -sd' ')"
   [[ "$panics" == "panic=10" ]] || die "the first kernel line of grub.cfg carries the panic tokens '${panics:-none}', expected exactly one panic=10. $ATLAS_GRUB_CRASH_DROPIN should leave only that; look for a drop-in sorting after it (ls /etc/default/grub.d) or a hand edit of /etc/grub.d"
-  log "GRUB: $all panic=10, no crashkernel= (applies at the reboot; V3a checks /proc/cmdline, the live module parameters, kernel.panic and the crash-kernel reservation in step 5)"
+  # S49: the same rule for kho=: exactly one token, kho=off. Whole words, because the kernel finds kho= by parameter name
+  # (parse_args, the last valid one wins), not with strstr as it does crashkernel=; kho_scratch= is another parameter.
+  # Split at whitespace like the panic= words, so a quoted value containing " kho=" stops the step too.
+  local khos
+  khos="$({ grep -m1 -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg || true; } \
+          | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^"?kho=/) print $i}' | paste -sd' ')"
+  [[ "$khos" == "kho=off" ]] || die "the first kernel line of grub.cfg carries the kho tokens '${khos:-none}', expected exactly one kho=off (S49: with kexec handover on, Ubuntu's 7.0 kernel sets aside about 13 GiB of MemTotal as CMA scratch that GTT pages cannot use). $ATLAS_GRUB_CRASH_DROPIN should leave only that; look for a drop-in sorting after it (ls /etc/default/grub.d) or a hand edit of /etc/grub.d"
+  log "GRUB: $all panic=10 kho=off, no crashkernel= (applies at the reboot; V3a checks /proc/cmdline, the live module parameters, kernel.panic, the crash-kernel reservation and the kexec handover scratch in step 5); $(_kho_scratch_note)"
+}
+
+# _kho_scratch_note — S49 record for step 4's GRUB log line; read-only, never a stop. The kexec handover scratch the
+# running boot holds as CMA: the zone 'cma' pages of /proc/zoneinfo (4 KiB each) less any named CMA area (CmaTotal,
+# which never counts the scratch). Section 4.1 only estimates it (about 13 GiB, INFERRED); this boot still has KHO on,
+# so the line measures it. On the first run this boot also still carries kdump's crash-kernel reservation, which KHO
+# counts too (about 8.5 GiB more than without it, S49), so the figure is above the final state's. The awk sum stays in
+# pages; bytes are computed in bash.
+_kho_scratch_note() {
+  local zone total bytes
+  zone="$(awk '$1 == "cma" && $2 ~ /^[0-9]+$/ {s += $2; n++} END {if (n) print s}' /proc/zoneinfo 2>/dev/null || true)"
+  total="$(awk '$1 == "CmaTotal:" {print $2}' /proc/meminfo 2>/dev/null || true)"
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  if [[ ! "$zone" =~ ^[0-9]+$ ]]; then
+    echo "kexec handover scratch on this boot: unreadable (no 'cma' lines in /proc/zoneinfo)"
+    return 0
+  fi
+  bytes=$(( zone * 4096 - total * 1024 ))
+  (( bytes > 0 )) || bytes=0
+  echo "kexec handover scratch on this boot: $(( bytes / 1048576 )) MiB of CMA (zone cma ${zone} pages, CmaTotal ${total} kB), usable by GTT once kho=off applies"
 }
 
 _ssh_harden() {
@@ -1165,8 +1211,8 @@ step_04() {
   retry 2 apt-get -y -q -o Dpkg::Options::=--force-confold dist-upgrade || die "apt-get dist-upgrade failed"
   apt-get -y -q autoremove >/dev/null || true
   _disable_beacons
-  # 4. kdump off and its crash-kernel reservation dropped, panic=10 (option (c), S48), the kernel parameters (V3), then
-  #    every initramfs rebuilt with the TPM2 pieces before the reboot (Section 3.5).
+  # 4. kdump off and its crash-kernel reservation dropped, panic=10 (option (c), S48), kho=off (S49), the kernel
+  #    parameters (V3), then every initramfs rebuilt with the TPM2 pieces before the reboot (Section 3.5).
   _kdump_off
   _grub_params
   phase1_initramfs_rebuild

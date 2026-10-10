@@ -30,9 +30,9 @@ DEFAULT_CONFIG_DIR = Path("/opt/atlas/day1/config")
 DEFAULT_ETC_DIR = Path("/etc/atlas")
 DEFAULT_DB_PATH = Path("/srv/atlas/data/orchestrator/atlas.sqlite3")
 DEFAULT_LLAMA_PORT_BASE = 8100
-# Section 4.1 (v0.3.5, S44; S48): memory the Engine Arbiter never budgets to an engine. Its resident set is read from
-# mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/Docker/
-# Cockpit 4 GB, Open WebUI/ChromaDB/graph store ~3 GB, Kokoro/Whisper/PyAnnote 3 GB, orchestrator/Celery/Redis/
+# Section 4.1 (v0.3.5, S44; S48; S49): memory the Engine Arbiter never budgets to an engine. Its resident set is read
+# from mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/
+# Docker/Cockpit 4 GB, Open WebUI/ChromaDB/graph store ~3 GB, Kokoro/Whisper/PyAnnote 3 GB, orchestrator/Celery/Redis/
 # Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it, and without a reserve they were budgeted to engines on a node
 # with no swap. 16 GiB = those ~12 GiB plus room for transient CPU work (Celery CPU workers, Docling, the Phase 2
 # tools) and kernel overhead; measured CPU-side use is logged against it at every measurement, so a node that needs
@@ -46,6 +46,13 @@ DEFAULT_LLAMA_PORT_BASE = 8100
 # ~0.5 GiB of firmware and kernel (an estimate until V3a records the real figure), ~3-5 GiB above that threshold.
 # Were the reservation to survive (MemTotal ~183-184 GiB), the f16 and q8_0 rungs would be refused at R = 8 GiB; that
 # is why V3a fails on any crashkernel= or reserved crash memory. (While the reservation stood, the default was 12 GiB.)
+# All of that assumes every page of MemTotal can back GTT, which holds only with kexec handover off: Phase 1 step 4 puts
+# kho=off on the kernel line (S49). Ubuntu's 7.0 kernel has it on by default (CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y,
+# VERIFIED) and then sets aside 200 % of the early kernel memblock reservations twice over (lowmem + global, plus node
+# 0's; the ~3 GiB page map dominates) as MIGRATE_CMA pageblocks: about 13 GiB (12.8-13.8, INFERRED) that stay inside
+# MemTotal but that TTM/GTT pages (no __GFP_MOVABLE) can never use, so only about 174 GiB could back GTT and the f16 and
+# q8_0 rungs (166-168 GiB with R) would likely fail with a Vulkan out-of-memory in Phase 3 although granted. MemTotal
+# itself is the same either way. V3a fails while any of that scratch is set aside.
 # ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env overrides it (whole GiB, within ARBITER_HEADROOM_RANGE_GIB); a bad
 # value stops only the Arbiter's construction (build_arbiter), never another reader of the settings (the backup
 # freeze, Sentinel, Celery tasks).
@@ -300,10 +307,11 @@ class EngineSpec(BaseModel):
     def footprint_bytes(self) -> int:
         """Weights, in bytes, reading the Section 4.1/5.1 `footprint_gb` figure as GiB (binary).
 
-        The budget side is binary throughout (sysfs mem_info_gtt_* bytes, amdgpu.gttsize in MiB, the 170 GiB budget),
-        and the document's figures are GGUF file sizes whose unit it does not state. Reading them as GiB is the upper
-        bound (7.4 % above decimal GB), which is the right side for the hard pre-flight of Section 4.3 (the OOM backstop
-        errs high); the measured footprint (Arbiter.register_measured / confirm_loaded) replaces it once known.
+        The budget side is binary throughout (sysfs mem_info_gtt_* bytes, amdgpu.gttsize in MiB, the ~164 GiB budget
+        Section 4.1 expects), and the document's figures are GGUF file sizes whose unit it does not state. Reading them
+        as GiB is the upper bound (7.4 % above decimal GB), which is the right side for the hard pre-flight of Section
+        4.3 (the OOM backstop errs high); the measured footprint (Arbiter.register_measured / confirm_loaded) replaces
+        it once known.
         """
         return int(self.footprint_gb * 1024**3)
 

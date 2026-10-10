@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # phase1/kernel_line_test.sh — regression test (v0.3.5, doc S45) for phase1/04-system.sh's kernel-line helpers
-# (_kl_installed, phase1_kernel_line_report, _kernel_line) and phase1/05-postboot.sh's _npu_record, with stubbed
+# (_kl_installed, phase1_kernel_line_report, _kernel_line) and phase1/05-postboot.sh's _kernel_line_record and
+# _npu_record, with stubbed
 # dpkg-query, apt-get, uname, lspci and dmesg. The stub dpkg-query matches its patterns as globs against a package list,
 # the way dpkg-query -W does; the stub apt-get prints the "Purg" lines of a simulation and edits that list on a real
 # purge. Touches nothing outside a fresh temp dir. Run: bash phase1/kernel_line_test.sh   (exit 0 when every case passes)
@@ -72,15 +73,21 @@ export PATH="$T/bin:$PATH" KL_T="$T"
 die() { echo "DIE: $*"; return 99; }
 log() { echo "LOG: $*" >>"$T/out"; }
 warn() { echo "WARN: $*" >>"$T/out"; }
-todo_add() { echo "$1" >>"$T/todo"; }
+# The to-do list as lib/common.sh keeps it: one record per call, the latest record per ID wins. $T/todo holds the IDs
+# ("done ID" for a close), $T/todo.detail the DETAIL of each todo_add, in the same order.
+todo_add() { echo "$1" >>"$T/todo"; printf '%s\n' "${3:-}" >>"$T/todo.detail"; }
 todo_done() { echo "done $1" >>"$T/todo"; }
-todo_is_open() { [[ -s "$T/todo" ]] && grep -qx "$1" "$T/todo" && ! grep -qx "done $1" "$T/todo"; }
+todo_is_open() { [[ -s "$T/todo" ]] && [[ "$(grep -xE "(done )?$1" "$T/todo" | tail -n1)" == "$1" ]]; }
 apt_install() { echo "apt_install $*" >>"$T/apt.log"; local p; for p in "$@"; do grep -qxF -- "$p" "$T/pkgs" || echo "$p" >>"$T/pkgs"; done; }
 # shellcheck source=/dev/null
 source <(grep -E '^ATLAS_KERNEL_(GA_METAS|HWE_GLOBS|OEM_GLOBS)=' "$REPO/phase1/04-system.sh"
          for f in _kl_installed phase1_kernel_line_report phase1_kernel_line_todo _kernel_line; do
            extract "$REPO/phase1/04-system.sh" "$f"; done
+         extract "$REPO/phase1/05-postboot.sh" _kernel_line_record
          extract "$REPO/phase1/05-postboot.sh" _npu_record | sed -e "s#/sys/bus/pci/devices#$T/sys#g" -e "s#find /dev/accel #find $T/accel #")
+for f in _kernel_line phase1_kernel_line_todo _kernel_line_record _npu_record; do
+  declare -F "$f" >/dev/null || { echo "FAIL could not extract $f"; exit 1; }
+done
 
 # Every _kernel_line and _npu_record call runs as step 4 and step 5 do: errexit, pipefail and an inherited ERR trap
 # (lib/common.sh). It must return 0 and trip the trap nowhere, not even in a process substitution.
@@ -91,7 +98,7 @@ strict() {  # strict FUNCTION — run it under the production shell options; rec
   ok "strict run $n_strict ($1): exit 0, no ERR trap" "$rc:$(cat "$T/err")" "0:"
 }
 reset_case() {  # reset_case UNAME PACKAGE...
-  : >"$T/out"; : >"$T/apt.log"; : >"$T/todo"; : >"$T/purge_extra"; : >"$T/src"; : >"$T/held"
+  : >"$T/out"; : >"$T/apt.log"; : >"$T/todo"; : >"$T/todo.detail"; : >"$T/purge_extra"; : >"$T/src"; : >"$T/held"
   printf '%s\n' "$1" >"$T/uname"; shift
   printf '%s\n' "$@" >"$T/pkgs"
 }
@@ -231,6 +238,37 @@ reset_case 7.0.0-38-generic "${HWE[@]}"
 echo kernel-line >"$T/todo"
 strict _kernel_line
 ok "earlier to-do closed after the switch" "$(tail -n1 "$T/todo")" "done kernel-line"
+
+# 12f. Step 4 on a GA node closes a to-do an earlier run left open (the Principal moved the line by hand and re-ran
+#      step 4, F10 of the v0.3.5 review); a GA node with nothing open writes nothing.
+reset_case 7.0.0-38-generic "${GA[@]}"
+echo kernel-line >"$T/todo"
+strict _kernel_line
+ok "GA line: an open to-do is closed" "$(tail -n1 "$T/todo"):$(wc -l <"$T/apt.log")" "done kernel-line:0"
+strict _kernel_line
+ok "GA line: closed once, not on every run" "$(grep -c '^done kernel-line$' "$T/todo")" "1"
+
+# 12g. Step 5 (_kernel_line_record) after a reboot into another kernel: the to-do step 4 raised with its pre-upgrade
+#      report is raised again with this boot's report (the latest record wins), on every run while the line is not GA;
+#      once it is GA, step 5 closes it.
+reset_case 7.0.0-38-generic "${HWE[@]}" linux-image-7.3.0-9-generic
+strict _kernel_line
+ok "step 4: to-do with the pre-reboot report" "$(tail -n1 "$T/todo"):$(tail -n1 "$T/todo.detail" | grep -c 'Found: running 7.0.0-38-generic;')" "kernel-line:1"
+echo 7.3.0-9-generic >"$T/uname"; echo linux-image-7.3.1-2-generic >>"$T/pkgs"
+strict _kernel_line_record
+ok "step 5, not GA: to-do raised again" "$(tail -n1 "$T/todo"):$(grep -c '^kernel-line$' "$T/todo")" "kernel-line:2"
+ok "step 5, not GA: with this boot's kernel and images" \
+   "$(tail -n1 "$T/todo.detail" | grep -c 'Found: running 7.3.0-9-generic; .*images: 7.0.0-38-generic 7.3.0-9-generic 7.3.1-2-generic\.')" "1"
+ok "step 5, not GA: warned" "$(grep -c '^WARN: kernel line: not the GA 7.0 line of Section 3.3: running 7.3.0-9-generic' "$T/out")" "1"
+strict _kernel_line_record
+ok "step 5 re-run, not GA: refreshed again" "$(grep -c '^kernel-line$' "$T/todo")" "3"
+reset_case 7.0.0-38-generic "${GA[@]}"
+echo kernel-line >"$T/todo"; echo "Found: old" >"$T/todo.detail"
+strict _kernel_line_record
+ok "step 5, GA: to-do closed" "$(tail -n1 "$T/todo")" "done kernel-line"
+ok "step 5, GA: logged" "$(grep -c '^LOG: kernel line: GA 7.0 (Section 3.3): running 7.0.0-38-generic' "$T/out")" "1"
+strict _kernel_line_record
+ok "step 5 re-run, GA: nothing more written" "$(wc -l <"$T/todo")" "2"
 
 # 13. _npu_record: bound NPU, revision and driver read from sysfs, accel node listed; then amdxdna errors warned.
 : >"$T/out"

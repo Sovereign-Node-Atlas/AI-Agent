@@ -104,8 +104,9 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   8 TB drive with the recovery key printed once; mounts under `/srv/atlas`, `/srv/cold`, `/srv/backups`, swap off,
   tmpfs `/tmp` verified; dist-upgrade, kernel parameters (`amdgpu.gttsize`, `ttm.pages_limit`,
   `amdgpu.lockup_timeout=10000,60000,10000,10000`), kdump switched off without a purge and its crash-kernel reservation
-  removed from the kernel line, `panic=10` added (doc S48), ufw, SSH hardening, Cockpit, the squid allowlist proxy;
-  reboot; post-reboot V3a (also: no crash-kernel memory reserved, one `panic=10`); a read-only record of whether a
+  removed from the kernel line, `panic=10` added (doc S48), `kho=off` added so kexec handover sets no memory aside
+  (doc S49), ufw, SSH hardening, Cockpit, the squid allowlist proxy; reboot; post-reboot V3a (also: no crash-kernel
+  memory reserved, one `panic=10`, one `kho=off`, no CMA memory); a read-only record of whether a
   kernel panic's log can be kept (pstore); XFCE + xrdp + Google Chrome (Google's apt repo, telemetry/sign-in off by policy, never a snap); Docker with GPU passthrough and the
   DOCKER-USER egress rules; WG-Easy, Cloudflare ddns, ntfy; gate.
 - **Phase 2 — engines and services** (30-60 min, no large downloads): llama.cpp Vulkan build (`-DLLAMA_OPENSSL=ON`,
@@ -175,7 +176,7 @@ real vault and records V18.
 | Phase 3 results | `/var/lib/atlas/day1/phase3/results/<engine>.json`; model manifests `/srv/atlas/data/manifests/`, `/srv/atlas/models/<key>/MANIFEST.json` |
 | Phase 4 results | `/var/lib/atlas/day1/phase4/<key>.json`; logs `/var/lib/atlas/day1/logs/phase4-<key>.log`; samples `/srv/atlas/workspace/phase4-samples/<key>/`; venv freezes `/srv/atlas/engines/manifests/<key>/freeze.txt` |
 | Reports | `/var/lib/atlas/day1/reports/ATLAS_BUILD_BASELINE-<timestamp>.xlsx` (the repo copy is never touched) |
-| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44, S48: the default fits every Apex KV-ladder rung only because Phase 1 step 4 removes kdump's 4.25 GiB crash-kernel reservation, which V3a proves; a bad value stops only `atlas-orchestrator`, which says why at start). `atlas-admin arbiter status` shows it beside MemAvailable; restart `atlas-orchestrator` after changing it |
+| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44, S48, S49: the default fits every Apex KV-ladder rung; at the larger GPU resident set, about 7-8 GiB, the f16 and q8_0 rungs fit only because Phase 1 step 4 removes kdump's 4.25 GiB crash-kernel reservation, and all of it assumes kexec handover is off (`kho=off`, step 4 too), V3a proving both; a bad value stops only `atlas-orchestrator`, which says why at start). `atlas-admin arbiter status` shows it beside the CPU-side use the Arbiter warns on (MemTotal - MemAvailable - the GPU's pages, marked when above the reserve) and MemAvailable; restart `atlas-orchestrator` after changing it |
 | Secrets | `/etc/atlas/secrets/` (root:atlas 710; every file 600, owned by its one reader): `hf-token.env`, `cloudflare.env`, `ntfy.env`, `smb.cred`, `restic.pass`, `redis.env`, `openwebui.env`, `wg-easy.env`, `google/` |
 | The scripts the node runs | `/opt/atlas/day1/` (a mirror of this directory) |
 
@@ -223,7 +224,7 @@ written with the reason, shown in the table and the workbook, and never silently
 - Section 17 Phase 2 now carries step `6d` (AEGIS sandbox image, Section 16.4, V17) and step `9b` (gocryptfs vault,
   Section 11, V18); `CONVENTIONS.md` §1 lists both.
 - Section 23 S21 records the two sudoers fragments, `atlas-engines` and `atlas-vault`.
-- The Secure Boot / PCR 7 consequence is decision **D15** (open, recommendation: enable Secure Boot) and risk R23; the
+- The Secure Boot / PCR 7 consequence is decision **D15** (closed 2026-10-05 as option (a): Secure Boot enabled) and risk R23; the
   Docker-group reach of the `atlas` user is R22.
 - Section 11 and Appendix C name `vault/cipher` (backed up) and `vault/open` (never backed up).
 - Section 21 declares `V10a`, the `T-<tool>` and `P4-wheels` recorded-only rows, and the Day 2 scope of V15's send
@@ -245,64 +246,68 @@ written with the reason, shown in the table and the workbook, and never silently
 ### UNVERIFIED items, by file
 
 Every `UNVERIFIED` comment in the code marks a fact the research could not confirm. The step that depends on it fails
-loudly if the assumption is wrong; none skips. Line numbers are those of this commit.
+loudly if the assumption is wrong; none skips. Line numbers are those of this commit (`grep -n UNVERIFIED <file>`).
 
-**lib/common.sh** — 504: hf_transfer ignores proxies (kept off). 546, 588: a download with no reference sha256 records
+**lib/common.sh** — 693: hf_transfer ignores proxies (kept off). 735, 777: a download with no reference sha256 records
 its computed hash as UNVERIFIED.
 
 **phase1-platform.sh / phase1/01-preflight.sh** — no UNVERIFIED marks beyond the Secure Boot decision above.
 
-**phase1/02-luks.sh** — 23, 87: `--unlock-tpm2-device=auto` (systemd 256+) for re-enrolment. 363: crypttab
+**phase1/02-luks.sh** — 33, 102: `--unlock-tpm2-device=auto` (systemd 256+) for re-enrolment. 234, 237: the V2 note
+of the initrd check (`phase1_initramfs_rebuild`) when it finds no image or an image without the TPM2 pieces. 516: crypttab
 `tpm2-device=auto` / `x-initrd.attach` spelling. VERIFIED since v0.3.4: dracut's tpm2-tss module needs the `tpm2`
 binary (tpm2-tools, universe, not on the server image), and in dracut's default hostonly mode a `tpm2-device=` in
 crypttab alone pulls that module in. So neither the drop-in nor crypttab mentions TPM2 until step 4 has installed
 tpm2-tools through the proxy; step 4 then adds both, rebuilds every initramfs and checks each image before the reboot.
 
-**phase1/04-system.sh** — 397, 401: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). Time sync
-(VERIFIED since v0.3.4): 26.04 runs chrony with NTS (1..4.ntp.ubuntu.com, ntp-bootstrap.ubuntu.com, UDP 123 and TCP
-4460), opened for uid `_chrony` only; the pinned-address and router fallback apply only to a host still on
-systemd-timesyncd. A chrony that does not synchronise within two minutes is a warning and the to-do `time-sync`. Kernel line (VERIFIED since v0.3.5, archive indices and the 26.04.1 server ISO): the ISO installs `linux-generic`; step 4 holds that line, swaps HWE metapackages over the same 7.0 image itself, and leaves anything else (OEM or platform metapackages, an image outside 7.0, a metapackage not from `linux-meta`) to the to-do `kernel-line`. Crash kernel and panic (doc S48, option (c) of 2026-10-10), VERIFIED: kdump-tools 1:1.10.7ubuntu3 is on the 26.04.1 server image and its conffile `/etc/default/grub.d/kdump-tools.cfg` adds `crashkernel=…,128G-:4096M` whatever `USE_KDUMP` says; kernel 7.0 then reserves 4.25 GiB on this machine (4096 MiB above 4 GiB plus 256 MiB below); grub-mkconfig sources the drop-ins in byte order under dash and `set -e`, so `zzz-atlas-crash.cfg` is sourced last; every kdump-tools configure rewrites `USE_KDUMP` from the debconf answer through ucf, and `systemctl disable` and `mask` both survive its upgrades; Ubuntu's kernel waits forever after a panic (`CONFIG_PANIC_TIMEOUT=0`). INFERRED: the installer already set `USE_KDUMP=0` and debconf `false` on this node (its rule wants about 935-940 GiB free on `/var`), so `_kdump_off` normally only confirms them; the crash kernel's capture initrd (initramfs-tools, no cryptsetup on the image) could never open the LUKS root, by TPM or by passphrase, so no dump was ever possible. Left on purpose: `/etc/kernel/postinst.d/kdump-tools` still builds an unused capture initrd at every kernel install (a conffile, not edited).
+**phase1/04-system.sh** — 399, 403: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). 515, 591:
+Canonical's ntp.ubuntu.com addresses kept as long-lived, and the router serving NTP. Time sync (VERIFIED since v0.3.4):
+26.04 runs chrony with NTS (1..4.ntp.ubuntu.com, ntp-bootstrap.ubuntu.com, UDP 123 and TCP 4460), opened for uid
+`_chrony` only; the pinned-address and router fallback (515, 591) apply only to a host still on systemd-timesyncd. A
+chrony that does not synchronise within two minutes is a warning and the to-do `time-sync`. Kernel line (VERIFIED since v0.3.5, archive indices and the 26.04.1 server ISO): the ISO installs `linux-generic`; step 4 holds that line, swaps HWE metapackages over the same 7.0 image itself unless a GA or HWE kernel metapackage is held with `apt-mark`, and leaves anything else (OEM or platform metapackages, an image outside 7.0, a metapackage not from `linux-meta`, a held kernel metapackage, which the to-do says to release first with `apt-mark unhold`) to the to-do `kernel-line`; step 5 closes that to-do on GA 7.0 and otherwise raises it again with the state after the reboot. Crash kernel and panic (doc S48, option (c) of 2026-10-10), VERIFIED: kdump-tools 1:1.10.7ubuntu3 is on the 26.04.1 server image and its conffile `/etc/default/grub.d/kdump-tools.cfg` adds `crashkernel=…,128G-:4096M` whatever `USE_KDUMP` says; kernel 7.0 then reserves 4.25 GiB on this machine (4096 MiB above 4 GiB plus 256 MiB below); grub-mkconfig sources the drop-ins in byte order under dash and `set -e`, so `zzz-atlas-crash.cfg` is sourced last; every kdump-tools configure rewrites `USE_KDUMP` from the debconf answer through ucf, and `systemctl disable` and `mask` both survive its upgrades; Ubuntu's kernel waits forever after a panic (`CONFIG_PANIC_TIMEOUT=0`). INFERRED: the installer already set `USE_KDUMP=0` and debconf `false` on this node (its rule wants about 935-940 GiB free on `/var`), so `_kdump_off` normally only confirms them; the crash kernel's capture initrd could never open the LUKS root, by TPM or by passphrase, so no dump was ever possible: initramfs-tools builds it without cryptsetup, because cryptsetup itself is on the image but `cryptsetup-initramfs`, the hook that would add it, is not. Left on purpose: `/etc/kernel/postinst.d/kdump-tools` still builds an unused capture initrd at every kernel install (a conffile, not edited). Kexec handover (doc S49, the Principal's decision of 2026-10-10), VERIFIED from Ubuntu's 7.0.0-38 and -39 configs and the v7.0 source: kexec handover is on by default, sets scratch memory aside at every boot and hands it to the page allocator as CMA, which GTT pages never use; `kho=off` stops that and leaves MemTotal unchanged; the kernel takes the last valid `kho=`, so the drop-in sourced last strips every other one and appends `kho=off`. INFERRED: the scratch is about 13 GiB on this node (12.8-13.8, from the sizing rule and the ~3 GiB page map); step 4's GRUB log line measures it on the boot that still has kexec handover on, where kdump-tools' crash-kernel reservation adds about 8.5 GiB to it on the first run (counted twice; doc S49). Field reports, VERIFIED from their commits: a community pull request to NVIDIA's NV-Kernels (#590) found 9.3 GiB of such CMA on the 128 GB GB10, and NVIDIA's own 7.0 branch turned the default off on arm64 only; Supabase's Postgres images add `kho=off` through a GRUB drop-in. UNKNOWN: a Proxmox patch one verifier cited (the list was unreachable; Proxmox's kernel configuration has no such change up to 2026-10-09).
 
 **phase1/05-postboot.sh** — the panic-log record (doc S48) is read-only and settles nothing by itself. UNKNOWN until it runs: whether this board registers a pstore backend (`efi_pstore`, or `erst` when the firmware has an ACPI ERST table) and whether its firmware accepts the EFI-variable writes. INFERRED: `systemd-pstore.service` is enabled on the image; after a `panic=10` restart the TPM unlocks the disks unattended, since PCR 7 is measured again from the same Secure Boot policy (whether this board's emergency reset can hang is UNKNOWN). Only a deliberate test panic on an idle node (`echo c > /proc/sysrq-trigger`) would settle these; that is the Principal's call and in no script.
 
-**phase1/05b-desktop.sh** — the Google apt repository recipe for Chrome (key URL `dl.google.com/linux/linux_signing_key.pub`,
-suite `stable main`); fails loudly on a non-armoured key. Chrome's managed policy path `/etc/opt/chrome/policies/managed/`
+**phase1/05b-desktop.sh** — 7, 75, 86, 91: the Google apt repository recipe for Chrome (key URL
+`dl.google.com/linux/linux_signing_key.pub`, suite `stable main`, no fingerprint pin); fails loudly on a non-armoured
+key. 52: whether Safe Browsing's standard level (left on) sends more than hash prefixes. Chrome's managed policy path `/etc/opt/chrome/policies/managed/`
 and the policy names are VERIFIED against the Chrome Enterprise documentation.
 
 **phase1/06-docker.sh** — 35: default daemon ulimits (baseline silent).
 
-**phase1/07-remote.sh** — 97: WG-Easy admin password minimum length. 123: `com.docker.network.bridge.name`
-driver option. 150: WG-Easy v15 `INIT_*` unattended setup and the minimal capability set. 175: Cloudflare
-`/user/tokens/verify` endpoint name. 257: ntfy CLI non-tty password read. 302, 327: `ntfy token add` output format.
-350, 359: probing ntfy from inside the wg-easy container (no wget in the image; check from the phone).
+**phase1/07-remote.sh** — 99: WG-Easy admin password minimum length. 125: `com.docker.network.bridge.name`
+driver option. 152: WG-Easy v15 `INIT_*` unattended setup and the minimal capability set. 185: Cloudflare
+`/user/tokens/verify` endpoint name. 280: ntfy CLI non-tty password read. 325, 350: `ntfy token add` output format.
+373, 382: probing ntfy from inside the wg-easy container (no wget in the image; check from the phone).
 
 **phase2/01-llama.sh** — 138: install layout of every llama.cpp tool. 220, 233: sudo-rs `visudo -c -f`. 246, 247:
 sudo-rs `-l COMMAND` and `listpw`.
 
-**phase2/02-orchestrator.sh** — 334: uv fetching python-build-standalone from github.com.
+**phase2/02-orchestrator.sh** — 340: uv fetching python-build-standalone from github.com.
 
 **phase2/03-openwebui.sh** — 248: API-key creation path (`ENABLE_API_KEYS`). 269: the model-list path.
 
-**phase2/04-memory.sh** — 129, 878: `+cpu` cp312 torch/torchvision wheels on download.pytorch.org. 317, 320: a tree
-entry without `lfs.oid`; research snippet sha256 vs tree API. 409, 419, 425: sudo-rs `-l COMMAND` fallback.
-556, 586: ChromaDB telemetry variable names for the Rust server (DOCKER-USER drop is the belt). 647, 656: Chroma v2
+**phase2/04-memory.sh** — 136, 912: `+cpu` cp312 torch/torchvision wheels on download.pytorch.org. 324, 327: a tree
+entry without `lfs.oid`; research snippet sha256 vs tree API. 416, 426, 432: sudo-rs `-l COMMAND` fallback.
+563, 593: ChromaDB telemetry variable names for the Rust server (DOCKER-USER drop is the belt). 654, 663: Chroma v2
 REST collection paths.
 
-**phase2/05-voice.sh** — 127: torchcodec 0.8.x / torch 2.9.x compatibility row. 252: §2.4 latency figure (recorded,
-not asserted). 281: which large-v3-turbo id speaches' registry offers. 401, 490: CPU wheels for torch 2.6.0 cp311 /
-2.9.1 on the CPU index.
+**phase2/05-voice.sh** — 152: torchcodec 0.8.x / torch 2.9.x compatibility row. 158: whether pyannote.audio 4.0.7
+loads the legacy 3.1 pipeline (V6 decides). 290: §2.4 latency figure (recorded, not asserted). 319: which
+large-v3-turbo id speaches' registry offers. 439, 536: CPU wheels for torch 2.6.0 cp311 / 2.9.1 on the CPU index.
 
-**phase2/06-tools.sh** — 122: Blender `--offline-mode` on 4.5. 128: Bonsai import pattern. 152, 405, 432, 441:
-extensions.blender.org API and Bonsai zip name; repo id for `--repo`. 158, 166, 244: tool tarball URLs without vendor
-hashes (hash FIXED at first download). 282: package names on 26.04. 354, 371: Blender 4.5.x patch level and sha256
-sidecar. 388, 394: Blender `use_online_access` preference name. 621, 641: OpenStudio's 24.04 build / .deb on 26.04.
-823: strict JDK/MinGW apt pins (bump when the archive moves). VERIFIED since v0.3.4 (S43): the pinned Radiance zip and
+**phase2/06-tools.sh** — 147: Blender `--offline-mode` on 4.5. 153: Bonsai import pattern. 177, 514, 541, 550:
+extensions.blender.org API and Bonsai zip name; repo id for `--repo`. 183, 191, 269: tool tarball URLs without vendor
+hashes (hash FIXED at first download). 307: package names on 26.04. 463, 480: Blender 4.5.x patch level and sha256
+sidecar. 497, 503: Blender `use_online_access` preference name. 734, 754: OpenStudio's 24.04 build / .deb on 26.04.
+957: strict JDK/MinGW apt pins (bump when the archive moves). 13, 15, 31, 369, 393, 1020-1032, 1054: the header and
+the soft-install rule for these inputs (a failure records `T-<tool>` deferred and the step continues). VERIFIED since v0.3.4 (S43): the pinned Radiance zip and
 OpenStudio tarball nest their trees (`.../usr/local/radiance/{bin,lib,man}`, `.../usr/local/openstudio-3.11.0/`); the
 step finds `bin/rtrace` and `bin/openstudio` at whatever depth and installs those trees; RAYPATH is `.:/opt/radiance/lib`.
 
 **phase2/06b-cloudflare-token.sh** — 29, 130: `/user/tokens/verify` endpoint name.
 
-**phase2/06c-google-oauth.sh** — 87, 88, 90, 239, 246, 260: rclone versioned download URL / SHA256SUMS layout. 310:
+**phase2/06c-google-oauth.sh** — 93, 94, 96, 283, 290, 304: rclone versioned download URL / SHA256SUMS layout. 354:
 whether rclone sends `READY=1` for mounts (`Type=simple` used).
 
 **phase2/07-restic.sh** — 197: restic `--files-from` (asserted at run time).
@@ -315,26 +320,30 @@ whether rclone sends `READY=1` for mounts (`Type=simple` used).
 later host FUSE mount (V18 checks it). 601, 625: sudo-rs `visudo -c -f`. 757: gocryptfs echoing on a wrong passphrase
 (journal used).
 
+**phase2/10-gate.sh** — 40, 586: the `T-<tool>` rows of step 6's soft installs (06-tools.sh), shown, never blocking.
+
 **phase2/engine-env.py** — 65: file-loading/network-path llama-server options at v0.4.1.
-**phase2/voice_render.py** — 37: Chatterbox real-time factor.
+**phase2/voice_render.py** — 57: Chatterbox real-time factor.
 
 **phase3-models.sh** — 598: whether any of the seven repos is gated (a 401/403 stops with the licence URL).
 **phase3/loadtest.py** — 82: per-request `cache_prompt: false`. 84: DeepSeek V4 Flash's chat template emitting
 `<think>` by default.
 
-**phase4-engines.sh** — 366: cp-tag list of AMD's torch wheels; whether the AMD index mirrors torch's third-party
+**phase4-engines.sh** — 353: whether stable.repo.amd.com serves a root listing (a 404 there is logged; the
+per-project pages decide). 447: cp-tag list of AMD's torch wheels; whether the AMD index mirrors torch's third-party
 dependencies (the die message gives the fix).
 **phase4/lib-engine.sh** — 80: hf_xet proxy handling (disabled). 618: a research repo id that does not exist.
 **phase4/selftest.py** — 5, 19: the self-test as a whole on this hardware; ROCm #5444 symptom.
+**phase4/wheel_preflight.py** — 13: whether the AMD channel root serves a listing (the project pages decide).
 **phase4/engines/p4common.py** — 47: the MIOpen/SDPA workaround flags as a fix for ROCm 10.0.
-**phase4/engines/flux1-dev.sh / wan2.2.sh / wan2.2_test.py** — checkpoint sizes; Wan 5B UniPC values.
+**phase4/engines/wan2.2.sh / wan2.2_test.py** — 4, 3: the 5B checkpoint's size; Wan 5B UniPC values.
 **phase4/engines/florence-2_test.py** — 3: the `-large` native repo id.
 **phase4/engines/ui-tars.sh / ui-tars_test.py** — 6, 3: inference code (Qwen2.5-VL convention).
 **phase4/engines/rad-dino.sh / rad-dino_test.py** — 3, 2: loader snippet; research-use licence note.
 **phase4/engines/sam2.sh** — 5: `facebook/sam2.1-hiera-large` id (falls back to `sam2-hiera-large`).
 **phase4/engines/stable-audio-open.sh / _test.py** — 8, 2: SDPA fallback for every module; inference call.
 **phase4/engines/cosyvoice2.sh / _test.py** — 5, 59, 2: requirements filtering workaround; synthesis call.
-**phase4/engines/trellis.sh / trellis_test.py** — 7, 29, 43, 2: shim layout, DINOv2 name, rembg `new_session`
+**phase4/engines/trellis.sh / trellis_test.py** — 7, 37, 51, 2: shim layout, DINOv2 name, rembg `new_session`
 API, end-to-end on Linux gfx1151.
 **phase4/engines/blender-cycles.sh / _test.py** — 6, 12, 40, 42, 5, 88, 140: tarball and sha256 names, HIP 6.x
 fatbins on the ROCm 10.0 runtime, libamdhip64 path inside the wheels.
@@ -342,38 +351,44 @@ fatbins on the ROCm 10.0 runtime, libamdhip64 path inside the wheels.
 dependency relaxations (transformers 4.34.1 / tokenizers 0.14), eval class names.
 **phase4/engines/clay-prithvi.sh / _test.py** — 5, 2: TerraTorch `BACKBONE_REGISTRY.build(..., pretrained=True)`.
 
-**orchestrator/src/atlas/arbiter.py** — 129-144: KV bytes-per-token figures for gpt-oss (8 KV heads), Nemotron,
+**orchestrator/src/atlas/arbiter.py** — 133-149: KV bytes-per-token figures for gpt-oss (8 KV heads), Nemotron,
 Qwen3.5 and DeepSeek (bounds from Section 4.3; remeasured in Phase 3). **tasks/aegis.py** — 38, 201: ChromaDB has no
 snapshot API. **tasks/sentinel.py** — 7: feed URLs. **engines.py** — 4: endpoints marked in the file. **router.py** —
 130: ~4 characters per token. **memory.py** — 1215: bge-m3 embedding dimension 1024. **config.py** — the 16 GiB
-default host reserve (doc S44, S48) rests on an estimate, not a measurement: MemTotal near 187-188 GiB once Phase 1
+default host reserve (doc S44, S48, S49) rests on an estimate, not a measurement: MemTotal near 187-188 GiB once Phase 1
 step 4 has removed the crash-kernel reservation (192 GiB less the UMA carve-out, a ~3 GiB page map and ~0.5 GiB of
 firmware and kernel); every Apex KV-ladder rung fits from about 182.3-184.3 GiB. V3a records the real MemTotal and
-fails on a surviving reservation; `ATLAS_ARBITER_HEADROOM_GIB` changes the reserve if the node needs it.
+fails on a surviving reservation; `ATLAS_ARBITER_HEADROOM_GIB` changes the reserve if the node needs it. MemTotal is
+the real limit only because step 4 also puts `kho=off` on the kernel line (doc S49): with kexec handover on, an
+estimated 13 GiB of MemTotal (12.8-13.8, INFERRED) would be CMA scratch that GTT pages can never use, and the Apex f16
+and q8_0 rungs would likely fail with a Vulkan out-of-memory in Phase 3 although granted. V3a fails while any of it
+is set aside; `kho=off` does not change MemTotal.
 
 **config/engines.json** — 13 (env_rule wording), 167 (DeepSeek f16 rung at half the pool), 291 (bge-m3 GGUF file
 name; enumerated case-insensitively). **config/phase4-engines.json** — 6, 77, 119, 148, 208, 236, 237, 277, 303,
 337, 425, 446, 478, 479, 525: per-engine research notes (sizes, repo ids by snippet, licence notes for Rad-DINO and
-PointLLM, TRELLIS shims, Blender tarball pattern, Prithvi build call). **config/allowlist.txt** — 98, 102, 118, 129,
-139, 144, 149, 157: Blender extensions API host, Playwright CDN hosts, Drive discovery hosts, Wix/pay.com hosts, Sentinel
-feed hosts. **config/sentinel-feeds.json** — 4, 31, 53, 75, 95, 116, 136: every feed URL (`verified=false`).
+PointLLM, TRELLIS shims, Blender tarball pattern, Prithvi build call). **config/allowlist.txt** — 117, 124, 141, 152,
+162, 167, 172, 180: Blender extensions API host, Playwright CDN hosts, Drive discovery hosts, Wix/pay.com/RewardPay
+hosts, Sentinel feed hosts. **config/sentinel-feeds.json** — 4, 31, 53, 75, 95, 116, 136: every feed URL (`verified=false`).
 
 **docker/core/compose.yml** — 84, 87, 95: redis 8.10.2 entrypoint name and minimal capability set. 142, 152, 153,
 171: ChromaDB data-dir needs, telemetry variable names, capability set. 221, 223, 224, 248, 256: Open WebUI
 `ENABLE_EVALUATION_ARENA_MODELS`, library telemetry switches, lazy fetches, Docling 2.0 requirement vs docling-serve
 1.34. **docker/core/compose.voice.yml** — 73, 89, 155: curl in the Kokoro image, speaches writable paths, docling-serve
 `/health` (uses `/docs`). **docker/wg-easy/compose.yml** — 5, 32, 83: v15 entrypoint needs, capability set, bridge-name
-option. **docker/ntfy/compose.yml** — none. **docker/rocm-base/Dockerfile** — 22, 30, 78, 117: hf_xet proxy handling,
+option. **docker/ntfy/compose.yml** — none. **docker/rocm-base/Dockerfile** — 22, 30, 84, 123: hf_xet proxy handling,
 the build-time assumption list (each fails the build loudly), Blender's shared-library list, `rocm-sdk path --root`.
 **docker/buildfarm/Dockerfile** — 26, 94, 107: Gradle host, cmdline-tools directory name, sdkmanager package ids.
-**docker/sandbox/Dockerfile** — 30: no cap on the total size of a sandbox job directory (recorded, not fixed).
+**docker/sandbox/Dockerfile** — none: the per-job size item it once carried is closed by the bounded `/work` tmpfs on
+the run line (48-51).
 
 **systemd/atlas-orchestrator.service** — 40: docker client needs under the hardening. **systemd/llama-server@.service**
-— 86: whether Mesa/RADV needs AF_UNIX (kept).
+— 86: whether Mesa/RADV needs AF_UNIX (kept). **systemd/srv-atlas-winpc.mount** — 10, 16: the `vers=3.1.1` and
+`seal` spellings (step 9 proves them when it runs; skipped on Day 1).
 
-**verify/v03a-gtt.sh** — VERIFIED since v0.3.5: kernel 7.0.0-38 reports the requested 196608 MiB GTT pool whatever MemTotal is, and 7.0.0-39 caps it at MemTotal; both pass (S47). VERIFIED (S48, v7.0 source): `/sys/kernel/kexec_crash_size` counts both crash-kernel regions and reads 0 without a reservation (4563402752 with kdump-tools' value); the kernel finds `crashkernel=` anywhere on its command line, hence the substring check; the last `panic=` wins and `/proc/sys/kernel/panic` is the same variable. UNKNOWN until V3a runs: the real MemTotal, expected near 187-188 GiB once the reservation is gone (the summary prints it).
+**verify/v03a-gtt.sh** — VERIFIED since v0.3.5: kernel 7.0.0-38 reports the requested 196608 MiB GTT pool whatever MemTotal is, and 7.0.0-39 caps it at MemTotal; both pass (S47). VERIFIED (S48, v7.0 source): `/sys/kernel/kexec_crash_size` counts both crash-kernel regions and reads 0 without a reservation (4563402752 with kdump-tools' value); the kernel finds `crashkernel=` anywhere on its command line, hence the substring check; the last `panic=` wins and `/proc/sys/kernel/panic` is the same variable. VERIFIED (S49, v7.0 source and Ubuntu's 7.0 configs): kexec handover scratch counts in the zone `cma` lines of `/proc/zoneinfo` (4 KiB pages) and never in `CmaTotal`, which counts named CMA areas only; `CmaFree` is only the free part of all CMA; Ubuntu's 7.0 configuration creates no named CMA area unless the command line asks for one, so all three read 0 once `kho=off` holds and the check cannot fail a correct node. UNKNOWN until V3a runs: the real MemTotal, expected near 187-188 GiB once the reservation is gone (the summary prints it, and the kexec handover figures beside it).
 
-**verify/v06-pyannote.sh** — 17: whether current pyannote loads the legacy 3.1 pipeline (a fail blocks the gate).
+**verify/v06-pyannote.sh** — 19: whether current pyannote loads the legacy 3.1 pipeline (a fail blocks the gate).
 **verify/v17-sandbox.sh** — 14: exit 137 convention. **verify/v23-cloudflare-token.sh** — 89: `/user/tokens/verify`.
 
 ### Open hardware and upstream risks flagged for the Principal (no Day 1 action)
@@ -398,7 +413,7 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 ## 7. Developing
 
 `bash -n` and `shellcheck -x` on every `.sh`, `python3 -m py_compile` on every `.py`, `ruff check orchestrator phase2
-phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash phase1/crash_params_test.sh` (the `zzz-atlas-crash.cfg` drop-in under grub-mkconfig's own sourcing lines, dash and `set -e`, with the real `kdump-tools.cfg`; `_grub_params` end to end; `_kdump_off` and `_panic_log_record` against stubbed `dpkg-query`/debconf/`systemctl`/`kdump-config`/`sysctl`/`findmnt`; doc S48; needs dash), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47, and its crash-kernel and panic checks, doc S48), and the package tests (Python 3.12+):
+phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold, step 5's kernel-line record that closes or refreshes the to-do, and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash phase1/crash_params_test.sh` (the `zzz-atlas-crash.cfg` drop-in under grub-mkconfig's own sourcing lines, dash and `set -e`, with the real `kdump-tools.cfg`, `kho=` words included; `_grub_params` end to end with its `panic=10` and `kho=off` checks and the kexec handover scratch record; `_kdump_off` and `_panic_log_record` against stubbed `dpkg-query`/debconf/`systemctl`/`kdump-config`/`sysctl`/`findmnt`; doc S48, S49; needs dash), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47, its crash-kernel and panic checks, doc S48, and its `kho=off` and CMA checks against a `/proc/zoneinfo` fixture, doc S49), and the package tests (Python 3.12+):
 
 ```
 cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest

@@ -2,13 +2,15 @@
 # phase1/05-postboot.sh — Phase 1 step 5 (Sections 3.3, 17, 21): after the reboot, prove that the kernel accepted the
 # GRUB parameters (all three of Section 3.3, lockup_timeout included) and that the GTT pool matches them (V3a:
 # /proc/cmdline, the live module parameters, 196608 MiB or MemTotal once the kernel caps the pool, S47), that no
-# crash-kernel memory is reserved and a panic restarts the node after 10 s (V3a too, option (c) of 2026-10-10, S48: no
-# crashkernel= on the cmdline, kexec_crash_size 0, exactly one panic=10, kernel.panic 10, panic_on_oops 0), that
-# vulkaninfo shows the GPU as RADV GFX1151, that /tmp is tmpfs and swap is off, and that the TPM unlocked the data
-# volume without a keyboard (V2 re-recorded post-reboot). The llama-cli half of V3 belongs to the Phase 2 gate.
-# Three read-only records follow: the kernel line (v0.3.5, Section 3.3, S45; closes or raises the to-do kernel-line),
-# what the unused XDNA 2 NPU shows (v0.3.5, 3.7 W-NPU), and whether a panic's log can be kept across the restart
-# (S48: pstore backend, systemd-pstore, kdump state).
+# crash-kernel memory is reserved and the kernel is set to restart the node 10 s after a panic (V3a too, option (c) of
+# 2026-10-10, S48: no crashkernel= on the cmdline, kexec_crash_size 0, exactly one panic=10, kernel.panic 10,
+# panic_on_oops 0; V3a proves the settings, while whether this board's reset completes stays unproven until a test
+# panic), that no kexec handover scratch is set aside (V3a, S49: exactly one kho=off on the cmdline, no CMA in
+# /proc/zoneinfo or /proc/meminfo), that vulkaninfo shows the GPU as RADV GFX1151, that /tmp is tmpfs and swap is off,
+# and that the TPM unlocked the data volume without a keyboard (V2 re-recorded post-reboot). The llama-cli half of V3
+# belongs to the Phase 2 gate. Three read-only records follow: the kernel line (v0.3.5, Section 3.3, S45; closes the
+# to-do kernel-line, or raises it again with this boot's state), what the unused XDNA 2 NPU shows (v0.3.5, 3.7 W-NPU),
+# and whether a panic's log can be kept across the restart (S48: pstore backend, systemd-pstore, kdump state).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -60,13 +62,28 @@ _panic_log_record() {
   fi
   log "panic log: pstore backend ${backend:-none}, kmsg_bytes $kmsg$efi; /sys/fs/pstore ${fs:-not mounted} with $n_live record(s); systemd-pstore.service ${pst:-unknown}; $n_arch archived under /var/lib/systemd/pstore; kdump-tools.service ${kd:-absent}, USE_KDUMP=${use:-unset} (option (c), S48)"
   case "$backend" in
-    ""|"(null)") warn "panic log: no pstore backend is registered, so a kernel panic leaves no log across the panic=10 restart on this board (record only; journalctl -k -b | grep -E '^pstore: |^ERST: ')" ;;
+    ""|"(null)") warn "panic log: no pstore backend is registered, so a kernel panic leaves no log across the panic=10 restart on this board (record only; journalctl -k -b -o cat | grep -E '^pstore: |^ERST: ')" ;;
   esac
   case "$kd" in
     enabled*) warn "panic log: kdump-tools.service is '$kd' again (step 4 disabled and masked it; V3a still fails on any crash-kernel reservation)" ;;
   esac
   if (( n_arch > 0 )); then
     warn "panic log: $n_arch crash record(s) from an earlier boot are archived under /var/lib/systemd/pstore (read them there; nothing is deleted)"
+  fi
+}
+
+# _kernel_line_record — Section 3.3, S45: the kernel line after the reboot; read-only. GA 7.0 closes the to-do
+# kernel-line; anything else raises it again with this boot's report, every time: todo_add keeps the latest record per
+# ID, so the to-do shows the kernel the node runs now, not step 4's pre-upgrade, pre-reboot view.
+_kernel_line_record() {
+  declare -F phase1_kernel_line_report >/dev/null || die "phase1_kernel_line_report is not defined: step 5 must be run by phase1-platform.sh"
+  local kl
+  if kl="$(phase1_kernel_line_report)"; then
+    log "kernel line: GA 7.0 (Section 3.3): $kl"
+    if todo_is_open kernel-line; then todo_done kernel-line; fi
+  else
+    warn "kernel line: not the GA 7.0 line of Section 3.3: $kl"
+    phase1_kernel_line_todo "$kl"
   fi
 }
 
@@ -109,17 +126,9 @@ step_05() {
   if dmesg 2>/dev/null | grep -q 'gttsize via module parameter is deprecated'; then
     log "dmesg: amdgpu.gttsize deprecation warning present (expected on kernel 7.x; ttm.pages_limit is the parameter of record)"
   fi
-  run_verify V3a v03a-gtt.sh 196608 || die "V3a failed: the kernel parameters (gttsize, ttm.pages_limit, lockup_timeout), the crash-kernel and panic settings (no crashkernel=, nothing reserved, exactly one panic=10, kernel.panic 10, panic_on_oops 0; S48), the GTT pool or the RADV device string do not match (see the verify table; cat /proc/cmdline; cat /sys/module/amdgpu/parameters/lockup_timeout; cat /sys/kernel/kexec_crash_size; ls /etc/default/grub.d; dmesg | grep -i gtt)"
-  # Kernel line after the reboot (Section 3.3, S45): read-only. Step 4's to-do closes here once the line is GA 7.0.
-  declare -F phase1_kernel_line_report >/dev/null || die "phase1_kernel_line_report is not defined: step 5 must be run by phase1-platform.sh"
-  local kl
-  if kl="$(phase1_kernel_line_report)"; then
-    log "kernel line: GA 7.0 (Section 3.3): $kl"
-    if todo_is_open kernel-line; then todo_done kernel-line; fi
-  else
-    warn "kernel line: not the GA 7.0 line of Section 3.3: $kl"
-    todo_is_open kernel-line || phase1_kernel_line_todo "$kl"
-  fi
+  run_verify V3a v03a-gtt.sh 196608 || die "V3a failed: the kernel parameters (gttsize, ttm.pages_limit, lockup_timeout), the crash-kernel and panic settings (no crashkernel=, nothing reserved, exactly one panic=10, kernel.panic 10, panic_on_oops 0; S48), kexec handover (exactly one kho=off, no CMA at all: neither KHO scratch nor a named CMA area, and /proc/zoneinfo readable; S49), the GTT pool or the RADV device string do not match (see the verify table; cat /proc/cmdline; cat /sys/module/amdgpu/parameters/lockup_timeout; cat /sys/kernel/kexec_crash_size; grep -E '^(CmaTotal|CmaFree):' /proc/meminfo; ls /etc/default/grub.d; dmesg | grep -i gtt)"
+  # Kernel line after the reboot (Section 3.3, S45): read-only; closes step 4's to-do or refreshes it.
+  _kernel_line_record
   _npu_record
   _panic_log_record
   log "step 5 complete: GTT pool $(gpu_gtt_total_mb) MiB, vulkaninfo sees RADV GFX1151"
