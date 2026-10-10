@@ -103,8 +103,10 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
 - **Phase 1 — platform** (30-60 min with the reboot): pre-flight on a bare host; LUKS2 + TPM2 (`--tpm2-pcrs=7`) on the
   8 TB drive with the recovery key printed once; mounts under `/srv/atlas`, `/srv/cold`, `/srv/backups`, swap off,
   tmpfs `/tmp` verified; dist-upgrade, kernel parameters (`amdgpu.gttsize`, `ttm.pages_limit`,
-  `amdgpu.lockup_timeout=10000,60000,10000,10000`), ufw, SSH hardening, Cockpit, the squid allowlist proxy; reboot;
-  post-reboot V3a; XFCE + xrdp + Google Chrome (Google's apt repo, telemetry/sign-in off by policy, never a snap); Docker with GPU passthrough and the
+  `amdgpu.lockup_timeout=10000,60000,10000,10000`), kdump switched off without a purge and its crash-kernel reservation
+  removed from the kernel line, `panic=10` added (doc S48), ufw, SSH hardening, Cockpit, the squid allowlist proxy;
+  reboot; post-reboot V3a (also: no crash-kernel memory reserved, one `panic=10`); a read-only record of whether a
+  kernel panic's log can be kept (pstore); XFCE + xrdp + Google Chrome (Google's apt repo, telemetry/sign-in off by policy, never a snap); Docker with GPU passthrough and the
   DOCKER-USER egress rules; WG-Easy, Cloudflare ddns, ntfy; gate.
 - **Phase 2 — engines and services** (30-60 min, no large downloads): llama.cpp Vulkan build (`-DLLAMA_OPENSSL=ON`,
   `-DLLAMA_USE_PREBUILT_UI=OFF`); Redis, Celery, the orchestrator (`atlas` package: Arbiter, router, approval queue,
@@ -173,7 +175,7 @@ real vault and records V18.
 | Phase 3 results | `/var/lib/atlas/day1/phase3/results/<engine>.json`; model manifests `/srv/atlas/data/manifests/`, `/srv/atlas/models/<key>/MANIFEST.json` |
 | Phase 4 results | `/var/lib/atlas/day1/phase4/<key>.json`; logs `/var/lib/atlas/day1/logs/phase4-<key>.log`; samples `/srv/atlas/workspace/phase4-samples/<key>/`; venv freezes `/srv/atlas/engines/manifests/<key>/freeze.txt` |
 | Reports | `/var/lib/atlas/day1/reports/ATLAS_BUILD_BASELINE-<timestamp>.xlsx` (the repo copy is never touched) |
-| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 12, whole GiB from 4 to 64; doc S44; a bad value stops only `atlas-orchestrator`, which says why at start). `atlas-admin arbiter status` shows it beside MemAvailable; restart `atlas-orchestrator` after changing it |
+| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44, S48: the default fits every Apex KV-ladder rung only because Phase 1 step 4 removes kdump's 4.25 GiB crash-kernel reservation, which V3a proves; a bad value stops only `atlas-orchestrator`, which says why at start). `atlas-admin arbiter status` shows it beside MemAvailable; restart `atlas-orchestrator` after changing it |
 | Secrets | `/etc/atlas/secrets/` (root:atlas 710; every file 600, owned by its one reader): `hf-token.env`, `cloudflare.env`, `ntfy.env`, `smb.cred`, `restic.pass`, `redis.env`, `openwebui.env`, `wg-easy.env`, `google/` |
 | The scripts the node runs | `/opt/atlas/day1/` (a mirror of this directory) |
 
@@ -256,10 +258,12 @@ binary (tpm2-tools, universe, not on the server image), and in dracut's default 
 crypttab alone pulls that module in. So neither the drop-in nor crypttab mentions TPM2 until step 4 has installed
 tpm2-tools through the proxy; step 4 then adds both, rebuilds every initramfs and checks each image before the reboot.
 
-**phase1/04-system.sh** — 387, 391: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). Time sync
+**phase1/04-system.sh** — 397, 401: NetworkManager `main.dns=none` drop-in (only if NM manages the LAN). Time sync
 (VERIFIED since v0.3.4): 26.04 runs chrony with NTS (1..4.ntp.ubuntu.com, ntp-bootstrap.ubuntu.com, UDP 123 and TCP
 4460), opened for uid `_chrony` only; the pinned-address and router fallback apply only to a host still on
-systemd-timesyncd. A chrony that does not synchronise within two minutes is a warning and the to-do `time-sync`. Kernel line (VERIFIED since v0.3.5, archive indices and the 26.04.1 server ISO): the ISO installs `linux-generic`; step 4 holds that line, swaps HWE metapackages over the same 7.0 image itself, and leaves anything else (OEM or platform metapackages, an image outside 7.0, a metapackage not from `linux-meta`) to the to-do `kernel-line`.
+systemd-timesyncd. A chrony that does not synchronise within two minutes is a warning and the to-do `time-sync`. Kernel line (VERIFIED since v0.3.5, archive indices and the 26.04.1 server ISO): the ISO installs `linux-generic`; step 4 holds that line, swaps HWE metapackages over the same 7.0 image itself, and leaves anything else (OEM or platform metapackages, an image outside 7.0, a metapackage not from `linux-meta`) to the to-do `kernel-line`. Crash kernel and panic (doc S48, option (c) of 2026-10-10), VERIFIED: kdump-tools 1:1.10.7ubuntu3 is on the 26.04.1 server image and its conffile `/etc/default/grub.d/kdump-tools.cfg` adds `crashkernel=…,128G-:4096M` whatever `USE_KDUMP` says; kernel 7.0 then reserves 4.25 GiB on this machine (4096 MiB above 4 GiB plus 256 MiB below); grub-mkconfig sources the drop-ins in byte order under dash and `set -e`, so `zzz-atlas-crash.cfg` is sourced last; every kdump-tools configure rewrites `USE_KDUMP` from the debconf answer through ucf, and `systemctl disable` and `mask` both survive its upgrades; Ubuntu's kernel waits forever after a panic (`CONFIG_PANIC_TIMEOUT=0`). INFERRED: the installer already set `USE_KDUMP=0` and debconf `false` on this node (its rule wants about 935-940 GiB free on `/var`), so `_kdump_off` normally only confirms them; the crash kernel's capture initrd (initramfs-tools, no cryptsetup on the image) could never open the LUKS root, by TPM or by passphrase, so no dump was ever possible. Left on purpose: `/etc/kernel/postinst.d/kdump-tools` still builds an unused capture initrd at every kernel install (a conffile, not edited).
+
+**phase1/05-postboot.sh** — the panic-log record (doc S48) is read-only and settles nothing by itself. UNKNOWN until it runs: whether this board registers a pstore backend (`efi_pstore`, or `erst` when the firmware has an ACPI ERST table) and whether its firmware accepts the EFI-variable writes. INFERRED: `systemd-pstore.service` is enabled on the image; after a `panic=10` restart the TPM unlocks the disks unattended, since PCR 7 is measured again from the same Secure Boot policy (whether this board's emergency reset can hang is UNKNOWN). Only a deliberate test panic on an idle node (`echo c > /proc/sysrq-trigger`) would settle these; that is the Principal's call and in no script.
 
 **phase1/05b-desktop.sh** — the Google apt repository recipe for Chrome (key URL `dl.google.com/linux/linux_signing_key.pub`,
 suite `stable main`); fails loudly on a non-armoured key. Chrome's managed policy path `/etc/opt/chrome/policies/managed/`
@@ -338,10 +342,14 @@ fatbins on the ROCm 10.0 runtime, libamdhip64 path inside the wheels.
 dependency relaxations (transformers 4.34.1 / tokenizers 0.14), eval class names.
 **phase4/engines/clay-prithvi.sh / _test.py** — 5, 2: TerraTorch `BACKBONE_REGISTRY.build(..., pretrained=True)`.
 
-**orchestrator/src/atlas/arbiter.py** — 97-112: KV bytes-per-token figures for gpt-oss (8 KV heads), Nemotron,
+**orchestrator/src/atlas/arbiter.py** — 129-144: KV bytes-per-token figures for gpt-oss (8 KV heads), Nemotron,
 Qwen3.5 and DeepSeek (bounds from Section 4.3; remeasured in Phase 3). **tasks/aegis.py** — 38, 201: ChromaDB has no
 snapshot API. **tasks/sentinel.py** — 7: feed URLs. **engines.py** — 4: endpoints marked in the file. **router.py** —
-130: ~4 characters per token. **memory.py** — 1215: bge-m3 embedding dimension 1024.
+130: ~4 characters per token. **memory.py** — 1215: bge-m3 embedding dimension 1024. **config.py** — the 16 GiB
+default host reserve (doc S44, S48) rests on an estimate, not a measurement: MemTotal near 187-188 GiB once Phase 1
+step 4 has removed the crash-kernel reservation (192 GiB less the UMA carve-out, a ~3 GiB page map and ~0.5 GiB of
+firmware and kernel); every Apex KV-ladder rung fits from about 182.3-184.3 GiB. V3a records the real MemTotal and
+fails on a surviving reservation; `ATLAS_ARBITER_HEADROOM_GIB` changes the reserve if the node needs it.
 
 **config/engines.json** — 13 (env_rule wording), 167 (DeepSeek f16 rung at half the pool), 291 (bge-m3 GGUF file
 name; enumerated case-insensitively). **config/phase4-engines.json** — 6, 77, 119, 148, 208, 236, 237, 277, 303,
@@ -363,7 +371,7 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 **systemd/atlas-orchestrator.service** — 40: docker client needs under the hardening. **systemd/llama-server@.service**
 — 86: whether Mesa/RADV needs AF_UNIX (kept).
 
-**verify/v03a-gtt.sh** — VERIFIED since v0.3.5: kernel 7.0.0-38 reports the requested 196608 MiB GTT pool whatever MemTotal is, and 7.0.0-39 caps it at MemTotal; both pass (S47).
+**verify/v03a-gtt.sh** — VERIFIED since v0.3.5: kernel 7.0.0-38 reports the requested 196608 MiB GTT pool whatever MemTotal is, and 7.0.0-39 caps it at MemTotal; both pass (S47). VERIFIED (S48, v7.0 source): `/sys/kernel/kexec_crash_size` counts both crash-kernel regions and reads 0 without a reservation (4563402752 with kdump-tools' value); the kernel finds `crashkernel=` anywhere on its command line, hence the substring check; the last `panic=` wins and `/proc/sys/kernel/panic` is the same variable. UNKNOWN until V3a runs: the real MemTotal, expected near 187-188 GiB once the reservation is gone (the summary prints it).
 
 **verify/v06-pyannote.sh** — 17: whether current pyannote loads the legacy 3.1 pipeline (a fail blocks the gate).
 **verify/v17-sandbox.sh** — 14: exit 137 convention. **verify/v23-cloudflare-token.sh** — 89: `/user/tokens/verify`.
@@ -376,6 +384,11 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
   prefill test checks the server survives and records a warning, not a hang.
 - DeepSeek V4 Flash: quantised KV produced garbage in mid-2026; Phase 3 ladders f16 → q8_0 → q4_0 with a coherence
   check (S2) and records the winner; the GRUB line carries `amdgpu.lockup_timeout` for the DeviceLost reports.
+- `panic=10` (doc S48) restarts the node after a kernel panic, but not after everything that can stop it: a panic before
+  the kernel reads its parameters still hangs; soft and hard lockups and hung tasks only warn; a crash of systemd itself
+  freezes; a failed TPM unseal waits at the passphrase prompt; recovery boots keep the wait-forever default. A panic
+  that recurs at every boot restarts the node in a loop (accepted). A hardware watchdog or lockup panics would each be
+  a separate decision; nothing was added.
 - The docker socket is host root and `atlas` is in the `docker` group: the sandbox bounds the job, not the
   orchestrator that launches it (recorded in `docker/sandbox/Dockerfile`, `phase2/README-contracts.md`).
 - Licences recorded, not argued (Section 16.5): PointLLM cc-by-nc-4.0, Rad-DINO research use, FLUX.1-dev and Stable
@@ -385,7 +398,7 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 ## 7. Developing
 
 `bash -n` and `shellcheck -x` on every `.sh`, `python3 -m py_compile` on every `.py`, `ruff check orchestrator phase2
-phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47), and the package tests (Python 3.12+):
+phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash phase1/crash_params_test.sh` (the `zzz-atlas-crash.cfg` drop-in under grub-mkconfig's own sourcing lines, dash and `set -e`, with the real `kdump-tools.cfg`; `_grub_params` end to end; `_kdump_off` and `_panic_log_record` against stubbed `dpkg-query`/debconf/`systemctl`/`kdump-config`/`sysctl`/`findmnt`; doc S48; needs dash), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47, and its crash-kernel and panic checks, doc S48), and the package tests (Python 3.12+):
 
 ```
 cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest

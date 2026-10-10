@@ -361,13 +361,11 @@ def test_pool_is_capped_at_memtotal_and_gpu_page_counters_are_preferred(engines:
     assert arb2.pool_bytes == gtt_total and arb2.status()["mem_total_bytes"] is None
 
 
-def test_default_reserve_keeps_every_apex_ladder_rung_on_the_expected_node(engines: dict[str, EngineSpec]) -> None:
-    """Review v0.3.5: the S2 KV ladder's f16 rung (ctx 16384) is the Apex fallback when quantised KV is incoherent, so
-    the default reserve must leave room for it, the q8_0 rung and the everyday pair on the node Section 4.1 expects:
-    MemTotal ~183.5 GiB (192 GiB less the UMA carve-out, the page map and kdump's 4 GiB crashkernel), resident 8 GiB."""
+def _apex_rungs_on(engines: dict[str, EngineSpec], mem_total: int, resident: int) -> tuple[Arbiter, dict[str, int]]:
+    """An Arbiter at the default reserve on a node with this MemTotal and GPU resident set (the GTT total reported as
+    the requested 192 GiB, as kernel 7.0.0-38 does), and the projected footprint of each S2 KV-ladder rung."""
     from atlas.config import DEFAULT_ARBITER_HEADROOM_GIB
 
-    mem_total, resident = int(183.5 * GIB), 8 * GIB
     probe = StubProbe(total_bytes=192 * GIB, used_bytes=resident, mem_total_bytes=mem_total,
                       mem_available_bytes=mem_total - resident - 10 * GIB)
     arb = Arbiter(engines, StubController(engines=engines, probe=probe), probe,
@@ -375,10 +373,30 @@ def test_default_reserve_keeps_every_apex_ladder_rung_on_the_expected_node(engin
     arb.measure_resident_set()
     rungs = {kv: arb.projected_footprint(APEX_KEY, ctx=ctx, parallel=1, kv_class=kv).total_bytes
              for kv, ctx in (("f16", 16384), ("q8_0", 32768), ("q4_0", 32768))}
+    return arb, rungs
+
+
+def test_default_reserve_keeps_every_apex_ladder_rung_on_the_expected_node(engines: dict[str, EngineSpec]) -> None:
+    """Review v0.3.5, S48: the S2 KV ladder's f16 rung (ctx 16384) is the Apex fallback when quantised KV is incoherent,
+    so the default reserve (16 GiB) must leave room for it, the q8_0 rung and the everyday pair on the node Section 4.1
+    expects once Phase 1 step 4 has dropped kdump's crash-kernel reservation: MemTotal ~187-188 GiB (192 GiB less the
+    UMA carve-out, the page map and firmware/kernel), taken at its low end, with the larger GPU resident set, 8 GiB."""
+    arb, rungs = _apex_rungs_on(engines, 187 * GIB, 8 * GIB)
+    assert arb.budget_bytes == 163 * GIB
     assert max(rungs.values()) <= arb.budget_bytes, {k: v / GIB for k, v in rungs.items()}
     pair = arb.projected_footprint("gpt-oss-120b").total_bytes + arb.projected_footprint(
         "qwen2.5-vl-72b", coresident=True).total_bytes
     assert pair <= arb.budget_bytes
+
+
+def test_a_surviving_crashkernel_reservation_refuses_the_f16_and_q8_0_rungs(engines: dict[str, EngineSpec]) -> None:
+    """S48: why V3a fails when crash-kernel memory is still reserved. kdump-tools' crashkernel= takes 4.25 GiB out of
+    MemTotal (~183.5 GiB left); at the 16 GiB default and an 8 GiB GPU resident set the budget is 159.5 GiB, below the
+    f16 (160.0 GiB) and q8_0 (160.3 GiB) rungs, so the Apex engine could run only at q4_0."""
+    arb, rungs = _apex_rungs_on(engines, int(183.5 * GIB), 8 * GIB)
+    assert arb.budget_bytes == int(159.5 * GIB)
+    assert rungs["f16"] > arb.budget_bytes and rungs["q8_0"] > arb.budget_bytes, {k: v / GIB for k, v in rungs.items()}
+    assert rungs["q4_0"] <= arb.budget_bytes
 
 
 def test_sysfs_probe_reads_memtotal_and_memavailable(tmp_path: Path) -> None:
@@ -400,7 +418,7 @@ def test_build_arbiter_takes_the_headroom_from_settings(engines: dict[str, Engin
     """Production wiring (S44): build_arbiter reserves Settings.arbiter_headroom_bytes; an explicit argument wins."""
     monkeypatch.setenv("ATLAS_ENGINES_ENV_DIR", str(tmp_path))
     monkeypatch.delenv("ATLAS_ARBITER_HEADROOM_GIB", raising=False)
-    assert build_arbiter(engines).headroom_bytes == 12 * GIB
+    assert build_arbiter(engines).headroom_bytes == 16 * GIB
     monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "20")
     assert build_arbiter(engines).headroom_bytes == 20 * GIB
     assert build_arbiter(engines, headroom_bytes=0).headroom_bytes == 0
@@ -448,7 +466,7 @@ def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path,
     (etc / "orchestrator.env").write_text("ATLAS_ARBITER_HEADROOM_GIB=2\n")
     assert admin.main(["arbiter", "status", "--json"]) == 0
     host = json.loads(capsys.readouterr().out)["host"]
-    assert host["headroom_bytes"] == 12 * GIB and "outside 4..64" in host["error"]
+    assert host["headroom_bytes"] == 16 * GIB and "outside 4..64" in host["error"]
 
 
 def test_build_arbiter_wires_the_engines_env_dir_from_settings(engines: dict[str, EngineSpec], tmp_path: Path,

@@ -29,7 +29,9 @@ objects, i.e. the three resident small models and whatever else sits on the iGPU
 Docker, Open WebUI, ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but does
 not appear on that counter (only memory a process hands the GPU through userptr or a dma-buf import does), so
 `headroom_bytes` reserves it (v0.3.5, S44: Settings.arbiter_headroom_bytes, default
-config.DEFAULT_ARBITER_HEADROOM_GIB = 12 GiB, set by build_arbiter; the constructor's 0 is for the stub tests only).
+config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set by build_arbiter; the constructor's 0 is for the stub tests only).
+At 16 GiB every Apex KV-ladder rung fits only because Phase 1 step 4 drops kdump's 4.25 GiB crash-kernel reservation
+from MemTotal (S48; config.py has the numbers), and V3a fails when that reservation survives.
 Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - (GPUActive + GPUReclaim where
 the kernel reports them, else gtt_used) is the CPU-side use at that moment, shown in status() as host_used_bytes and
 logged at WARNING when it exceeds the headroom (the reserve is then too small for this node: raise

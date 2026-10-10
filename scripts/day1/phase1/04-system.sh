@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # phase1/04-system.sh — Phase 1 step 4 (Sections 3.3, 3.6, 12.5, 17; Appendix B): allowlist proxy (squid) and the
 # proxy environment, the allowlisting DNS forwarder (dnsmasq) the host resolves through, ufw default-deny in AND out,
-# full system update through the proxy (held on the GA 7.0 kernel line, S45), Canonical's beacons off, GRUB kernel
-# parameters (V3), SSH hardening, Cockpit, then the reboot marker and the reboot (unless --no-reboot).
+# full system update through the proxy (held on the GA 7.0 kernel line, S45), Canonical's beacons off, kdump switched
+# off and its crash-kernel reservation dropped from the kernel line with panic=10 added (option (c) of 2026-10-10, S48),
+# GRUB kernel parameters (V3), SSH hardening, Cockpit, then the reboot marker and the reboot (unless --no-reboot).
 # Order matters: the proxy, the forwarder and the firewall come first so that even the system update obeys rule §7.1.
 #
 # THE UNAVOIDABLE PRE-PROXY INSTALLS: squid itself and dnsmasq (with jq and gettext-base for rendering their configs)
@@ -56,6 +57,11 @@ export ATLAS_NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.
 # the kernel 7.x GPU watchdog S8 added so that V22 (DeepSeek V4 DeviceLost, llama.cpp issue #25664) cannot fail for a
 # kernel reason, which is exactly why a cmdline without it must fail V3a rather than pass.
 export ATLAS_GRUB_PARAMS="amdgpu.gttsize=196608 ttm.pages_limit=50331648 amdgpu.lockup_timeout=10000,60000,10000,10000"
+# Option (c), S48 (Section 3.3, 4.1, Appendix B): the crash-kernel drop-in. It is sourced LAST by grub-mkconfig, removes
+# every crashkernel= and panic= token and appends panic=10, so it is the one authority over both. panic=10 is therefore
+# NOT in ATLAS_GRUB_PARAMS: 90-atlas.cfg is sourced before kdump-tools.cfg and any later drop-in, so it cannot have the
+# last word, and its substring guards below would mangle a hand-typed panic=100. V3a checks the same literal panic=10.
+ATLAS_GRUB_CRASH_DROPIN="/etc/default/grub.d/zzz-atlas-crash.cfg"
 # Hosts rule §7.1 forbids outright, enforced at render time (Section 16.3 item 6: a one-line edit must not open them).
 ATLAS_ALLOWLIST_NEVER=(api.openai.com api.anthropic.com generativelanguage.googleapis.com aiplatform.googleapis.com
                        api.openwebui.com motd.ubuntu.com daisy.ubuntu.com errors.ubuntu.com)
@@ -900,10 +906,124 @@ _kernel_line() {
   fi
 }
 
+# --- Crash kernel off, panic restarts (option (c) of 2026-10-10; S48; Sections 3.3, 4.1; Appendix B) --------------------
+# Ubuntu's kdump-tools (installed by the 26.04.1 server ISO, base layer) ships /etc/default/grub.d/kdump-tools.cfg, one
+# unconditional line appending crashkernel=2G-4G:320M,...,128G-:4096M to GRUB_CMDLINE_LINUX_DEFAULT whatever USE_KDUMP
+# says. On this 192 GiB machine kernel 7.0 reserves 4096 MiB above 4 GiB plus an automatic 256 MiB below it: 4.25 GiB
+# out of MemTotal at every boot (VERIFIED, v7.0 kernel/crash_reserve.c). The crash kernel could not write a dump here
+# anyway: its initramfs-tools capture initrd has no cryptsetup, so it cannot open the LUKS root (INFERRED). And while a
+# crash kernel is loaded, kdump-config sets kernel.panic_on_oops=1, turning a survivable oops into a full crash.
+# The Principal's decision: neutralise, never purge. kdump-tools is only a Recommends of ubuntu-server-minimal, but a
+# removal keeps its conffiles (kdump-tools.cfg included, so crashkernel= would stay), and editing or deleting a conffile
+# makes the next kdump-tools upgrade that changes it stop at a dpkg prompt. So nothing of the package is edited:
+#   - the reservation goes through a drop-in of our own that grub-mkconfig sources after kdump-tools.cfg (below);
+#   - kdump is switched off where the maintainer scripts read it: the debconf answer (every postinst rewrites
+#     USE_KDUMP from it through ucf) and USE_KDUMP=0 in /etc/default/kdump-tools (ucf-managed, never deleted: the unit's
+#     EnvironmentFile= has no '-' and ucf would recreate it), both agreeing so no upgrade prompts or re-enables it;
+#   - kdump-tools.service is disabled AND masked. Both survive upgrades (deb-systemd-helper sees the missing link and
+#     only updates its state; its unmask removes only masks it made itself; deb-systemd-invoke skips a disabled or
+#     masked unit); the mask also blocks a manual or dependency start. kdump-tools-dump.service is static (started only
+#     on a capture kernel's command line) and is left alone.
+# Known residue, left on purpose: /etc/kernel/postinst.d/kdump-tools still builds a capture initrd under /var/lib/kdump
+# at every kernel install (it checks only for mkinitramfs); deleting that conffile would cause the same dpkg prompt.
+# Never `dpkg-reconfigure kdump-tools` after this: in reconfigure mode its config script reads the file back into debconf.
+
+# _grub_crash_dropin — print the content of $ATLAS_GRUB_CRASH_DROPIN. grub-mkconfig sources /etc/default/grub, then
+# /etc/default/grub.d/*.cfg in the byte order of dash's own glob sort (strcmp, whatever the locale): 50-curtin-settings,
+# 90-atlas, kdump-tools, zz-*, then zzz-atlas-crash (VERIFIED). "zzz-" so it also follows a zz-kdump-tools.cfg (the DGX
+# crashkernel package in multiverse); 90-atlas.cfg sorts BEFORE kdump-tools.cfg and could not strip what that adds.
+# The content runs inside grub-mkconfig's own /bin/sh (dash) under `set -e`, and inside grub-efi-amd64's postinst
+# (bash): POSIX sh and POSIX sed only (GNU sed's \n escapes misbehave under POSIXLY_CORRECT), no grep in a command
+# substitution and no &&/|| as the last command (either aborts update-grub, and with it the kdump-tools postinst,
+# zz-update-grub and every kernel install; tested), no globbing of command-line words, and it sets nothing but the two
+# variables (its helper is unset). Tokens are cut out whole, following the kernel's own rule that a double quote
+# toggles quoting anywhere in a word (kernel/params.c next_arg): oops=panic, panic_on_warn=1 and a quoted value that
+# merely contains " panic=" stay. The last line appends panic=10 to GRUB_CMDLINE_LINUX_DEFAULT, so on every normal entry
+# (10_linux: GRUB_CMDLINE_LINUX then _DEFAULT) panic=10 is the one panic= token whatever /etc/default/grub or another
+# drop-in says; recovery entries (GRUB_CMDLINE_LINUX_RECOVERY + GRUB_CMDLINE_LINUX) get no panic= and keep the kernel's
+# wait-forever default, which suits a boot with someone at the console.
+_grub_crash_dropin() {
+  cat <<'CFG'
+# A.T.L.A.S. Phase 1 step 4, option (c) of 2026-10-10 (S48; Section 3.3, 4.1, Appendix B). Written by the Day 1 scripts.
+# Sourced last by grub-mkconfig: removes every crashkernel= and panic= word from both kernel-line variables (kdump-tools.cfg
+# would reserve 4.25 GiB for a crash kernel that cannot unlock this node's disks), then appends panic=10 so a kernel panic
+# restarts the node after 10 seconds and the TPM unlocks the disks unattended. V3a gates both. POSIX sh only; ends in ':'.
+_atlas_crash_sed='s/^(([^"]*"[^"]*")*[^"]*)[[:space:]]+("(crashkernel|panic)=[^"]*("([^[:space:]"]|"[^"]*"|"[^"]*$)*)?|(crashkernel|panic)=([^[:space:]"]|"[^"]*"|"[^"]*$)*)/\1/'
+GRUB_CMDLINE_LINUX=$(printf '%s\n' "${GRUB_CMDLINE_LINUX-}" | sed -E -e 's/^/ /' -e ':a' -e "$_atlas_crash_sed" -e 'ta' -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//')
+GRUB_CMDLINE_LINUX_DEFAULT=$(printf '%s\n' "${GRUB_CMDLINE_LINUX_DEFAULT-}" | sed -E -e 's/^/ /' -e ':a' -e "$_atlas_crash_sed" -e 'ta' -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//')
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+$GRUB_CMDLINE_LINUX_DEFAULT }panic=10"
+unset _atlas_crash_sed
+:
+CFG
+}
+
+# _kdump_off — switch kdump off without purging it (comment above); idempotent (rule §7.3), never fails on an absent unit.
+# Logs one line: what was done, and the crash-kernel memory this boot holds that comes back to MemTotal at the reboot.
+_kdump_off() {
+  local st size mem did=() unit f=/etc/default/kdump-tools
+  size="$(cat /sys/kernel/kexec_crash_size 2>/dev/null || echo unreadable)"
+  if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
+    mem="$(awk -v b="$size" 'BEGIN {printf "%.2f", b / 1073741824}') GiB ($size bytes) reserved for a crash kernel on this boot, back in MemTotal after the reboot"
+  elif [[ "$size" == 0 ]]; then
+    mem="no crash-kernel memory reserved on this boot"
+  else
+    mem="crash-kernel reservation unreadable (/sys/kernel/kexec_crash_size: $size)"
+  fi
+  # Installed in any state that keeps its files ("ii", "hi", or "rc" after a removal: conffiles stay); "un" or no
+  # record at all means never installed.
+  st="$(dpkg-query -W -f='${db:Status-Abbrev}' kdump-tools 2>/dev/null || true)"
+  if [[ -z "${st:1:1}" || "${st:1:1}" == n ]]; then
+    log "kdump: kdump-tools is not installed, nothing to switch off; $ATLAS_GRUB_CRASH_DROPIN still removes any crashkernel= and sets panic=10 (S48); $mem"
+    return 0
+  fi
+  # 1. The debconf answer every postinst turns into USE_KDUMP (through ucf). Set, then read back.
+  apt_wait_idle
+  printf 'kdump-tools kdump-tools/use_kdump boolean false\n' | debconf-set-selections \
+    || die "debconf-set-selections could not set kdump-tools/use_kdump=false (another debconf frontend holding its lock?); re-run step 4"
+  { debconf-show kdump-tools 2>/dev/null || true; } | grep -qE 'kdump-tools/use_kdump: false$' \
+    || die "debconf still does not answer kdump-tools/use_kdump=false after debconf-set-selections (debconf-show kdump-tools)"
+  did+=("debconf use_kdump=false")
+  # 2. USE_KDUMP=0 in the defaults file: every USE_KDUMP line, or one appended; rewritten only when it differs.
+  #    _kdump_use_other FILE: 0 when some USE_KDUMP line in FILE is not exactly USE_KDUMP=0 (one process, no pipe).
+  _kdump_use_other() { awk '/^[[:space:]]*USE_KDUMP=/ && $0 != "USE_KDUMP=0" {bad = 1} END {exit !bad}' "$1"; }
+  if [[ -f "$f" ]]; then
+    if ! grep -qE '^[[:space:]]*USE_KDUMP=' "$f"; then
+      ensure_kv "$f" USE_KDUMP 0
+    elif _kdump_use_other "$f"; then
+      sed -i -E 's/^[[:space:]]*USE_KDUMP=.*/USE_KDUMP=0/' "$f"
+    fi
+    if _kdump_use_other "$f" || ! grep -qx 'USE_KDUMP=0' "$f"; then
+      die "$f does not read USE_KDUMP=0 after the edit: $({ grep -E 'USE_KDUMP' "$f" || true; } | paste -sd' ')"
+    fi
+    did+=("USE_KDUMP=0 in $f")
+  else
+    did+=("no $f (ucf recreates it from debconf, now false, at the next configure)")
+  fi
+  # 3. A crash kernel loaded now (an upgrade's postinst may just have restarted the unit): unload it, and undo the
+  #    panic_on_oops=1 kdump-config set when it loaded (unload leaves it, and with USE_KDUMP=0 the unit's stop path
+  #    exits before unloading). Otherwise the reboot that applies the GRUB line clears both.
+  if [[ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" == 1 ]]; then
+    kdump-config unload >/dev/null 2>&1 || warn "kdump: 'kdump-config unload' failed; the crash kernel stays loaded until the reboot"
+    sysctl -q -w kernel.panic_on_oops=0 >/dev/null 2>&1 || warn "kdump: could not reset kernel.panic_on_oops to 0 (the reboot does)"
+    did+=("loaded crash kernel unloaded, kernel.panic_on_oops=0")
+  fi
+  # 4. The unit: disabled and masked (comment above). An absent unit is not an error.
+  systemctl disable --now kdump-tools.service >/dev/null 2>&1 || true
+  systemctl mask kdump-tools.service >/dev/null 2>&1 || true
+  unit="$(systemctl is-enabled kdump-tools.service 2>/dev/null || true)"
+  case "$unit" in
+    masked|masked-runtime|disabled|not-found|"") ;;
+    *) die "kdump-tools.service is still '$unit' after systemctl disable and mask (systemctl status kdump-tools.service)" ;;
+  esac
+  did+=("kdump-tools.service ${unit:-absent}")
+  log "kdump off, not purged (option (c), S48): ${did[*]}; $mem; $ATLAS_GRUB_CRASH_DROPIN removes crashkernel= and sets panic=10"
+}
+
 _grub_params() {
   # Section 3.3 / Appendix B: the three parameters in ATLAS_GRUB_PARAMS, all gated by V3a (header).
   # A drop-in under /etc/default/grub.d/ is sourced by grub-mkconfig after /etc/default/grub (VERIFIED), so the
   # variable is extended without editing the distro file, and rewriting the whole drop-in makes it idempotent.
+  # The crash drop-in (S48, _grub_crash_dropin) is written in the same pass, before the one update-grub.
   local all="$ATLAS_GRUB_PARAMS"
   install -d -m 755 /etc/default/grub.d
   {
@@ -912,12 +1032,13 @@ _grub_params() {
     echo "# amdgpu.lockup_timeout keeps DeepSeek V4 from a Vulkan DeviceLost (S8, llama.cpp issue #25664). All three are gated by V3a."
     echo "GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT $all\""
   } >/etc/default/grub.d/90-atlas.cfg
+  _grub_crash_dropin >"$ATLAS_GRUB_CRASH_DROPIN"
   # Never duplicate: strip our parameters from the distro line if a hand edit put them there.
   local p
   for p in $all; do
     sed -i -E "/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/[[:space:]]*$(printf '%s' "$p" | sed 's/[.]/\\./g')//g" /etc/default/grub
   done
-  update-grub >/dev/null 2>&1 || die "update-grub failed"
+  update-grub >/dev/null 2>&1 || die "update-grub failed (a drop-in that fails under grub-mkconfig's set -e stops it: run update-grub by hand and read the last 'Sourcing file' line)"
   for p in $all; do
     grep -qF -- "$p" /boot/grub/grub.cfg || die "/boot/grub/grub.cfg does not carry $p after update-grub"
     # `|| true` inside the pipeline: with pipefail a zero-match grep -o would otherwise abort the step through the
@@ -926,7 +1047,20 @@ _grub_params() {
     c="$({ grep -m1 -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg || true; } | { grep -o -F -- "$p" || true; } | wc -l)"
     (( c == 1 )) || die "$p appears $c times on the first kernel line of grub.cfg (expected exactly once)"
   done
-  log "GRUB: $all (applies at the reboot; V3a checks /proc/cmdline and the live module parameters in step 5)"
+  # S48: no crashkernel= anywhere in grub.cfg (normal, advanced and recovery entries alike). A substring check, because
+  # the kernel finds the parameter with strstr anywhere on its command line (get_last_crashkernel, v7.0
+  # kernel/crash_reserve.c, VERIFIED), even inside another word or a quoted value the drop-in rightly leaves alone.
+  local ck
+  ck="$({ grep -n -F -- 'crashkernel=' /boot/grub/grub.cfg || true; } | cut -d: -f1 | paste -sd' ')"
+  [[ -z "$ck" ]] || die "/boot/grub/grub.cfg still carries crashkernel= (lines $ck) after update-grub, so the kernel would keep reserving crash-kernel memory (4.25 GiB with kdump-tools' value) and the Arbiter's 16 GiB reserve would refuse the Apex f16 and q8_0 rungs. Look for a drop-in that sorts after $(basename "$ATLAS_GRUB_CRASH_DROPIN") (ls /etc/default/grub.d), a crashkernel= inside another word or a quoted value, or an entry in /etc/grub.d/40_custom"
+  # S48: the default entry's kernel line carries exactly one panic= token, and it is panic=10 (the kernel uses the last
+  # one; one token keeps V3a's reading unambiguous). Whole words here, so oops=panic and panic_on_warn= never count;
+  # words split at whitespace, so a quoted value containing " panic=" stops the step too (loud, never a silent pass).
+  local panics
+  panics="$({ grep -m1 -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg || true; } \
+            | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^"?panic=/) print $i}' | paste -sd' ')"
+  [[ "$panics" == "panic=10" ]] || die "the first kernel line of grub.cfg carries the panic tokens '${panics:-none}', expected exactly one panic=10. $ATLAS_GRUB_CRASH_DROPIN should leave only that; look for a drop-in sorting after it (ls /etc/default/grub.d) or a hand edit of /etc/grub.d"
+  log "GRUB: $all panic=10, no crashkernel= (applies at the reboot; V3a checks /proc/cmdline, the live module parameters, kernel.panic and the crash-kernel reservation in step 5)"
 }
 
 _ssh_harden() {
@@ -1031,7 +1165,9 @@ step_04() {
   retry 2 apt-get -y -q -o Dpkg::Options::=--force-confold dist-upgrade || die "apt-get dist-upgrade failed"
   apt-get -y -q autoremove >/dev/null || true
   _disable_beacons
-  # 4. Kernel parameters (V3), then every initramfs rebuilt with the TPM2 pieces before the reboot (Section 3.5).
+  # 4. kdump off and its crash-kernel reservation dropped, panic=10 (option (c), S48), the kernel parameters (V3), then
+  #    every initramfs rebuilt with the TPM2 pieces before the reboot (Section 3.5).
+  _kdump_off
   _grub_params
   phase1_initramfs_rebuild
   # 5. SSH and Cockpit (Section 3.6).

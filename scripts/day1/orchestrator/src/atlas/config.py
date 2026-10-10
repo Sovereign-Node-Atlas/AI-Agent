@@ -30,22 +30,26 @@ DEFAULT_CONFIG_DIR = Path("/opt/atlas/day1/config")
 DEFAULT_ETC_DIR = Path("/etc/atlas")
 DEFAULT_DB_PATH = Path("/srv/atlas/data/orchestrator/atlas.sqlite3")
 DEFAULT_LLAMA_PORT_BASE = 8100
-# Section 4.1 (v0.3.5, S44): memory the Engine Arbiter never budgets to an engine. Its resident set is read from
+# Section 4.1 (v0.3.5, S44; S48): memory the Engine Arbiter never budgets to an engine. Its resident set is read from
 # mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/Docker/
 # Cockpit 4 GB, Open WebUI/ChromaDB/graph store ~3 GB, Kokoro/Whisper/PyAnnote 3 GB, orchestrator/Celery/Redis/
 # Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it, and without a reserve they were budgeted to engines on a node
-# with no swap. 12 GiB matches those rows, the always-resident set of 4.1 less its GPU part; measured CPU-side use is
-# logged against it at every measurement, so a node that needs more says so (raise the override then).
-# Why not more: the Phase 3 KV ladder of the Apex engine (S2) projects 160.0 GiB at f16 (ctx 16384), 160.3 at q8_0 and
-# 157.8 at q4_0, and the f16 rung is the fallback when quantised KV is incoherent. It fits only while pool - GPU
-# resident set (6-8 GiB) - reserve >= 160.3 GiB, i.e. pool >= ~178-180 GiB at 12 GiB. The pool is min(GTT total,
-# MemTotal) (S47), and MemTotal on this node is expected near 183-184 GiB: 192 GiB less the UMA carve-out (3.2), the
-# kernel's page map (~3 GiB) and the 4 GiB kdump-tools reserves by default for crash dumps (crashkernel= on the GRUB
-# line, review v0.3.5; an estimate until V3a records the real figure). A 16 GiB reserve would refuse the f16 and q8_0
-# rungs on such a node. ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env overrides it (whole GiB, within
-# ARBITER_HEADROOM_RANGE_GIB); a bad value stops only the Arbiter's construction (build_arbiter), never another reader
-# of the settings (the backup freeze, Sentinel, Celery tasks).
-DEFAULT_ARBITER_HEADROOM_GIB = 12
+# with no swap. 16 GiB = those ~12 GiB plus room for transient CPU work (Celery CPU workers, Docling, the Phase 2
+# tools) and kernel overhead; measured CPU-side use is logged against it at every measurement, so a node that needs
+# more says so (raise the override then).
+# The Apex fit: the Phase 3 KV ladder of the Apex engine (S2) projects 160.0 GiB at f16 (ctx 16384), 160.3 at q8_0 and
+# 157.8 at q4_0, and the f16 rung is the fallback when quantised KV is incoherent. Every rung fits while
+# pool - GPU resident set R (6-8 GiB) - reserve >= 160.3 GiB; the pool is min(GTT total, MemTotal) (S47), so at 16 GiB
+# that needs MemTotal >= ~182.3-184.3 GiB. Phase 1 step 4 removes the crash-kernel reservation kdump-tools puts on the
+# GRUB line (option (c) of 2026-10-10, S48: 4096 MiB plus a 256 MiB low block, 4.25 GiB, taken out of MemTotal at every
+# boot), so MemTotal is expected at ~187-188 GiB: 192 GiB less the 512 MiB UMA carve-out (3.2), the ~3 GiB page map and
+# ~0.5 GiB of firmware and kernel (an estimate until V3a records the real figure), ~3-5 GiB above that threshold.
+# Were the reservation to survive (MemTotal ~183-184 GiB), the f16 and q8_0 rungs would be refused at R = 8 GiB; that
+# is why V3a fails on any crashkernel= or reserved crash memory. (While the reservation stood, the default was 12 GiB.)
+# ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env overrides it (whole GiB, within ARBITER_HEADROOM_RANGE_GIB); a bad
+# value stops only the Arbiter's construction (build_arbiter), never another reader of the settings (the backup
+# freeze, Sentinel, Celery tasks).
+DEFAULT_ARBITER_HEADROOM_GIB = 16
 ARBITER_HEADROOM_RANGE_GIB: tuple[int, int] = (4, 64)  # 4 = the OS row of 4.1 alone; 64 would refuse the Apex engine
 
 # CONVENTIONS.md §8: the names that must agree across every file.
