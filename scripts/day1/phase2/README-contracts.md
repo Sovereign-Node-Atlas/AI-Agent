@@ -246,7 +246,7 @@ documented path). The Section 17 wording for 6d/9b is a baseline amendment the P
    `run_phase_steps`' `NN-*.sh` glob between 06c and 07); `10-gate.sh` only reads the image labels and the keys. Needs
    item 2's amendments.
 8. **V10's Phase 2 half.** The gate records `verify/v10a-router-resident.sh`'s line as **`V10 info`** ("Phase 2 half
-   (resident router, gate) pass|FAIL: ..."), as CONVENTIONS §4 (ids V1..V23, halves only V3a/b and V14a/b) and
+   (resident router, gate) pass|FAIL: ..."), as CONVENTIONS §4 (ids V1..V24, halves V3a/b and V14a/b, plus V10a) and
    `tools/fill-workbook.py` (an undeclared `V10a` is dropped from the workbook silently; an `info` row shows as "Not yet
    run — info: ...") require, and only while verify.jsonl holds no Phase 3 `V10` record, so a Phase 2 re-run can never
    shadow the load test's verdict (gate() takes the latest record per id and treats `info` as non-blocking). A failing

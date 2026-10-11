@@ -6,11 +6,13 @@
 # 2026-10-10, S48: no crashkernel= on the cmdline, kexec_crash_size 0, exactly one panic=10, kernel.panic 10,
 # panic_on_oops 0; V3a proves the settings, while whether this board's reset completes stays unproven until a test
 # panic), that no kexec handover scratch is set aside (V3a, S49: exactly one kho=off on the cmdline, no CMA in
-# /proc/zoneinfo or /proc/meminfo), that vulkaninfo shows the GPU as RADV GFX1151, that /tmp is tmpfs and swap is off,
-# and that the TPM unlocked the data volume without a keyboard (V2 re-recorded post-reboot). The llama-cli half of V3
-# belongs to the Phase 2 gate. Three read-only records follow: the kernel line (v0.3.5, Section 3.3, S45; closes the
-# to-do kernel-line, or raises it again with this boot's state), what the unused XDNA 2 NPU shows (v0.3.5, 3.7 W-NPU),
-# and whether a panic's log can be kept across the restart (S48: pstore backend, systemd-pstore, kdump state).
+# /proc/zoneinfo or /proc/meminfo), that PID 1 has armed the watchdog step 4 installed with its two timeouts (V24, S50:
+# a hardware watchdog passes, the softdog fallback is deferred with the to-do watchdog), that vulkaninfo shows the GPU
+# as RADV GFX1151, that /tmp is tmpfs and swap is off, and that the TPM unlocked the data volume without a keyboard (V2
+# re-recorded post-reboot). The llama-cli half of V3 belongs to the Phase 2 gate. Three read-only records follow: the
+# kernel line (v0.3.5, Section 3.3, S45; closes the to-do kernel-line, or raises it again with this boot's state), what
+# the unused XDNA 2 NPU shows (v0.3.5, 3.7 W-NPU), and whether a panic's log can be kept across the restart (S48: pstore
+# backend, systemd-pstore, kdump state).
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -127,6 +129,11 @@ step_05() {
     log "dmesg: amdgpu.gttsize deprecation warning present (expected on kernel 7.x; ttm.pages_limit is the parameter of record)"
   fi
   run_verify V3a v03a-gtt.sh 196608 || die "V3a failed: the kernel parameters (gttsize, ttm.pages_limit, lockup_timeout), the crash-kernel and panic settings (no crashkernel=, nothing reserved, exactly one panic=10, kernel.panic 10, panic_on_oops 0; S48), kexec handover (exactly one kho=off, no CMA at all: neither KHO scratch nor a named CMA area, and /proc/zoneinfo readable; S49), the GTT pool or the RADV device string do not match (see the verify table; cat /proc/cmdline; cat /sys/module/amdgpu/parameters/lockup_timeout; cat /sys/kernel/kexec_crash_size; grep -E '^(CmaTotal|CmaFree):' /proc/meminfo; ls /etc/default/grub.d; dmesg | grep -i gtt)"
+  # V24 (S50): PID 1 has armed the watchdog step 4 installed, with step 4's timeouts. A hardware watchdog passes; the
+  # softdog fallback is deferred (to-do watchdog, raised by step 4) and the step goes on; anything else stops here.
+  [[ -n "${ATLAS_WATCHDOG_RUNTIME_SEC:-}" && -n "${ATLAS_WATCHDOG_REBOOT_SEC:-}" ]] \
+    || die "ATLAS_WATCHDOG_RUNTIME_SEC/ATLAS_WATCHDOG_REBOOT_SEC are not defined: step 5 must be run by phase1-platform.sh"
+  run_verify V24 v24-watchdog.sh "$ATLAS_WATCHDOG_RUNTIME_SEC" "$ATLAS_WATCHDOG_REBOOT_SEC" || die "V24 failed: the watchdog is not armed as S50 configures it (see the verify table; systemctl show -p RuntimeWatchdogUSec -p RebootWatchdogUSec -p WatchdogDevice -p WatchdogLastPingTimestamp; ls /sys/class/watchdog; cat /sys/class/watchdog/watchdog0/{identity,state,timeout}; systemctl status atlas-watchdog-driver.service; journalctl -b -o cat SYSLOG_IDENTIFIER=systemd | grep -i watchdog; never open /dev/watchdog*). When the hardware driver no longer makes a device, re-run sudo $ATLAS_ENTRY phase1 --force 04 --force 05 (step 4 probes again and reboots)"
   # Kernel line after the reboot (Section 3.3, S45): read-only; closes step 4's to-do or refreshes it.
   _kernel_line_record
   _npu_record

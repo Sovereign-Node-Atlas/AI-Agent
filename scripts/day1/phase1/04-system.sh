@@ -3,8 +3,8 @@
 # proxy environment, the allowlisting DNS forwarder (dnsmasq) the host resolves through, ufw default-deny in AND out,
 # full system update through the proxy (held on the GA 7.0 kernel line, S45), Canonical's beacons off, kdump switched
 # off and its crash-kernel reservation dropped from the kernel line with panic=10 added (option (c) of 2026-10-10, S48),
-# kexec handover switched off with kho=off (S49), GRUB kernel parameters (V3), SSH hardening, Cockpit, then the reboot
-# marker and the reboot (unless --no-reboot).
+# kexec handover switched off with kho=off (S49), GRUB kernel parameters (V3), SSH hardening, Cockpit, the hardware
+# watchdog that PID 1 arms from the reboot on (S50, V24), then the reboot marker and the reboot (unless --no-reboot).
 # Order matters: the proxy, the forwarder and the firewall come first so that even the system update obeys rule §7.1.
 #
 # THE UNAVOIDABLE PRE-PROXY INSTALLS: squid itself and dnsmasq (with jq and gettext-base for rendering their configs)
@@ -42,6 +42,7 @@
 #   _squid_render                      also called by step 6 once the docker0 gateway is known (second http_port)
 #   phase1_kernel_line_report          one line on the kernel line; 0 when it is GA 7.0 (step 5 records it, S45)
 #   phase1_kernel_line_todo REPORT     the to-do kernel-line, raised by step 4 or step 5
+#   ATLAS_WATCHDOG_RUNTIME_SEC, ATLAS_WATCHDOG_REBOOT_SEC   the S50 watchdog timeouts step 5 passes to V24
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -64,6 +65,12 @@ export ATLAS_GRUB_PARAMS="amdgpu.gttsize=196608 ttm.pages_limit=50331648 amdgpu.
 # any later drop-in, so it cannot have the last word (the kernel takes the last kho= it can parse), and its substring
 # guards below would mangle a hand-typed panic=100. V3a checks the same literal panic=10 and kho=off.
 ATLAS_GRUB_CRASH_DROPIN="/etc/default/grub.d/zzz-atlas-crash.cfg"
+# S50 (_watchdog): the unit that loads the watchdog driver at every boot, PID 1's watchdog settings, and the two
+# timeouts in seconds. The drop-in writes them in minutes; step 5 passes the seconds to V24, which checks them.
+ATLAS_WATCHDOG_UNIT="/etc/systemd/system/atlas-watchdog-driver.service"
+ATLAS_WATCHDOG_DROPIN="/etc/systemd/system.conf.d/90-atlas-watchdog.conf"
+ATLAS_WATCHDOG_RUNTIME_SEC=120   # RuntimeWatchdogSec=2min
+ATLAS_WATCHDOG_REBOOT_SEC=600    # RebootWatchdogSec=10min (systemd's default, written out)
 # Hosts rule §7.1 forbids outright, enforced at render time (Section 16.3 item 6: a one-line edit must not open them).
 ATLAS_ALLOWLIST_NEVER=(api.openai.com api.anthropic.com generativelanguage.googleapis.com aiplatform.googleapis.com
                        api.openwebui.com motd.ubuntu.com daisy.ubuntu.com errors.ubuntu.com)
@@ -1109,6 +1116,169 @@ _kho_scratch_note() {
   echo "kexec handover scratch on this boot: $(( bytes / 1048576 )) MiB of CMA (zone cma ${zone} pages, CmaTotal ${total} kB), usable by GTT once kho=off applies"
 }
 
+# --- Hardware watchdog (S50, the Principal's decision of 2026-10-11; Sections 3.6, 21) --------------------------------
+# PID 1 arms the platform's watchdog timer and pings it (RuntimeWatchdogSec=2min: every minute when idle). When PID 1 or
+# the whole kernel stops, nobody pings, the timer runs out and resets the node, and the TPM unlocks the disks unattended
+# as after panic=10. That covers what panic=10 does not (S48): a hard hang that never panics, and a crashed PID 1, which
+# CrashAction=freeze leaves frozen (freeze() closes every fd, the watchdog's too, without the magic 'V', so the timer
+# keeps running and fires one timeout later; VERIFIED, systemd 259.5). RebootWatchdogSec=10min (systemd's default,
+# written out) bounds systemd's last reboot phase. No softlockup_panic, hardlockup_panic or hung_task_panic (outside
+# S50: they could reset the node during a long but legitimate I/O or GPU stall).
+# The timer is the TCO timer of the FCH SMBus controller 1022:790b (rev 0x71 on Strix Halo, VERIFIED; on this Gorgon
+# Halo board INFERRED until _watchdog's log line records 00:14.0), driven by sp5100_tco on its efch_mmio path
+# (VERIFIED, v7.0). Ubuntu blacklists every watchdog module (/usr/lib/modprobe.d/blacklist_linux_<abi>-generic.conf, a
+# new copy with each kernel ABI), and udev, /etc/modules-load.d, modules_load= and modprobe@.service all apply that
+# blacklist: systemd 259 logs "Module 'sp5100_tco' is deny-listed (by kmod)" at INFO and still succeeds. Only a plain
+# `modprobe NAME` (no -b) loads it (VERIFIED, kmod 34.2, systemd 259.5), so a oneshot unit of ours does that before
+# sysinit.target at each boot.
+# The probe never opens /dev/watchdog* (an open starts the timer, and a close without 'V' leaves it running). Loading
+# sp5100_tco arms nothing: the driver stops the timer at probe, and PID 1's RuntimeWatchdogSec stays 0 until the reboot.
+# modprobe's exit status proves nothing: a firmware-disabled timer ("Watchdog hardware is disabled") still exits 0 and
+# leaves the module loaded with no device, so the probe reads /sys/class/watchdog. Order: sp5100_tco; if it makes no
+# 'SP5100 TCO timer' device it is unloaded and, only when ACPI has a WDAT table (none in the Strix Halo, Strix Point and
+# Krackan boot logs read; UNKNOWN here), wdat_wdt is tried; with neither, softdog stands in (to-do watchdog). softdog
+# still resets the node when PID 1 freezes or crashes, but not reliably when the whole kernel locks up (its timer needs
+# a working timer interrupt; INFERRED), and soft_panic=1 makes an expiry a real panic: a pstore record, then the
+# panic=10 restart. softdog is never loaded beside a hardware driver (whichever registers first is watchdog0, the device PID 1
+# arms; VERIFIED), and not here at all: the unit loads it at the next boot. WatchdogDevice= stays unset: with one
+# driver, PID 1's default /dev/watchdog0 is it.
+# The initramfs stays unwatched: dracut copies the blacklist into it, so no watchdog driver loads there and nothing
+# starts a timer in that boot (INFERRED, dracut 110). A timer left running when the board reset (a panic=10 or sysrq
+# emergency restart does not stop it, VERIFIED) is stopped only when the driver loads in the real root; whether this
+# board's reset clears it first is UNKNOWN, so a LUKS passphrase wait in that boot could be reset once (doc 3.6, S50).
+# In the real root a passphrase wait, rescue.target or emergency.target keep PID 1 alive and pinging: no reset loop out
+# of a recoverable state (S50's condition). When a failure (a failed mount, say) starts emergency.target, the driver
+# has loaded and the timer is armed; only a boot that asks for emergency.target on the command line leaves it out.
+# The settings take effect at the reboot that ends this step. Nothing reloads PID 1 here (the unit is enabled with
+# --no-reload): a daemon-reload with the drop-in present and the driver loaded would arm the timer mid-step. Once the
+# probe has loaded a hardware driver, step 4's own reboot already runs under systemd's default 10-minute
+# RebootWatchdogSec. The kernel stops sp5100_tco in its reboot notifier (watchdog_stop_on_reboot), before its own device
+# shutdown, so a hang there is not covered; PID 1 disarms the timer before a poweroff or halt (VERIFIED).
+
+# _watchdog_dev IDENTITY DRIVER — the name of the /sys/class/watchdog device whose identity is exactly IDENTITY and whose
+# parent device is bound to the platform driver DRIVER (sp5100-tco, wdat_wdt); nothing when there is none. sysfs only.
+_watchdog_dev() {
+  local d drv
+  for d in /sys/class/watchdog/watchdog[0-9]*; do
+    [[ -r "$d/identity" ]] || continue
+    [[ "$(cat "$d/identity" 2>/dev/null || true)" == "$1" ]] || continue
+    drv="$(readlink -f "$d/device/driver" 2>/dev/null || true)"
+    if [[ "${drv##*/}" == "$2" ]]; then echo "${d##*/}"; return 0; fi
+  done
+  return 0
+}
+
+# _watchdog_klines PATTERN — the last three kernel log lines matching PATTERN (the driver's own words), one line.
+_watchdog_klines() {
+  { dmesg 2>/dev/null || true; } | { grep -iE -- "$1" || true; } | tail -n 3 | sed -E 's/^\[[^]]*\] *//' | paste -sd';'
+}
+
+# _watchdog_unit MODPROBE_ARGS — the content of $ATLAS_WATCHDOG_UNIT: one modprobe by name, before sysinit.target.
+_watchdog_unit() {
+  cat <<UNIT
+# A.T.L.A.S. Phase 1 step 4, S50 (the Principal's decision of 2026-10-11). Written by the Day 1 scripts; V24 checks it.
+# Loads the watchdog driver step 4 chose, by name: Ubuntu blacklists every watchdog module, and udev,
+# /etc/modules-load.d and modprobe@.service all honour that blacklist, while a plain modprobe of a name does not.
+# PID 1 then arms the device (RuntimeWatchdogSec in $ATLAS_WATCHDOG_DROPIN).
+[Unit]
+Description=A.T.L.A.S. watchdog driver ($1; S50)
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/modprobe $1
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+}
+
+# _watchdog_dropin — the content of $ATLAS_WATCHDOG_DROPIN (a drop-in, never /etc/systemd/system.conf: that is a dpkg
+# conffile of systemd, and an edit makes later upgrades stop at a prompt).
+_watchdog_dropin() {
+  cat <<CONF
+# A.T.L.A.S. Phase 1 step 4, S50 (the Principal's decision of 2026-10-11). Written by the Day 1 scripts; V24 checks it.
+# PID 1 arms the watchdog device and pings it every minute; when two minutes pass without a ping (PID 1 or the whole
+# kernel stopped), the watchdog resets the node and the TPM unlocks the disks unattended, as after panic=10.
+# RebootWatchdogSec repeats systemd's default: it bounds the last phase of a reboot (systemd-shutdown).
+# No RuntimeWatchdogPreSec: sp5100_tco has no pretimeout. No WatchdogDevice: only one watchdog driver is ever loaded
+# ($ATLAS_WATCHDOG_UNIT), so PID 1's default, /dev/watchdog0, is that driver's device.
+[Manager]
+RuntimeWatchdogSec=$(( ATLAS_WATCHDOG_RUNTIME_SEC / 60 ))min
+RebootWatchdogSec=$(( ATLAS_WATCHDOG_REBOOT_SEC / 60 ))min
+CONF
+}
+
+# _watchdog — step 4, before the reboot marker (comment above). Never stops the step for a missing hardware watchdog:
+# that is the softdog fallback plus the to-do watchdog. Stops only when the unit cannot be enabled. Rewrites both files
+# whole on every run (rule §7.3) and closes the to-do once a hardware watchdog is found. Logs one line.
+_watchdog() {
+  local pci=/sys/bus/pci/devices/0000:00:14.0 smbus wdat=absent before rt out dev="" drv="" load why="" kl f facts=""
+  smbus="$(for f in vendor device revision; do cat "$pci/$f" 2>/dev/null || echo '?'; done | paste -sd' ')"
+  [[ -e /sys/firmware/acpi/tables/WDAT ]] && wdat=present
+  before="$({ ls /sys/class/watchdog 2>/dev/null || true; } | paste -sd' ')"
+  rt="$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null || true)"
+  # 1. The FCH TCO timer, by name (never -b, which would apply the blacklist).
+  if out="$(modprobe sp5100_tco 2>&1)"; then
+    dev="$(_watchdog_dev 'SP5100 TCO timer' sp5100-tco)"
+  else
+    why="modprobe sp5100_tco: $(tr '\n' ' ' <<<"$out")"
+  fi
+  if [[ -n "$dev" ]]; then
+    drv=sp5100_tco
+  else
+    kl="$(_watchdog_klines 'sp5100[-_]tco')"
+    why="${why:-sp5100_tco loaded but made no 'SP5100 TCO timer' device}${kl:+ (kernel: $kl)}"
+    # A loaded module without a device does nothing; unloaded so no driver but the chosen one stays.
+    if [[ -d /sys/module/sp5100_tco ]]; then
+      modprobe -r sp5100_tco >/dev/null 2>&1 || warn "watchdog: could not unload sp5100_tco (it made no device); the reboot clears it"
+    fi
+    # 2. The ACPI WDAT watchdog, only when the firmware describes one.
+    if [[ "$wdat" == present ]]; then
+      if out="$(modprobe wdat_wdt 2>&1)"; then dev="$(_watchdog_dev wdat_wdt wdat_wdt)"; fi
+      if [[ -n "$dev" ]]; then
+        drv=wdat_wdt
+      else
+        why="$why; wdat_wdt made no device${out:+ ($(tr '\n' ' ' <<<"$out"))}"
+        if [[ -d /sys/module/wdat_wdt ]]; then
+          modprobe -r wdat_wdt >/dev/null 2>&1 || warn "watchdog: could not unload wdat_wdt (it made no device); the reboot clears it"
+        fi
+      fi
+    else
+      why="$why; no ACPI WDAT table"
+    fi
+  fi
+  if [[ -n "$drv" ]]; then
+    load="$drv"
+    for f in state timeout nowayout bootstatus; do facts+="${facts:+, }$f $(cat "/sys/class/watchdog/$dev/$f" 2>/dev/null || echo '?')"; done
+  else
+    # 3. No hardware watchdog: softdog at the next boot (comment above). Not loaded now.
+    load="softdog soft_panic=1"
+  fi
+  phase1_write_file 644 '' "$ATLAS_WATCHDOG_UNIT" < <(_watchdog_unit "$load")
+  systemctl --no-reload enable "${ATLAS_WATCHDOG_UNIT##*/}" >/dev/null 2>&1 \
+    || die "systemctl enable ${ATLAS_WATCHDOG_UNIT##*/} failed (systemctl status ${ATLAS_WATCHDOG_UNIT##*/}; systemd-analyze verify $ATLAS_WATCHDOG_UNIT)"
+  out="$(systemctl is-enabled "${ATLAS_WATCHDOG_UNIT##*/}" 2>/dev/null || true)"
+  [[ "$out" == enabled ]] || die "${ATLAS_WATCHDOG_UNIT##*/} is '${out:-unknown}' after systemctl enable, not enabled"
+  install -d -m 755 "${ATLAS_WATCHDOG_DROPIN%/*}"
+  phase1_write_file 644 '' "$ATLAS_WATCHDOG_DROPIN" < <(_watchdog_dropin)
+  local seen="SMBus 00:14.0 $smbus, ACPI WDAT $wdat, /sys/class/watchdog before: ${before:-empty}, PID 1 RuntimeWatchdogUSec=${rt:-unknown}"
+  local wrote="$ATLAS_WATCHDOG_UNIT (modprobe $load at every boot) and $ATLAS_WATCHDOG_DROPIN (RuntimeWatchdogSec=$(( ATLAS_WATCHDOG_RUNTIME_SEC / 60 ))min, RebootWatchdogSec=$(( ATLAS_WATCHDOG_REBOOT_SEC / 60 ))min); PID 1 arms it from the reboot, V24 checks it in step 5"
+  if [[ -n "$drv" ]]; then
+    # A softdog from an earlier fallback boot stays loaded, held by PID 1, until this step's reboot; then only $drv loads.
+    log "watchdog (S50): hardware watchdog $drv '$(cat "/sys/class/watchdog/$dev/identity" 2>/dev/null || echo '?')' at $dev ($facts)${why:+ (first: $why)}; $seen, now: $({ ls /sys/class/watchdog 2>/dev/null || true; } | paste -sd' '); wrote $wrote"
+    if todo_is_open watchdog; then todo_done watchdog; fi
+    return 0
+  fi
+  warn "watchdog (S50): no hardware watchdog ($why); $seen; softdog stands in; wrote $wrote"
+  todo_add watchdog "No hardware watchdog found: softdog stands in, which restarts a frozen or crashed systemd but not reliably a hard lockup of the whole kernel" \
+    "S50. Step 4 found: $why. softdog is a timer inside the kernel: it resets the node when systemd (PID 1) freezes or crashes, but a lockup of the whole kernel can stop it too; the FCH hardware timer would still fire. Check: whether the BIOS offers a watchdog setting (not known for this board), and the driver's kernel lines quoted above ('Watchdog hardware is disabled' means the firmware switched the timer off). Never open /dev/watchdog* to test it (an open starts the timer). After a BIOS change, re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 04 --force 05 (step 4 repeats the system update and reboots; step 5 records V24 again)"
+}
+
 _ssh_harden() {
   local ak="/home/$PRINCIPAL_USER/.ssh/authorized_keys" keyonly=1
   # Policy v0.3.3: no public key yet (or ATLAS_SSH_PASSWORD_AUTH=keep from the pre-flight) keeps password login on,
@@ -1222,7 +1392,10 @@ step_04() {
   _ssh_harden
   systemctl start cockpit.socket || die "cockpit.socket failed to start: $(systemctl status cockpit.socket --no-pager | tail -n5)"
   log "Cockpit: https://$LAN_IP:9090 (LAN and WireGuard only)"
-  # 6. Reboot marker; the reboot itself is the driver's (phase1_request_reboot writes this step's done marker first).
+  # 6. The hardware watchdog (S50): probe without arming, then the driver unit and PID 1's settings, armed at the reboot.
+  #    Last before the reboot, so nothing in this step reloads PID 1 with the drop-in present.
+  _watchdog
+  # 7. Reboot marker; the reboot itself is the driver's (phase1_request_reboot writes this step's done marker first).
   declare -F phase1_request_reboot >/dev/null || die "phase1_request_reboot is not defined: step 4 must be run by phase1-platform.sh"
   phase1_request_reboot
 }
