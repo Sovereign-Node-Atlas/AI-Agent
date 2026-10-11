@@ -8,7 +8,8 @@
 # files _watchdog reads; when the case says the firmware disabled it, the module loads with no device and the kernel log
 # gets the driver's own "Watchdog hardware is disabled". Every node path is moved under a fresh temp dir per case.
 # Nothing here opens a watchdog device. Run: bash phase1/watchdog_test.sh   (exit 0 when every case passes)
-# shellcheck disable=SC2016  # file-wide: the single-quoted $ are meant unexpanded (the ${W_ROOT} that relocate() writes
+# shellcheck disable=SC2016,SC2030,SC2031  # file-wide: SC2030/SC2031, each gate and w-drill case sets its state in its own
+# subshell on purpose; the single-quoted $ are meant unexpanded (the ${W_ROOT} that relocate() writes
 #                              into the extracted functions, and the literal "$ATLAS_WATCHDOG_..." text step 5 must carry)
 set -Euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
@@ -344,5 +345,38 @@ else
   echo "SKIP fill-workbook sheet case (openpyxl not installed)"
 fi
 
+
+# --- 10. Step 5's to-do w-drill (doc 3.7 W-DRILL), with the real lib/common.sh -----------------------------------------
+drill_run() {  # drill_run STATE_DIR -> runs _drill_todo once in that state; prints nothing
+  ( export ATLAS_STATE="$1" ATLAS_PHASE=phase1 ATLAS_ENTRY=./atlas-day1.sh
+    # shellcheck source=lib/common.sh
+    source "$REPO/lib/common.sh"
+    export ATLAS_TODO_FILE="$1/todo.jsonl"
+    eval "$(extract "$REPO/phase1/05-postboot.sh" _drill_todo)"
+    _drill_todo ) >>"$1/out" 2>&1
+}
+drill_state() {  # drill_state STATE_DIR -> "open-records:latest-open(0|1)"
+  python3 -I - "$1/todo.jsonl" <<'PY'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+d = [r for r in recs if r["id"] == "w-drill"]
+print(f"{sum(1 for r in d if not r['done'])}:{0 if not d or d[-1]['done'] else 1}")
+PY
+}
+ds="$T/drill"; rm -rf "$ds"; mkdir -p "$ds"
+drill_run "$ds"
+ok "w-drill: raised on the first run, open" "$(drill_state "$ds")" "1:1"
+ok "w-drill: names the four tests and the Principal's go-ahead" \
+   "$(python3 -I -c 'import json,sys; r=[json.loads(l) for l in open(sys.argv[1])][-1]; d=r["detail"]; print(all(k in d for k in ("(1) Crash restart","(2) Watchdog reset","(3) Timer survival","(4) Suspend","go-ahead")), r["title"].startswith("W-DRILL:"))' "$ds/todo.jsonl")" "True True"
+drill_run "$ds"
+ok "w-drill: a rerun while open adds no record" "$(drill_state "$ds")" "1:1"
+( export ATLAS_STATE="$ds" ATLAS_PHASE=phase1 ATLAS_ENTRY=./atlas-day1.sh
+  # shellcheck source=lib/common.sh
+  source "$REPO/lib/common.sh"; export ATLAS_TODO_FILE="$ds/todo.jsonl"; todo_done w-drill ) >>"$ds/out" 2>&1
+ok "w-drill: closed by the live ATLAS" "$(drill_state "$ds")" "1:0"
+drill_run "$ds"
+ok "w-drill: step 5 raises a closed one again" "$(drill_state "$ds")" "2:1"
+ok "step 5: _drill_todo runs last, after the panic-log record" \
+   "$(grep -oE '^[[:space:]]+_(panic_log_record|drill_todo)$' <<<"$s5" | tr -d ' ' | paste -sd' ')" "_panic_log_record _drill_todo"
 echo "watchdog_test: $pass passed, $fail failed"
 (( fail == 0 ))

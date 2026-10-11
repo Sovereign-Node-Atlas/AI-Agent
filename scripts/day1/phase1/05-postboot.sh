@@ -12,7 +12,8 @@
 # re-recorded post-reboot). The llama-cli half of V3 belongs to the Phase 2 gate. Three read-only records follow: the
 # kernel line (v0.3.5, Section 3.3, S45; closes the to-do kernel-line, or raises it again with this boot's state), what
 # the unused XDNA 2 NPU shows (v0.3.5, 3.7 W-NPU), and whether a panic's log can be kept across the restart (S48: pstore
-# backend, systemd-pstore, kdump state).
+# backend, systemd-pstore, kdump state). Last, the to-do w-drill (3.7 W-DRILL): the crash and watchdog tests the live
+# ATLAS runs later with the Principal present; no Day 1 script runs them.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -89,6 +90,17 @@ _kernel_line_record() {
   fi
 }
 
+# _drill_todo — doc 3.7 W-DRILL (the Principal's request of 2026-10-11): put the crash and watchdog tests on the to-do
+# list the live ATLAS works from, so ATLAS raises them once Day 1 is complete. No Day 1 script runs them: a deliberate
+# panic or reset needs the Principal at the console with the LUKS recovery keys, and is never ATLAS's own decision.
+# Raised once while it is open. A closed one is raised again whenever step 5 runs (phase1 --force 04 --force 05 after a
+# kernel-line or setting change), because each such change can alter the restart or unlock path the tests proved.
+_drill_todo() {
+  todo_is_open w-drill && return 0
+  todo_add w-drill "W-DRILL: once Day 1 is complete, run the crash and watchdog tests with the Principal present (doc 3.7)" \
+    "ATLAS proposes a session for an idle node (no engine loaded, no task running, the night's AEGIS backup done), with the Principal at the console and the LUKS recovery keys at hand; it explains each test and its risk, waits for the Principal's go-ahead before each one, and records the result. (1) Crash restart (S48): sync, then echo c > /proc/sysrq-trigger; proves panic=10 restarts the node, the TPM unlocks both disks unattended, and whether a pstore record reaches /var/lib/systemd/pstore. (2) Watchdog reset (S50): stop systemd's pings and let the timer expire (about two minutes); proves this board's watchdog resets the node, the unattended unlock, and the reset cause on the next boot. (3) Timer survival (S50): after a reset, hold the next boot at the GRUB menu for over two minutes; a second reset means the timer outlives the board's reset. (4) Suspend (S50): a short test suspend with the timer armed, or the Principal masks the sleep targets instead. Write each result back to the document (S48, S50; W-DRILL), then close this to-do; step 5 raises it again when it next runs."
+}
+
 step_05() {
   # The driver refuses to reach this step while the reboot marker still names the current boot.
   declare -F phase1_check_reboot >/dev/null && phase1_check_reboot
@@ -138,5 +150,6 @@ step_05() {
   _kernel_line_record
   _npu_record
   _panic_log_record
+  _drill_todo
   log "step 5 complete: GTT pool $(gpu_gtt_total_mb) MiB, vulkaninfo sees RADV GFX1151"
 }
