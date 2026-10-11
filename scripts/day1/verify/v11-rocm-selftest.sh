@@ -7,9 +7,12 @@
 # (research rocm-containers.md §6.3 says `timeout 900`; a fresh node pays image start, the torch/ROCm import, the CPU
 # fp32 4096^3 reference matmul, a 4 GB GTT fill and MIOpen compiling every conv/GroupNorm kernel of the UNet for
 # gfx1151 into an EMPTY cache, so 300 s was a realistic false "hang"; fix round 3). A run that uses its whole budget is
-# a hang, the kernel-7.0 symptom of ROCm/legacy-rocm-build #6530 / ROCm/ROCm #6182, and counts as a fail, not a wait.
+# a hang (the symptom of the open gfx1151 report ROCm/legacy-rocm-build #6530, seen on kernels 6.17 and 7.0) and
+# counts as a fail, not a wait.
 # Usage: v11-rocm-selftest.sh [IMAGE]   (default: base_image.tag of config/phase4-engines.json, built by
 #        phase4-engines.sh step 01; the image must already exist — this script builds nothing)
+# torchaudio (S51): base_image.torchaudio of the same json is passed in as V11_EXPECT_TORCHAUDIO, and selftest.py fails
+# V11 unless the image's torchaudio imports and is exactly that build (+rocm local label included).
 # Relies on /etc/atlas/docker.env (Phase 1 step 6: ATLAS_UID ATLAS_GID RENDER_GID VIDEO_GID) and on
 # $ATLAS_SRV/engines existing (Phase 1 step 3). Writes, ROOT-HELD under $ATLAS_STATE/phase4/: v11.json (the full step
 # table, captured from the container's stdout as a tagged V11JSON line; the container writes nothing but the MIOpen
@@ -42,6 +45,8 @@ if [[ -z "$image" ]]; then
   [[ -f "$json" ]] || { echo "V11 fail: $json missing and no IMAGE argument"; exit 1; }
   image="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_image"]["tag"])' "$json")"
 fi
+ta_pin="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_image"].get("torchaudio") or "")' "$json" 2>/dev/null || true)"
+[[ -n "$ta_pin" ]] || { echo "V11 fail: no base_image.torchaudio pin in $json (S51: V11 checks the image's torchaudio against it)"; exit 1; }
 denv="$ATLAS_ETC/docker.env"
 engines="$ATLAS_SRV/engines"
 flags_dir="$ATLAS_STATE/phase4"
@@ -85,7 +90,7 @@ v11_run() {
     --tmpfs "/tmp:mode=700,uid=$uid,gid=$gid" -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache \
     -e TORCH_HOME=/tmp/.cache/torch -e PIP_CONFIG_FILE=/dev/null \
     -e HF_HUB_OFFLINE=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e DO_NOT_TRACK=1 \
-    -e PYTHONNOUSERSITE=1 -e V11_EXPECT_DEVICE_WHEEL=1 -e V11_OUT= \
+    -e PYTHONNOUSERSITE=1 -e V11_EXPECT_DEVICE_WHEEL=1 -e "V11_EXPECT_TORCHAUDIO=$ta_pin" -e V11_OUT= \
     -v "$engines/miopen:/srv/atlas/engines/miopen" \
     -v "$ATLAS_DAY1_DIR/phase4:/opt/atlas/phase4:ro" \
     "$image" python3.12 /opt/atlas/phase4/selftest.py </dev/null >"$out" || rc=$?
@@ -129,7 +134,7 @@ v11_run hardened
 write_json
 used="hardened (default seccomp, no ipc=host)"
 if (( rc == 124 || rc == 137 )); then
-  echo "V11 fail: self-test hung and was killed after ${cap} s in $image (hardened run, not retried: a hang is not a seccomp symptom) — on kernel 7.0 + gfx1151 this matches the open hang reports ROCm/legacy-rocm-build #6530 and ROCm/ROCm #6182: the host kernel may be the cause, not the container (Principal: no Day 1 action; see the README)"
+  echo "V11 fail: self-test hung and was killed after ${cap} s in $image (hardened run, not retried: a hang is not a seccomp symptom) — on gfx1151 this matches the open hang report ROCm/legacy-rocm-build #6530 (kernels 6.17 and 7.0): that issue, not the container, may be the cause (Principal: no Day 1 action; see the README)"
   exit 1
 fi
 passed_flags=()
@@ -151,7 +156,7 @@ if (( rc != 0 )); then
     write_json
     tried+=("[$rung] exit $rc")
     if (( rc == 124 || rc == 137 )); then
-      echo "V11 fail: hardened run failed ($first); the relaxed run [$rung] then hung and was killed after ${cap} s in $image (kernel 7.0 hang reports #6530 #6182 may apply)"
+      echo "V11 fail: hardened run failed ($first); the relaxed run [$rung] then hung and was killed after ${cap} s in $image (the open hang report #6530 may apply)"
       exit 1
     fi
     if (( rc == 0 )); then
@@ -174,6 +179,6 @@ case "$rc" in
     echo "$summary (image $image; container flags: $used; recorded in $flags_file; step table $json_out)"
     exit 0 ;;
   *)
-    echo "${summary:-V11 FAIL: selftest.py exit $rc with no summary (see stderr / journal)} (image $image; the hardened run and every relaxed rung failed: ${tried[*]:-}; kernel 7.0 hang/mmap reports #6530 #6182 may apply)"
+    echo "${summary:-V11 FAIL: selftest.py exit $rc with no summary (see stderr / journal)} (image $image; the hardened run and every relaxed rung failed: ${tried[*]:-}; the open hang report #6530 may apply)"
     exit 1 ;;
 esac

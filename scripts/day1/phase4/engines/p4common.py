@@ -42,10 +42,12 @@ Two roles:
    honoured for the pull itself; the token is sent ONLY when the endpoint is https://huggingface.co or a *.hf.co host
    (rule §7.2): a gated repo behind another mirror is refused (exit 1), a public one is pulled without the token.
 
-Kernel 7.0 mmap regression (ROCm/legacy-rocm-build #6530, research §0 item 5): safetensors loading through mmap runs
-at ~1.5 MB/s on this kernel. `Test` therefore monkeypatches safetensors.torch.load_file to read-then-load
-(research §6.4, UNVERIFIED as a fix for ROCm 10.0 but harmless) and arms a watchdog: a model load longer than
---load-timeout seconds is killed and reported as a fail with the issue number, never waited for.
+Slow mmap loads and hangs (ROCm/legacy-rocm-build #6530, research §0 item 5): the report measured safetensors loading
+through mmap at ~1.5 MB/s on kernel 7.0; its reporter has since put that slowdown down to the then-unsupported 7.0.0
+kernel, and the hang, still open, reproduces on 6.17 as well (VERIFIED 2026-10-11, S51). `Test` still monkeypatches
+safetensors.torch.load_file to read-then-load (research §6.4, UNVERIFIED as a fix for ROCm 10.0 but harmless) and
+arms a watchdog: a model load longer than --load-timeout seconds is killed and reported as a fail with the issue
+number, never waited for.
 """
 
 from __future__ import annotations
@@ -69,8 +71,8 @@ MANIFEST_TAG = "P4MANIFEST "
 PIN_TAG = "P4PIN "
 RESOLVED_TAG = "P4RESOLVED "
 HANG_NOTE = (
-    "model load exceeded the load watchdog: on kernel 7.0 + gfx1151 this is the mmap/hang symptom of "
-    "ROCm/legacy-rocm-build #6530 (also ROCm/ROCm #6182); the host kernel may be the cause, not the container"
+    "model load exceeded the load watchdog: on gfx1151 this matches the open hang report "
+    "ROCm/legacy-rocm-build #6530 (kernels 6.17 and 7.0); that issue, not the container, may be the cause"
 )
 
 

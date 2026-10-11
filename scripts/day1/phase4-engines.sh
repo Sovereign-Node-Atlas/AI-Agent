@@ -8,26 +8,27 @@
 #
 # Steps (CONVENTIONS.md §1, §6; each wrapped in run_step, so a re-run skips what is complete):
 #   01  the ONE base image docker/rocm-base/Dockerfile -> atlas/rocm-base:10.0.0 (AMD's gfx1151 wheels, ROCm 10.0.0,
-#       torch 2.13.0; conflict 12). BEFORE docker build, the wheel pre-flight (_p4_wheel_preflight ->
-#       phase4/wheel_preflight.py, fix round 4): the exact wheel file names the Dockerfile's pins need are resolved from
-#       the AMD index through the proxy and each wheel URL is HEADed; the result is the `P4-wheels` info row (Section
-#       21 scope note, v0.3.2; written by _p4_record_info, below); a miss stops the step with the exact missing file
-#       name and the index URL, an unreachable index or wheel host with the URL and the proxy error, so no pin failure
-#       is ever discovered inside docker build.
+#       torch 2.13.0, torchaudio 2.11.0.2; conflict 12, S51). BEFORE docker build, the wheel pre-flight
+#       (_p4_wheel_preflight -> phase4/wheel_preflight.py, fix round 4): the exact wheel file names the Dockerfile's
+#       pins need are resolved from the AMD index through the proxy and each wheel URL is HEADed; the result is the
+#       `P4-wheels` info row (Section 21 scope note, v0.3.2; written by _p4_record_info, below); a miss stops the step
+#       with the exact missing file name and the index URL, an unreachable index or wheel host with the URL and the
+#       proxy error, so no pin failure is ever discovered inside docker build.
 #       Then the image is built through the allowlist proxy, its freeze/constraints kept root-held under
 #       $ATLAS_STATE/phase4/ and published to $ATLAS_SRV/engines/manifests/ by the image itself (as atlas), then V11
-#       (verify/v11-rocm-selftest.sh -> phase4/selftest.py: rocminfo gfx1151, torch sees the device, matmul, 4 GB
-#       alloc, two-step diffusion). V11 also records which container flags the GPU needs
+#       (verify/v11-rocm-selftest.sh -> phase4/selftest.py: rocminfo gfx1151, torch sees the device, the pinned
+#       torchaudio (S51), matmul, 4 GB alloc, two-step diffusion). V11 also records which container flags the GPU needs
 #       ($ATLAS_STATE/phase4/v11-runflags.txt, root-held: the default seccomp profile first, seccomp=unconfined/ipc=host
 #       only when the default demonstrably fails, each flag probed separately). V11 fail STOPS the phase (Section 17
-#       step 1: the first and only place ROCm runs): conflict 19's kernel note is logged (ROCm/pytorch #6530, #6182:
-#       the host kernel may be the cause; no Day 1 action), the gate table is printed, then the driver stops. The
-#       community-image diagnostic (research §1.1: the same self-test once in kyuz0/amd-strix-halo-comfyui,
-#       digest-pinned in the json, hardened flags first, the relaxed flags one at a time on a non-timeout failure) is
-#       OPT-IN (fix round 3): P4_V11_DIAG=1 in /etc/atlas/atlas.env or the environment. The default does not pull a
-#       5.4 GB third-party image and run a second ROCm userspace on the GPU, because Section 17 step 1 makes the base
-#       container the only place ROCm runs and S15 says the kernel-7.0 hang risk is flagged, not acted on. When run,
-#       the diagnostic is folded into the V11 fail record (never a second record with another status).
+#       step 1: the first and only place ROCm runs): conflict 19's note is logged (the open gfx1151 hang report
+#       ROCm/legacy-rocm-build #6530, seen on kernels 6.17 and 7.0; no Day 1 action), the gate table is printed, then
+#       the driver stops. The community-image diagnostic (research §1.1: the same self-test once in
+#       kyuz0/amd-strix-halo-comfyui, digest-pinned in the json, hardened flags first, the relaxed flags one at a time
+#       on a non-timeout failure) is OPT-IN (fix round 3): P4_V11_DIAG=1 in /etc/atlas/atlas.env or the environment.
+#       The default does not pull a 5.4 GB third-party image and run a second ROCm userspace on the GPU, because
+#       Section 17 step 1 makes the base container the only place ROCm runs and S15 says the kernel-7.0 hang risk is
+#       flagged, not acted on. When run, the diagnostic is folded into the V11 fail record (never a second record with
+#       another status).
 #   02  green engines in Section 17's order, each by phase4/engines/<key>.sh under its json timeout; per-engine JSON at
 #       $ATLAS_STATE/phase4/<key>.json (built, loaded, sample_output_path, footprint_mb from the GTT delta, seconds);
 #       a failure is recorded fail and the phase CONTINUES (per-engine pass/fail, never block). Before the first engine
@@ -287,10 +288,11 @@ _p4_v11_last_msg() {
 # what runs whatever ENTRYPOINT the image declares (fix round 2). Flag ladder mirrors V11 (fix round 3): the hardened
 # profile first; a NON-timeout failure is repeated with --security-opt seccomp=unconfined alone, then with --ipc=host
 # added, then with --ipc=host alone (the community image's documented run line carries both, research §6.2; a hang is
-# a kernel symptom, never a seccomp one, so a timeout ends the ladder). The image does not use AMD's device wheel, so
-# selftest.py runs WITHOUT V11_EXPECT_DEVICE_WHEEL and skips that one check (the same tensor/matmul/alloc/diffusion
-# steps run). Pinned by digest: config diagnostic_fallback_digest (VERIFIED from the Docker Hub registry API on
-# 2026-10-04 for :latest), else the digest recorded in $P4_STATE/diag-image.txt after the first pull (rule §7.9).
+# never a seccomp symptom, so a timeout ends the ladder). The image does not use AMD's device wheel or the atlas
+# torchaudio pin, so selftest.py runs WITHOUT V11_EXPECT_DEVICE_WHEEL and V11_EXPECT_TORCHAUDIO and skips those two
+# checks (the same tensor/matmul/alloc/diffusion steps run). Pinned by digest: config diagnostic_fallback_digest
+# (VERIFIED from the Docker Hub registry API on 2026-10-04 for :latest), else the digest recorded in
+# $P4_STATE/diag-image.txt after the first pull (rule §7.9).
 # Prints one line on STDOUT (the caller folds it into the V11 record); logs go to stderr so they never land in that
 # record (fix round 2). Never fails the caller.
 _p4_diag_run() {
@@ -328,7 +330,7 @@ _p4_diag_run() {
   }
   _diag_once
   if (( rc == 124 || rc == 137 )); then
-    used="hardened run hung and was killed (not retried: a hang is a kernel symptom, #6530 #6182)"
+    used="hardened run hung and was killed (not retried: a hang is not a seccomp symptom; open report #6530)"
   elif (( rc != 0 )); then
     local first="$out" rung
     used="hardened failed (exit; $(tr '\n' ' ' <<<"$first" | cut -c1-160))"
@@ -344,8 +346,9 @@ _p4_diag_run() {
 
 # _p4_wheel_preflight — BEFORE `docker build` (fix round 4): resolve, on the index the Dockerfile builds against
 # (base_image.rocm_index), the exact wheel file names its pins need (rocm==ROCM_VER, torch==TORCH_VER+rocmROCM_VER,
-# torchvision==TORCHVISION_VER+rocmROCM_VER, all cp312: the image's python is 3.12) plus the two names the build asserts
-# without a version (torchaudio, amd-torch-device-gfx1151); HEAD every wheel URL through the allowlist proxy; record the
+# torchvision==TORCHVISION_VER+rocmROCM_VER, torchaudio==TORCHAUDIO_VER+rocmROCM_VER (S51), all cp312: the image's
+# python is 3.12) plus the one name the build asserts without a version (amd-torch-device-gfx1151, which torch's
+# [device-gfx1151] extra brings in); HEAD every wheel URL through the allowlist proxy; record the
 # `P4-wheels` info row (Section 21 scope note, v0.3.2). Rule §7.4: a renamed or withdrawn wheel stops the step HERE,
 # with the exact missing file name and the index URL, not an hour into a 5 GB build with pip's "no matching
 # distribution"; an index or wheel host that cannot be fetched through the proxy stops with the URL and the proxy error
@@ -353,8 +356,9 @@ _p4_diag_run() {
 # stable.repo.amd.com serves a root listing is UNVERIFIED, so a 404 there is logged and the per-project pages decide;
 # "channel URL wrong or gone" is concluded only when EVERY project page is 404. Rule §7.9: the resolved names
 # are the pins made concrete and are kept root-held in $P4_STATE/wheels-preflight.json. ROCM_VER reaches the Dockerfile
-# as a build arg from the json; TORCH_VER/TORCHVISION_VER are the Dockerfile's own ARG defaults, read from it so what is
-# checked is what is built, and the json's torch string must agree with them (the image-manifest log line uses it).
+# as a build arg from the json; TORCH_VER/TORCHVISION_VER/TORCHAUDIO_VER are the Dockerfile's own ARG defaults, read
+# from it so what is checked is what is built, and the json's torch and torchaudio strings must agree with them (the
+# build failure message quotes them; V11 checks the installed torchaudio against the json's, S51).
 # phase4/wheel_preflight.py reads the index the way pip does (PEP 503 pages, PEP 427 file names); the extras' own
 # wheels (rocm-sdk-*, the [device-gfx1151] packs) are resolved by pip inside the build and are not pinned here.
 #
@@ -376,14 +380,20 @@ print(json.dumps({"ts": sys.argv[1], "phase": sys.argv[2], "id": "P4-wheels", "r
 }
 
 _p4_wheel_preflight() {
-  local index rocm_ver torch_ver tv_ver torch_pin out summary rc=0
+  local index rocm_ver torch_ver tv_ver ta_ver torch_pin tv_pin ta_pin out summary rc=0
   index="$(_p4_cfg rocm_index)"; rocm_ver="$(_p4_cfg rocm_version)"; torch_pin="$(_p4_cfg torch)"
+  tv_pin="$(_p4_cfg torchvision)"; ta_pin="$(_p4_cfg torchaudio)"
   torch_ver="$(sed -nE 's/^ARG TORCH_VER=([^[:space:]]+)[[:space:]]*$/\1/p' "$P4_DOCKERFILE_DIR/Dockerfile" | head -n1)"
   tv_ver="$(sed -nE 's/^ARG TORCHVISION_VER=([^[:space:]]+)[[:space:]]*$/\1/p' "$P4_DOCKERFILE_DIR/Dockerfile" | head -n1)"
+  ta_ver="$(sed -nE 's/^ARG TORCHAUDIO_VER=([^[:space:]]+)[[:space:]]*$/\1/p' "$P4_DOCKERFILE_DIR/Dockerfile" | head -n1)"
   [[ -n "$index" && -n "$rocm_ver" ]] || die "config/phase4-engines.json base_image lacks rocm_index / rocm_version"
-  [[ -n "$torch_ver" && -n "$tv_ver" ]] || die "$P4_DOCKERFILE_DIR/Dockerfile has no 'ARG TORCH_VER=' / 'ARG TORCHVISION_VER=' line to read the pins from"
+  [[ -n "$torch_ver" && -n "$tv_ver" && -n "$ta_ver" ]] || die "$P4_DOCKERFILE_DIR/Dockerfile has no 'ARG TORCH_VER=' / 'ARG TORCHVISION_VER=' / 'ARG TORCHAUDIO_VER=' line to read the pins from"
   [[ "$torch_pin" == "${torch_ver}+rocm${rocm_ver}" ]] \
     || die "config/phase4-engines.json base_image.torch is '$torch_pin' but the Dockerfile pins ${torch_ver}+rocm${rocm_ver}: change both together (rule §7.9)"
+  [[ "$tv_pin" == "${tv_ver}+rocm${rocm_ver}" ]] \
+    || die "config/phase4-engines.json base_image.torchvision is '$tv_pin' but the Dockerfile pins ${tv_ver}+rocm${rocm_ver}: change both together (rule §7.9)"
+  [[ "$ta_pin" == "${ta_ver}+rocm${rocm_ver}" ]] \
+    || die "config/phase4-engines.json base_image.torchaudio is '$ta_pin' but the Dockerfile pins ${ta_ver}+rocm${rocm_ver}: change both together (rule §7.9; S51)"
   [[ -f "$ATLAS_DAY1_DIR/phase4/wheel_preflight.py" ]] || die "$ATLAS_DAY1_DIR/phase4/wheel_preflight.py is missing"
   proxy_env
   mkdir -p "$P4_STATE"
@@ -391,7 +401,7 @@ _p4_wheel_preflight() {
   out="$(python3 "$ATLAS_DAY1_DIR/phase4/wheel_preflight.py" --index "$index" --python-tag cp312 \
            --prefer-local "rocm${rocm_ver}" --json "$P4_STATE/wheels-preflight.json" \
            "rocm==${rocm_ver}" "torch==${torch_ver}+rocm${rocm_ver}" "torchvision==${tv_ver}+rocm${rocm_ver}" \
-           torchaudio amd-torch-device-gfx1151 </dev/null)" || rc=$?
+           "torchaudio==${ta_ver}+rocm${rocm_ver}" amd-torch-device-gfx1151 </dev/null)" || rc=$?
   summary="$(tail -n1 <<<"$out")"
   [[ -n "$summary" ]] || summary="wheel_preflight.py exited $rc without a summary line"
   # The die happens inside run_step before the marker is written, so the plain phase4 command re-runs step 01; no
@@ -400,7 +410,7 @@ _p4_wheel_preflight() {
     0) _p4_record_info "$summary"
        log "wheel pre-flight ok (detail $P4_STATE/wheels-preflight.json)" ;;
     1) _p4_record_info "$summary"
-       die "wheel pre-flight: a wheel the Dockerfile pins is not on the index; nothing was built. $summary. If AMD renamed or withdrew it, change the pins in docker/rocm-base/Dockerfile and config/phase4-engines.json base_image together (rule §7.9), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (step 01 is not marked done)" ;;
+       die "wheel pre-flight: a wheel the Dockerfile pins is not on the index; nothing was built. $summary. If AMD renamed or withdrew it, re-check AMD's PyTorch install page for ROCm $rocm_ver, the SAME version, and change the pins in docker/rocm-base/Dockerfile and config/phase4-engines.json base_image together, raising base_image.version and the Dockerfile's org.atlas.rocm-base.version label with them so a built node rebuilds (rule §7.9). NEVER drop a pin: a +rocm build for another ROCm version listed above is the Section 23 watch-list re-test, not a fix (S51). Then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (step 01 is not marked done)" ;;
     2) _p4_record_info "$summary"
        die "wheel pre-flight: $summary. stable.repo.amd.com AND the host each wheel href points at (the summary names it; AMD may serve the files from another host) must be in config/allowlist.txt, and squid up (grep TCP_DENIED /var/log/squid/access.log); a missing host is added to the repository copy and rendered with: sudo /opt/atlas/day1/phase1-platform.sh --reload-allowlist /path/to/repo/scripts/day1/config/allowlist.txt; then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4 (step 01 is not marked done)" ;;
     *) die "wheel pre-flight: phase4/wheel_preflight.py exited $rc: $out" ;;
@@ -444,7 +454,7 @@ step_01() {
       --build-arg "ATLAS_UID=$uid" --build-arg "ATLAS_GID=$gid" \
       --build-arg "ROCM_INDEX=$(_p4_cfg rocm_index)" --build-arg "ROCM_VER=$(_p4_cfg rocm_version)" \
       "$P4_DOCKERFILE_DIR" </dev/null \
-      || die "docker build of $P4_IMAGE failed. If pip could not resolve torch==$(_p4_cfg torch) for cp312 (UNVERIFIED cp-tag list, research §1.1), drop the == pins in the Dockerfile and let the [device-gfx1151] extras resolve; if pip reports 'no matching distribution' for a third-party dependency of torch (sympy, filelock, jinja2, networkx, fsspec, typing-extensions, setuptools: the stable AMD index is used ALONE, research-VERIFIED pattern, and whether it mirrors them is UNVERIFIED), add '--extra-index-url https://pypi.org/simple' to the ROCm pip line of the Dockerfile (pypi.org is allowlisted) and pin torchaudio to the +rocm$(_p4_cfg rocm_version) build it then resolves so PyPI cannot substitute a CUDA torchaudio; if the build stopped at 'rocminfo not found', the rocm[...] wheel layout changed (research §1.2); otherwise check /var/log/squid/access.log for TCP_DENIED"
+      || die "docker build of $P4_IMAGE failed. If pip could not resolve a pin (torch==$(_p4_cfg torch), torchaudio==$(_p4_cfg torchaudio) and the rest, cp312; UNVERIFIED cp-tag list, research §1.1), NEVER drop the == pins: the index also serves other ROCm versions (10.1.0 with torch 2.14) and an unpinned name takes the newest. Re-check AMD's PyTorch install page for ROCm $(_p4_cfg rocm_version), the SAME version, and change the Dockerfile ARGs and config/phase4-engines.json base_image together (rule §7.9); a move to another ROCm version is the deliberate re-test on the Section 23 watch-list, not a build fix (S51). If pip reports 'no matching distribution' for a third-party dependency of torch (sympy, filelock, jinja2, networkx, fsspec, typing-extensions, setuptools: the stable AMD index is used ALONE, research-VERIFIED pattern, and whether it mirrors them is UNVERIFIED), add '--extra-index-url https://pypi.org/simple' to the ROCm pip line of the Dockerfile (pypi.org is allowlisted; torch, torchvision and torchaudio keep their +rocm$(_p4_cfg rocm_version) pins, which no PyPI wheel carries, so PyPI cannot substitute a CUDA build). If the build stopped at 'rocminfo not found', the rocm[...] wheel layout changed (research §1.2); otherwise check /var/log/squid/access.log for TCP_DENIED"
   fi
   # The resolved wheel set is the manifest of this image (rule §7.9; Appendix C: engines/ is backed up as manifests).
   # Root keeps its copy under $P4_STATE; the data-volume copies are written by the image itself as atlas (header).
@@ -461,7 +471,7 @@ step_01() {
       -v "$P4_ENGINES_DIR:/srv/atlas/engines" \
       --entrypoint sh "$P4_IMAGE" -c 'cp -f /opt/atlas/base-freeze.txt /srv/atlas/engines/manifests/rocm-base-freeze.txt && cp -f /opt/atlas/constraints-rocm.txt /srv/atlas/engines/manifests/constraints-rocm.txt' </dev/null \
     || die "could not publish the image manifests into $P4_ENGINES_DIR/manifests (as atlas)"
-  log "image manifest: $(grep -E '^(torch|amd-torch-device-gfx1151|rocm-sdk-core)==' "$P4_STATE/rocm-constraints-rocm.txt" | paste -sd ' ' -) (root copy $P4_STATE/rocm-base-freeze.txt; published to $P4_ENGINES_DIR/manifests/)"
+  log "image manifest: $(grep -E '^(torch|torchaudio|amd-torch-device-gfx1151|rocm-sdk-core)==' "$P4_STATE/rocm-constraints-rocm.txt" | paste -sd ' ' -) (root copy $P4_STATE/rocm-base-freeze.txt; published to $P4_ENGINES_DIR/manifests/)"
 
   # V11: the first and only place ROCm runs. A fail stops the phase (CONVENTIONS.md §6: V11 required).
   notify "Phase 4 step 1: V11 self-test in $P4_IMAGE"
@@ -474,7 +484,7 @@ step_01() {
   # kernel/BIOS combination is broken") runs only on P4_V11_DIAG=1 (header) and is then folded into the V11 fail
   # record: gate, --status, report and tools/fill-workbook.py read the LATEST record per id, so a second record with
   # another status would mask the fail.
-  warn "V11 FAILED in $P4_IMAGE. Kernel 7.0 + gfx1151 has open PyTorch hang reports (ROCm/pytorch #6530, #6182; ROCm/legacy-rocm-build #6530, ROCm/ROCm #6182): the host kernel, not the container, may be the cause. Adjudicated conflict 19: no Day 1 action, flagged for the Principal in the README."
+  warn "V11 FAILED in $P4_IMAGE. gfx1151 has an open hang report, ROCm/legacy-rocm-build #6530 (kernels 6.17 and 7.0; reporter's workaround HSA_ENABLE_INTERRUPT=0, not applied): that issue, not this image, may be the cause. #6182 was closed as a container setup problem; #6508, the kernel-7.0 unified-memory deadlock, is fixed from Ubuntu kernel 7.0.0-29. Adjudicated conflict 19: no Day 1 action, flagged for the Principal in the README."
   if [[ "${P4_V11_DIAG:-0}" == "1" ]]; then
     local v11_msg diag
     v11_msg="$(_p4_v11_last_msg)"

@@ -15,8 +15,9 @@ only as a `pip --index-url` target, so a miss names every file the page did list
      when EVERY project page is 404 the channel URL is wrong or gone -> exit 2
   3. choose the wheel that satisfies the spec: exact version for NAME==VERSION (string equality after lower-casing;
      the pins and the index spell the local tag the same way, "+rocm10.0.0"), any version for a bare NAME (newest,
-     preferring one whose version carries --prefer-local), python tag compatible with --python-tag (cpXYZ, py3, pyX)
-     and a platform the container can use (`any`, linux_x86_64, manylinux*_x86_64)
+     preferring one whose version carries --prefer-local: this tool's choice, not pip's, see resolve()), python tag
+     compatible with --python-tag (cpXYZ, py3, pyX) and a platform the container can use (`any`, linux_x86_64,
+     manylinux*_x86_64)
   4. HEAD each chosen wheel URL (a ranged GET when the host refuses HEAD): the bytes must exist behind the href. A
      transport failure HERE (squid's "Tunnel connection failed: 403" on a CONNECT to a host the allowlist does not
      admit; the hosts the index's hrefs point at are NOT research-verified) is exit 2 naming that host, never a
@@ -242,8 +243,11 @@ def resolve(index: str, spec: str, pytag: str, prefer_local: str) -> tuple[dict[
     if not candidates:
         listed = ", ".join(sorted(seen)[:12]) + (" ..." if len(seen) > 12 else "") or "no wheel of this project"
         return rec, f"{expected_name(name, version, pytag)} not on {page_url} (there: {listed})"
-    # Newest first; a version carrying --prefer-local (e.g. rocm10.0.0) wins over one without it, as the Dockerfile's
-    # single-index install would land on it rather than on a wheel built against another ROCm.
+    # Newest first; a version carrying --prefer-local (e.g. rocm10.0.0) is put ahead of one without it. That is this
+    # pre-flight's preference only: pip has none, it takes the newest version the requirements allow whatever its local
+    # label (S51: a bare torchaudio would most likely have taken a +rocm10.1.0 build), so the driver passes every name
+    # the Dockerfile installs with its exact +rocm pin. The one bare name left, amd-torch-device-gfx1151, comes in
+    # through torch's [device-gfx1151] extra, whose requirement decides its version in the build (UNVERIFIED).
     candidates.sort(
         key=lambda c: (prefer_local != "" and prefer_local in c[0].version.lower(), version_key(c[0].version)),
         reverse=True,

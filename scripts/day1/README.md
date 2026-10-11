@@ -131,8 +131,9 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   worker and Open WebUI are quiesced during the tests and resumed afterwards: **do not use the assistant while Phase 3
   runs** (the ntfy push says when it is done).
 - **Phase 4 — multimodal engines** (build-bound): the one ROCm base image (AMD's gfx1151 wheels, ROCm 10.0.0, torch
-  2.13.0) and its self-test (V11); the green engines, then the yellow ones, then PointLLM (V8) and Clay/Prithvi (V9);
-  registration of every passing engine with the Arbiter; the per-engine table and gate.
+  2.13.0, torchvision 0.28.0, torchaudio 2.11.0.2, each pinned exactly; doc S51) and its self-test (V11, which also
+  checks that the installed torchaudio is the pinned build); the green engines, then the yellow ones, then PointLLM
+  (V8) and Clay/Prithvi (V9); registration of every passing engine with the Arbiter; the per-engine table and gate.
 
 ## 3. The prompts and waits
 
@@ -245,7 +246,7 @@ written with the reason, shown in the table and the workbook, and never silently
 | `ubuntu:26.04` (buildfarm base) | pinned by the multi-arch index digest of 2026-10-04 (`docker/buildfarm/Dockerfile`); apt pins inside are strict and the build fails when the archive moves on |
 | `gocryptfs` | installed from the archive, must be 2.6.1 (the VERIFIED pin); override once re-verified with `ATLAS_GOCRYPTFS_VERSION_OK=1` |
 | `pytest==9.1.1` | a resolved pin by the package writer (runtime dependency of `atlas`) |
-| ROCm base image Python packages | no research pin beyond torch 2.13.0 / ROCm 10.0.0; the resolved wheel set is frozen into the image manifest (`/srv/atlas/engines/manifests/`) |
+| ROCm base image Python packages | no research pin beyond ROCm 10.0.0, torch 2.13.0, torchvision 0.28.0 and torchaudio 2.11.0.2 (torch, torchvision and torchaudio are AMD's documented gfx1151 set for ROCm 10.0.0, each pinned with its `+rocm10.0.0` label, and the SDK is pinned `rocm[...]==10.0.0`, with no label; doc S51: never drop these pins, since AMD's index also serves 10.1.0 builds); the resolved wheel set is frozen into the image manifest (`/srv/atlas/engines/manifests/`) |
 | Phase 4 engine pip lists (FLUX.1-dev, Stable Audio Open 0.0.20 deviation, PointLLM relaxations: `tokenizers>=0.14,<0.15`, `transformers==4.34.1`, `open3d` unpinned) | resolved at build time under the image's constraints file; frozen per engine into `freeze.txt`; hub revisions pinned on first pull (`P4PIN`) |
 | Phase 4 diagnostic image | `:latest` on the first pull, then the recorded digest |
 | Blender 4.5 LTS | the newest 4.5.x on download.blender.org at run time (tarball name pattern UNVERIFIED) |
@@ -338,13 +339,18 @@ later host FUSE mount (V18 checks it). 601, 625: sudo-rs `visudo -c -f`. 757: go
 **phase3/loadtest.py** — 82: per-request `cache_prompt: false`. 84: DeepSeek V4 Flash's chat template emitting
 `<think>` by default.
 
-**phase4-engines.sh** — 353: whether stable.repo.amd.com serves a root listing (a 404 there is logged; the
-per-project pages decide). 447: cp-tag list of AMD's torch wheels; whether the AMD index mirrors torch's third-party
-dependencies (the die message gives the fix).
+**phase4-engines.sh** — 356: whether stable.repo.amd.com serves a root listing (a 404 there is logged; the
+per-project pages decide). 457: cp-tag list of AMD's torch wheels; whether the AMD index mirrors torch's third-party
+dependencies (the die message gives the fix, and says never to drop the pins, doc S51).
 **phase4/lib-engine.sh** — 80: hf_xet proxy handling (disabled). 618: a research repo id that does not exist.
-**phase4/selftest.py** — 5, 19: the self-test as a whole on this hardware; ROCm #5444 symptom.
-**phase4/wheel_preflight.py** — 13: whether the AMD channel root serves a listing (the project pages decide).
-**phase4/engines/p4common.py** — 47: the MIOpen/SDPA workaround flags as a fix for ROCm 10.0.
+**phase4/selftest.py** — 5, 22: the self-test as a whole on this hardware; ROCm #5444 symptom. 107: whether AMD's
+`torchaudio.__version__` carries the `+rocm` label (V11 compares the installed distribution's version instead, as
+`pip freeze` spells it, so the answer does not change the check; doc S51).
+**phase4/wheel_preflight.py** — 13: whether the AMD channel root serves a listing (the project pages decide). 250:
+that torch's `[device-gfx1151]` extra decides the version of amd-torch-device-gfx1151, the one name the pre-flight
+looks up without a pin.
+**phase4/engines/p4common.py** — 48: the read-then-load safetensors patch as a fix on ROCm 10.0 (kept because it is
+harmless; #6530's reporter has withdrawn the mmap slowdown it answered, doc S51).
 **phase4/engines/wan2.2.sh / wan2.2_test.py** — 4, 3: the 5B checkpoint's size; Wan 5B UniPC values.
 **phase4/engines/florence-2_test.py** — 3: the `-large` native repo id.
 **phase4/engines/ui-tars.sh / ui-tars_test.py** — 6, 3: inference code (Qwen2.5-VL convention).
@@ -374,8 +380,8 @@ and q8_0 rungs would likely fail with a Vulkan out-of-memory in Phase 3 although
 is set aside; `kho=off` does not change MemTotal.
 
 **config/engines.json** — 13 (env_rule wording), 167 (DeepSeek f16 rung at half the pool), 291 (bge-m3 GGUF file
-name; enumerated case-insensitively). **config/phase4-engines.json** — 6, 77, 119, 148, 208, 236, 237, 277, 303,
-337, 425, 446, 478, 479, 525: per-engine research notes (sizes, repo ids by snippet, licence notes for Rad-DINO and
+name; enumerated case-insensitively). **config/phase4-engines.json** — 6, 78, 120, 149, 209, 237, 238, 278, 304,
+338, 426, 447, 479, 480, 526: per-engine research notes (sizes, repo ids by snippet, licence notes for Rad-DINO and
 PointLLM, TRELLIS shims, Blender tarball pattern, Prithvi build call). **config/allowlist.txt** — 117, 124, 141, 152,
 162, 167, 172, 180: Blender extensions API host, Playwright CDN hosts, Drive discovery hosts, Wix/pay.com/RewardPay
 hosts, Sentinel feed hosts. **config/sentinel-feeds.json** — 4, 31, 53, 75, 95, 116, 136: every feed URL (`verified=false`).
@@ -385,7 +391,7 @@ hosts, Sentinel feed hosts. **config/sentinel-feeds.json** — 4, 31, 53, 75, 95
 `ENABLE_EVALUATION_ARENA_MODELS`, library telemetry switches, lazy fetches, Docling 2.0 requirement vs docling-serve
 1.34. **docker/core/compose.voice.yml** — 73, 89, 155: curl in the Kokoro image, speaches writable paths, docling-serve
 `/health` (uses `/docs`). **docker/wg-easy/compose.yml** — 5, 32, 83: v15 entrypoint needs, capability set, bridge-name
-option. **docker/ntfy/compose.yml** — none. **docker/rocm-base/Dockerfile** — 22, 30, 84, 123: hf_xet proxy handling,
+option. **docker/ntfy/compose.yml** — none. **docker/rocm-base/Dockerfile** — 28, 36, 98, 138: hf_xet proxy handling,
 the build-time assumption list (each fails the build loudly), Blender's shared-library list, `rocm-sdk path --root`.
 **docker/buildfarm/Dockerfile** — 26, 94, 107: Gradle host, cmdline-tools directory name, sdkmanager package ids.
 **docker/sandbox/Dockerfile** — none: the per-job size item it once carried is closed by the bounded `/work` tmpfs on
@@ -402,8 +408,20 @@ the run line (48-51).
 
 ### Open hardware and upstream risks flagged for the Principal (no Day 1 action)
 
-- Kernel 7.0 + gfx1151 PyTorch has open hang reports (ROCm/pytorch #6530, #6182). A V11 failure may be the host
-  kernel; the Phase 4 driver logs that possibility with the issue numbers.
+- gfx1151 PyTorch has an open hang report, ROCm/legacy-rocm-build #6530 (doc S15, corrected in S51; new issues go to
+  ROCm/TheRock). It reproduces on kernels 6.17 and 7.0; the reporter's workaround, `HSA_ENABLE_INTERRUPT=0`, is not
+  applied. A V11 failure may be that issue rather than the image; the Phase 4 driver logs that possibility with the
+  issue number. #6182 was closed as a container (SELinux) setup problem, and #6508, the kernel-7.0 unified-memory
+  deadlock, is fixed in Ubuntu's kernel from 7.0.0-29 (the 26.04.1 ISO installs 7.0.0-30). ROCm/TheRock #7578 (two or
+  more idle ROCm processes pin the GPU at 100% busy; workaround `GPU_MAX_HW_QUEUES=1` on every client, not applied)
+  is UNKNOWN for ROCm 10.0.0 clients.
+- ROCm 10.1 (doc S51): Ubuntu never moves the node to it, since no ROCm is installed on the host and Phase 4 takes
+  ROCm from AMD's index at exact pins. Phase 4 stays on 10.0.0 until a deliberate re-test after the Phase 4 gate
+  (sooner if V11 fails for a reason the kernel does not explain); the move is the Principal's call. What does change
+  unattended is the kernel, through `-security`, and with it the GPU driver under the container's ROCm (GPU firmware
+  is not in `-security` today but has been on other releases): after a kernel ABI change or a GPU firmware update,
+  re-run V11 by hand with `sudo ./atlas-day1.sh phase4 --force 01` (it reuses the built image;
+  no Day 1 script does this on its own).
 - Nemotron 3 Super on Vulkan has an open GPU memory fault report at ~20k-token prompts (llama.cpp #20732); the 8k
   prefill test checks the server survives and records a warning, not a hang.
 - DeepSeek V4 Flash: quantised KV produced garbage in mid-2026; Phase 3 ladders f16 → q8_0 → q4_0 with a coherence

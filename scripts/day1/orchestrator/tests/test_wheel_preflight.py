@@ -1,7 +1,9 @@
 """scripts/day1/phase4/wheel_preflight.py (the Phase 4 step 1 wheel pre-flight) and the driver's `P4-wheels` recorder,
 with NO network (CONVENTIONS.md §7.8): fetch() and head() are replaced by a fake PEP 503 index held in a dict, so the
 parser, the platform/py-tag filter (fix round 4 caught a macosx_*_x86_64 wheel being admitted by a suffix test), the
-exact-version vs bare-name selection with --prefer-local, and every exit code are pinned here. Loaded by path:
+exact-version vs bare-name selection with --prefer-local, and every exit code are pinned here. The torchaudio page
+carries AMD's ROCm 10.0.0 and 10.1.0 builds side by side, as the shared index does (S51): the driver's exact
+"torchaudio==2.11.0.2+rocm10.0.0" must find the 10.0.0 build and nothing else. Loaded by path:
 wheel_preflight.py is a script, not part of the atlas package (like test_phase3_loadtest.py does for loadtest.py).
 
 The last test runs phase4-engines.sh's `_p4_record_info` (the local twin of record_v for the non-V id P4-wheels,
@@ -47,9 +49,13 @@ TORCH_OK = "torch-2.13.0+rocm10.0.0-cp312-cp312-manylinux_2_28_x86_64.whl"
 TORCH_MAC = "torch-2.13.0+rocm10.0.0-cp312-cp312-macosx_11_0_x86_64.whl"
 TORCH_311 = "torch-2.13.0+rocm10.0.0-cp311-cp311-manylinux_2_28_x86_64.whl"
 TORCH_OLD = "torch-2.12.0+rocm10.0.0-cp312-cp312-linux_x86_64.whl"
-TA_PLAIN = "torchaudio-2.13.0-cp312-cp312-manylinux_2_28_x86_64.whl"
-TA_LOCAL = "torchaudio-2.13.0+rocm10.0.0-cp312-cp312-linux_x86_64.whl"
-TA_NEWER = "torchaudio-2.14.0-cp312-cp312-linux_x86_64.whl"
+# torchaudio as AMD's install docs name it (S51): 2.11.0.2+rocm10.0.0 is the ROCm 10.0.0 pairing for torch 2.13.0;
+# 2.11.0.2+rocm10.1.0 (torch 2.13 on 10.1) and 2.11.0.3+rocm10.1.0 (torch 2.14) are on the same index.
+TA_PLAIN = "torchaudio-2.11.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+TA_LOCAL = "torchaudio-2.11.0.2+rocm10.0.0-cp312-cp312-linux_x86_64.whl"
+TA_101 = "torchaudio-2.11.0.2+rocm10.1.0-cp312-cp312-linux_x86_64.whl"
+TA_NEWER = "torchaudio-2.11.0.3+rocm10.1.0-cp312-cp312-linux_x86_64.whl"
+TA_PIN = "torchaudio==2.11.0.2+rocm10.0.0"
 DEVICE = "amd_torch_device_gfx1151-2.13.0+rocm10.0.0-py3-none-any.whl"
 ROCM = "rocm-10.0.0-py3-none-any.whl"
 
@@ -65,7 +71,7 @@ def _page(*names: str) -> str:
 DEFAULT_PAGES: dict[str, tuple[int, str]] = {
     INDEX: (200, "<html><body><a href='torch/'>torch</a></body></html>"),
     INDEX + "torch/": (200, _page(TORCH_OK, TORCH_MAC, TORCH_311, TORCH_OLD)),
-    INDEX + "torchaudio/": (200, _page(TA_PLAIN, TA_LOCAL, TA_NEWER)),
+    INDEX + "torchaudio/": (200, _page(TA_PLAIN, TA_LOCAL, TA_101, TA_NEWER)),
     INDEX + "amd-torch-device-gfx1151/": (200, _page(DEVICE)),
     INDEX + "rocm/": (200, _page(ROCM)),
 }
@@ -184,8 +190,27 @@ def test_resolve_missing_project_page_is_a_404_miss(index: FakeIndex) -> None:
 def test_resolve_bare_name_prefers_local_tag_then_newest(index: FakeIndex) -> None:
     rec, miss = wp.resolve(INDEX, "torchaudio", "cp312", "rocm10.0.0")
     assert miss is None and rec["filename"] == TA_LOCAL
+    # Without the preference the newest wins, a +rocm10.1.0 build: what pip itself does with a bare name (S51).
     rec, miss = wp.resolve(INDEX, "torchaudio", "cp312", "")
     assert miss is None and rec["filename"] == TA_NEWER
+
+
+@pytest.mark.parametrize("prefer", ["rocm10.0.0", "rocm10.1.0", ""])
+def test_resolve_exact_torchaudio_pin_takes_only_the_10_0_build(index: FakeIndex, prefer: str) -> None:
+    """S51: the driver passes torchaudio==2.11.0.2+rocm10.0.0; the 10.1 builds of the same and a newer version are
+    never chosen, whatever --prefer-local says."""
+    rec, miss = wp.resolve(INDEX, TA_PIN, "cp312", prefer)
+    assert miss is None and rec["filename"] == TA_LOCAL
+
+
+def test_resolve_exact_torchaudio_pin_is_a_miss_when_only_10_1_builds_exist(index: FakeIndex) -> None:
+    """S51: with the 10.0.0 build withdrawn the pre-flight stops (exit 1 in main) naming the expected file and the
+    10.1 builds that are there; it never settles for one of them."""
+    index.pages[INDEX + "torchaudio/"] = (200, _page(TA_101, TA_NEWER))
+    rec, miss = wp.resolve(INDEX, TA_PIN, "cp312", "rocm10.0.0")
+    assert rec["filename"] is None and index.headed == []
+    assert miss is not None and miss.startswith("torchaudio-2.11.0.2+rocm10.0.0-cp312-*.whl not on ")
+    assert TA_101 in miss and TA_NEWER in miss
 
 
 def test_resolve_underscored_project_matches_dashed_spec(index: FakeIndex) -> None:
@@ -212,7 +237,7 @@ def test_resolve_head_transport_failure_raises_naming_the_host(index: FakeIndex)
 
 # --- main(): exit codes and the json ---------------------------------------------------------------------------------
 
-SPECS = ["rocm==10.0.0", "torch==2.13.0+rocm10.0.0", "torchaudio", "amd-torch-device-gfx1151"]
+SPECS = ["rocm==10.0.0", "torch==2.13.0+rocm10.0.0", TA_PIN, "amd-torch-device-gfx1151"]  # as the driver passes them
 
 
 def _run(tmp_path: Path, capsys: pytest.CaptureFixture[str], *specs: str) -> tuple[int, str, dict[str, Any]]:

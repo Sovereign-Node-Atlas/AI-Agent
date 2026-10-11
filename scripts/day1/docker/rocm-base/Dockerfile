@@ -9,6 +9,12 @@
 #     (ROCm/TheRock RELEASES.md). Versions torch 2.13.0+rocm10.0.0 / torchvision 0.28.0+rocm10.0.0: VERIFIED (TheRock
 #     #7839). "rocm[libraries,devel,device-gfx1151]" installs the SDK (rocminfo, hipcc): extras VERIFIED (RELEASES.md).
 #     Adjudicated conflict 12: AMD's own wheels are the primary; scottt's 2025 wheel is not pinned.
+#   * torchaudio 2.11.0.2+rocm10.0.0 (S51, 2026-10-11): AMD's install docs pair it with torch 2.13.0 and torchvision
+#     0.28.0 for gfx1151 on ROCm 10.0.0 (VERIFIED, AMD-Ecosystem/ai-ecosystem rocm10.0.0-pip-install.rst). It is
+#     pinned WITH its +rocm local label: "==2.11.0.2" alone also matches 2.11.0.2+rocm10.1.0, and AMD's 10.1.0 docs
+#     name that build and 2.11.0.3+rocm10.1.0 on this same index (VERIFIED). Upstream torchaudio 2.11 declares no torch
+#     requirement (VERIFIED, pytorch/audio setup.py), so a bare "torchaudio" would most likely take the newest, a
+#     +rocm10.1.0 build (INFERRED).
 #   * If the exact-arch device wheel is missing every kernel launch fails with hipErrorInvalidImage (TheRock #7839),
 #     so the build asserts `pip show amd-torch-device-gfx1151`.
 #   * Env: TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 and TORCH_BLAS_PREFER_HIPBLASLT=1 (VERIFIED kyuz0
@@ -28,14 +34,19 @@
 #     needs more than the built-in frontend.
 #
 # UNVERIFIED (each fails the build loudly rather than silently when wrong):
-#   * that the stable index serves cp312 wheels for the "==" pins above (research §1.1: exact cp-tag list unverified).
-#     If pip cannot resolve "torch==2.13.0+rocm10.0.0" the RUN fails and the error names the pin; drop the "==" pins
-#     and let the extras resolve, then record the resolved versions from /opt/atlas/constraints-rocm.txt.
+#   * that the stable index serves cp312 wheels for the "==" pins above (research §1.1: exact cp-tag list unverified;
+#     the driver's wheel pre-flight checks each file first). If pip cannot resolve a pin the RUN fails and the error
+#     names it. NEVER drop the pins (S51): AMD's docs install ROCm 10.0.0 and 10.1.0 (torch 2.14, released 2026-10-05)
+#     from this same index (VERIFIED), and an unpinned name takes the newest build there. A pin that cannot be resolved
+#     means re-checking AMD's PyTorch install page for the SAME ROCm version (ROCM_VER) and changing the ARGs below and
+#     config/phase4-engines.json base_image together; a move to another ROCm version is the deliberate re-test on the
+#     Section 23 watch-list, never a build fix.
 #   * that the stable index ALONE (--index-url, the research-VERIFIED pattern) also serves torch's third-party
 #     dependencies (sympy, filelock, jinja2, networkx, fsspec, typing-extensions, setuptools). If pip reports "no
 #     matching distribution" for one of them, add `--extra-index-url https://pypi.org/simple` to that RUN (pypi.org is
-#     allowlisted) and pin torchaudio to the +rocm${ROCM_VER} build it resolves, so PyPI cannot substitute a CUDA
-#     torchaudio; phase4-engines.sh's build failure message says the same.
+#     allowlisted). torch, torchvision and torchaudio are pinned with their +rocm${ROCM_VER} local label, which no PyPI
+#     wheel carries (PyPI refuses uploads with a local version, INFERRED), so PyPI cannot substitute a CUDA build of
+#     any of them; phase4-engines.sh's build failure message says the same.
 #   * The constraints file is generated IMMEDIATELY after the ROCm install, from what pip resolved there, and every
 #     later install in this image runs under it (fix round 3): a shared library that dragged in another torch would
 #     fail that install loudly instead of replacing the gfx1151 wheel and poisoning the constraints for every venv.
@@ -45,20 +56,23 @@
 #     Section 21; selftest.py no longer accepts torch's gcnArchName as a substitute).
 #   * Telemetry off for every process in this image (rule §7.1): HF_HUB_DISABLE_TELEMETRY, DISABLE_TELEMETRY,
 #     DO_NOT_TRACK, HF_HUB_DISABLE_IMPLICIT_TOKEN in the ENV block (lib-engine.sh repeats them at run time).
-#   * torchaudio, diffusers, transformers, accelerate, huggingface_hub, safetensors, einops, pillow, numpy, scipy carry
-#     no research pin (rule §7.9; the README must say so). The resolved versions are frozen into
-#     /opt/atlas/base-freeze.txt at build time and copied to /srv/atlas/engines/manifests/ by the driver (as atlas).
+#   * diffusers, transformers, accelerate, huggingface_hub, safetensors, einops, pillow, numpy, scipy carry no research
+#     pin (rule §7.9; the README must say so; torchaudio has one since S51, above). The resolved versions are frozen
+#     into /opt/atlas/base-freeze.txt at build time and copied to /srv/atlas/engines/manifests/ by the driver (as atlas).
 FROM ubuntu:24.04
 
 ARG ROCM_INDEX=https://stable.repo.amd.com/rocm/whl-next/
 ARG ROCM_VER=10.0.0
 ARG TORCH_VER=2.13.0
 ARG TORCHVISION_VER=0.28.0
+ARG TORCHAUDIO_VER=2.11.0.2
 # The atlas service account's uid/gid (from /etc/atlas/docker.env, written by Phase 1 step 6): the image runs as it.
 ARG ATLAS_UID=999
 ARG ATLAS_GID=999
 # Proxy build args are passed by the driver (CONTAINER_HTTP(S)_PROXY from /etc/atlas/docker.env); apt and pip honour them.
 
+# Raise this label and config/phase4-engines.json base_image.version together whenever a pin above changes: a node whose
+# image already carries the label skips the build (a new ROCM_VER also changes the tag, which forces it).
 LABEL org.atlas.rocm-base.version="1" \
       org.atlas.rocm-base.section="3.4,17.4.1" \
       org.atlas.rocm-base.rocm="${ROCM_VER}"
@@ -93,20 +107,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ROCm SDK + torch for gfx1151 into the SYSTEM python (see header). The pip show line fails the build when the gfx1151
 # kernel pack did not come with torch (hipErrorInvalidImage at run time otherwise, TheRock #7839). The constraints file
 # every later install runs under (research §6.6) is generated HERE, from exactly what this step resolved, so no later
-# step and no engine pin (OpenVLA torch==2.2.0, CosyVoice requirements) can replace the ROCm torch (header).
+# step and no engine pin (OpenVLA torch==2.2.0, CosyVoice requirements) can replace the ROCm torch (header). The torch
+# and torchaudio lines in it must be exactly the pins, local label included (S51).
 RUN python3.12 -m pip install --break-system-packages --upgrade pip \
     && python3.12 -m pip install --break-system-packages --index-url "${ROCM_INDEX}" \
       "rocm[libraries,devel,device-gfx1151]==${ROCM_VER}" \
       "torch[device-gfx1151]==${TORCH_VER}+rocm${ROCM_VER}" \
       "torchvision[device-gfx1151]==${TORCHVISION_VER}+rocm${ROCM_VER}" \
-      torchaudio \
+      "torchaudio==${TORCHAUDIO_VER}+rocm${ROCM_VER}" \
     && python3.12 -m pip show amd-torch-device-gfx1151 >/dev/null \
     && python3.12 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; assert torch.__version__ == '${TORCH_VER}+rocm${ROCM_VER}', torch.__version__; print('torch', torch.__version__, 'hip', torch.version.hip)" \
     && mkdir -p /opt/atlas \
     && python3.12 -m pip freeze | grep -E '^(torch|torchaudio|torchvision|amd-|rocm)[A-Za-z0-9_.-]*==' > /opt/atlas/constraints-rocm.txt \
     && test -s /opt/atlas/constraints-rocm.txt \
     && grep -q "^torch==${TORCH_VER}+rocm${ROCM_VER}$" /opt/atlas/constraints-rocm.txt \
-    && grep -q '^torchaudio==' /opt/atlas/constraints-rocm.txt \
+    && grep -q "^torchaudio==${TORCHAUDIO_VER}+rocm${ROCM_VER}$" /opt/atlas/constraints-rocm.txt \
     && cat /opt/atlas/constraints-rocm.txt
 
 # Shared pure-python libraries every engine venv inherits (no research pins; see header), installed UNDER the

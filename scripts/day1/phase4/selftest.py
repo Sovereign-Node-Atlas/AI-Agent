@@ -11,9 +11,12 @@ Steps (all must pass; each is timed and reported):
   2. torch_device       torch.cuda.is_available(), device name/arch, HSA_OVERRIDE_GFX_VERSION unset (#6034), and,
                         ONLY when V11_EXPECT_DEVICE_WHEEL=1 (set by verify/v11-rocm-selftest.sh for the atlas base
                         image), `pip show amd-torch-device-gfx1151` succeeds (TheRock #7839: without it every kernel
-                        launch fails with hipErrorInvalidImage). The driver's opt-in community-image diagnostic runs
-                        this same file without that variable, so a check specific to the atlas image cannot fail an
-                        image that never used AMD's device wheel (fix round 3).
+                        launch fails with hipErrorInvalidImage). torchaudio is imported and its version reported;
+                        ONLY when V11_EXPECT_TORCHAUDIO is set (verify/v11-rocm-selftest.sh passes base_image.torchaudio
+                        of config/phase4-engines.json) it must import and equal that pin exactly, +rocm label included
+                        (S51: a torchaudio built for another ROCm fails V11). The driver's opt-in community-image
+                        diagnostic runs this same file without either variable, so a check specific to the atlas image
+                        cannot fail an image that never used AMD's device wheel or the atlas pins (fix round 3).
   3. matmul_bf16        4096x4096 bf16 matmul on device vs the CPU result (rel. max error < 2e-2) + TFLOPS.
   4. alloc_4GB_gtt      a 4 GB device tensor filled and read back (GTT-backed device memory beyond the "15.5 GB only"
                         symptom, ROCm/ROCm #5444 UNVERIFIED-by-snippet).
@@ -23,12 +26,14 @@ Steps (all must pass; each is timed and reported):
 Output: the step table as one JSON document, written to $V11_OUT when that is set to a path, else printed on stdout as
 the tagged line "V11JSON {json}" (the default: the container then writes nothing and the caller keeps the table
 root-held, fix round 3), followed by a one-line summary on stdout as the last line ("V11 ok ..." or "V11 FAIL ...").
-Exit 0 only when every step passed. The caller runs it under `timeout`: a hang (the kernel-7.0 symptom of #6530/#6182)
-must count as a fail, not wait forever.
+Exit 0 only when every step passed. The caller runs it under `timeout`: a hang (the symptom of the open gfx1151 report
+ROCm/legacy-rocm-build #6530, kernels 6.17 and 7.0) must count as a fail, not wait forever.
 """
 
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
 import json
 import os
 import shutil
@@ -97,9 +102,27 @@ def torch_gpu() -> dict[str, Any]:
         device_wheel = "amd-torch-device-gfx1151 installed"
     else:
         device_wheel = "not checked (V11_EXPECT_DEVICE_WHEEL unset: not the atlas base image)"
+    # torchaudio (S51): the version compared is the installed distribution's, read without importing, as pip freeze
+    # and the build's constraints line spell it (whether AMD's torchaudio.__version__ carries the +rocm label is
+    # UNVERIFIED). A wrong or missing build fails V11; whether it imports is only recorded, so a torchaudio that will
+    # not load fails the two engines that use it (CosyVoice 2, Stable Audio Open), not the whole of Phase 4.
+    want_ta = os.environ.get("V11_EXPECT_TORCHAUDIO", "")
+    try:
+        ta = importlib.metadata.version("torchaudio")
+    except importlib.metadata.PackageNotFoundError:
+        ta = "not installed"
+    if want_ta and ta != want_ta:
+        raise AssertionError(f"torchaudio is {ta}, not the pinned {want_ta} (config/phase4-engines.json; S51)")
+    try:
+        importlib.import_module("torchaudio")
+        ta_import = "ok"
+    except Exception as exc:  # a library built against another torch, or a missing shared object
+        ta_import = f"failed: {type(exc).__name__}: {exc}"[:200]
     return {
         "device_wheel": device_wheel,
         "torch": torch.__version__,
+        "torchaudio": ta,
+        "torchaudio_import": ta_import,
         "hip": torch.version.hip,
         "name": p.name,
         "arch": arch,
@@ -190,6 +213,7 @@ def main() -> int:
     if ok:
         print(
             f"V11 ok: {results['rocminfo_gfx1151']['detail']}; torch={td.get('torch')} hip={td.get('hip')} "
+            f"torchaudio={td.get('torchaudio')} "
             f"name='{td.get('name')}' arch={td.get('arch')} mem={td.get('total_mem_GB')}GB; "
             f"matmul rel_err={mm.get('rel_err')} {mm.get('tflops_bf16')} TFLOPS bf16; 4GB alloc ok; "
             f"diffusion 2-step ok peak={df.get('peak_alloc_MB')}MB"
