@@ -29,7 +29,7 @@ import httpx
 import pytest
 
 from atlas.config import AtlasConfig, ConfigError, Settings, load_config, owner_persona_key
-from atlas.engines import LlamaClient
+from atlas.engines import LlamaClient, SlotWindow
 from atlas.ledger import Ledger
 from atlas.prompts import GOVERNANCE_BLOCK, PromptBuilder, build_system_prompt
 from atlas.router import (
@@ -49,6 +49,7 @@ from atlas.router import (
     find_sensitive_keywords,
     parse_override,
 )
+from stubs import counting
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
 # Invented placeholder family names (never the Principal's; those live only in /etc/atlas/atlas.env).
@@ -607,7 +608,9 @@ def test_verdict_naming_a_director_falls_back_to_the_hemisphere(config: AtlasCon
 
 
 def _fake_llama(handler: Callable[[httpx.Request], httpx.Response]) -> LlamaClient:
-    return LlamaClient("http://127.0.0.1:8108", transport=httpx.MockTransport(handler))
+    # The classifier's verdict counts the prompt first and keeps to the router's per-slot window (S52).
+    return LlamaClient("http://127.0.0.1:8108", transport=httpx.MockTransport(counting(handler)),
+                       window=SlotWindow("router-qwen3.5-4b", 8192, "test"))
 
 
 def test_llama_classifier_parses_the_resident_verdict() -> None:

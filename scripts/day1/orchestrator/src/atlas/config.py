@@ -304,6 +304,21 @@ class EngineSpec(BaseModel):
         return self.arbiter_class == "external"
 
     @property
+    def standing_coresident(self) -> bool:
+        """S52: an engine that defines a co-resident profile (today only the vision engine, 2 x 32k) runs it as its
+        STANDING profile, alone or beside gpt-oss-120b, so Section 4.1's everyday pairing forms in production.
+        phase2/engine-env.py renders it unless overrides.json says "coresident": false (the Principal's choice of the
+        full ctx_size x parallel profile); the Arbiter projects it before a unit env file exists."""
+        return self.ctx_size_coresident is not None or self.parallel_coresident is not None
+
+    def profile(self, coresident: bool | None = None) -> tuple[int, int]:
+        """(ctx_size, parallel) of the co-resident profile (True), the full one (False) or the standing one (None).
+        A field the co-resident profile does not define falls back to the full value, as in phase2/engine-env.py."""
+        co = self.standing_coresident if coresident is None else coresident
+        return (self.ctx_size_coresident if co and self.ctx_size_coresident else self.ctx_size,
+                self.parallel_coresident if co and self.parallel_coresident else self.parallel)
+
+    @property
     def footprint_bytes(self) -> int:
         """Weights, in bytes, reading the Section 4.1/5.1 `footprint_gb` figure as GiB (binary).
 

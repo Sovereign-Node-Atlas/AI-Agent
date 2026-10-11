@@ -8,7 +8,10 @@
 # serve; TimeoutStartSec bounds a 155 GB load (Section 5.4 says 25-35 s from NVMe, a cold page cache can take minutes).
 # Bind: 127.0.0.1 only (CONVENTIONS.md §8), set twice — in $ARGS (--host) and as the LLAMA_ARG_HOST env var.
 # Logs: the journal (journalctl -u llama-server@<key>) is where Phase 3 reads the V4 proof line
-#       "llama_kv_cache: size = ... K (q8_0): ... V (q8_0): ..." (research conflict h).
+#       "llama_kv_cache: size = ... K (q8_0): ... V (q8_0): ..." (research conflict h) and the S52 memory records'
+#       size and compute lines. At the pinned llama.cpp these are TRACE (library INFO, common/log.cpp:532), printed
+#       only at -lv 4: engine-env.py renders `--verbosity 4` into every chat/vision engine's $ARGS (exactly 4, never
+#       5 or -v; see its docstring). At the default 3 none of them reaches the journal and V4 cannot pass.
 # Control path: the orchestrator runs `sudo systemctl start|stop|restart llama-server@<key>` under
 #       /etc/sudoers.d/atlas-engines (CONVENTIONS.md §8), written by phase2/01-llama.sh.
 

@@ -110,17 +110,29 @@ def test_renders_every_engine(engine_env: ModuleType, monkeypatch: pytest.Monkey
         assert kv["ATLAS_MODEL_PATTERN"] == (eng.get("model_file_pattern") or eng["files"][0]["name"].split("/")[-1])
         assert kv["LLAMA_ARG_HOST"] == "127.0.0.1"
         assert kv["LLAMA_ARG_PORT"] == str(PORT_BASE + index)
-        assert kv["ATLAS_CTX_SIZE"] == str(eng["ctx_size"])
-        assert kv["ATLAS_PARALLEL"] == str(eng["parallel"])
+        # S52: an engine with a co-resident profile (the vision engine) renders it by default, ATLAS_CORESIDENT=1.
+        standing = "ctx_size_coresident" in eng or "parallel_coresident" in eng
+        want_ctx = eng.get("ctx_size_coresident", eng["ctx_size"]) if standing else eng["ctx_size"]
+        want_par = eng.get("parallel_coresident", eng["parallel"]) if standing else eng["parallel"]
+        assert kv["ATLAS_CORESIDENT"] == ("1" if standing else "0")
+        assert kv["ATLAS_CTX_SIZE"] == str(want_ctx)
+        assert kv["ATLAS_PARALLEL"] == str(want_par)
         args = kv["ARGS"].split()
         assert args[args.index("--port") + 1] == str(PORT_BASE + index)
         assert args[args.index("--host") + 1] == "127.0.0.1"
-        assert args[args.index("--ctx-size") + 1] == str(eng["ctx_size"])  # the TOTAL pool (conflict 9)
+        assert args[args.index("--ctx-size") + 1] == str(want_ctx)  # the TOTAL pool (conflict 9)
+        assert args[args.index("--parallel") + 1] == str(want_par)
         assert "--n-gpu-layers" in args and "--no-webui" in args
         assert Path(args[args.index("--model") + 1]).is_file()
         if eng.get("mode", "chat") in {"chat", "vision"}:
             assert args[args.index("--slot-save-path") + 1] == str(tree["slots"])
             assert "--context-shift" in args
+            # S52 fix round: the V4 proof and the memory records' lines are TRACE at the pin (common/log.cpp:532);
+            # exactly 4, once, never 5 or -v (--fit's trial context would print its K/V lines too).
+            assert args.count("--verbosity") == 1 and args[args.index("--verbosity") + 1] == "4"
+            assert not {"-v", "--verbose", "--log-verbose", "-lv", "--log-verbosity"} & set(args)
+        else:
+            assert "--verbosity" not in args
         if eng.get("mmproj"):
             assert Path(args[args.index("--mmproj") + 1]).is_file()
         kv_type = eng.get("kv_class", "none")
@@ -281,16 +293,79 @@ def test_override_refuses_unknown_engine_and_field(engine_env: ModuleType, monke
         _run(engine_env, monkeypatch, tree, "--set-override", "deepseek-v4-flash", "kv_type", "q3_k")
 
 
-def test_coresident_override_uses_the_coresident_ctx(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
-                                                     tree: dict[str, Path], engines: list[dict[str, Any]]) -> None:
+def test_coresident_profile_is_the_standing_profile(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                                                   tree: dict[str, Path], engines: list[dict[str, Any]]) -> None:
+    """S52: the vision engine's co-resident profile (2 x 32k) is what it runs with NO override, so the unit the Arbiter
+    projects pairs with gpt-oss-120b (Section 4.1); only an explicit coresident=false (the Principal's choice) renders
+    the full 8 x 32k profile, and clearing it brings the standing profile back."""
     cores = [e for e in engines if "ctx_size_coresident" in e]
-    if not cores:
-        pytest.skip("no engine declares ctx_size_coresident")
+    assert [e["key"] for e in cores] == ["qwen2.5-vl-72b"], "only the vision engine defines a co-resident profile"
     eng = cores[0]
-    assert _run(engine_env, monkeypatch, tree, "--set-override", eng["key"], "coresident", "true") == 0
-    kv = _kv(tree["out"] / f"{eng['key']}.env")
-    assert kv["ATLAS_CORESIDENT"] == "1"
-    assert kv["ATLAS_CTX_SIZE"] == str(eng["ctx_size_coresident"])
+    key = eng["key"]
+    assert (eng["ctx_size_coresident"], eng["parallel_coresident"]) == (65536, 2)  # Section 4.3: 2 slots x 32k
+    assert _run(engine_env, monkeypatch, tree) == 0
+    kv = _kv(tree["out"] / f"{key}.env")
+    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == ("1", "65536", "2")
+    assert not tree["overrides"].exists()  # the standing profile needs no overrides.json at all
+    # The Principal's explicit choice of the full profile.
+    assert _run(engine_env, monkeypatch, tree, "--set-override", key, "coresident", "false") == 0
+    assert json.loads(tree["overrides"].read_text(encoding="utf-8")) == {key: {"coresident": False}}
+    kv = _kv(tree["out"] / f"{key}.env")
+    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == (
+        "0", str(eng["ctx_size"]), str(eng["parallel"]))
+    args = kv["ARGS"].split()
+    assert args[args.index("--ctx-size") + 1] == str(eng["ctx_size"]) and args[args.index("--parallel") + 1] == "8"
+    # A plain re-render keeps the choice; clearing it restores the standing profile; true is the same as the default.
+    assert _run(engine_env, monkeypatch, tree) == 0
+    assert _kv(tree["out"] / f"{key}.env")["ATLAS_PARALLEL"] == "8"
+    assert _run(engine_env, monkeypatch, tree, "--clear-override", key, "coresident") == 0
+    assert _kv(tree["out"] / f"{key}.env")["ATLAS_PARALLEL"] == "2"
+    assert _run(engine_env, monkeypatch, tree, "--set-override", key, "coresident", "true") == 0
+    kv = _kv(tree["out"] / f"{key}.env")
+    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == ("1", "65536", "2")
+    # An engine without a co-resident profile is unchanged: its full profile, ATLAS_CORESIDENT=0.
+    kv = _kv(tree["out"] / "gpt-oss-120b.env")
+    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == ("0", "262144", "8")
+
+
+def test_rendered_units_pair_gpt_oss_and_vision_in_the_arbiter(engine_env: ModuleType,
+                                                               monkeypatch: pytest.MonkeyPatch,
+                                                               tree: dict[str, Path]) -> None:
+    """S52 end to end: the real engines.json rendered with no overrides, read by the real Arbiter (stub probe and
+    controller): gpt-oss-120b then qwen2.5-vl-72b PAIR within Section 4.1's budget (~164 GiB, checked at its 163 GiB
+    low end) at the 157.7 GiB the document projects, instead of the vision engine swapping gpt-oss out. With the
+    Principal's coresident=false rendered, the same requests swap, and the grant says how to restore the pair."""
+    from atlas.arbiter import GIB, Arbiter, StubProbe
+    from atlas.config import load_engines
+    from atlas.engines import StubController
+
+    specs = load_engines(DAY1 / "config", PORT_BASE)
+    resident_set = 22 * GIB
+
+    def arbiter() -> Arbiter:
+        probe = StubProbe(total_bytes=resident_set + 163 * GIB, used_bytes=resident_set)
+        arb = Arbiter(specs, StubController(engines=specs, probe=probe), probe, release_timeout_s=60.0,
+                      poll_interval_s=1.0, sleep=lambda _s: None, engines_env_dir=tree["out"])
+        arb.measure_resident_set()
+        return arb
+
+    assert _run(engine_env, monkeypatch, tree) == 0
+    arb = arbiter()
+    assert arb.budget_bytes == 163 * GIB
+    assert arb.request_load("gpt-oss-120b", task_id="s52-1").granted
+    d = arb.request_load("qwen2.5-vl-72b", task_id="s52-2")
+    assert d.granted and d.evicted == (), d.reason
+    assert list(arb.resident) == ["gpt-oss-120b", "qwen2.5-vl-72b"]
+    assert "ATLAS_CORESIDENT=1" in d.reason and "ctx 65536 x 2 slots" in d.reason
+    assert arb.charged_bytes <= arb.budget_bytes
+    assert round(arb.charged_bytes / GIB, 1) == 157.7  # Section 4.1 "What fits together": 157.7 GiB projected
+    # The Principal's explicit 8-slot choice: the unit is projected at 8 x 32k and gpt-oss is swapped out.
+    assert _run(engine_env, monkeypatch, tree, "--set-override", "qwen2.5-vl-72b", "coresident", "false") == 0
+    arb = arbiter()
+    assert arb.request_load("gpt-oss-120b", task_id="s52-3").granted
+    d = arb.request_load("qwen2.5-vl-72b", task_id="s52-4")
+    assert d.granted and d.evicted == ("gpt-oss-120b",) and list(arb.resident) == ["qwen2.5-vl-72b"]
+    assert "--clear-override qwen2.5-vl-72b coresident" in d.reason
 
 
 def test_reserved_lists_are_mirrored_in_engines_json_meta(engine_env: ModuleType) -> None:

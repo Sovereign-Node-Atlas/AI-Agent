@@ -140,9 +140,10 @@ def cmd_engines_list(args: argparse.Namespace) -> int:
     controller = SystemdEngineController(engines=engines)
     rows: list[dict[str, Any]] = []
     for spec in engines.values():
+        ctx_size, parallel = spec.profile()  # the standing profile (S52: the vision engine's co-resident 2 x 32k)
         rows.append({
             "key": spec.key, "class": spec.arbiter_class, "mode": spec.mode, "kv": spec.kv_class,
-            "footprint_gb": spec.footprint_gb, "ctx_size": spec.ctx_size, "parallel": spec.parallel,
+            "footprint_gb": spec.footprint_gb, "ctx_size": ctx_size, "parallel": parallel,
             "port": spec.port, "unit": spec.systemd_unit,
             "state": "-" if args.no_state else _unit_state(controller, spec.key, spec),
         })

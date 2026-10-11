@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -491,11 +492,14 @@ def test_pending_overrides_journal_round_trip(tmp_path: Path, monkeypatch: pytes
 
     monkeypatch.setattr(ctx, "render", fake_render)
     e1 = lt.pending_begin(ctx, "nemotron-3-super", ["ctx_size"], "probe")
-    e2 = lt.pending_begin(ctx, "qwen2.5-vl-72b", ["coresident"], "pair", clear_always=["coresident"])
-    assert e1["set"] == {"ctx_size": 131072} and e1["clear"] == [] and e2["set"] == {} and e2["clear"] == ["coresident"]
+    # clear_always: a field journalled as "clear" whatever overrides.json holds now (never a persistent override).
+    (tmp_path / "overrides.json").write_text(json.dumps({"nemotron-3-super": {"ctx_size": 131072},
+                                                         "deepseek-v4-flash": {"n_keep": 64}}))
+    e2 = lt.pending_begin(ctx, "deepseek-v4-flash", ["n_keep"], "probe2", clear_always=["n_keep"])
+    assert e1["set"] == {"ctx_size": 131072} and e1["clear"] == [] and e2["set"] == {} and e2["clear"] == ["n_keep"]
     assert len(lt.pending_read(ctx)) == 2
     lt.pending_recover(ctx)  # an interrupted run: both restored, newest first, journal gone
-    assert rendered == [("qwen2.5-vl-72b", [], ["coresident"]), ("nemotron-3-super", [("ctx_size", "131072")], [])]
+    assert rendered == [("deepseek-v4-flash", [], ["n_keep"]), ("nemotron-3-super", [("ctx_size", "131072")], [])]
     assert not lt.pending_path(ctx).exists() and lt.pending_read(ctx) == []
     e3 = lt.pending_begin(ctx, "nemotron-3-super", ["ctx_size"], "probe")
     lt.pending_end(ctx, e3)
@@ -704,6 +708,94 @@ def test_control_load_queued_retries_the_arbiter_not_the_ledger(monkeypatch: pyt
     assert ctl.load("qwen3.5-122b", 262144, 8, 8104) >= 0
 
 
+def test_test_engine_renders_the_unit_as_production_runs_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            capsys: pytest.CaptureFixture[str]) -> None:
+    """S52: step 2 measures the vision engine at the profile production runs (its standing co-resident one, or the
+    Principal's overrides.json coresident=false): it neither sets nor clears `coresident` any more."""
+    ctx = _ctx(tmp_path, ENGINES)
+    ctx.results_dir.mkdir(parents=True)
+    (ctx.results_dir / "baseline.json").write_text(json.dumps({"gtt_used_bytes": 10 * lt.GB}))
+    rendered: list[tuple[str, list[Any], list[Any]]] = []
+
+    def fake_render(key: str, set_ov: Any = (), clear_ov: Any = ()) -> dict[str, str]:
+        rendered.append((key, list(set_ov), list(clear_ov)))
+        return {"ATLAS_MODEL_PRESENT": "0", "ATLAS_MODEL_FILE": "x.gguf", "ATLAS_KV_TYPE": "q8_0"}
+
+    monkeypatch.setattr(lt, "Control", lambda *_a, **_k: FakeControl(set()))
+    monkeypatch.setattr(ctx, "render", fake_render)
+    monkeypatch.setattr(lt, "swap_out", lambda *_a: (0.0, "released"))
+    lt.test_engine(ctx, "qwen2.5-vl-72b", None)
+    assert rendered == [("qwen2.5-vl-72b", [], [])]
+    assert _records(capsys)[0][:2] == ("V4", "fail")
+
+
+VISION_CO = {"key": "qwen2.5-vl-72b", "arbiter_class": "vision", "ctx_size": 262144, "parallel": 8,
+             "ctx_size_coresident": 65536, "parallel_coresident": 2, "footprint_gb": 79}
+
+
+class _CoControl:
+    mode = "orchestrator"
+
+    def resident_keys(self) -> list[str]:
+        return []
+
+    def status(self) -> dict[str, Any]:
+        return {"budget_bytes": 164 * lt.GB}
+
+
+def _coresident_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vision_env: dict[str, str],
+                        ) -> tuple[Any, list[tuple[str, list[Any], list[Any]]]]:
+    engines = [{**ENGINES[0], "footprint_gb": 63}, VISION_CO]
+    ctx = _ctx(tmp_path, engines)
+    ctx.results_dir.mkdir(parents=True, exist_ok=True)
+    (ctx.results_dir / "baseline.json").write_text(json.dumps({"gtt_used_bytes": 10 * lt.GB}))
+    rendered: list[tuple[str, list[Any], list[Any]]] = []
+
+    def fake_render(key: str, set_ov: Any = (), clear_ov: Any = ()) -> dict[str, str]:
+        rendered.append((key, list(set_ov), list(clear_ov)))
+        base = {"ATLAS_MODEL_PRESENT": "0", "ATLAS_MODEL_FILE": f"{key}.gguf", "LLAMA_ARG_PORT": "8101"}
+        return {**base, **vision_env} if key == "qwen2.5-vl-72b" else base
+
+    monkeypatch.setattr(lt, "Control", lambda *_a, **_k: _CoControl())
+    monkeypatch.setattr(ctx, "render", fake_render)
+    monkeypatch.setattr(lt, "unit_active", lambda _k: False)
+    monkeypatch.setattr(lt, "clear_residents", lambda _c, _r, base, _w: (True, 0.0, "nothing resident", base))
+    return ctx, rendered
+
+
+def test_coresident_step_renders_the_standing_profile_without_a_temporary_override(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """S52: step 3 renders both units exactly as production runs them (no set, no clear, nothing journalled, nothing
+    restored at the end), and still asserts ATLAS_CORESIDENT=1 at engines.json's 2-slot values before any load."""
+    import argparse
+
+    good = {"ATLAS_CORESIDENT": "1", "ATLAS_PARALLEL": "2", "ATLAS_CTX_SIZE": "65536"}
+    ctx, rendered = _coresident_harness(tmp_path, monkeypatch, good)
+    args = argparse.Namespace(text="gpt-oss-120b", vision="qwen2.5-vl-72b")
+    assert lt.cmd_coresident(ctx, args) == 0  # the model files are absent here: V21 recorded as a fail, no load
+    assert rendered == [("gpt-oss-120b", [], []), ("qwen2.5-vl-72b", [], [])]
+    assert not lt.pending_path(ctx).exists() and not ctx.overrides.exists()
+    assert [r[:2] for r in _records(capsys)] == [("V21", "fail"), ("V14b", "fail")]
+    # The Principal's coresident=false: the pair cannot form at the full profile and Phase 3 does not override it.
+    ctx.overrides.write_text(json.dumps({"qwen2.5-vl-72b": {"coresident": False}}))
+    ctx, rendered = _coresident_harness(tmp_path, monkeypatch, {**good, "ATLAS_CORESIDENT": "0",
+                                                                "ATLAS_PARALLEL": "8", "ATLAS_CTX_SIZE": "262144"})
+    principal = r"coresident=false for qwen2\.5-vl-72b.*--clear-override qwen2\.5-vl-72b coresident"
+    with pytest.raises(lt.Infra, match=principal):
+        lt.cmd_coresident(ctx, args)
+    assert json.loads(ctx.overrides.read_text()) == {"qwen2.5-vl-72b": {"coresident": False}}  # untouched
+    # No override, yet not rendered co-resident (an engine-env.py without the S52 default): still refused.
+    ctx.overrides.unlink()
+    ctx, _ = _coresident_harness(tmp_path, monkeypatch, {**good, "ATLAS_CORESIDENT": "0"})
+    with pytest.raises(lt.Infra, match=re.escape("did not render qwen2.5-vl-72b with ATLAS_CORESIDENT=1")):
+        lt.cmd_coresident(ctx, args)
+    # Co-resident flag but not engines.json's 2-slot values: refused before any load (the existing check).
+    ctx, _ = _coresident_harness(tmp_path, monkeypatch, {**good, "ATLAS_PARALLEL": "8"})
+    with pytest.raises(lt.Infra, match="parallel_coresident 2"):
+        lt.cmd_coresident(ctx, args)
+    assert _records(capsys) == []
+
+
 def test_test_engine_releases_the_previous_engine_before_the_model_check(tmp_path: Path,
                                                                         monkeypatch: pytest.MonkeyPatch,
                                                                         capsys: pytest.CaptureFixture[str]) -> None:
@@ -721,3 +813,599 @@ def test_test_engine_releases_the_previous_engine_before_the_model_check(tmp_pat
     assert saved["resident_after"] is False and not saved["load_ok"]
     assert _records(capsys) == [("V4", "fail", "gpt-oss-120b: not loaded (ATLAS_MODEL_PRESENT=0 in gpt-oss-120b.env: "
                                  "model file x.gguf not found (step 01))")]
+
+
+# --- S52 Phase 3 items: context memory, host-RAM caches, context shift (records, never a verdict) --------------------
+#
+# Fixture lines are produced from the format strings of llama.cpp b29c606 (the pinned build), copied verbatim below
+# with their file and line, through common_log's prefix (common/log.cpp:141-154: "%d.%02d.%03d.%03d " then "I ", "W "
+# or "D "). The sizes are invented for the fixtures except where a test says it re-derives one.
+
+REAL_ENGINES = Path(__file__).resolve().parents[2] / "config" / "engines.json"
+FMT_PREFIX = "%d.%02d.%03d.%03d "  # common/log.cpp:141 ("[M.s.ms.us]"), then "I ", "W " or "D " (log.cpp:151-154)
+FMT_KV = ("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB"
+          )  # src/llama-kv-cache.cpp:301
+FMT_ISWA_BASE = "%s: creating non-SWA KV cache, size = %u cells"  # src/llama-kv-cache-iswa.cpp:83
+FMT_ISWA_SWA = "%s: creating     SWA KV cache, size = %u cells"  # src/llama-kv-cache-iswa.cpp:100
+FMT_RS = ("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, "
+          "P (%s): %7.2f MiB")  # src/llama-memory-recurrent.cpp:133
+FMT_DSV4_RAW = "%s: creating DSV4 raw KV cache"  # src/llama-kv-cache-dsv4.cpp:1251
+FMT_DSV4_CSA = "%s: creating DSV4 CSA compressed KV cache, size = %u cells"  # src/llama-kv-cache-dsv4.cpp:1289
+FMT_DSV4_HCA = "%s: creating DSV4 HCA compressed KV cache, size = %u cells"  # src/llama-kv-cache-dsv4.cpp:1297
+FMT_DSV4_LID = "%s: creating DSV4 lightning-indexer KV cache, size = %u cells"  # src/llama-kv-cache-dsv4.cpp:1305
+FMT_DSV4_STATE = ("%s: %s ratio = %u, state = %u x %u, streams = %u, rs_seq = %u, layers = %d, size = %7.2f MiB"
+                  )  # src/llama-kv-cache-dsv4.cpp:998 (%zu in C for layers)
+FMT_COMPUTE = "%s: %10s compute buffer size = %8.2f MiB"  # src/llama-context.cpp:692, tools/mtmd/clip.cpp:3773
+FMT_FIT_END = "%s: fitting params to free memory took %.2f seconds"  # common/fit.cpp:902 (LOG_TRC: printed "I ")
+FMT_SRV = "srv  %12.*s: "  # tools/server/server-common.h:34-36 (SRV_TRC/SRV_INF/SRV_WRN)
+FMT_SLT = "slot %12.*s: id %2d | task %d | "  # tools/server/server-common.h:27-29
+FMT_SLOTS = "initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'"  # tools/server/server-context.cpp:1250
+FMT_SHIFT_CTX = "ctx_shift is not supported by this context, it will be disabled"  # server-context.cpp:1188
+FMT_SHIFT_MM = "ctx_shift is not supported by multimodal, it will be disabled"  # server-context.cpp:1176
+FMT_PC_ROOM = " - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)"  # server-task.cpp:1753
+FMT_PC_LIMIT = " - cache size limit reached, removing oldest entry (size = %.3f MiB)"  # server-task.cpp:1873
+FMT_PC_SKIP = " - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping"  # server-task.cpp:1732
+FMT_PC_STATE = " - cache state: %d prompts, %.3f MiB (limits: %.3f MiB, %d tokens, %d est)"  # server-task.cpp:1894
+FMT_CK_ERASE = ("erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB)"
+                )  # server-context.cpp:2335 (PRId64 n_tokens)
+FMT_CK_CREATE = ("created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB)"
+                 )  # server-context.cpp:2369 (TRACE)
+
+
+def _cl(level: str, msg: str, t_us: int = 3_123_456) -> str:
+    """One journal line as common_log prints it with prefix and timestamps on (common/common.cpp:391-392)."""
+    s = t_us // 1_000_000
+    return FMT_PREFIX % (s // 60, s % 60, t_us // 1000 % 1000, t_us % 1000) + f"{level} {msg}"
+
+
+def _kv(cells: int, layers: int, seqs: int, streams: int, typ: str, k_mib: float, v_mib: float) -> str:
+    return _cl("I", FMT_KV % ("llama_kv_cache", k_mib + v_mib, cells, layers, seqs, streams, typ, k_mib, typ, v_mib))
+
+
+def _srv(func: str, level: str, msg: str) -> str:
+    return _cl(level, FMT_SRV % (12, func) + msg)
+
+
+def _compute(func: str, buf: str, mib: float) -> str:
+    return _cl("I", FMT_COMPUTE % (func, buf, mib))
+
+
+# gpt-oss-120b at 262144 x 8, q4_0 (sizes re-derived: 18 full layers of 8 KV heads x 64 x 32768 cells x 8 streams at
+# 18/32 B = 1296 MiB each for K and V; the window of 2304 cells gives 91.125 MiB each). The first line is --fit's trial
+# context as -lv 5 or -v prints it ("I ": common/common.cpp:1326 keeps its INFO level there), then the fit-end line.
+GPT_OSS_MEM = [
+    _cl("I", FMT_KV % ("llama_kv_cache", 9999.0, 32768, 18, 8, 8, "q4_0", 4999.5, "q4_0", 4999.5)),  # --fit's trial
+    _cl("I", FMT_FIT_END % ("common_fit_params", 0.42)),
+    _cl("I", FMT_ISWA_BASE % ("llama_kv_cache_iswa", 32768)),
+    _kv(32768, 18, 8, 8, "q4_0", 1296.0, 1296.0),
+    _cl("I", FMT_ISWA_SWA % ("llama_kv_cache_iswa", 2304)),
+    _kv(2304, 18, 8, 8, "q4_0", 91.125, 91.125),
+    _cl("I", "llama_context: flash_attn            = enabled"),
+    _compute("sched_reserve", "Vulkan0", 1200.25),
+    _compute("sched_reserve", "Vulkan_Host", 40.0),
+    _compute("sched_reserve", "Vulkan0", 1100.0),  # a later re-reservation: the largest stands
+    _srv("load_model", "W", FMT_SHIFT_CTX),
+    _srv("load_model", "I", FMT_SLOTS % (8, 32768, "false")),
+    _srv("main", "I", "model loaded"),
+    _srv("alloc", "W", FMT_PC_ROOM % 345.5),
+    _srv("update", "W", FMT_PC_LIMIT % 512.25),
+    _cl("W", FMT_SLT % (12, "create_checkpoint", 3, 41) + FMT_CK_ERASE % (0, 8191, 8192, 22.781)),
+]
+VISION_MEM = [
+    _compute("reserve_compute_meta", "Vulkan0", 300.0),
+    _kv(32768, 80, 2, 2, "q8_0", 5440.0, 5440.0),
+    _compute("sched_reserve", "Vulkan0", 700.0),
+    _srv("load_model", "W", FMT_SHIFT_MM),
+    _srv("load_model", "I", FMT_SLOTS % (2, 32768, "false")),
+]
+NEMOTRON_MEM = [
+    _kv(32768, 8, 8, 8, "q8_0", 768.0, 768.0),
+    _cl("I", FMT_RS % ("llama_memory_recurrent", 2400.0, 8, 40, 8, 0, "f32", 400.0, "f32", 2000.0, "f32", 0.0)),
+    _srv("load_model", "I", FMT_SLOTS % (8, 32768, "false")),
+    _srv("update", "I", FMT_PC_STATE % (3, 1234.5, 8192.0, 0, 0)),
+    _cl("I", FMT_SLT % (12, "create_checkpoint", 0, 7) + FMT_CK_CREATE % (4, 32, 0, 4095, 4096, 300.0)),
+]
+DEEPSEEK_MEM = [
+    _cl("I", FMT_DSV4_RAW % "llama_kv_cache_dsv4"),
+    _cl("I", FMT_ISWA_BASE % ("llama_kv_cache_iswa", 32768)),
+    _kv(32768, 0, 1, 1, "q4_0", 0.0, 0.0),
+    _cl("I", FMT_ISWA_SWA % ("llama_kv_cache_iswa", 768)),
+    _kv(768, 43, 1, 1, "q4_0", 11.5, 0.0),
+    _cl("I", FMT_DSV4_CSA % ("llama_kv_cache_dsv4", 8192)),
+    _kv(8192, 21, 1, 1, "q4_0", 40.0, 0.0),
+    _cl("I", FMT_DSV4_HCA % ("llama_kv_cache_dsv4", 256)),
+    _kv(256, 20, 1, 1, "q4_0", 1.25, 0.0),
+    _cl("I", FMT_DSV4_LID % ("llama_kv_cache_dsv4", 8192)),
+    _kv(8192, 21, 1, 1, "q4_0", 10.0, 0.0),
+    _cl("I", FMT_DSV4_STATE % ("llama_dsv4_comp_state", "csa", 4, 8, 1024, 1, 0, 21, 2.5)),
+    _cl("I", FMT_DSV4_STATE % ("llama_dsv4_comp_state", "hca", 128, 256, 1024, 1, 0, 20, 1.5)),
+    _srv("load_model", "W", FMT_SHIFT_CTX),
+    _srv("load_model", "I", FMT_SLOTS % (1, 32768, "false")),
+]
+ROUTER_MEM = [
+    _kv(8192, 8, 4, 4, "q8_0", 204.0, 204.0),
+    _cl("I", FMT_RS % ("llama_memory_recurrent", 120.0, 4, 24, 4, 0, "f32", 20.0, "f32", 100.0, "f32", 0.0)),
+    _srv("load_model", "W", FMT_SHIFT_CTX),
+    _srv("load_model", "I", FMT_SLOTS % (4, 8192, "false")),
+]
+CHAT_ARGS = "--model /m --ctx-size 262144 --parallel 8 --keep 4096 --context-shift --slot-save-path /s"
+
+
+def test_fixture_lines_have_the_pinned_shape() -> None:
+    # The regexes are matched against the printf output, not against hand-typed lines: spot-check two renderings.
+    assert GPT_OSS_MEM[3].endswith("I llama_kv_cache: size = 2592.00 MiB ( 32768 cells,  18 layers,  8/8 seqs), "
+                                   "K (q4_0): 1296.00 MiB, V (q4_0): 1296.00 MiB")
+    assert GPT_OSS_MEM[1] == "0.03.123.456 I common_fit_params: fitting params to free memory took 0.42 seconds"
+    assert GPT_OSS_MEM[0].startswith("0.03.123.456 I llama_kv_cache: size = 9999.00 MiB") and GPT_OSS_MEM[10] == (
+        "0.03.123.456 W srv    load_model: ctx_shift is not supported by this context, it will be disabled")
+
+
+def test_parse_memory_lines_gpt_oss_iswa_compute_caches_and_shift() -> None:
+    m = lt.parse_memory_lines(GPT_OSS_MEM)
+    assert [p["part"] for p in m["kv_parts"]] == ["non-SWA", "SWA"] and m["kv_lines"] == 2  # the trial is discarded
+    assert m["kv_mib"] == 2774.25 and m["swa_mib"] == 182.25 and m["context_mib"] == 2774.25
+    assert m["recurrent_mib"] is None and m["dsv4_state_mib"] is None
+    assert m["compute_mib"] == {"Vulkan0": 1200.25, "Vulkan_Host": 40.0} and m["mmproj_compute_mib"] == {}
+    assert (m["n_slots"], m["n_ctx_slot"], m["kv_unified"]) == (8, 32768, "false")
+    assert m["ctx_shift_off"] == "not supported by this context"
+    assert m["prompt_cache"]["evicted"] == 2 and m["prompt_cache"]["evicted_max_mib"] == 512.25
+    assert m["prompt_cache"]["state_max_mib"] is None  # TRACE, and this fixture has no cache-state line
+    assert m["checkpoints"]["erased"] == 1 and m["checkpoints"]["size_max_mib"] == 22.781
+    assert m["checkpoint_state_mib"] == round(182.25 / 8, 3)  # one slot's window cells (INFERRED)
+
+
+def test_parse_memory_lines_vision_hybrid_dsv4() -> None:
+    v = lt.parse_memory_lines(VISION_MEM)
+    assert v["kv_mib"] == 10880.0 and [p["part"] for p in v["kv_parts"]] == ["full"]
+    assert v["compute_mib"] == {"Vulkan0": 700.0} and v["mmproj_compute_mib"] == {"Vulkan0": 300.0}
+    assert v["ctx_shift_off"] == "not supported by multimodal" and v["checkpoint_state_mib"] is None
+    n = lt.parse_memory_lines(NEMOTRON_MEM)
+    assert n["kv_mib"] == 1536.0 and n["recurrent_mib"] == 2400.0 and n["context_mib"] == 3936.0
+    assert n["checkpoint_state_mib"] == 300.0 and not n["ctx_shift_off"]
+    assert n["prompt_cache"]["state_max_mib"] == 1234.5 and n["prompt_cache"]["prompts_max"] == 3
+    assert n["checkpoints"]["created_max"] == 4 and n["checkpoints"]["limit"] == 32
+    d = lt.parse_memory_lines(DEEPSEEK_MEM)
+    assert [p["part"] for p in d["kv_parts"]] == ["non-SWA", "SWA", "DSV4 CSA compressed", "DSV4 HCA compressed",
+                                                  "DSV4 lightning-indexer"]
+    assert d["kv_lines"] == 5 and d["kv_mib"] == 62.75 and d["dsv4_state_mib"] == 4.0 and d["context_mib"] == 66.75
+    assert d["checkpoint_state_mib"] == 15.5  # SWA 11.5 + compressor states 4.0, one stream
+    empty = lt.parse_memory_lines([])
+    assert empty["kv_mib"] is None and empty["context_mib"] is None and empty["n_ctx_slot"] is None
+    # An announcement names only the next size line: a later unannounced one is a full cache again.
+    mixed = lt.parse_memory_lines([GPT_OSS_MEM[4], GPT_OSS_MEM[5], VISION_MEM[1]])
+    assert [p["part"] for p in mixed["kv_parts"]] == ["SWA", "full"]
+
+
+def test_parse_memory_lines_discards_fits_trial_context() -> None:
+    """S52 fix round: at -lv 5 or -v --fit's trial context prints its iSWA, K/V and compute lines as "I " (never
+    "D "); everything before the fit-end line (common/fit.cpp:902) is the trial's, so nothing counts twice. At the
+    rendered -lv 4 the trial is not printed at all, and a "D " line is still skipped."""
+    trial = [
+        _cl("I", FMT_ISWA_BASE % ("llama_kv_cache_iswa", 32768)),
+        _kv(32768, 18, 8, 8, "q4_0", 1296.0, 1296.0),
+        _cl("I", FMT_ISWA_SWA % ("llama_kv_cache_iswa", 2304)),
+        _kv(2304, 18, 8, 8, "q4_0", 91.125, 91.125),
+        _cl("I", FMT_RS % ("llama_memory_recurrent", 77.0, 8, 4, 8, 0, "f32", 7.0, "f32", 70.0, "f32", 0.0)),
+        _cl("I", FMT_DSV4_STATE % ("llama_dsv4_comp_state", "csa", 4, 8, 1024, 1, 0, 21, 9.5)),  # reset too
+        _compute("sched_reserve", "Vulkan0", 5000.0),  # larger than the served context's: must not stand
+        _cl("I", FMT_ISWA_BASE % ("llama_kv_cache_iswa", 32768)),  # a dangling announcement: must not tag
+    ]
+    served = GPT_OSS_MEM[2:]
+    lv5 = [*trial, GPT_OSS_MEM[1], _cl("D", "llama_kv_cache: size = 1.00 MiB (1 cells, 1 layers, 1/1 seqs), "
+                                            "K (q4_0): 0.50 MiB, V (q4_0): 0.50 MiB"), *served]
+    m = lt.parse_memory_lines(lv5)
+    assert m["kv_lines"] == 2 and m["kv_mib"] == 2774.25 and m["context_mib"] == 2774.25  # not 5548.5 + 77
+    assert [p["part"] for p in m["kv_parts"]] == ["non-SWA", "SWA"] and m["recurrent_mib"] is None
+    assert m["dsv4_state_mib"] is None  # the trial's compressor state is reset at the fit-end line too
+    assert m["compute_mib"] == {"Vulkan0": 1200.25, "Vulkan_Host": 40.0}
+    assert m["checkpoint_state_mib"] == round(182.25 / 8, 3)
+    assert lt.parse_memory_lines(served) == m  # -lv 4: the served context's lines only, the same record
+    # Lines after the fit-end line are all kept (the served context and the mmproj load after the fit), and the
+    # trial's last announcement does not name the served context's first, unannounced, size line.
+    after = lt.parse_memory_lines([trial[-1], GPT_OSS_MEM[1], *VISION_MEM])
+    assert after["kv_mib"] == 10880.0 and after["mmproj_compute_mib"] == {"Vulkan0": 300.0}
+    assert [p["part"] for p in after["kv_parts"]] == ["full"]
+
+
+def _host(pid: int, rss_gib: float, anon_gib: float) -> dict[str, Any]:
+    return {"pid": pid, "comm": "llama-server", "VmRSS": int(rss_gib * lt.GIB), "RssAnon": int(anon_gib * lt.GIB)}
+
+
+def test_memory_record_context_shift_states_growth_and_unknowns() -> None:
+    env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ATLAS_KV_TYPE": "q4_0", "ARGS": CHAT_ARGS}
+    proj = {"kv_bytes": int(5.0625 * lt.GIB), "per_token_f16": 73728, "kv_factor": 0.28125}
+    rec = lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM), proj, "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5))
+    assert rec["ctx_shift"] == "disabled" and rec["ctx_shift_why"] == "not supported by this context"
+    assert rec["profile"] == {"ctx": 262144, "parallel": 8, "kv": "q4_0", "coresident": False}
+    assert rec["anon_growth_bytes"] == int(1.5 * lt.GIB) - lt.GIB
+    assert any("prompt-cache size" in u for u in rec["unknown"]) and not any("projection" in u for u in rec["unknown"])
+    kept = lt.memory_record(env, lt.parse_memory_lines(NEMOTRON_MEM), None, "no python", {"why": "x"}, {"why": "y"})
+    assert kept["ctx_shift"] == "kept" and kept["anon_growth_bytes"] is None
+    assert any(u == "projection: no python" for u in kept["unknown"])
+    assert any(u.startswith("host RAM after the load: x") for u in kept["unknown"])
+    no_slot = lt.memory_record(env, lt.parse_memory_lines(NEMOTRON_MEM[:2]), None, "", {}, {})
+    assert no_slot["ctx_shift"] == "UNKNOWN" and any("slot line" in u for u in no_slot["unknown"])
+    unrequested = lt.memory_record({**env, "ARGS": "--model /m"}, lt.parse_memory_lines(NEMOTRON_MEM), None, "", {}, {})
+    assert unrequested["ctx_shift"] == "not requested"
+    restarted = lt.memory_record(env, lt.parse_memory_lines(NEMOTRON_MEM), None, "", _host(7, 3, 1), _host(9, 3, 1))
+    assert restarted["anon_growth_bytes"] is None and any("restart" in u for u in restarted["unknown"])
+    blank = lt.memory_record(env, lt.parse_memory_lines([]), None, "", {}, {})
+    assert any("no 'llama_kv_cache: size =' line" in u for u in blank["unknown"])
+
+
+def test_read_proc_status_and_host_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "4242").mkdir()
+    (tmp_path / "4242" / "status").write_text("Name:\tllama-server\nVmHWM:\t 9000 kB\nVmRSS:\t 8000 kB\n"
+                                              "RssAnon:\t 3000 kB\nRssFile:\t 4000 kB\nRssShmem:\t 1000 kB\n")
+    st = lt.read_proc_status(4242, tmp_path)
+    assert st == {"pid": 4242, "comm": "llama-server", "VmHWM": 9000 * 1024, "VmRSS": 8000 * 1024,
+                  "RssAnon": 3000 * 1024, "RssFile": 4000 * 1024, "RssShmem": 1000 * 1024}
+    assert "why" in lt.read_proc_status(1, tmp_path)
+    seen: list[list[str]] = []
+
+    def fake_run(cmd: list[str], timeout: float = 60.0) -> Any:
+        seen.append(cmd)
+        return lt.subprocess.CompletedProcess(cmd, 0, "4242\n", "")
+
+    monkeypatch.setattr(lt, "run", fake_run)
+    assert lt.host_memory("gpt-oss-120b", tmp_path)["VmRSS"] == 8000 * 1024
+    assert seen == [["systemctl", "show", "-p", "MainPID", "--value", "llama-server@gpt-oss-120b"]]  # read-only
+    monkeypatch.setattr(lt, "run", lambda cmd, timeout=60.0: lt.subprocess.CompletedProcess(cmd, 0, "0\n", ""))
+    assert "no main process" in lt.host_memory("gpt-oss-120b", tmp_path)["why"]
+
+    def no_systemctl(cmd: list[str], timeout: float = 60.0) -> Any:
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(lt, "run", no_systemctl)
+    assert "systemctl show" in lt.host_memory("gpt-oss-120b", tmp_path)["why"]  # a measurement never raises
+
+
+def _real_ctx(tmp_path: Path, python: str = sys.executable) -> Any:
+    ctx = lt.Ctx(engines_path=REAL_ENGINES, env_dir=tmp_path / "env", results_dir=tmp_path / "results",
+                 orch_url="http://127.0.0.1:8800", engine_env=tmp_path / "engine-env.py", models_dir=tmp_path,
+                 slots_dir=tmp_path, port_base=8100, overrides=tmp_path / "overrides.json", atlas_python=python)
+    ctx.load_engines()
+    return ctx
+
+
+def test_arbiter_projection_runs_the_arbiters_own_code(tmp_path: Path) -> None:
+    ctx = _real_ctx(tmp_path)
+    d, why = lt.arbiter_projection(ctx, "qwen2.5-vl-72b", 65536, 2, "q8_0")  # the S52 standing vision profile
+    assert why == "" and d is not None and not d["measured"]
+    assert d["kv_bytes"] == int(327_680 * 65536 * 8.5 / 16) and d["total_bytes"] == int(89.625 * lt.GIB)
+    d, _ = lt.arbiter_projection(ctx, "gpt-oss-120b", 262144, 8, "q4_0")
+    assert d is not None and d["kv_bytes"] == int(73_728 * 262144 * 4.5 / 16) and d["kv_factor"] == 0.28125
+    d, _ = lt.arbiter_projection(ctx, "deepseek-v4-flash", 16384, 1, "f16")  # a ladder rung: its own profile
+    assert d is not None and d["total_bytes"] == 160 * lt.GIB
+    d, why = lt.arbiter_projection(_real_ctx(tmp_path, ""), "gpt-oss-120b", 262144, 8, "q4_0")
+    assert d is None and "no orchestrator python" in why
+    argv: list[list[str]] = []
+
+    def fake_run(cmd: list[str], timeout: float = 60.0) -> Any:
+        argv.append(cmd)
+        return lt.subprocess.CompletedProcess(cmd, 0, 'noise\n{"kv_bytes": 1}\n', "")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "run", fake_run)
+        assert lt.arbiter_projection(ctx, "meditron-70b", 4096, 1, "q8_0") == ({"kv_bytes": 1}, "")
+    # Isolated (no PYTHONPATH, no cwd on sys.path) and no .pyc written as root; the config dir, then the profile.
+    assert argv[0][1:4] == ["-I", "-B", "-c"] and argv[0][5:] == [str(REAL_ENGINES.parent), "meditron-70b", "4096",
+                                                                  "1", "q8_0"]
+    bad = _ctx(tmp_path, ENGINES)  # four engines: atlas.config refuses it, so the projection is UNKNOWN, not a crash
+    bad.atlas_python = sys.executable
+    d, why = lt.arbiter_projection(bad, "gpt-oss-120b", 262144, 8, "q4_0")
+    assert d is None and why.startswith("projection failed (exit 1)") and "ConfigError" in why
+
+
+def _engine_harness(ctx: Any, monkeypatch: pytest.MonkeyPatch, journal: Any) -> dict[str, Any]:
+    ctx.results_dir.mkdir(parents=True, exist_ok=True)
+    (ctx.results_dir / "baseline.json").write_text(json.dumps({"gtt_used_bytes": 10 * lt.GB}))
+    calls: dict[str, Any] = {"host": [], "journal": []}
+    env = {"ATLAS_MODEL_PRESENT": "1", "LLAMA_ARG_PORT": "8101", "ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8",
+           "ATLAS_KV_TYPE": "q4_0", "ARGS": CHAT_ARGS}
+    hosts = iter([_host(77, 3.0, 1.0), _host(77, 3.4, 1.4)])
+
+    def fake_journal(key: str, inv: str, since: str) -> list[str]:
+        calls["journal"].append((key, inv))
+        return journal(key) if callable(journal) else journal
+
+    def fake_measure(_ctx: Any, res: Any, *_a: Any) -> None:
+        calls["host"].append("<the tests>")
+        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 40.0, 800.0
+
+    monkeypatch.setattr(lt, "Control", lambda *_a, **_k: FakeControl(set()))
+    monkeypatch.setattr(ctx, "render", lambda *_a, **_k: dict(env))
+    monkeypatch.setattr(lt, "swap_out", lambda *_a: (0.0, "no previous engine"))
+    monkeypatch.setattr(lt, "unit_invocation_id", lambda _k: "inv-1")
+    monkeypatch.setattr(lt, "prove_kv", lambda key, kv, *_a: (True, f"{key}: {kv} applied", kv))
+    monkeypatch.setattr(lt, "run_measurements", fake_measure)
+    monkeypatch.setattr(lt, "gtt_used_bytes", lambda: 80 * lt.GB)
+    monkeypatch.setattr(lt, "journal_lines", fake_journal)
+    monkeypatch.setattr(lt, "host_memory", lambda key: calls["host"].append(key) or next(hosts))
+    return calls
+
+
+def test_test_engine_records_memory_beside_the_projection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _real_ctx(tmp_path)
+    calls = _engine_harness(ctx, monkeypatch, GPT_OSS_MEM)
+    lt.test_engine(ctx, "gpt-oss-120b", None)
+    saved = json.loads(ctx.result_path("gpt-oss-120b").read_text())
+    assert saved["ok"] and saved["resident_after"] and len(saved["memory"]) == 1
+    rec = saved["memory"][0]
+    assert rec["measured"]["context_mib"] == 2774.25 and rec["projected"]["kv_bytes"] == int(5.0625 * lt.GIB)
+    assert rec["ctx_shift"] == "disabled" and rec["anon_growth_bytes"] == int(1.4 * lt.GIB) - lt.GIB
+    assert calls["journal"] == [("gpt-oss-120b", "inv-1")]
+    assert calls["host"] == ["gpt-oss-120b", "<the tests>", "gpt-oss-120b"]  # RSS read before and after the requests
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if "memory (S52)" in ln]
+    assert len(lines) == 1 and "context 2.71 GiB measured (2 K/V line(s), SWA 0.18) vs 5.06 GiB projected" in lines[0]
+    assert "context shift disabled (not supported by this context)" in lines[0] and "(anon +410 MiB)" in lines[0]
+
+
+def test_test_engine_never_fails_on_the_memory_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _real_ctx(tmp_path, "")
+
+    def broken(_key: str) -> list[str]:
+        raise RuntimeError("journalctl exploded")
+
+    _engine_harness(ctx, monkeypatch, broken)
+    lt.test_engine(ctx, "gpt-oss-120b", None)
+    saved = json.loads(ctx.result_path("gpt-oss-120b").read_text())
+    assert saved["ok"] and saved["memory"][0]["error"] == "RuntimeError: journalctl exploded"
+    assert "memory (S52): not recorded (RuntimeError: journalctl exploded)" in capsys.readouterr().err
+
+    def stopped(_key: str) -> list[str]:
+        raise lt.Terminated("signal 15")
+
+    _engine_harness(ctx, monkeypatch, stopped)
+    with pytest.raises(lt.Terminated):  # SIGTERM still stops the run: only measurement faults are absorbed
+        lt.test_engine(ctx, "gpt-oss-120b", None)
+
+
+def test_ladder_records_every_rung_that_loaded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ctx(tmp_path, ENGINES)
+    ctl = FakeControl(fail_loads={"q4_0"})
+
+    def fake_measure(_ctx: Any, res: Any, *_a: Any) -> None:
+        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
+
+    _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    monkeypatch.setattr(lt, "journal_lines", lambda *_a: DEEPSEEK_MEM)
+    monkeypatch.setattr(lt, "host_memory", lambda _k: _host(5, 160.0, 2.0))
+    res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
+    lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
+    assert [r["label"] for r in res.memory] == ["f16", "q8_0"]  # the q4_0 rung never loaded: nothing to measure
+    assert all(r["measured"]["kv_lines"] == 5 and r["ctx_shift"] == "disabled" for r in res.memory)
+    saved = json.loads(ctx.result_path("deepseek-v4-flash").read_text())
+    assert [r["label"] for r in saved["memory"]] == ["f16", "q8_0"] and saved["kv_applied"] == "q8_0"
+
+
+def test_cache_suggestion_rules() -> None:
+    env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ATLAS_KV_TYPE": "q4_0", "ARGS": CHAT_ARGS}
+    s = lt.cache_suggestion(lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM), None, "", {}, {}))
+    ckpt = round(182.25 / 8, 3)
+    assert s == {"cache_ram_mib": 2816, "ctx_checkpoints": 5, "checkpoints_known": True,
+                 "worst_default_mib": round(8192 + 32 * 8 * ckpt), "worst_suggested_mib": round(2816 + 5 * 8 * ckpt)}
+    vis = lt.memory_record({**env, "ATLAS_CTX_SIZE": "65536", "ATLAS_PARALLEL": "2"},
+                           lt.parse_memory_lines(VISION_MEM), None, "", {}, {})
+    # K/V lines parsed and none of them sliding-window, recurrent or compressor state: none made.
+    assert lt.cache_suggestion(vis) == {"cache_ram_mib": 8192, "ctx_checkpoints": None, "checkpoints_known": True,
+                                        "worst_default_mib": 8192, "worst_suggested_mib": 8192}
+    # Nothing measured is not "none made" (S52 fix round): --ctx-checkpoints from the window anyway, lower bounds.
+    unknown = lt.memory_record(env, lt.parse_memory_lines([]), None, "", {}, {})
+    assert lt.cache_suggestion(unknown) == {"cache_ram_mib": 8192, "ctx_checkpoints": 5, "checkpoints_known": False,
+                                            "worst_default_mib": 8192, "worst_suggested_mib": 8192}
+    router = lt.memory_record({**env, "ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "4"},
+                              lt.parse_memory_lines(ROUTER_MEM), None, "", {}, {})
+    assert lt.cache_suggestion(router)["cache_ram_mib"] == 768 and lt.cache_suggestion(router)["ctx_checkpoints"] == 2
+    nem = lt.memory_record({**env, "ATLAS_KV_TYPE": "q8_0"}, lt.parse_memory_lines(NEMOTRON_MEM), None, "",
+                           _host(8, 130.0, 1.0), _host(8, 131.0, 2.0))
+    text, sug = lt.cache_item("nemotron-3-super", "", nem)
+    assert sug is not None and sug["cache_ram_mib"] == 4096 and sug["ctx_checkpoints"] == 5
+    assert text == (
+        "nemotron-3-super: RSS 130.00 GiB after the load, 131.00 after the tests (RssAnon 1.00 -> 2.00, +1024 MiB); "
+        "prompt cache: no eviction logged (below its limit), 1234.5 MiB in 3 prompt(s) at most (TRACE); checkpoints: "
+        "0 erased, 4 of 32 made at most (TRACE), one slot's state about 300.0 MiB (INFERRED), so the defaults allow up "
+        f"to {8192 + 32 * 8 * 300} MiB; suggested --cache-ram 4096 --ctx-checkpoints 5 (up to "
+        f"{4096 + 5 * 8 * 300} MiB)")
+
+
+# gpt-oss as llama-server's default -lv 3 logs it at the pin: only the srv/slot INF and WRN lines (library INFO is
+# TRACE, common/log.cpp:532), so no K/V, flash_attn or compute line; the checkpoint erasures (WRN) are there.
+GPT_OSS_LV3 = [ln for ln in GPT_OSS_MEM if " srv " in ln or " slot " in ln]
+
+
+def test_cache_item_says_unknown_not_none_made_when_nothing_was_measured() -> None:
+    """S52 fix round: with no K/V, recurrent or compressor size line (an empty or rotated journal, a unit at -lv 3)
+    the cache-ram item says checkpoints UNKNOWN and still suggests --ctx-checkpoints, never 'none made'."""
+    assert GPT_OSS_LV3 and not any("llama_kv_cache" in ln or "compute buffer" in ln for ln in GPT_OSS_LV3)
+    env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ATLAS_KV_TYPE": "q4_0", "ARGS": CHAT_ARGS}
+    empty = lt.memory_record(env, lt.parse_memory_lines([]), None, "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5))
+    text, sug = lt.cache_item("gpt-oss-120b", "", empty)
+    assert sug is not None and sug["checkpoints_known"] is False and sug["ctx_checkpoints"] == 5
+    assert "checkpoints: UNKNOWN (no K/V, recurrent or compressor size line in the load log" in text
+    assert "none made" not in text and "so it makes them" not in text
+    assert text.endswith("suggested --cache-ram 8192 --ctx-checkpoints 5 (at least 8192 MiB, checkpoints UNKNOWN)")
+    assert any(u.startswith("checkpoints: UNKNOWN") for u in empty["unknown"])
+    lv3 = lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_LV3), None, "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5))
+    assert lv3["measured"]["kv_mib"] is None and lv3["measured"]["n_ctx_slot"] == 32768
+    text3, sug3 = lt.cache_item("gpt-oss-120b", "", lv3)
+    assert sug3 is not None and sug3["checkpoints_known"] is False and "none made" not in text3
+    # An erasure is a WRN line, printed at -lv 3: the engine makes checkpoints, their size is what is UNKNOWN.
+    assert ("checkpoints: 1 erased logged, so it makes them, but one slot's state is UNKNOWN (no K/V, recurrent or "
+            "compressor size line in the load log)") in text3
+    assert text3.endswith("suggested --cache-ram 8192 --ctx-checkpoints 5 (at least 8192 MiB, checkpoints UNKNOWN)")
+    assert any(u.startswith("checkpoints: one slot's state UNKNOWN") for u in lv3["unknown"])
+    assert any("printed only at the -lv 4" in u for u in lv3["unknown"])
+    # Measured K/V lines without sliding-window, recurrent or compressor state: still "none made", no UNKNOWN reason.
+    vis = lt.memory_record({**env, "ATLAS_CTX_SIZE": "65536", "ATLAS_PARALLEL": "2", "ATLAS_KV_TYPE": "q8_0"},
+                           lt.parse_memory_lines(VISION_MEM), None, "", {}, {})
+    assert "checkpoints: none made (its cache rolls back)" in lt.cache_item("qwen2.5-vl-72b", "", vis)[0]
+    assert not any(u.startswith("checkpoints: UNKNOWN") for u in vis["unknown"])
+
+
+def test_memory_todos_word_an_unknown_total_as_at_least(capsys: pytest.CaptureFixture[str]) -> None:
+    env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ATLAS_KV_TYPE": "q4_0", "ARGS": CHAT_ARGS}
+    known = lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM), None, "", {}, {})
+    unknown = lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_LV3), None, "", {}, {})
+    lt.raise_memory_todos([("gpt-oss-120b", "", known, None), ("nemotron-3-super", "", unknown, None)])
+    todos = _todos(capsys.readouterr().out)
+    kv, cache = todos["kv-estimates"][1], todos["cache-ram"][1]
+    assert "could hold at worst at least " in cache and "checkpoints UNKNOWN for at least one engine" in cache
+    assert "could hold up to " not in cache
+    # An UNKNOWN engine ranked out of the two largest still makes the total a lower bound (S52 fix round).
+    lt.raise_memory_todos([("gpt-oss-120b", "", known, None), ("gpt-oss-120b-abliterated", "", known, None),
+                           ("nemotron-3-super", "", unknown, None)])
+    cache = _todos(capsys.readouterr().out)["cache-ram"][1]
+    assert "could hold at worst at least " in cache and "may be larger than the two ranked here" in cache
+    assert ("nemotron-3-super 262144 x 8 q4_0: context UNKNOWN GiB measured (no K/V size line in the load log: TRACE "
+            "at the pin, printed only at -lv 4)") in kv
+    lt.raise_memory_todos([("gpt-oss-120b", "", known, None)])
+    cache = _todos(capsys.readouterr().out)["cache-ram"][1]
+    assert "could hold up to " in cache and "at least" not in cache
+    # S52 fix round: the registered measurement holds at its profile and until a restart only; the estimates govern
+    # every decision after that, so a corrected figure is never "on paper only".
+    assert "only at the profile it was measured at and only until the orchestrator restarts" in kv
+    assert "a corrected figure changes real Arbiter decisions" in kv and "on paper only" not in kv
+    assert "already replaces" not in kv
+
+
+def _todos(stdout: str) -> dict[str, tuple[str, str]]:
+    out: dict[str, tuple[str, str]] = {}
+    for line in stdout.splitlines():
+        tag, tid, title, detail = line.split("\t")
+        assert tag == "TODO" and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", tid)  # lib/common.sh todo_add's ID rule
+        out[tid] = (title, detail)
+    return out
+
+
+def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _real_ctx(tmp_path)
+    env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ATLAS_KV_TYPE": "q4_0", "ARGS": CHAT_ARGS}
+    gpt = lt.EngineResult(key="gpt-oss-120b", ok=True, footprint_bytes=70 * lt.GB)
+    gpt.memory.append(lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM),
+                                       {"kv_bytes": int(5.0625 * lt.GIB), "per_token_f16": 73728, "kv_factor": 0.28125},
+                                       "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5)))
+    gpt.save(ctx)
+    vis = lt.EngineResult(key="qwen2.5-vl-72b", ok=True)
+    vis_env = {**env, "ATLAS_CTX_SIZE": "65536", "ATLAS_PARALLEL": "2", "ATLAS_KV_TYPE": "q8_0"}
+    vis.memory.append(lt.memory_record(vis_env, lt.parse_memory_lines(VISION_MEM), None, "no python", {}, {}))
+    vis.save(ctx)
+    ds = lt.EngineResult(key="deepseek-v4-flash", kv_applied="q8_0", ladder=[
+        {"kv": "f16", "footprint_bytes": 160 * lt.GB}, {"kv": "q8_0", "footprint_bytes": None}])
+    for kv in ("f16", "q8_0"):
+        ds.memory.append({**lt.memory_record({**env, "ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "1",
+                                              "ATLAS_KV_TYPE": kv}, lt.parse_memory_lines(DEEPSEEK_MEM), None, "",
+                                             {}, {}, kv)})
+    ds.save(ctx)
+    lt.EngineResult(key="meditron-70b", memory=[{"label": "", "error": "OSError: boom", "unknown": []}]).save(ctx)
+    monkeypatch.setattr(lt, "unit_active", lambda k: k == "router-qwen3.5-4b")
+    monkeypatch.setattr(lt, "unit_invocation_id", lambda _k: "inv-router")
+    monkeypatch.setattr(lt, "run", lambda cmd, timeout=60.0: lt.subprocess.CompletedProcess(
+        cmd, 0, "\n".join(ROUTER_MEM) if cmd[-1] == "_SYSTEMD_INVOCATION_ID=inv-router" else "", ""))
+    monkeypatch.setattr(lt, "host_memory", lambda _k: _host(3, 5.0, 0.9))
+    monkeypatch.setattr(ctx, "env", lambda _k: {**env, "ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "4",
+                                                "ATLAS_KV_TYPE": "q8_0"})
+    assert lt.cmd_memory(ctx, None) == 0
+    cap = capsys.readouterr()
+    todos = _todos(cap.out)
+    assert set(todos) == {"kv-estimates", "cache-ram"}
+    kv_title, kv = todos["kv-estimates"]
+    assert kv_title.startswith("Phase 3 measured each engine's context memory") and "(S52)" in kv_title
+    assert ("gpt-oss-120b 262144 x 8 q4_0: context 2.71 GiB measured (K/V 2.71 GiB in 2 line(s), of which "
+            "sliding-window 0.18) vs 5.06 GiB projected (73728 B/token at f16 x 0.28125); implied 39,456 B/token at "
+            "f16 at this profile; compute buffers 1.21 GiB; GTT footprint 70.0 GB registered (rule 1)") in kv
+    assert "qwen2.5-vl-72b 65536 x 2 q8_0: context 10.62 GiB measured" in kv and "projection UNKNOWN" in kv
+    assert "(+ mmproj 0.29)" in kv
+    assert "deepseek-v4-flash (ladder rung f16)" in kv and "deepseek-v4-flash (ladder rung q8_0, the rung that " \
+        "stands)" in kv and "GTT footprint 160.0 GB" in kv
+    assert "meditron-70b: UNKNOWN (record not taken: OSError: boom)" in kv
+    assert "nemotron-3-super (not tested): UNKNOWN" in kv
+    assert "router-qwen3.5-4b (resident, not loaded by Phase 3" in kv and "(resident: never charged, Section 4.1)" in kv
+    assert "Updating the figures is the Principal's call" in kv
+    cache_title, cache = todos["cache-ram"]
+    assert cache_title.startswith("Set --cache-ram and --ctx-checkpoints explicitly")
+    assert ("gpt-oss-120b: RSS 3.00 GiB after the load, 3.50 after the tests (RssAnon 1.00 -> 1.50, +512 MiB); "
+            "prompt cache: 2 eviction(s) logged, largest entry 512.25 MiB; checkpoints: 1 erased") in cache
+    assert "suggested --cache-ram 2816 --ctx-checkpoints 5" in cache
+    assert "qwen2.5-vl-72b: RSS UNKNOWN" in cache and "checkpoints: none made (its cache rolls back); suggested " \
+        "--cache-ram 8192 (up to 8192 MiB)" in cache
+    assert "deepseek-v4-flash (ladder rung q8_0, the rung that stands)" in cache and "rung f16)" not in cache
+    assert ("router-qwen3.5-4b (resident, not loaded by Phase 3: current journal and RSS, read-only): RSS 5.00 GiB "
+            "now (RssAnon 0.90)") in cache and "Phase 3 changed no engine setting" in cache
+    assert "The two largest engines plus the resident chat engine(s) could hold up to" in cache
+    assert "router-qwen3.5-4b: memory (S52) resident:" in cap.err and "context shift disabled" in cap.err
+
+
+def test_cmd_memory_never_fails_and_still_raises_both_todos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _real_ctx(tmp_path)
+
+    def unreadable(_ctx: Any) -> Any:
+        raise json.JSONDecodeError("bad", "x", 0)
+
+    monkeypatch.setattr(lt, "memory_entries", unreadable)
+    assert lt.cmd_memory(ctx, None) == 0
+    todos = _todos(capsys.readouterr().out)
+    assert set(todos) == {"kv-estimates", "cache-ram"}
+    assert all(d.startswith("Figures UNKNOWN: the result files could not be read (JSONDecodeError") and "no record" in d
+               for _, d in todos.values())
+    monkeypatch.setattr(lt, "memory_entries", lambda _c: [("x", "", {"measured": {}}, None)])  # a malformed record
+    assert lt.cmd_memory(ctx, None) == 0
+    todos = _todos(capsys.readouterr().out)
+    assert set(todos) == {"kv-estimates", "cache-ram"}
+    assert all(d.startswith("Figures UNKNOWN: the to-do could not be built (KeyError") for _, d in todos.values())
+
+    def stopped(_ctx: Any) -> Any:
+        raise lt.Terminated("signal 15")
+
+    monkeypatch.setattr(lt, "memory_entries", stopped)
+    with pytest.raises(lt.Terminated):
+        lt.cmd_memory(ctx, None)
+
+
+def test_todo_line_protocol(capsys: pytest.CaptureFixture[str]) -> None:
+    lt.todo("cache-ram", "a\ttitle", "two\nlines\tof detail")
+    assert capsys.readouterr().out == "TODO\tcache-ram\ta title\ttwo lines of detail\n"
+
+
+def test_driver_raises_the_todos_and_passes_the_venv() -> None:
+    """phase3-models.sh (root-only, not runnable here): the TODO lines reach todo_add, `memory` runs in step 04 before
+    the gate, and loadtest.py gets the orchestrator's venv python for the Arbiter's projection."""
+    driver = (LOADTEST.parents[1] / "phase3-models.sh").read_text(encoding="utf-8")
+    assert re.search(r'^\s*TODO\) todo_add "\$id" "\$result" "\$msg" ;;', driver, re.M)
+    assert re.search(r'^\s*RECORD\) record_v "\$id" "\$result" "\$msg" ;;', driver, re.M)
+    assert '--atlas-python "$ATLAS_OPT/venv/bin/python"' in driver
+    step4 = driver[driver.index("step_04() {"):]
+    step4 = step4[:step4.index("\n}\n")]
+    assert step4.index("_p3_loadtest memory") < step4.index("_p3_loadtest table") < step4.index("gate phase3")
+
+
+def test_resident_memory_record_is_read_only_and_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _real_ctx(tmp_path)
+    monkeypatch.setattr(ctx, "env", lambda _k: {"ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "4", "ARGS": CHAT_ARGS})
+    monkeypatch.setattr(lt, "unit_active", lambda _k: False)
+    rec = lt.resident_memory_record(ctx, "router-qwen3.5-4b")
+    assert rec["error"] == "llama-server@router-qwen3.5-4b is not active"
+    monkeypatch.setattr(lt, "unit_active", lambda _k: True)
+    monkeypatch.setattr(lt, "unit_invocation_id", lambda _k: "")
+    monkeypatch.setattr(lt, "host_memory", lambda _k: _host(3, 5.0, 0.9))
+    rec = lt.resident_memory_record(ctx, "router-qwen3.5-4b")
+    assert rec["unknown"][0].startswith("the journal of its current invocation (none) is empty")
+    assert rec["ctx_shift"] == "UNKNOWN" and rec["host_after_tests"]["VmRSS"] == 5 * lt.GIB
+
+    def missing(_k: str) -> dict[str, str]:
+        raise lt.Infra("router-qwen3.5-4b.env missing")
+
+    monkeypatch.setattr(ctx, "env", missing)
+    assert lt.resident_memory_record(ctx, "router-qwen3.5-4b")["error"] == "Infra: router-qwen3.5-4b.env missing"
+
+    def stopped(_k: str) -> dict[str, str]:
+        raise lt.Terminated("signal 15")
+
+    monkeypatch.setattr(ctx, "env", stopped)
+    with pytest.raises(lt.Terminated):
+        lt.resident_memory_record(ctx, "router-qwen3.5-4b")

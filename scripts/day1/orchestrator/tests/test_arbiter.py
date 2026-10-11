@@ -230,29 +230,53 @@ def test_two_resident_limit_evicts_least_recently_used(engines: dict[str, Engine
     assert arb.charged_bytes <= arb.budget_bytes
 
 
-def test_evicted_engine_leaves_the_newcomer_alone_at_its_full_profile(engines: dict[str, EngineSpec]) -> None:
-    """Nemotron resident, the vision engine requested: Nemotron goes (LRU), and the vision engine, now alone, runs
-    its full 262144 x 8 profile, not the 65536 x 2 co-resident one it would run beside gpt-oss (Section 4.1/4.3)."""
+def test_vision_engine_runs_its_standing_coresident_profile_alone_or_paired(engines: dict[str, EngineSpec]) -> None:
+    """S52: the co-resident profile (65536 x 2) is the vision engine's STANDING profile, so without an env file the
+    projection is that profile whether the engine ends up alone or beside gpt-oss, exactly what phase2/engine-env.py
+    renders; the full 262144 x 8 profile is projected only when the caller names it (coresident=False, the
+    overrides.json coresident=false of the Principal)."""
+    assert engines["qwen2.5-vl-72b"].standing_coresident and engines["qwen2.5-vl-72b"].profile() == (65536, 2)
+    assert not engines["gpt-oss-120b"].standing_coresident and engines["gpt-oss-120b"].profile() == (262144, 8)
     arb, controller, _, _ = make(engines)
     assert arb.request_load("nemotron-3-super", task_id="t1").granted
     d = arb.request_load("qwen2.5-vl-72b", task_id="t2")
-    assert d.granted and d.evicted == ("nemotron-3-super",) and "coresident" not in d.reason
+    # Nemotron (123 GB) and the vision engine do not fit together: Nemotron goes (LRU), the profile does not change.
+    assert d.granted and d.evicted == ("nemotron-3-super",) and "coresident" in d.reason
     res = arb.resident["qwen2.5-vl-72b"]
-    assert (res.footprint.ctx, res.footprint.parallel) == (262144, 8)
+    assert (res.footprint.ctx, res.footprint.parallel, res.footprint.coresident) == (65536, 2, True)
     assert d.projected_bytes == arb.projected_footprint("qwen2.5-vl-72b").total_bytes
+    assert d.projected_bytes == arb.projected_footprint("qwen2.5-vl-72b", coresident=True).total_bytes
     assert list(arb.resident) == ["qwen2.5-vl-72b"] and controller.calls[-1] == ("start", "qwen2.5-vl-72b")
-    # Beside gpt-oss it is the co-resident profile (the everyday pairing, no eviction).
+    # Beside gpt-oss it is the same profile, and the everyday pairing forms with no eviction.
     arb2, _, _, _ = make(engines)
     assert arb2.request_load("gpt-oss-120b", task_id="t3").granted
     d2 = arb2.request_load("qwen2.5-vl-72b", task_id="t4")
     assert d2.granted and d2.evicted == () and "coresident" in d2.reason
     assert (arb2.resident["qwen2.5-vl-72b"].footprint.ctx, arb2.resident["qwen2.5-vl-72b"].footprint.parallel) == (
         65536, 2)
+    # Loaded first, with nothing resident, it is the same profile; an engine without a co-resident profile stays at
+    # its full one (and is not marked co-resident) whatever is resident beside it.
+    arb4, _, _, _ = make(engines)
+    d4 = arb4.request_load("qwen2.5-vl-72b", task_id="t7")
+    assert d4.granted and (arb4.resident["qwen2.5-vl-72b"].footprint.ctx,
+                           arb4.resident["qwen2.5-vl-72b"].footprint.parallel) == (65536, 2)
+    assert arb4.request_load("gpt-oss-120b", task_id="t8").granted and len(arb4.resident) == 2
+    ren = arb4.resident["gpt-oss-120b"].footprint
+    assert (ren.ctx, ren.parallel, ren.coresident) == (262144, 8, False)
+    # Named explicitly, the full profile is projected (and does not fit beside gpt-oss: it evicts it, LRU).
+    full = arb.projected_footprint("qwen2.5-vl-72b", coresident=False)
+    assert (full.ctx, full.parallel, full.coresident) == (262144, 8, False) and full.total_bytes > d.projected_bytes
+    arb3, _, _, _ = make(engines)
+    assert arb3.request_load("gpt-oss-120b", task_id="t5").granted
+    d3 = arb3.request_load("qwen2.5-vl-72b", task_id="t6", coresident=False)
+    assert d3.granted and d3.evicted == ("gpt-oss-120b",) and arb3.resident["qwen2.5-vl-72b"].footprint.parallel == 8
 
 
 def test_projection_follows_the_unit_env_file(engines: dict[str, EngineSpec], tmp_path: Path) -> None:
     """What `systemctl start` runs is <ATLAS_ENGINES_ENV_DIR>/<key>.env, not the Arbiter's wish: the projection
     follows the file, and a request that disagrees with it is refused (the Arbiter cannot re-render a root file)."""
+    # The vision unit at its FULL profile: what engine-env.py renders for overrides.json coresident=false (S52: the
+    # Principal's explicit choice; its default is the co-resident profile, below).
     write_env(tmp_path, "qwen2.5-vl-72b", ctx=262144, parallel=8, kv="q8_0", coresident=False)
     write_env(tmp_path, "gpt-oss-120b", ctx=262144, parallel=8, kv="q4_0", coresident=False)
     arb, controller, _, _ = make(engines, engines_env_dir=tmp_path)
@@ -263,19 +287,21 @@ def test_projection_follows_the_unit_env_file(engines: dict[str, EngineSpec], tm
     assert "coresident True != unit False" in refused.reason and "engine-env.py --set-override" in refused.reason
     assert list(arb.resident) == ["gpt-oss-120b"] and ("start", "qwen2.5-vl-72b") not in controller.calls
     # Left to itself the Arbiter projects the file's 8-slot footprint (~123 GB), which does not fit beside gpt-oss:
-    # gpt-oss is evicted (LRU) instead of the pair being admitted at a projection the unit would not run.
+    # gpt-oss is evicted (LRU) instead of the pair being admitted at a projection the unit would not run, and the
+    # grant says how the standing co-resident profile comes back (S52), never "set coresident=true".
     d = arb.request_load("qwen2.5-vl-72b", task_id="t3")
     assert d.granted and d.evicted == ("gpt-oss-120b",)
     assert (arb.resident["qwen2.5-vl-72b"].footprint.ctx, arb.resident["qwen2.5-vl-72b"].footprint.parallel) == (
         262144, 8)
-    assert "ATLAS_CORESIDENT=0" in d.reason and "overrides.json coresident=true" in d.reason
+    assert "ATLAS_CORESIDENT=0" in d.reason and "overrides.json coresident=false" in d.reason
+    assert "--clear-override qwen2.5-vl-72b coresident" in d.reason and "coresident=true" not in d.reason
     assert arb.charged_bytes <= arb.budget_bytes
-    # With the override rendered (what Phase 3's coresident step does through engine-env.py), the pair fits.
+    # The standing profile as engine-env.py renders it with no override (S52): the pair fits.
     write_env(tmp_path, "qwen2.5-vl-72b", ctx=65536, parallel=2, kv="q8_0", coresident=True)
     arb2, _, _, _ = make(engines, engines_env_dir=tmp_path)
     assert arb2.request_load("gpt-oss-120b", task_id="t4").granted
     d2 = arb2.request_load("qwen2.5-vl-72b", task_id="t5")
-    assert d2.granted and d2.evicted == () and "ATLAS_CORESIDENT=1" in d2.reason
+    assert d2.granted and d2.evicted == () and "ATLAS_CORESIDENT=1" in d2.reason and "--clear-override" not in d2.reason
     assert len(arb2.resident) == 2 and arb2.resident["qwen2.5-vl-72b"].footprint.parallel == 2
     assert arb2.request_load("qwen2.5-vl-72b", task_id="t6", ctx=262144).decision is Decision.REFUSED
     # The DeepSeek KV ladder's f16 result reaches the Arbiter the same way (config.KV_CLASSES stays quantised).
@@ -439,6 +465,17 @@ def test_host_used_bytes_prefers_the_gpu_page_counters_and_never_goes_negative()
     assert host_used_bytes(187 * GIB, 165 * GIB, 6 * GIB, 9 * GIB) == 16 * GIB  # GPUActive + GPUReclaim win
     assert host_used_bytes(187 * GIB, 165 * GIB, None, 9 * GIB) == 13 * GIB  # else the GTT counter
     assert host_used_bytes(187 * GIB, 180 * GIB, None, 9 * GIB) == 0  # clamped, never negative
+
+
+def test_admin_engines_list_shows_the_standing_profile(config_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`atlas-admin engines list` prints what the units run by default (S52): the vision engine at its standing
+    co-resident 65536 x 2, every other engine at ctx_size x parallel."""
+    from atlas import admin
+
+    assert admin.main(["engines", "list", "--json", "--no-state"]) == 0
+    rows = {r["key"]: r for r in json.loads(capsys.readouterr().out)}
+    assert (rows["qwen2.5-vl-72b"]["ctx_size"], rows["qwen2.5-vl-72b"]["parallel"]) == (65536, 2)
+    assert (rows["gpt-oss-120b"]["ctx_size"], rows["gpt-oss-120b"]["parallel"]) == (262144, 8)
 
 
 def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path, tmp_path: Path,
@@ -804,6 +841,66 @@ def test_confirm_loaded_records_the_measured_footprint(engines: dict[str, Engine
     assert status["resident"][0]["measured_bytes"] == measured and status["budget_bytes"] == 170 * GIB
 
 
+def test_measured_footprint_applies_at_the_standing_profile(engines: dict[str, EngineSpec]) -> None:
+    """Rule 1 with S52: Phase 3 step 2 measures the vision unit as rendered, i.e. at its standing co-resident profile
+    (65536 x 2), so that is the profile the measurement replaces the estimate for; the full 8-slot profile (an explicit
+    coresident=false) keeps the projection, which errs high (Section 4.3 hard pre-flight)."""
+    arb, _, _, _ = make(engines)
+    arb.register_measured("qwen2.5-vl-72b", 85 * GIB, task_id="p3")
+    standing = arb.projected_footprint("qwen2.5-vl-72b")
+    assert standing.measured is True and standing.total_bytes == 85 * GIB and standing.parallel == 2
+    full = arb.projected_footprint("qwen2.5-vl-72b", coresident=False)
+    assert full.measured is False and full.parallel == 8 and full.total_bytes > 85 * GIB
+
+
+def test_measurement_is_charged_only_at_the_profile_it_was_taken_at(engines: dict[str, EngineSpec],
+                                                                    tmp_path: Path) -> None:
+    """S52 fix round: the Principal's overrides.json coresident=false makes Phase 3 step 2 measure (and register) the
+    8 x 32k vision unit; step 03 then asks for the override to be cleared, and the orchestrator is not restarted. That
+    8-slot figure must never be charged to the 2 x 32k standing unit: the pair with gpt-oss stays together, with the
+    standing unit at its projection until it is measured itself. At the 164 GiB Section 4.1 budget."""
+    write_env(tmp_path, "qwen2.5-vl-72b", ctx=262144, parallel=8, kv="q8_0", coresident=False)
+    write_env(tmp_path, "gpt-oss-120b", ctx=262144, parallel=8, kv="q4_0", coresident=False)
+    arb, _, _, _ = make(engines, budget_gib=164.0, engines_env_dir=tmp_path)
+    assert arb.request_load("qwen2.5-vl-72b", task_id="p3-02").granted
+    m8 = 118 * GIB  # ~72 GiB of Q8 weights plus ~42.5 GiB of q8_0 K/V at 262144 tokens
+    arb.register_measured("qwen2.5-vl-72b", m8, task_id="p3-02")
+    assert arb.measured_profile["qwen2.5-vl-72b"] == (262144, 8, "q8_0")
+    fp8, _ = arb.unit_footprint("qwen2.5-vl-72b") or (None, None)
+    assert fp8 is not None and fp8.measured and fp8.total_bytes == m8  # the 8-slot unit is charged its measurement
+    assert {m["engine"]: m["profile"] for m in arb.status()["measured"]}["qwen2.5-vl-72b"] == [262144, 8, "q8_0"]
+    assert arb.request_unload("qwen2.5-vl-72b", task_id="p3-02").granted
+    # `engine-env.py --clear-override qwen2.5-vl-72b coresident`: the standing 2 x 32k unit again.
+    write_env(tmp_path, "qwen2.5-vl-72b", ctx=65536, parallel=2, kv="q8_0", coresident=True)
+    fp2, prof2 = arb.unit_footprint("qwen2.5-vl-72b") or (None, None)
+    assert fp2 is not None and prof2 is not None and (prof2.ctx, prof2.parallel) == (65536, 2)
+    assert fp2.measured is False and fp2.total_bytes < m8
+    assert fp2.total_bytes == arb.projected_footprint("qwen2.5-vl-72b").total_bytes  # the projection, not M8
+    assert arb.request_load("gpt-oss-120b", task_id="p3-03").granted
+    d = arb.request_load("qwen2.5-vl-72b", task_id="p3-03")
+    assert d.granted and d.evicted == () and d.projected_bytes == fp2.total_bytes
+    assert set(arb.resident) == {"gpt-oss-120b", "qwen2.5-vl-72b"} and arb.charged_bytes <= arb.budget_bytes
+    # Measured again at the standing profile while resident, the figure is charged there; registered while not
+    # resident (no profile known), it is taken as the standing profile's, as before.
+    arb.register_measured("qwen2.5-vl-72b", 80 * GIB, task_id="p3-04")
+    assert arb.measured_profile["qwen2.5-vl-72b"] == (65536, 2, "q8_0")
+    assert arb.unit_footprint("qwen2.5-vl-72b")[0].measured  # type: ignore[index]
+    arb2, _, _, _ = make(engines, budget_gib=164.0)
+    arb2.register_measured("qwen2.5-vl-72b", 80 * GIB, task_id="p3-05")
+    assert "qwen2.5-vl-72b" not in arb2.measured_profile and arb2.projected_footprint("qwen2.5-vl-72b").measured
+    # A later registration while not resident replaces an earlier 8-slot one and its profile with it.
+    write_env(tmp_path, "qwen2.5-vl-72b", ctx=262144, parallel=8, kv="q8_0", coresident=False)
+    arb3, _, _, _ = make(engines, budget_gib=164.0, engines_env_dir=tmp_path)
+    assert arb3.request_load("qwen2.5-vl-72b", task_id="p3-06").granted
+    arb3.register_measured("qwen2.5-vl-72b", m8, task_id="p3-06")
+    assert arb3.request_unload("qwen2.5-vl-72b", task_id="p3-06").granted
+    arb3.register_measured("qwen2.5-vl-72b", 80 * GIB, task_id="p3-07")
+    assert "qwen2.5-vl-72b" not in arb3.measured_profile
+    standing = arb3.projected_footprint("qwen2.5-vl-72b")
+    assert standing.measured and standing.total_bytes == 80 * GIB and standing.parallel == 2
+    assert not arb3.projected_footprint("qwen2.5-vl-72b", coresident=False).measured
+
+
 def test_register_measured_accepts_phase4_engines(engines: dict[str, EngineSpec], config_dir: Path,
                                                   caplog: pytest.LogCaptureFixture) -> None:
     # Section 4.2: every weight-bearing process, the Phase 4 container engines included, passes through the Arbiter;
@@ -819,7 +916,8 @@ def test_register_measured_accepts_phase4_engines(engines: dict[str, EngineSpec]
     arb, _, _, _ = make({**engines, **phase4}, ledger=ledger)
     arb.register_measured("flux1-dev", 24 * GIB, task_id="p4-05")
     measured = {m["engine"]: m for m in arb.status()["measured"]}
-    assert measured["flux1-dev"] == {"engine": "flux1-dev", "class": "phase4", "measured_bytes": 24 * GIB}
+    assert measured["flux1-dev"] == {"engine": "flux1-dev", "class": "phase4", "measured_bytes": 24 * GIB,
+                                     "profile": None}  # registered while not resident
     rows = ledger.list_arbiter_decisions(task_id="p4-05")
     assert rows[0]["action"] == "measure" and rows[0]["decision"] == "granted" and "class phase4" in rows[0]["reason"]
     assert "created from request" not in rows[0]["reason"]

@@ -83,12 +83,14 @@ $ATLAS_ENGINES_ENV_DIR/<key>.env (ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_KV_TYPE,
 phase2/engine-env.py from engines.json plus overrides.json — the orchestrator (user atlas) cannot re-render that
 root-owned file. So when the env file exists the Arbiter projects against exactly those values (the "hard pre-flight,
 the actual OOM backstop" of Section 4.3 then guards the real load) and refuses a request whose explicit ctx/parallel/
-kv/coresident argument disagrees with it; the everyday pairing of Section 4.1 (gpt-oss + the vision engine at 2 slots)
-therefore needs overrides.json to say coresident=true for qwen2.5-vl-72b (Phase 3's coresident step sets it through
-engine-env.py --set-override; that is a root action, never this process). Without an env file (unit tests, an engine
-not rendered yet) the projection comes from engines.json: full profile, or the coresident profile when another engine
-stays resident beside it (evictions are planned first; an engine that ends up alone is projected and loaded at its
-full profile).
+kv/coresident argument disagrees with it. The everyday pairing of Section 4.1 (gpt-oss + the vision engine at 2 slots)
+forms because the co-resident profile is the vision engine's STANDING profile (S52, EngineSpec.standing_coresident):
+engine-env.py renders it, ATLAS_CORESIDENT=1, unless overrides.json says coresident=false, the Principal's choice of
+the 8-slot profile (a root action, never this process); such a unit is projected at 8 slots and evicts gpt-oss
+instead of pairing, and the grant says how to restore the standing profile. Without an env file (unit tests, an
+engine not rendered yet) the projection comes from engines.json at the same standing profile, alone or beside another
+engine, so it never differs from what the rendered unit will run; an explicit coresident argument picks the
+co-resident (True) or full (False) profile instead.
 
 Locking (fix round). One state lock (`_cv`, a Condition) guards the ledger; the controller's stop/start and the
 release poll — minutes on a cold load — run OUTSIDE it. A load reserves its budget under the lock by inserting a
@@ -472,6 +474,9 @@ class Arbiter:
         self._resident_set_bytes = resident_set_bytes
         self.resident: dict[str, Resident] = {}  # rule 1, insertion order = load order
         self.measured: dict[str, int] = {}  # measured total footprints by engine key (Phase 3 / Phase 4 step 5)
+        # (ctx, parallel, kv) each figure in `measured` was taken at, when the engine was resident at registration
+        # (S52 fix round): a measurement is charged only to that profile; without an entry, the standing profile.
+        self.measured_profile: dict[str, tuple[int, int, str]] = {}
         self._request_specs: set[str] = set()  # keys register_measured(allow_unknown=True) created (MAX_REQUEST_SPECS)
         self._cv = threading.Condition(threading.RLock())  # the state lock; never held across controller I/O
         self._busy: str | None = None  # "loading <key>" / "unloading <key>" while the I/O runs outside the lock
@@ -578,22 +583,26 @@ class Arbiter:
             if spec.key in self.measured:
                 return Footprint(self.measured[spec.key], 0, 0, 1, "none", measured=True)
             return Footprint(spec.footprint_bytes, 0, 0, 1, "none")
-        if spec.key in self.measured and (ctx, parallel, kv_class) == (spec.ctx_size, spec.parallel, spec.kv_class):
+        # Phase 3 step 2 measures the rendered unit: the standing profile (S52) unless an override changed it (the
+        # Principal's coresident=false, 8 x 32k). A measurement applies only to the profile it was measured at
+        # (measured_profile); one registered while the engine was not resident is taken as the standing profile.
+        measured_at = self.measured_profile.get(spec.key, (*spec.profile(), spec.kv_class))
+        if spec.key in self.measured and (ctx, parallel, kv_class) == measured_at:
             return Footprint(self.measured[spec.key], 0, ctx, parallel, kv_class, measured=True,
                              coresident=coresident)
         return Footprint(spec.footprint_bytes, kv_estimate_bytes(spec, ctx, parallel, kv_class), ctx, parallel,
                          kv_class, coresident=coresident)
 
     def projected_footprint(self, key: str, ctx: int | None = None, parallel: int | None = None,
-                            kv_class: str | None = None, *, coresident: bool = False) -> Footprint:
-        """The engines.json projection: the full profile, or the coresident one (ctx_size_coresident x
-        parallel_coresident) when `coresident` and the engine defines it. See unit_profile() for what the unit runs."""
+                            kv_class: str | None = None, *, coresident: bool | None = None) -> Footprint:
+        """The engines.json projection: the standing profile (coresident None: the co-resident one where the engine
+        defines it, S52), the co-resident one (True) or the full one (False). See unit_profile() for what the unit
+        runs."""
         spec = self.spec(key)
-        if ctx is None:
-            ctx = spec.ctx_size_coresident if coresident and spec.ctx_size_coresident else spec.ctx_size
-        if parallel is None:
-            parallel = spec.parallel_coresident if coresident and spec.parallel_coresident else spec.parallel
-        return self._footprint(spec, ctx, parallel, kv_class or spec.kv_class, coresident=coresident)
+        co = spec.standing_coresident if coresident is None else coresident
+        prof_ctx, prof_parallel = spec.profile(co)
+        return self._footprint(spec, prof_ctx if ctx is None else ctx, prof_parallel if parallel is None else parallel,
+                               kv_class or spec.kv_class, coresident=co)
 
     def unit_profile(self, key: str) -> UnitProfile | None:
         """<engines_env_dir>/<key>.env as phase2/engine-env.py rendered it, or None (no dir, or not rendered yet)."""
@@ -617,7 +626,9 @@ class Arbiter:
 
     def register_measured(self, key: str, total_bytes: int, *, task_id: str | None = None,
                           allow_unknown: bool = False) -> None:
-        """Phase 3 step 2 / Phase 4 step 5: replace the estimate with the measured footprint (rule 1).
+        """Phase 3 step 2 / Phase 4 step 5: replace the estimate with the measured footprint (rule 1), at the profile
+        (ctx, parallel, kv) the engine is resident at when it is registered, or at its standing profile when it is not
+        resident (measured_profile, S52 fix round). Held in memory only: nothing replays it after a restart.
 
         `key` must be in engines.json or phase4-engines.json (CONVENTIONS.md §8: one list of names); anything else is
         UnknownEngine, so a typo in a registration fails loudly and the key gets added to config/phase4-engines.json
@@ -655,6 +666,11 @@ class Arbiter:
             res = self.resident.get(key)
             if res is not None:
                 res.measured_bytes = int(total_bytes)
+                # The profile the figure belongs to (S52 fix round): an 8-slot measurement is never charged to the
+                # 2-slot standing unit after the override is cleared, and vice versa.
+                self.measured_profile[key] = (res.footprint.ctx, res.footprint.parallel, res.footprint.kv_class)
+            else:
+                self.measured_profile.pop(key, None)
             self._log("measure", key, Decision.GRANTED, task_id, int(total_bytes),
                       reason=f"measured footprint {total_bytes / GIB:.2f} GiB recorded "
                              f"(class {self.engines[key].arbiter_class})"
@@ -751,10 +767,9 @@ class Arbiter:
         if self._busy:
             return self._decide(Decision.QUEUED, key, task_id, 0, f"arbiter busy: {self._busy}")
         budget = self.budget_bytes
-        # 1. What will actually load: the unit's env file when it exists, else the engines.json profile.
+        # 1. What will actually load: the unit's env file when it exists, else the engines.json standing profile.
         unit = self.unit_footprint(key)
         profile: UnitProfile | None = None
-        auto = coresident is None
         if unit is not None:
             fp, profile = unit
             mismatch = [f"{name} {want!r} != unit {have!r}" for name, want, have in (
@@ -767,8 +782,10 @@ class Arbiter:
                                     "it with phase2/engine-env.py --set-override (root), the Arbiter cannot")
             co = profile.coresident
         else:
-            co = coresident if not auto else (bool(self.resident) and not spec.is_apex)
-            fp = self.projected_footprint(key, ctx, parallel, kv_class, coresident=co)
+            # The standing profile (S52) unless the caller names one: the same profile alone or beside another engine,
+            # as engine-env.py will render it, so a projection never changes with what happens to be resident.
+            fp = self.projected_footprint(key, ctx, parallel, kv_class, coresident=coresident)
+            co = fp.coresident
         if fp.total_bytes > budget:
             return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
                                 f"projected {fp.total_gib:.1f} GiB exceeds the engine budget {budget / GIB:.1f} GiB "
@@ -783,16 +800,7 @@ class Arbiter:
         if isinstance(victims, str):
             # An external resident (Section 4.2 "Chatterbox when invoked") cannot be stopped by the Arbiter: queued.
             return self._decide(Decision.QUEUED, key, task_id, fp.total_bytes, victims)
-        # 3. No env file and nothing stays beside it: an engine that ends up alone runs its full profile, not a
-        #    quarter of its context (fix round). Re-project and re-check; everything is already being evicted.
-        if profile is None and auto and co and not any(k not in victims for k in self.resident):
-            co = False
-            fp = self.projected_footprint(key, ctx, parallel, kv_class, coresident=False)
-            if fp.total_bytes > budget:
-                return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
-                                    f"projected {fp.total_gib:.1f} GiB (full profile, would run alone) exceeds the "
-                                    f"engine budget {budget / GIB:.1f} GiB (Section 4.2 rule 2)")
-        # 4. Reserve: the placeholder is charged at the projection so nothing else can claim the memory meanwhile.
+        # 3. Reserve: the placeholder is charged at the projection so nothing else can claim the memory meanwhile.
         now = self._clock()
         self.resident[key] = Resident(key=key, spec=spec, footprint=fp, loaded_at=now, last_used=now, loading=True,
                                       measured_bytes=self.measured.get(key) if fp.measured else None)
@@ -888,10 +896,13 @@ class Arbiter:
                     f"{plan.footprint.parallel} slots, kv {plan.footprint.kv_class}"
                 )
             hint = ""
-            if plan.profile and not plan.profile.coresident and plan.victims and plan.spec.ctx_size_coresident:
+            if plan.profile and not plan.profile.coresident and plan.victims and plan.spec.standing_coresident:
+                # S52: the co-resident profile is this engine's standing one, so a unit at its full profile carries
+                # an explicit overrides.json coresident=false (the Principal's choice) or predates that rule.
                 hint = (
-                    "; co-residency needs overrides.json coresident=true for this engine "
-                    "(phase2/engine-env.py --set-override, root)"
+                    "; its unit runs the full profile (overrides.json coresident=false, or an env file rendered "
+                    "before S52), which evicts instead of pairing (Section 4.1): the standing co-resident profile "
+                    f"comes back with phase2/engine-env.py --clear-override {key} coresident (root)"
                 )
             return self._decide(
                 Decision.GRANTED,
@@ -1195,7 +1206,9 @@ class Arbiter:
                 ],
                 "measured": [
                     {"engine": k, "class": self.engines[k].arbiter_class if k in self.engines else None,
-                     "measured_bytes": n}
+                     "measured_bytes": n,
+                     # [ctx, parallel, kv] it applies to; None: registered while not resident (standing profile)
+                     "profile": list(self.measured_profile[k]) if k in self.measured_profile else None}
                     for k, n in self.measured.items()
                 ],
                 "busy": self._busy,

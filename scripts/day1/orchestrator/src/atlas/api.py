@@ -101,6 +101,20 @@ takes the slot for the classifier, releases it, then takes it again for the gene
 happens INSIDE that second hold, so the Arbiter's swap of rules 4/6 is serialised in the one FIFO and an engine granted
 to a queued request can never be evicted by a later request before it generates).
 
+The per-slot window (S52). Every generation reaches a llama-server through engines.LlamaClient._open_chat: the chat
+pipeline, /internal (the Celery tasks, LightRAG, the Phase 3 load test) and inline Deep Think go through
+HttpEngineStreamer, the classifier and the approval cross-checker through their own LlamaClient. Inside the generation
+slot, with the engine resident, the prompt is counted by the engine, the oldest exchanges are dropped only as far as a
+bounded reply reserve needs (engines.fit_to_window: the max_tokens asked for, DEFAULT_MAX_TOKENS when the request sets
+none, capped at a quarter of the slot; the leading system messages and the current turn always stay) and max_tokens
+is clamped to the room left, so prompt + reply stays inside one slot of the profile the unit runs (engine_window: the
+unit's env file, never a fixed figure). A request whose prefix and current turn alone leave less than the minimum
+reply is refused with status 413 (`context_window_exceeded`, ledger row failed, no strike) and nothing is sent: the
+HTTP status of a non-streamed request; a streamed one (Open WebUI) has already been answered HTTP 200, so the 413
+arrives as the error chunk's error.status with the "[ATLAS] ..." text. A trim or clamp is one log line
+(atlas.engines). No response field carries it: the `atlas` object goes out in the first chunk, before the engine is
+loaded and the prompt counted.
+
 Wiring: `build_app(deps)` takes an `AppDeps` so tests inject doubles for llama-server, the engine controller, the
 memory probe, docker and the vault helper (CONVENTIONS.md §7.8); the router, the prompt builder and the approval
 queue are the real modules (atlas.router, atlas.prompts, atlas.approval). `main()` builds the production deps.
@@ -126,6 +140,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -135,9 +150,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from atlas import __version__, deep_think
 from atlas.approval import ApprovalError, ApprovalItem, ApprovalQueue, CrossCheckRequired, NotPending, SendError
-from atlas.arbiter import APEX_KEY, DEEP_THINK_TIERS, Arbiter, ArbiterError, Decision, ReleaseTimeout, UnknownEngine
+from atlas.arbiter import (
+    APEX_KEY,
+    DEEP_THINK_TIERS,
+    Arbiter,
+    ArbiterError,
+    Decision,
+    ReleaseTimeout,
+    UnknownEngine,
+    read_unit_profile,
+)
 from atlas.config import HEMISPHERES, AtlasConfig, ConfigError, EngineSpec
-from atlas.engines import EngineError, _sse_events
+from atlas.engines import ContextWindowExceeded, EngineError, LlamaClient, SlotWindow, window_for
 from atlas.governance import RewriteResult, never_delegate_rewrite, register
 from atlas.ledger import Ledger, new_task_id
 from atlas.memory import MemoryStore, MemoryStoreError
@@ -185,9 +209,12 @@ __all__ = [
     "RouterLike",
     "build_app",
     "build_production_deps",
+    "engine_window",
     "history_has_vault_prefix",
     "is_owui_task_call",
     "main",
+    "production_llama_client",
+    "production_streamer_for",
 ]
 
 
@@ -317,13 +344,22 @@ class NtfyNotifier:
 
 
 class HttpEngineStreamer:
-    """Streams /v1/chat/completions of one llama-server (engines.py facts: SSE `data:` lines, final `timings`)."""
+    """Streams /v1/chat/completions of one llama-server (engines.py facts: SSE `data:` lines, final `timings`) through
+    LlamaClient.chat_chunks, the one request path that keeps a generation inside the engine's per-slot window (S52):
+    the prompt is counted by the engine, the oldest exchanges are dropped and max_tokens clamped when needed, and a
+    request that cannot fit raises ContextWindowExceeded before anything is sent. `window` is what
+    production_streamer_for passes (engine_window, read per request); without it, engines.json's (window_for)."""
 
     def __init__(
-        self, spec: EngineSpec, *, timeout_s: float = 3600.0, transport: httpx.BaseTransport | None = None
+        self,
+        spec: EngineSpec,
+        *,
+        timeout_s: float = 3600.0,
+        transport: httpx.BaseTransport | None = None,
+        window: SlotWindow | Callable[[], SlotWindow] | None = None,
     ) -> None:
         self.spec = spec
-        self._http = httpx.Client(base_url=spec.base_url, timeout=timeout_s, trust_env=False, transport=transport)
+        self.client = LlamaClient.for_engine(spec, timeout_s=timeout_s, transport=transport, window=window)
 
     def stream(
         self,
@@ -333,19 +369,44 @@ class HttpEngineStreamer:
         max_tokens: int | None,
         **params: Any,
     ) -> Iterator[dict[str, Any]]:
-        body: dict[str, Any] = {"model": self.spec.key, "messages": list(messages), "stream": True, **params}
-        if temperature is not None:
-            body["temperature"] = temperature
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
-        with self._http.stream("POST", "/v1/chat/completions", json=body) as r:
-            if r.status_code >= 400:
-                detail = r.read().decode("utf-8", "replace")[:500]
-                raise EngineError(f"{self.spec.key}: llama-server HTTP {r.status_code}: {detail}")
-            yield from _sse_events(r.iter_lines())
+        yield from self.client.chat_chunks(
+            messages, model=self.spec.key, temperature=temperature, max_tokens=max_tokens, **params
+        )
 
     def close(self) -> None:
-        self._http.close()
+        self.client.close()
+
+
+def engine_window(arbiter: Arbiter, spec: EngineSpec) -> SlotWindow:
+    """S52: the per-slot window of the profile the unit really runs, read on every request: the env file the Arbiter
+    projects from (Arbiter.unit_profile; for a resident small model, which the Arbiter does not budget and so does
+    not read, the same file directly), else engines.json (engines.window_for). Never a hard-coded figure: the vision
+    engine's standing profile is whatever phase2/engine-env.py rendered (2 x 32k unless overrides.json says
+    otherwise)."""
+    profile = arbiter.unit_profile(spec.key)
+    if profile is None and spec.is_resident and arbiter.engines_env_dir is not None:
+        profile = read_unit_profile(Path(arbiter.engines_env_dir) / f"{spec.key}.env")
+    if profile is None:
+        return window_for(spec)
+    return window_for(spec, profile.ctx, profile.parallel, source=profile.describe())
+
+
+def production_streamer_for(
+    arbiter: Arbiter, *, transport: httpx.BaseTransport | None = None
+) -> Callable[[EngineSpec], HttpEngineStreamer]:
+    """AppDeps.streamer_for in production: an HttpEngineStreamer whose window follows the unit (engine_window).
+    `transport` is for tests only (CONVENTIONS.md §7.8: a stub llama-server)."""
+
+    def streamer_for(spec: EngineSpec) -> HttpEngineStreamer:
+        return HttpEngineStreamer(spec, transport=transport, window=lambda: engine_window(arbiter, spec))
+
+    return streamer_for
+
+
+def production_llama_client(arbiter: Arbiter, spec: EngineSpec, **kw: Any) -> LlamaClient:
+    """A LlamaClient for direct generation (the router's classifier; approval.LlamaCrossChecker's `client_for`) whose
+    window follows the unit (engine_window), like production_streamer_for's."""
+    return LlamaClient.for_engine(spec, window=lambda: engine_window(arbiter, spec), **kw)
 
 
 class GenerationSlot:
@@ -1056,13 +1117,15 @@ def _respond(gen: Iterator[dict[str, Any]], stream: bool) -> Any:
 # --- the chat pipeline (Appendix A) -----------------------------------------------------------------------------------
 
 
-def _error_chunk(cid: str, model: str, created: int, status: int, message: str, task_id: str) -> dict[str, Any]:
+def _error_chunk(
+    cid: str, model: str, created: int, status: int, message: str, task_id: str, etype: str = "atlas_error"
+) -> dict[str, Any]:
     return {
         "id": cid,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "error": {"status": status, "message": message, "task_id": task_id, "type": "atlas_error"},
+        "error": {"status": status, "message": message, "task_id": task_id, "type": etype},
         "choices": [{"index": 0, "delta": {"content": f"\n[ATLAS] {message}\n"}, "finish_reason": "error"}],
     }
 
@@ -1381,6 +1444,15 @@ def _chat_pipeline(
         _fail(deps, task_id, info, message, exc, status=status, session_id=session_id, strike=not owui_task,
               internal=internal, hemisphere_declared=hemisphere_declared)
         yield _error_chunk(cid, req.model, created, status, str(exc.args[0]), task_id)
+    except ContextWindowExceeded as exc:
+        # S52: the prefix and the current message alone do not fit the engine's per-slot window, so nothing was sent
+        # (engines.fit_to_window): status 413 with the engine, its window and the prompt size, never a silent cut (the
+        # HTTP status only when not streamed: a stream already went out as 200, so _respond relays this chunk). No 9.4
+        # strike: no generation ran, and a scar would only repeat the size of the Principal's own message; the ledger
+        # row records the failure.
+        _fail(deps, task_id, info, message, exc, status=413, session_id=session_id, strike=False,
+              internal=internal, hemisphere_declared=hemisphere_declared)
+        yield _error_chunk(cid, req.model, created, 413, str(exc), task_id, etype="context_window_exceeded")
     except (EngineError, ConfigError, RouterError, RuntimeError, httpx.HTTPError) as exc:
         _fail(deps, task_id, info, message, exc, status=502, session_id=session_id, strike=not owui_task,
               internal=internal, hemisphere_declared=hemisphere_declared)
@@ -1595,7 +1667,7 @@ def _command(deps: AppDeps, info: RouteInfo, *, session_id: str, task_id: str) -
 def build_production_deps() -> AppDeps:
     from atlas.arbiter import build_arbiter
     from atlas.config import load_config
-    from atlas.engines import LlamaClient, SystemdEngineController
+    from atlas.engines import SystemdEngineController
     from atlas.ledger import open_ledger
     from atlas.memory import build_memory_store
     from atlas.personas import PersonaRegistry
@@ -1646,8 +1718,11 @@ def build_production_deps() -> AppDeps:
         log.warning("celery app not importable (%s); manual AEGIS trigger disabled", exc)
     personas = PersonaRegistry(config.personas, config.engines)
     classifier_spec = config.engines[config.router_rules.classifier_engine]
-    # Eleanor's resident classifier (7.2 rule 2): the router itself tolerates it being down (defaults to Arthur).
-    classifier = LlamaClassifier(LlamaClient.for_engine(classifier_spec), task_force_codes=tuple(config.task_forces))
+    # Eleanor's resident classifier (7.2 rule 2): the router itself tolerates it being down (defaults to Arthur). Its
+    # verdict call keeps to the router unit's per-slot window like every generation (S52; engine_window).
+    classifier = LlamaClassifier(
+        production_llama_client(arbiter, classifier_spec), task_force_codes=tuple(config.task_forces)
+    )
     router = Router(config, classifier, ledger, personas=personas)
     approval = ApprovalQueue(ledger, NoChannelSender(), NtfyNotifier(notify), personas=personas)
     log.warning("approval queue: no outbound channel is wired (Section 13); approving records it and fails the send")
@@ -1661,7 +1736,7 @@ def build_production_deps() -> AppDeps:
         arbiter=arbiter,
         router=router,
         build_system_prompt=prompt_builder,
-        streamer_for=HttpEngineStreamer,
+        streamer_for=production_streamer_for(arbiter),  # the window follows the unit's env file (S52)
         vault=build_vault_controller(sessions=sessions, notify=notify),
         sessions=sessions,
         approval=approval,

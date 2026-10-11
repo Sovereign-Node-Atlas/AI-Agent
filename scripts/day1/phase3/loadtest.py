@@ -4,7 +4,9 @@ Phase 3 steps 2-4; Section 21 V4, V10, V14b, V21, V22; Section 4.2 rules 1-9; R1
 
 Run as root by the driver. Stdout carries ONLY lines of the form
     RECORD<TAB><ID><TAB><pass|fail|deferred|info><TAB><message>
-which the driver turns into verify.jsonl records with record_v; everything else goes to stderr (the unit's journal).
+which the driver turns into verify.jsonl records with record_v, and (the `memory` subcommand only, S52)
+    TODO<TAB><ID><TAB><title><TAB><detail>
+which it raises with lib/common.sh todo_add; everything else goes to stderr (the unit's journal).
 Exit status 0 means "measured and recorded" (a failed engine is a recorded fail, not an exit code); non-zero means an
 infrastructure error the driver must stop on.
 
@@ -16,7 +18,10 @@ Subcommands (global options first, see main()):
     engine KEY [--previous PREV]
                             swap PREV out (unload + release check, credited to PREV) and KEY in through the Arbiter,
                             prove V4 from the journal, measure decode/prefill at 512 and 8k prompt tokens, register
-                            the measured footprint with the Arbiter (rule 1), leave KEY resident.
+                            the measured footprint with the Arbiter (rule 1), leave KEY resident. Every load also
+                            records (S52, never a verdict) its context memory from the load log beside the Arbiter's
+                            projection for the same profile, its host RAM after the load and after the tests, the
+                            prompt-cache/checkpoint lines and whether context shift was switched off ("memory").
                             DeepSeek (kv_ladder) runs the engines.json ladder with a coherence prompt instead.
                             A result whose engine is NOT resident afterwards (not loaded, failed, the ladder) says
                             so in "resident_after": the driver reads it to know what the next swap releases.
@@ -24,13 +29,18 @@ Subcommands (global options first, see main()):
                             unload the last resident engine and credit its release check
     summarize               print the V10 lines (one per engine, then the summary the gate reads) and V22
     coresident --text KEY --vision KEY
-                            Section 17 step 3: both resident (vision at parallel_coresident / ctx_size_coresident,
-                            asserted on the rendered env before the load), GTT delta within [0.85 x 142 GB,
+                            Section 17 step 3: both resident (vision at its standing co-resident profile, S52:
+                            parallel_coresident / ctx_size_coresident with ATLAS_CORESIDENT=1, asserted on the
+                            rendered env before the load; no temporary override), GTT delta within [0.85 x 142 GB,
                             min(142 + 28 + 10 GB, the Arbiter's live budget)], two generation requests through the
                             orchestrator, the second proven to queue (V21), then the real-engine refusal and Deep
                             Think downgrade of Section 21 V14 (V14b). A rule-5 leak in its cleanup fails V21 AND
                             stops the phase (exit 2) after the records are written, as step 02 does.
     table                   the Section 17 step 4 table from the result files, plus every baseline_deviation
+    memory                  S52 (end of Phase 3, step 04): the context memory, host-RAM caches and context-shift
+                            records of every load (result files) plus the resident chat engines' current journals
+                            (read-only), raised as the Principal's to-dos kv-estimates and cache-ram (TODO lines).
+                            Records only: it never fails the phase (a parse miss is UNKNOWN)
 
 Verdicts fixed by the baseline (the document wins over this file and over engines.json, CONVENTIONS.md preamble):
   * Section 21 V10 "measured tok/s within the expected bands": a decode rate under the band's lower bound is a V10
@@ -53,7 +63,7 @@ Result files: <results-dir>/<key>.json, one per engine (schema: EngineResult bel
 coresident.json. A result with "ok": true AND "released": true makes the driver skip that engine on a re-run
 (file-level resumability, CONVENTIONS.md §7.3; an engine saved while still resident is re-tested unless `prepare`
 credited its release on the re-run). <results-dir>/pending-overrides.json journals every TEMPORARY overrides.json
-change (ladder rungs, the co-resident vision profile, the V14b probe profile) before it is written; every subcommand
+change (ladder rungs, the V14b probe profile) before it is written; every subcommand
 that touches the node restores and deletes it first, so an interrupted run never leaves a probe profile in production.
 SIGTERM (`systemctl stop atlas-day1-phase3`) is turned into an exception in the main thread so every finally block runs.
 
@@ -70,6 +80,9 @@ the research files are cited through config/engines.json _meta where this checko
     plus "llama_context: flash_attn = enabled"; hard-error lines that mean the request was refused (server exits):
     "Flash Attention not supported, set to disabled", "quantized V cache requires flash_attn",
     "does not support different K", "does not divide n_embd_head". No ^ anchor: --log-timestamps may prefix lines.
+    The size and flash_attn lines are library INFO, which the pin logs as TRACE (common/log.cpp:532, since
+    67b2b7f2f): they reach the journal only at -lv 4, which phase2/engine-env.py renders into every chat engine
+    (--verbosity 4); at llama-server's default 3 the journal has none and V4 is unproven on every engine.
     Research conflict 11: llama.cpp errors out at context creation instead of falling back; the proof is the log line
     plus the process-alive/health check.
   * /props does not expose the KV cache types (README): when the journal has no proof line, V4 is a fail with reason.
@@ -84,6 +97,61 @@ the research files are cited through config/engines.json _meta where this checko
   # UNVERIFIED: that DeepSeek V4 Flash 0731's chat template emits a <think> block by default — the reviewer's reading
     of the 0731 template; handled by budget (1024/2048 tokens), finish_reason and one retry, never assumed.
     "chat_template_kwargs": {"thinking": false} is NOT sent (unverified for this template).
+
+S52 Phase 3 items: records, never a verdict and never an Infra stop (a line that is not found is UNKNOWN). The log
+lines, VERIFIED against llama.cpp b29c606 (the pinned build, phase2/01-llama.sh LLAMA_CPP_COMMIT). llama-server logs
+with prefix and timestamps on (common/common.cpp:391-392), "M.SS.mmm.uuu I " before a line, "W " before a warning,
+"D " before a debug line (common/log.cpp:141-154), so no pattern is anchored. Every library line below (K/V,
+recurrent, DSV4, flash_attn, compute buffers, the mmproj's too: the server routes clip's log through
+common_log_default_callback, tools/server/server-context.cpp:1159) is INFO, which the pin logs as TRACE
+(common/log.cpp:532): at llama-server's default -lv 3 none reaches the journal, so phase2/engine-env.py renders every
+chat engine with --verbosity 4 (exactly 4: see --fit below). Only the srv/slot INF and WRN lines print at -lv 3.
+  * context memory, one line per K/V sub-cache (src/llama-kv-cache.cpp:301):
+        "llama_kv_cache: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB"
+    On gpt-oss "llama_kv_cache_iswa: creating non-SWA KV cache, size = %u cells" / "creating     SWA KV cache, ..."
+    (src/llama-kv-cache-iswa.cpp:83, 100), on DeepSeek V4 those and "llama_kv_cache_dsv4: creating DSV4 CSA
+    compressed|HCA compressed|lightning-indexer KV cache, size = %u cells" (src/llama-kv-cache-dsv4.cpp:1289-1305)
+    come just before the size line of the sub-cache they name. The hybrids' recurrent state
+    (src/llama-memory-recurrent.cpp:133)
+        "llama_memory_recurrent: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, ..."
+    and DeepSeek V4's compressor states (src/llama-kv-cache-dsv4.cpp:998)
+        "llama_dsv4_comp_state: %s ratio = %u, state = %u x %u, streams = %u, rs_seq = %u, layers = %zu, size =
+        %7.2f MiB" (one line in the log)
+    are context memory too. Their sum is set beside the Arbiter's projection for the same profile (arbiter.py
+    projected_footprint, run in the orchestrator's venv: see arbiter_projection).
+  * compute buffers, per buffer type: "sched_reserve: %10s compute buffer size = %8.2f MiB" (src/llama-context.cpp:692;
+    printed again whenever the scheduler re-reserves, so the largest per buffer is kept) and the mmproj's
+    "reserve_compute_meta: ..." in the same format (tools/mtmd/clip.cpp:3773). --fit (on by default, common/common.h:
+    476) builds a trial context first (common/fit.cpp:263). Below -lv 5 its lines are demoted to debug and dropped
+    (common/common.cpp:1326, common/fit.cpp:52), so at the rendered -lv 4 the journal has the served context's
+    lines only; at -lv 5 or -v they keep INFO and print as "I " beside the real ones. parse_memory_lines therefore
+    discards everything before --fit's closing TRACE line "common_fit_params: fitting params to free memory took"
+    (common/fit.cpp:902, printed at every verbosity that shows the trial); the served context and the mmproj load
+    after it (tools/server/server-context.cpp:1099, 1162), so nothing is counted twice.
+  * "srv    load_model: initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'" (tools/server/
+    server-context.cpp:1250): the real slot window, logged AFTER the context-shift check, so a load log that has it
+    covers that check.
+  * context shift switched off (warnings, tools/server/server-context.cpp:1176 and 1188):
+        "ctx_shift is not supported by multimodal, it will be disabled" / "... by this context, it will be disabled"
+    Every chat engine starts with --context-shift (phase2/engine-env.py), so a load log with the slot line and no such
+    warning means it stayed on.
+  * host-RAM caches outside the Arbiter's budget: the prompt cache (--cache-ram, default 8192 MiB per server, idle slots
+    copied into it on every new task: --cache-idle-slots on) and the context checkpoints (--ctx-checkpoints, default
+    32 per slot, thinned to 8192 tokens apart when full) (common/common.h:628-632; flags common/arg.cpp:1695, 1713;
+    tools/server/server-context.cpp:2309-2340). Checkpoints are
+    made only where the cache cannot roll back: sliding-window or recurrent layers (tools/server/server-context.cpp:
+    3460-3473). Their sizes are TRACE lines (verbosity 4): " - cache state: %zu prompts, %.3f MiB (limits: ...)"
+    (tools/server/server-task.cpp:1894) and "created context checkpoint %d of %d (pos_min = ..., size = %.3f MiB)"
+    (server-context.cpp:2369); llama-server's default verbosity is 3 (common/common.h:534; LOG_TRC common/log.h:121),
+    which leaves only the warnings: an eviction from a full prompt cache (" - making room for prompt cache entry,
+    removing oldest entry (size = %.3f MiB)", " - cache size limit reached, removing oldest entry (size = %.3f MiB)",
+    server-task.cpp:1753, 1873; the token-limit and oversize forms at 1887 and 1732) and "erasing old context
+    checkpoint (... size = %.3f MiB)" (server-context.cpp:2335). Both kinds are parsed; the TRACE lines are there
+    because every chat engine runs at -lv 4 (phase2/engine-env.py), and a journal without them (an engine started
+    before that render, a rotated journal) leaves the figure UNKNOWN. Phase 3 changes no engine setting, and it
+    measures the RAM itself, read-only: VmRSS, VmHWM, RssAnon, RssFile and RssShmem of the unit's MainPID (systemctl
+    show, /proc/<pid>/status) right after the load and after the tests. Both caches are heap (std::vector), so
+    RssAnon's growth over the tests is their upper bound for that traffic (INFERRED).
 
 CONTRACT with the orchestrator (orchestrator/src/atlas/api.py, another writer; read at fix-round time, every route
 below exists there; CONVENTIONS.md §8 control path). Loopback only; admin routes take X-Atlas-Token when
@@ -213,6 +281,58 @@ KV_REFUSED = (
     "does not divide n_embd_head",
 )
 EXTERNAL_STOP_MARKS = ("Received SIGTERM", "Stopping ", "Deactivated successfully", "Stopped ")
+
+# S52 Phase 3 items (module docstring: the pinned format strings these follow, file and line). Records only.
+MIB = 1024**2
+DEBUG_LINE_RE = re.compile(r"^\s*\d+\.\d{2}\.\d{3}\.\d{3} D ")  # common/log.cpp:154: a debug line
+# common/fit.cpp:902, LOG_TRC after every --fit run: the K/V and compute lines before it were the trial context's
+# (printed at -lv 5 and -v, where common/common.cpp:1326 keeps them at INFO), never the served one's.
+FIT_END_RE = re.compile(r"common_fit_params: fitting params to free memory took")
+KV_SIZE_RE = re.compile(r"llama_kv_cache: size = +([0-9.]+) MiB \( *(\d+) cells, +(\d+) layers, +(\d+)/(\d+) seqs\), "
+                        r"K \((\w+)\): +[0-9.]+ MiB, V \((\w+)\): +[0-9.]+ MiB")
+ISWA_PART_RE = re.compile(r"llama_kv_cache_iswa: creating +(non-SWA|SWA) KV cache, size = \d+ cells")
+DSV4_PART_RE = re.compile(r"llama_kv_cache_dsv4: creating DSV4 (.+?) KV cache, size = \d+ cells")
+RECURRENT_SIZE_RE = re.compile(r"llama_memory_recurrent: size = +([0-9.]+) MiB \( *(\d+) cells, +(\d+) layers")
+DSV4_STATE_RE = re.compile(r"llama_dsv4_comp_state: (\w+) ratio = \d+, state = \d+ x \d+, streams = (\d+), "
+                           r"rs_seq = \d+, layers = \d+, size = +([0-9.]+) MiB")
+COMPUTE_RE = re.compile(r"(sched_reserve|reserve_compute_meta): +(\S+) compute buffer size = +([0-9.]+) MiB")
+SLOTS_RE = re.compile(r"initializing, n_slots = (\d+), n_ctx_slot = (\d+), kv_unified = '(\w+)'")
+CTX_SHIFT_OFF_RE = re.compile(r"ctx_shift is not supported by (this context|multimodal), it will be disabled")
+PCACHE_EVICT_RE = re.compile(r" - (?:making room for prompt cache entry|cache size limit reached|cache token limit "
+                             r"\(\d+, est: \d+\) reached), removing oldest entry \(size = ([0-9.]+) MiB\)")
+PCACHE_SKIP_RE = re.compile(r" - prompt state size ([0-9.]+) MiB exceeds cache size limit ([0-9.]+) MiB, skipping")
+PCACHE_REDUCED_RE = re.compile(r" - cache size limit reduced to ([0-9.]+) MiB")
+PCACHE_STATE_RE = re.compile(r" - cache state: (\d+) prompts, ([0-9.]+) MiB \(limits: ([0-9.]+) MiB")  # TRACE
+CKPT_ERASED_RE = re.compile(r"erasing old context checkpoint \(pos_min = -?\d+, pos_max = -?\d+, n_tokens = -?\d+, "
+                            r"size = ([0-9.]+) MiB\)")
+CKPT_CREATED_RE = re.compile(r"created context checkpoint (\d+) of (\d+) \(pos_min = -?\d+, pos_max = -?\d+, "
+                             r"n_tokens = -?\d+, size = ([0-9.]+) MiB\)")  # TRACE
+# llama-server's defaults at the pin (common/common.h:628-632): the figures the cache-ram to-do weighs.
+LLAMA_CACHE_RAM_DEFAULT_MIB = 8192
+LLAMA_CTX_CHECKPOINTS_DEFAULT = 32
+LLAMA_CHECKPOINT_MIN_STEP = 8192
+PROC_STATUS_FIELDS = ("VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem")
+PROJECTION_TIMEOUT_S = 60.0
+# Runs in the orchestrator's venv (the atlas package the live Arbiter imports; phase2/02-orchestrator.sh leaves both
+# trees root:atlas without group or other write, so running it as root runs root-owned code). Nothing measured is
+# registered with this throw-away Arbiter, so projected_footprint returns its ESTIMATE for the profile given: the
+# figure the kv-estimates to-do weighs against the log. No controller and no probe are touched by a projection.
+PROJECTION_SNIPPET = """
+import json, sys
+from pathlib import Path
+from atlas.arbiter import KV_BYTES_PER_TOKEN_F16, KV_CLASS_FACTOR, Arbiter
+from atlas.config import load_engines
+cfg, key, ctx, parallel, kv = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+engines = load_engines(cfg)
+fp = Arbiter(engines, None, None).projected_footprint(key, ctx, parallel, kv)
+spec = engines[key]
+per_token = spec.kv_bytes_per_token_f16
+if per_token is None:
+    per_token = KV_BYTES_PER_TOKEN_F16.get(key)
+print(json.dumps({"weights_bytes": fp.weights_bytes, "kv_bytes": fp.kv_bytes, "total_bytes": fp.total_bytes,
+                  "measured": fp.measured, "per_token_f16": per_token, "kv_factor": KV_CLASS_FACTOR.get(kv),
+                  "arbiter_class": spec.arbiter_class}))
+"""
 
 WORDS = (
     "atlas harbour ledger granite meadow copper lantern orbit velvet marble quartz ember willow falcon cinder timber "
@@ -459,6 +579,7 @@ class Ctx:
     port_base: int
     overrides: Path
     admin_token: str = ""
+    atlas_python: str = ""  # the orchestrator venv's python: the Arbiter's projection for the S52 memory record
     engines: dict[str, dict[str, Any]] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
 
@@ -567,6 +688,7 @@ class EngineResult:
     release_note: str = ""
     warnings: list[str] = field(default_factory=list)
     ladder: list[dict[str, Any]] = field(default_factory=list)
+    memory: list[dict[str, Any]] = field(default_factory=list)  # S52: one record per load (per rung on the ladder)
     baseline_deviation: str = ""
     v22_result: str = ""
     v22_msg: str = ""
@@ -643,10 +765,12 @@ def pending_write(ctx: Ctx, entries: list[dict[str, Any]]) -> None:
 def pending_begin(ctx: Ctx, key: str, fields: Sequence[str], why: str, clear_always: Sequence[str] = (),
                   ) -> dict[str, Any]:
     """Journal a TEMPORARY overrides.json change BEFORE it is written: the prior value of every field (restored on
-    end), or "clear" for fields that are never a legitimate persistent override (coresident: the orchestrator decides
-    co-residency live). A SIGKILL, OOM or power cut between the render and its restore then cannot leave a probe
-    profile (a 256x ctx_size, coresident=true, an f16 ladder rung) in a production unit env file: pending_recover()
-    restores it at the start of the next invocation."""
+    end), or "clear" for the fields in clear_always (never a legitimate persistent override). A SIGKILL, OOM or power
+    cut between the render and its restore then cannot leave a probe profile (a 256x ctx_size, an f16 ladder rung) in
+    a production unit env file: pending_recover() restores it at the start of the next invocation. `coresident` is
+    never journalled (S52): the vision engine's co-resident profile is its standing one, and an overrides.json
+    coresident=false is the Principal's persistent choice, which Phase 3 never sets and never clears on an engine that
+    defines a co-resident profile (the Apex ladder clears the field on deepseek-v4-flash, which defines none)."""
     entry: dict[str, Any] = {"id": f"{key}:{why}:{now_iso()}:{random.randrange(10**6)}", "key": key, "why": why,
                              "set": {}, "clear": []}
     for f in fields:
@@ -987,8 +1111,9 @@ def evaluate_kv_lines(key: str, expected: str, proof_lines: int, lines: list[str
     fa = [m.group(1) for m in (FA_RE.search(ln) for ln in lines) if m]
     refused = [s for s in KV_REFUSED if any(s in ln for ln in lines)]
     if not kv:
-        why = "journal of the current invocation has no 'llama_kv_cache: size =' line" if lines else \
-            "journal of the current invocation is empty (journalctl access?)"
+        why = ("journal of the current invocation has no 'llama_kv_cache: size =' line (TRACE at the pin: printed "
+               "only at -lv 4, which phase2/engine-env.py renders; a unit started before that render has none)"
+               if lines else "journal of the current invocation is empty (journalctl access?)")
         return False, f"{key}: V4 unproven: {why}{build}" + (f"; refused: {refused}" if refused else ""), ""
     types = sorted({(m.group(1), m.group(2)) for m in kv})
     applied = types[0][0] if len(types) == 1 and types[0][0] == types[0][1] else ",".join(f"{k}/{v}" for k, v in types)
@@ -1032,6 +1157,265 @@ def prove_kv(key: str, expected: str, proof_lines: int, invocation_id: str, sinc
         except HttpFail:
             pass
     return evaluate_kv_lines(key, expected, proof_lines, lines, build)
+
+
+# --- S52 Phase 3 items: context memory, host-RAM caches, context shift (records, never a verdict) ---------------------
+
+
+def _fnum(text: str) -> float:
+    return round(float(text), 3)
+
+
+def _max_opt(a: float | None, b: float) -> float:
+    return b if a is None else max(a, b)
+
+
+def parse_memory_lines(lines: Sequence[str]) -> dict[str, Any]:
+    """Pure: what one load's log says about its memory (module docstring, S52; MiB as llama-server prints them, None
+    when the line was not logged). A K/V size line belongs to the sub-cache announced just before it (iSWA, DSV4),
+    else to the one full cache. --fit's trial context logs its own K/V, recurrent, compressor and compute lines as
+    "I " at -lv 5 or -v (module docstring), so everything before its closing "common_fit_params: fitting params to
+    free memory took" line is discarded and nothing counts twice; debug ("D ") lines are skipped."""
+    parts: list[dict[str, Any]] = []
+    recurrent: list[dict[str, Any]] = []
+    states: list[dict[str, Any]] = []
+    compute: dict[str, float] = {}
+    mmproj: dict[str, float] = {}
+    pcache: dict[str, Any] = {"evicted": 0, "evicted_max_mib": None, "oversize_skipped": 0, "limit_reduced_mib": None,
+                              "state_max_mib": None, "prompts_max": None}
+    ckpt: dict[str, Any] = {"erased": 0, "size_max_mib": None, "created_max": None, "limit": None}
+    out: dict[str, Any] = {"n_slots": None, "n_ctx_slot": None, "kv_unified": None, "ctx_shift_off": ""}
+    tag = ""
+    for ln in lines:
+        if DEBUG_LINE_RE.search(ln):
+            continue
+        if FIT_END_RE.search(ln):  # what came before was --fit's trial context (FIT_END_RE)
+            parts, recurrent, states, compute, tag = [], [], [], {}, ""
+        elif m := ISWA_PART_RE.search(ln):
+            tag = m.group(1)
+        elif m := DSV4_PART_RE.search(ln):
+            tag = f"DSV4 {m.group(1)}"
+        elif m := KV_SIZE_RE.search(ln):
+            parts.append({"part": tag or "full", "mib": _fnum(m.group(1)), "cells": int(m.group(2)),
+                          "layers": int(m.group(3)), "seqs": int(m.group(4)), "streams": int(m.group(5)),
+                          "k": m.group(6), "v": m.group(7)})
+            tag = ""
+        elif m := RECURRENT_SIZE_RE.search(ln):
+            recurrent.append({"mib": _fnum(m.group(1)), "cells": int(m.group(2)), "layers": int(m.group(3))})
+        elif m := DSV4_STATE_RE.search(ln):
+            states.append({"name": m.group(1), "streams": int(m.group(2)), "mib": _fnum(m.group(3))})
+        elif m := COMPUTE_RE.search(ln):
+            into = compute if m.group(1) == "sched_reserve" else mmproj
+            into[m.group(2)] = max(into.get(m.group(2), 0.0), _fnum(m.group(3)))  # the largest reservation stands
+        elif m := SLOTS_RE.search(ln):
+            out["n_slots"], out["n_ctx_slot"], out["kv_unified"] = int(m.group(1)), int(m.group(2)), m.group(3)
+        elif m := CTX_SHIFT_OFF_RE.search(ln):
+            out["ctx_shift_off"] = f"not supported by {m.group(1)}"
+        elif m := PCACHE_EVICT_RE.search(ln):
+            pcache["evicted"] += 1
+            pcache["evicted_max_mib"] = _max_opt(pcache["evicted_max_mib"], _fnum(m.group(1)))
+        elif m := PCACHE_SKIP_RE.search(ln):
+            pcache["oversize_skipped"] += 1
+        elif m := PCACHE_REDUCED_RE.search(ln):
+            pcache["limit_reduced_mib"] = _fnum(m.group(1))
+        elif m := PCACHE_STATE_RE.search(ln):
+            pcache["state_max_mib"] = _max_opt(pcache["state_max_mib"], _fnum(m.group(2)))
+            pcache["prompts_max"] = max(pcache["prompts_max"] or 0, int(m.group(1)))
+        elif m := CKPT_ERASED_RE.search(ln):
+            ckpt["erased"] += 1
+            ckpt["size_max_mib"] = _max_opt(ckpt["size_max_mib"], _fnum(m.group(1)))
+        elif m := CKPT_CREATED_RE.search(ln):
+            ckpt["created_max"] = max(ckpt["created_max"] or 0, int(m.group(1)))
+            ckpt["limit"] = int(m.group(2))
+            ckpt["size_max_mib"] = _max_opt(ckpt["size_max_mib"], _fnum(m.group(3)))
+    kv = round(sum(p["mib"] for p in parts), 2) if parts else None
+    rec_mib = round(sum(r["mib"] for r in recurrent), 2) if recurrent else None
+    state_mib = round(sum(s["mib"] for s in states), 2) if states else None
+    # One slot's share of what a checkpoint holds (the parts that cannot be rolled back: sliding-window cells,
+    # recurrent state, compressor state; tools/server/server-context.cpp:3465-3473), INFERRED from the sizes above.
+    per_slot = (sum(p["mib"] / max(p["streams"], 1) for p in parts if p["part"] == "SWA")
+                + sum(r["mib"] / max(r["cells"], 1) for r in recurrent)
+                + sum(s["mib"] / max(s["streams"], 1) for s in states))
+    out.update({
+        "kv_mib": kv, "kv_lines": len(parts), "kv_parts": parts,
+        "swa_mib": round(sum(p["mib"] for p in parts if p["part"] == "SWA"), 2) if parts else None,
+        "recurrent_mib": rec_mib, "dsv4_state_mib": state_mib,
+        "context_mib": None if kv is None else round(kv + (rec_mib or 0.0) + (state_mib or 0.0), 2),
+        "compute_mib": compute, "mmproj_compute_mib": mmproj,
+        "checkpoint_state_mib": round(per_slot, 3) if per_slot > 0 else None,
+        "prompt_cache": pcache, "checkpoints": ckpt,
+    })
+    return out
+
+
+def read_proc_status(pid: int, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    """The host RAM of one process, read-only: /proc/<pid>/status VmRSS, VmHWM, RssAnon, RssFile, RssShmem (kB there,
+    bytes here) and comm. {"pid", "why"} when it cannot be read."""
+    out: dict[str, Any] = {"pid": pid}
+    try:
+        text = (proc_root / str(pid) / "status").read_text(encoding="ascii", errors="replace")
+    except OSError as exc:
+        return {**out, "why": f"/proc/{pid}/status: {exc.strerror or exc}"}
+    for line in text.splitlines():
+        name, _, value = line.partition(":")
+        if name == "Name":
+            out["comm"] = value.strip()
+        elif name in PROC_STATUS_FIELDS and value.split() and value.split()[0].isdigit():
+            out[name] = int(value.split()[0]) * 1024
+    if "VmRSS" not in out:
+        out["why"] = f"/proc/{pid}/status has no VmRSS (a zombie or a kernel thread)"
+    return out
+
+
+def host_memory(key: str, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    """S52 (b): the host RAM of llama-server@KEY's main process now (systemctl show MainPID, then /proc; read-only).
+    A measurement: never raises, a failure is {"why"}."""
+    try:
+        p = run(["systemctl", "show", "-p", "MainPID", "--value", unit_of(key)])
+        pid = int(p.stdout.strip() or "0")
+    except (OSError, ValueError) as exc:
+        return {"why": f"systemctl show -p MainPID {unit_of(key)}: {exc}"}
+    if pid <= 0:
+        return {"why": f"{unit_of(key)} has no main process (MainPID {pid})"}
+    return read_proc_status(pid, proc_root)
+
+
+def arbiter_projection(ctx: Ctx, key: str, ctx_size: int, parallel: int, kv: str,
+                       ) -> tuple[dict[str, Any] | None, str]:
+    """The Arbiter's projection for exactly this profile, from its own code (PROJECTION_SNIPPET in the orchestrator's
+    venv, `python -I -B`: no PYTHONPATH, no cwd on sys.path, no .pyc written as root), never a copy of its figures here.
+    (None, why) when it cannot be had: the record then says UNKNOWN."""
+    py = ctx.atlas_python
+    if not py or not os.access(py, os.X_OK):
+        return None, f"no orchestrator python at {py or '(none given)'} (--atlas-python)"
+    try:
+        p = run([py, "-I", "-B", "-c", PROJECTION_SNIPPET, str(ctx.engines_path.parent), key, str(ctx_size),
+                 str(parallel), kv], timeout=PROJECTION_TIMEOUT_S)
+    except OSError as exc:
+        return None, f"{py}: {exc}"
+    if p.returncode != 0:
+        return None, f"projection failed (exit {p.returncode}): {short((p.stderr or p.stdout).strip()[-400:], 300)}"
+    try:
+        data = json.loads(p.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as exc:
+        return None, f"projection printed no JSON ({exc}): {short(p.stdout, 200)}"
+    return (data, "") if isinstance(data, dict) else (None, f"projection printed {short(data, 120)}")
+
+
+def memory_record(env: dict[str, str], parsed: dict[str, Any], projection: dict[str, Any] | None, proj_why: str,
+                  host_load: dict[str, Any], host_after: dict[str, Any], label: str = "") -> dict[str, Any]:
+    """Pure: one load's S52 record (results file "memory"): the profile the unit ran, what its log says (a), the
+    Arbiter's projection for that profile, the host RAM right after the load and after the tests (b), and whether
+    context shift stayed on (c). Everything not measured is listed under "unknown" with its reason."""
+    unknown: list[str] = []
+    requested = "--context-shift" in env.get("ARGS", "").split()
+    if parsed.get("ctx_shift_off"):
+        shift = "disabled"
+    elif not requested:
+        shift = "not requested"
+    elif parsed.get("n_ctx_slot") is not None:
+        shift = "kept"  # the slot line comes after the check (module docstring), and no warning came before it
+    else:
+        shift = "UNKNOWN"
+        unknown.append("context shift: the load log has no slot line, so it does not cover the check")
+    pc, ck = parsed.get("prompt_cache") or {}, parsed.get("checkpoints") or {}
+    if parsed.get("kv_mib") is None:
+        unknown.append("context memory: no 'llama_kv_cache: size =' line in the load log (TRACE at the pin: printed "
+                       "only at the -lv 4 phase2/engine-env.py renders)")
+        if parsed.get("checkpoint_state_mib") is None:  # not measured, which is not "none made" (cache_suggestion)
+            unknown.append("checkpoints: one slot's state UNKNOWN (no K/V, recurrent or compressor size line in the "
+                           "load log); erasures or creations are logged, so the engine makes them"
+                           if ck.get("erased") or ck.get("created_max") else
+                           "checkpoints: UNKNOWN (no K/V, recurrent or compressor size line in the load log, so "
+                           "whether the engine makes them, and their size, is not known)")
+    if projection is None:
+        unknown.append(f"projection: {proj_why}")
+    for when, h in (("after the load", host_load), ("after the tests", host_after)):
+        if "VmRSS" not in h:
+            unknown.append(f"host RAM {when}: {h.get('why', 'not read')}")
+    growth = None
+    if "RssAnon" in host_load and "RssAnon" in host_after and host_load.get("pid") == host_after.get("pid"):
+        growth = host_after["RssAnon"] - host_load["RssAnon"]
+    elif "RssAnon" in host_load and "RssAnon" in host_after:
+        unknown.append("host RAM growth: the main process changed between the two readings (a restart)")
+    if pc.get("state_max_mib") is None:
+        unknown.append("prompt-cache size: no ' - cache state:' line in the log (TRACE, printed at the -lv 4 "
+                       "phase2/engine-env.py renders); RssAnon growth is the measured bound")
+    if parsed.get("checkpoint_state_mib") is not None and ck.get("size_max_mib") is None:
+        unknown.append("checkpoint size: no 'created context checkpoint' (TRACE, -lv 4) or 'erasing' line in the log; "
+                       "INFERRED from the sliding-window/recurrent/compressor sizes instead")
+    return {
+        "label": label,
+        "profile": {"ctx": int(env.get("ATLAS_CTX_SIZE") or 0), "parallel": int(env.get("ATLAS_PARALLEL") or 1),
+                    "kv": env.get("ATLAS_KV_TYPE", ""), "coresident": env.get("ATLAS_CORESIDENT") == "1"},
+        "measured": parsed,
+        "projected": projection,
+        "ctx_shift": shift,
+        "ctx_shift_why": parsed.get("ctx_shift_off") or "",
+        "ctx_shift_requested": requested,
+        "host_after_load": host_load,
+        "host_after_tests": host_after,
+        "anon_growth_bytes": growth,
+        "unknown": unknown,
+        "taken_at": now_iso(),
+    }
+
+
+def _gib(mib: float | None) -> str:
+    return "UNKNOWN" if mib is None else f"{mib / 1024:.2f}"
+
+
+def _rss(h: dict[str, Any], fld: str = "VmRSS") -> str:
+    return f"{h[fld] / GIB:.2f}" if fld in h else "UNKNOWN"
+
+
+def memory_line(rec: dict[str, Any]) -> str:
+    """The one log line per load (S52): measured beside projected, host RAM, caches, context shift."""
+    if rec.get("error"):
+        return f"memory (S52){' ' + rec['label'] if rec.get('label') else ''}: not recorded ({rec['error'][:200]})"
+    m, prof, proj = rec["measured"], rec["profile"], rec.get("projected") or {}
+    extra = [f"SWA {_gib(m['swa_mib'])}" if m.get("swa_mib") else "",
+             f"recurrent {_gib(m['recurrent_mib'])}" if m.get("recurrent_mib") is not None else "",
+             f"compressor {_gib(m['dsv4_state_mib'])}" if m.get("dsv4_state_mib") is not None else ""]
+    kvb = proj.get("kv_bytes")
+    pc, ck = m["prompt_cache"], m["checkpoints"]
+    growth = rec.get("anon_growth_bytes")
+    resident = rec.get("label") == "resident"
+    versus = ("resident, never charged" if resident
+              else f"vs {'UNKNOWN' if kvb is None else f'{kvb / GIB:.2f}'} GiB projected")
+    host = (f"host RSS {_rss(rec['host_after_tests'])} GiB now" if resident
+            else f"host RSS {_rss(rec['host_after_load'])} GiB after the load, {_rss(rec['host_after_tests'])} after "
+            f"the tests (anon {'UNKNOWN' if growth is None else f'{growth / MIB:+.0f} MiB'})")
+    return (f"memory (S52){' ' + rec['label'] if rec.get('label') else ''}: {prof['ctx']} x {prof['parallel']} "
+            f"{prof['kv']}; context {_gib(m['context_mib'])} GiB measured ({m['kv_lines']} K/V line(s)"
+            + "".join(f", {e}" for e in extra if e) + f") {versus}; compute "
+            f"{_gib(sum(m['compute_mib'].values()) if m['compute_mib'] else None)} GiB; slot window "
+            f"{m['n_ctx_slot'] or 'UNKNOWN'}; context shift {rec['ctx_shift']}"
+            + (f" ({rec['ctx_shift_why']})" if rec.get("ctx_shift_why") else "")
+            + f"; {host}; prompt cache {pc['evicted']} eviction(s), checkpoints {ck['erased']} erased")
+
+
+def take_memory_record(ctx: Ctx, res: EngineResult, key: str, env: dict[str, str], inv: str, since: str,
+                       host_load: dict[str, Any], label: str = "") -> None:
+    """S52 Phase 3 items (a)-(c) for one load, after its tests while the unit is still up: the load's journal (the
+    invocation read for V4), the host RAM now, and the Arbiter's projection for the profile the env file gave. One
+    record into res.memory and one log line. Never fails the engine or the phase (a measurement, not a verdict):
+    whatever goes wrong is recorded with its reason; only SIGTERM still stops the run."""
+    try:
+        lines = journal_lines(key, inv, since)
+        host_after = host_memory(key)
+        projection, why = arbiter_projection(ctx, key, int(env.get("ATLAS_CTX_SIZE") or 0),
+                                             int(env.get("ATLAS_PARALLEL") or 1), env.get("ATLAS_KV_TYPE", ""))
+        rec = memory_record(env, parse_memory_lines(lines), projection, why, host_load, host_after, label)
+        if not lines:
+            rec["unknown"].insert(0, "the load's journal is empty (journalctl access?)")
+    except Terminated:
+        raise
+    except Exception as exc:  # S52: a record, never a verdict; broken tooling is UNKNOWN, not a failed engine
+        rec = {"label": label, "error": f"{type(exc).__name__}: {exc}", "unknown": [f"record not taken: {exc}"],
+               "taken_at": now_iso()}
+    res.memory.append(rec)
+    log(f"{key}: {memory_line(rec)}")
 
 
 # --- generation and measurement ---------------------------------------------------------------------------------------
@@ -1395,9 +1779,12 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     if spec.get("kv_ladder"):
         ladder_engine(ctx, ctl, key, previous, baseline, res)
         return
-    # Step 2 measures the STAND-ALONE profile: a `coresident` override left by an interrupted step 3 would otherwise
-    # register the 2-slot / 65536 profile as the vision engine's footprint (rule 1) and print it as its row.
-    env = ctx.render(key, [], ["coresident"])
+    # Step 2 measures the unit as production runs it: the standing profile (S52: the vision engine's co-resident
+    # 2 x 32k) or whatever overrides.json says, e.g. the Principal's coresident=false. The footprint registered here
+    # (rule 1) is charged by the Arbiter at the profile it was measured at only (arbiter.py measured_profile): an
+    # 8 x 32k figure never stands for the 2 x 32k unit once the override is cleared, which runs at its projection until
+    # measured itself. Nothing in Phase 3 sets or clears the vision engine's coresident field.
+    env = ctx.render(key)
     res.kv_requested = env.get("ATLAS_KV_TYPE", spec.get("kv_class", ""))
     # The previous engine is released BEFORE the model-file check: an engine that never loads must not leave the
     # earlier one resident with the driver believing this one is (its --previous would then name the wrong engine and
@@ -1436,7 +1823,9 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     res.kv_proof_ok, res.kv_proof_msg, res.kv_applied = prove_kv(key, res.kv_requested, proof_lines, inv, since, port)
     log(f"{key}: V4 {'PASS' if res.kv_proof_ok else 'FAIL'}: {res.kv_proof_msg}")
     record("V4", "pass" if res.kv_proof_ok else "fail", res.kv_proof_msg)
+    host_load = host_memory(key)  # S52 (b): before any request, so the tests' cache growth can be told apart
     run_measurements(ctx, res, key, port, env)
+    take_memory_record(ctx, res, key, env, inv, since, host_load)  # S52 (a)-(c): a record, never a verdict
     if not res.load_error and not res.crashed_at_8k:
         register_footprint(ctl, res, baseline)
         res.resident_after = True  # the next engine's swap (or `finish`) measures this one's release
@@ -1619,6 +2008,7 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         ok, msg, applied = prove_kv(key, kv, proof_lines, inv, since, port)
         rung["kv_proof_ok"], rung["kv_proof_msg"], rung["applied"] = ok, msg, applied
         log(f"{key}: rung {kv} proof {'ok' if ok else 'NOT ok'}: {msg}")
+        host_load = host_memory(key)  # S52 (b), before the rung's first request
         require_generation_idle(ctx.orch_url, f"{key} rung {kv} coherence prompt")  # rule 3: direct to the port
         coherent, detail = coherence_check(port, key)
         rung["coherent"], rung["coherence"] = coherent, detail
@@ -1634,6 +2024,8 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
             else:
                 register_footprint(ctl, res, baseline)
             rung.update({f: getattr(res, f) for f in LADDER_RUNG_FIELDS})
+        # S52 (a)-(c) for every rung that loaded, labelled with its KV type: each rung is its own profile.
+        take_memory_record(ctx, res, key, env, inv, since, host_load, label=kv)
         stop_and_release(ctx, ctl, key, baseline, res)
         rung["released"] = res.released
         if res.released is False:
@@ -1870,6 +2262,292 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
     return 0
 
 
+# --- S52 Phase 3 items: the Principal's two to-dos at the end of Phase 3 (step 04) -----------------------------------
+
+KV_TODO_ID = "kv-estimates"
+CACHE_TODO_ID = "cache-ram"
+CHAT_MODES = ("chat", "vision")  # engines.json modes started with --context-shift (phase2/engine-env.py CHAT_MODES)
+
+
+def todo(tid: str, title: str, detail: str) -> None:
+    """One to-do for the driver (lib/common.sh todo_add). Tabs and newlines would break the line protocol."""
+    print(f"TODO\t{tid}\t{' '.join(title.split())}\t{' '.join(detail.split())}", flush=True)
+
+
+def _ceil_to(x: float, step: int) -> int:
+    return int(-(-x // step) * step)
+
+
+def cache_suggestion(rec: dict[str, Any]) -> dict[str, Any]:
+    """INFERRED, for the Principal to weigh (S52 (b)): an explicit --cache-ram that holds a RAM copy of every slot at
+    full length (the engine's measured context memory rounded up to 256 MiB, never above the 8192 MiB default; the
+    default made explicit when the context memory is UNKNOWN), and, where checkpoints are made, an explicit
+    --ctx-checkpoints of one per --checkpoint-min-step across a full slot plus the one near the prompt's end. Worst
+    cases: the cache limit plus every slot full of checkpoints of one slot's sliding-window, recurrent and compressor
+    state.
+
+    "Not measured" is not "not made" (S52 fix round): with no K/V, recurrent or compressor size line in the log
+    (checkpoints_known False: a journal without the -lv 4 lines, rotated or empty) whether the engine makes checkpoints,
+    and their size, is UNKNOWN, so --ctx-checkpoints is suggested anyway (it does nothing on an engine that makes none)
+    and the worst cases are lower bounds that leave the checkpoints out. ctx_checkpoints None means none are made: K/V
+    lines were parsed and none of them is sliding-window, recurrent or compressor state."""
+    m, prof = rec.get("measured") or {}, rec.get("profile") or {}
+    parallel = max(int(prof.get("parallel") or 1), 1)
+    window = m.get("n_ctx_slot") or int(prof.get("ctx") or 0) // parallel
+    ctx_mib = m.get("context_mib")
+    cache_ram = (LLAMA_CACHE_RAM_DEFAULT_MIB if ctx_mib is None
+                 else max(256, min(LLAMA_CACHE_RAM_DEFAULT_MIB, _ceil_to(ctx_mib, 256))))
+    n = min(LLAMA_CTX_CHECKPOINTS_DEFAULT, -(-window // LLAMA_CHECKPOINT_MIN_STEP) + 1) if window else \
+        LLAMA_CTX_CHECKPOINTS_DEFAULT
+    ckpt = m.get("checkpoint_state_mib")
+    if ckpt is None and m.get("kv_mib") is None:
+        return {"cache_ram_mib": cache_ram, "ctx_checkpoints": n, "checkpoints_known": False,
+                "worst_default_mib": LLAMA_CACHE_RAM_DEFAULT_MIB, "worst_suggested_mib": cache_ram}
+    if ckpt is None:
+        return {"cache_ram_mib": cache_ram, "ctx_checkpoints": None, "checkpoints_known": True,
+                "worst_default_mib": LLAMA_CACHE_RAM_DEFAULT_MIB, "worst_suggested_mib": cache_ram}
+    return {"cache_ram_mib": cache_ram, "ctx_checkpoints": n, "checkpoints_known": True,
+            "worst_default_mib": round(LLAMA_CACHE_RAM_DEFAULT_MIB + LLAMA_CTX_CHECKPOINTS_DEFAULT * parallel * ckpt),
+            "worst_suggested_mib": round(cache_ram + n * parallel * ckpt)}
+
+
+def resident_memory_record(ctx: Ctx, key: str) -> dict[str, Any]:
+    """S52 (c) and (b) for a resident chat engine Phase 3 never loads (the router, Phase 2): its current invocation's
+    journal and its host RAM now, read-only. No projection: resident models are never charged (Section 4.1)."""
+    try:
+        env = ctx.env(key)
+        if not unit_active(key):
+            return {"label": "resident", "error": f"{unit_of(key)} is not active", "unknown": ["not running"],
+                    "taken_at": now_iso()}
+        inv = unit_invocation_id(key)
+        lines: list[str] = []
+        if inv:
+            p = run(["journalctl", "--no-pager", "-o", "cat", f"_SYSTEMD_INVOCATION_ID={inv}"], timeout=120)
+            lines = p.stdout.splitlines()
+        rec = memory_record(env, parse_memory_lines(lines), None,
+                            "resident: never charged against the engine budget (Section 4.1)",
+                            {"why": "not read: Phase 3 does not load the resident engines"}, host_memory(key),
+                            "resident")
+        if not lines:
+            rec["unknown"].insert(0, f"the journal of its current invocation ({inv or 'none'}) is empty (rotated?)")
+        return rec
+    except Terminated:
+        raise
+    except Exception as exc:  # S52: a record, never a verdict
+        return {"label": "resident", "error": f"{type(exc).__name__}: {exc}", "unknown": [str(exc)],
+                "taken_at": now_iso()}
+
+
+MemoryEntry = tuple[str, str, dict[str, Any], int | None]  # (engine, role, record, GTT footprint registered)
+
+
+def memory_entries(ctx: Ctx) -> list[MemoryEntry]:
+    """Every load's record from the result files (a DeepSeek rung is its own entry), then the resident chat engines."""
+    out: list[MemoryEntry] = []
+    for key in ctx.core_keys():
+        res = load_result(ctx, key)
+        if res is None:
+            out.append((key, "not tested", {}, None))
+            continue
+        if not res.memory:
+            out.append((key, "no record: the load failed, or the result predates S52", {}, None))
+            continue
+        for rec in res.memory:
+            label = str(rec.get("label") or "")
+            rung = next((r for r in res.ladder if r.get("kv") == label), None) if label else None
+            fp = (rung or {}).get("footprint_bytes") if label else res.footprint_bytes
+            role = ""
+            if label:
+                role = f"ladder rung {label}" + (", the rung that stands" if label == res.kv_applied else "")
+            out.append((key, role, rec, fp))
+    for key in ctx.order:
+        spec = ctx.spec(key)
+        if spec.get("arbiter_class") == "resident" and spec.get("mode", "chat") in CHAT_MODES:
+            out.append((key, "resident, not loaded by Phase 3: current journal and RSS, read-only",
+                        resident_memory_record(ctx, key), None))
+    return out
+
+
+def _head(key: str, role: str) -> str:
+    return f"{key} ({role})" if role else key
+
+
+def kv_item(key: str, role: str, rec: dict[str, Any], footprint: int | None) -> str:
+    """One engine (or rung) in the kv-estimates to-do: measured context memory beside the projection."""
+    if not rec or rec.get("error"):
+        return f"{_head(key, role)}: UNKNOWN" + (f" (record not taken: {rec['error'][:160]})" if rec else "")
+    m, prof, proj = rec["measured"], rec["profile"], rec.get("projected")
+    text = (f"{_head(key, role)} {prof['ctx']} x {prof['parallel']} {prof['kv']}: context "
+            f"{_gib(m['context_mib'])} GiB measured")
+    if m.get("kv_mib") is not None:
+        bits = [f"K/V {_gib(m['kv_mib'])} GiB in {m['kv_lines']} line(s)"]
+        if m.get("swa_mib"):
+            bits.append(f"of which sliding-window {_gib(m['swa_mib'])}")
+        if m.get("recurrent_mib") is not None:
+            bits.append(f"recurrent state {_gib(m['recurrent_mib'])}")
+        if m.get("dsv4_state_mib") is not None:
+            bits.append(f"compressor state {_gib(m['dsv4_state_mib'])}")
+        text += f" ({', '.join(bits)})"
+    else:
+        text += " (no K/V size line in the load log: TRACE at the pin, printed only at -lv 4)"
+    factor = (proj or {}).get("kv_factor")
+    if proj is not None:
+        text += (f" vs {proj['kv_bytes'] / GIB:.2f} GiB projected ({proj.get('per_token_f16')} B/token at f16 x "
+                 f"{factor})")
+    elif rec.get("label") == "resident":
+        text += " (resident: never charged, Section 4.1)"
+    else:
+        why = next((u for u in rec.get("unknown", []) if u.startswith("projection")), "projection: ?")
+        text += f" vs projection UNKNOWN ({why})"
+    if m.get("context_mib") and factor and prof["ctx"]:
+        text += f"; implied {m['context_mib'] * MIB / (prof['ctx'] * factor):,.0f} B/token at f16 at this profile"
+    if m.get("compute_mib"):
+        text += f"; compute buffers {_gib(sum(m['compute_mib'].values()))} GiB"
+    if m.get("mmproj_compute_mib"):
+        text += f" (+ mmproj {_gib(sum(m['mmproj_compute_mib'].values()))})"
+    if footprint is not None:
+        text += f"; GTT footprint {fmt_gb(footprint)} registered (rule 1)"
+    return text
+
+
+def cache_item(key: str, role: str, rec: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """One engine in the cache-ram to-do: its host RAM, what the log says of its caches, and the suggestion."""
+    if not rec or rec.get("error"):
+        return f"{_head(key, role)}: UNKNOWN" + (f" (record not taken: {rec['error'][:160]})" if rec else ""), None
+    m, hl, ht = rec["measured"], rec["host_after_load"], rec["host_after_tests"]
+    growth = rec.get("anon_growth_bytes")
+    if rec.get("label") == "resident":
+        text = f"{_head(key, role)}: RSS {_rss(ht)} GiB now (RssAnon {_rss(ht, 'RssAnon')})"
+    else:
+        text = (f"{_head(key, role)}: RSS {_rss(hl)} GiB after the load, {_rss(ht)} after the tests (RssAnon "
+                f"{_rss(hl, 'RssAnon')} -> {_rss(ht, 'RssAnon')}, "
+                f"{'UNKNOWN' if growth is None else f'{growth / MIB:+.0f} MiB'})")
+    pc, ck = m["prompt_cache"], m["checkpoints"]
+    if pc["evicted"]:
+        text += f"; prompt cache: {pc['evicted']} eviction(s) logged, largest entry {pc['evicted_max_mib']} MiB"
+    else:
+        text += "; prompt cache: no eviction logged (below its limit)"
+    if pc.get("state_max_mib") is not None:
+        text += f", {pc['state_max_mib']} MiB in {pc['prompts_max']} prompt(s) at most (TRACE)"
+    if pc.get("oversize_skipped"):
+        text += f", {pc['oversize_skipped']} prompt(s) larger than the limit skipped"
+    sug = cache_suggestion(rec)
+    if not sug["checkpoints_known"]:  # not measured, which is not "none made" (cache_suggestion)
+        if ck.get("erased") or ck.get("created_max"):
+            made = f", {ck['created_max']} of {ck['limit']} made at most" if ck.get("created_max") else ""
+            text += (f"; checkpoints: {ck['erased']} erased{made} logged, so it makes them, but one slot's state is "
+                     "UNKNOWN (no K/V, recurrent or compressor size line in the load log)")
+        else:
+            text += ("; checkpoints: UNKNOWN (no K/V, recurrent or compressor size line in the load log, so whether "
+                     "this engine makes them, and their size, is not known)")
+        flags = f"--cache-ram {sug['cache_ram_mib']} --ctx-checkpoints {sug['ctx_checkpoints']}"
+        return f"{text}; suggested {flags} (at least {sug['worst_suggested_mib']} MiB, checkpoints UNKNOWN)", sug
+    if sug["ctx_checkpoints"] is None:
+        text += "; checkpoints: none made (its cache rolls back)"
+        flags = f"--cache-ram {sug['cache_ram_mib']}"
+    else:
+        made = f", {ck['created_max']} of {ck['limit']} made at most (TRACE)" if ck.get("created_max") else ""
+        text += (f"; checkpoints: {ck['erased']} erased{made}, one slot's state about "
+                 f"{m['checkpoint_state_mib']:.1f} MiB (INFERRED), so the defaults allow up to "
+                 f"{sug['worst_default_mib']} MiB")
+        flags = f"--cache-ram {sug['cache_ram_mib']} --ctx-checkpoints {sug['ctx_checkpoints']}"
+    return f"{text}; suggested {flags} (up to {sug['worst_suggested_mib']} MiB)", sug
+
+
+def is_weight_bearing(key: str, entries: Sequence[MemoryEntry]) -> bool:
+    """True for an engine the Arbiter charges, False for a resident one (memory_entries' role)."""
+    return not any(k == key and role.startswith("resident") for k, role, _, _ in entries)
+
+
+KV_TODO_TITLE = ("Phase 3 measured each engine's context memory: compare it with the Arbiter's estimates and decide "
+                 "whether to correct them (S52)")
+CACHE_TODO_TITLE = ("Set --cache-ram and --ctx-checkpoints explicitly on each chat llama-server: host RAM outside the "
+                    "Arbiter's budget (S52)")
+
+
+def raise_memory_todos(entries: Sequence[MemoryEntry], note: str = "") -> None:
+    """Pure apart from the two TODO lines: kv-estimates and cache-ram with the measured figures in their detail."""
+    lead = f"{note}. " if note else ""
+    kv_items = " | ".join(kv_item(k, role, rec, fp) for k, role, rec, fp in entries) or "no record"
+    todo(KV_TODO_ID, KV_TODO_TITLE,
+         lead + "Measured from each load's own log (the llama_kv_cache, llama_memory_recurrent and "
+         "llama_dsv4_comp_state 'size =' lines of llama.cpp b29c606) beside the Arbiter's projection for the same "
+         "profile (arbiter.py projected_footprint, estimate): " + kv_items + ". The estimates are "
+         "orchestrator/src/atlas/arbiter.py KV_BYTES_PER_TOKEN_F16 (an engines.json kv_bytes_per_token_f16 overrides "
+         "one engine's) and err high on purpose (an out-of-memory backstop). The GTT footprint Phase 3 registered "
+         "(POST /arbiter/register, Section 4.2 rule 1) replaces the projection only at the profile it was measured at "
+         "and only until the orchestrator restarts: the Arbiter keeps it in memory (arbiter.py Arbiter.measured) and "
+         "nothing replays it or re-measures an ordinary load (VERIFIED in the source). After any restart or reboot "
+         "the estimates govern every load, pairing and eviction, at every profile (another context size, a KV-ladder "
+         "rung, the Deep Think plans), so a corrected figure changes real Arbiter decisions. The implied figure is "
+         "the measured context memory over ctx x the K/V type's size factor; recurrent state, sliding-window cells "
+         "and compressor state are per slot and do not scale with ctx, so it holds at the measured profile only. "
+         "Updating the figures is the Principal's call; Phase 3 changed nothing.")
+    by_engine: dict[str, tuple[str, dict[str, Any] | None]] = {}
+    for k, role, rec, _ in entries:
+        if k not in by_engine or "the rung that stands" in role:  # one per engine: the ladder's standing rung
+            by_engine[k] = cache_item(k, role, rec)
+    # (worst at the defaults, worst at the suggested values, checkpoints UNKNOWN: then both are lower bounds)
+    heavy = sorted((s["worst_default_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
+                   for k, (_, s) in by_engine.items() if s and is_weight_bearing(k, entries))[-2:]
+    light = [(s["worst_default_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
+             for k, (_, s) in by_engine.items() if s and not is_weight_bearing(k, entries)]
+    total = ""
+    if heavy:
+        d, s = (sum(w[i] for w in heavy + light) / 1024 for i in (0, 1))
+        # every record, not only the summed ones: an UNKNOWN engine ranked out of the two largest may be larger
+        lower = any(s and not s["checkpoints_known"] for _, s in by_engine.values())
+        bound, least = ("at worst at least", "at least ") if lower else ("up to", "")
+        total = (f" The two largest engines plus the resident chat engine(s) could hold {bound} {d:.1f} GiB of host "
+                 f"RAM at the defaults and {least}{s:.1f} GiB at the suggested values"
+                 + (" (checkpoints UNKNOWN for at least one engine, whose checkpoints are left out of the sum "
+                    "and which may be larger than the two ranked here)" if lower else "")
+                 + ", against the host reserve (16 GiB, S44) that also carries about 12 GB of CPU-side services "
+                 "(Section 4.2 rule 3: at most two engines resident).")
+    todo(CACHE_TODO_ID, CACHE_TODO_TITLE,
+         lead + "Each chat llama-server keeps a prompt cache in host RAM (--cache-ram, default 8192 MiB per server; "
+         "idle slots are copied into it at every new task, --cache-idle-slots on) and, where its cache cannot roll "
+         "back (sliding-window or recurrent layers), up to 32 context checkpoints per slot (--ctx-checkpoints). "
+         "Neither is on the GTT counter or in the Arbiter's grants; only the host reserve covers them. Measured in "
+         "Phase 3 (a few test requests, not normal use; the cache and checkpoint sizes are TRACE lines, logged at "
+         "the -lv 4 phase2/engine-env.py renders, and RssAnon's growth over the tests is the measured bound): "
+         + (" | ".join(text for text, _ in by_engine.values()) or "no record") + "." + total + " Suggested values, "
+         "INFERRED: --cache-ram = the engine's measured context memory rounded up to 256 MiB, at most the 8192 "
+         "default (a RAM copy of every slot); --ctx-checkpoints = the slot window / 8192 + 1 (one per "
+         "--checkpoint-min-step across a full slot), where checkpoints are made or UNKNOWN (it does nothing on an "
+         "engine that makes none). They would go in engines.json "
+         "extra_args (\"--cache-ram\", \"<MiB>\", \"--ctx-checkpoints\", \"<N>\"); setting them is the Principal's "
+         "call, Phase 3 changed no engine setting.")
+
+
+def cmd_memory(ctx: Ctx, _args: argparse.Namespace) -> int:
+    """S52 Phase 3 items at the end of Phase 3 (step 04). Never fails the phase and always raises both to-dos: a
+    broken record is UNKNOWN in its detail, and unreadable records or a to-do that cannot be built still leave the
+    two to-dos with the reason (SIGTERM still stops the run)."""
+    note = ""
+    try:
+        entries = memory_entries(ctx)
+    except Terminated:
+        raise
+    except Exception as exc:  # S52: records, never a verdict
+        entries, note = [], f"Figures UNKNOWN: the result files could not be read ({type(exc).__name__}: {exc})"
+        log(f"memory: {note}")
+    for key, role, rec, _ in entries:
+        if role.startswith("resident"):
+            log(f"{key}: {memory_line(rec)}")
+    try:
+        raise_memory_todos(entries, note)
+    except Terminated:
+        raise
+    except Exception as exc:  # S52: the to-dos go out with the reason rather than not at all
+        why = (f"Figures UNKNOWN: the to-do could not be built ({type(exc).__name__}: {exc}); see "
+               f"{ctx.results_dir}/<engine>.json, field memory")
+        log(f"memory: {why}")
+        todo(KV_TODO_ID, KV_TODO_TITLE, why)
+        todo(CACHE_TODO_ID, CACHE_TODO_TITLE, why)
+    return 0
+
+
 # --- two-residency (Section 17 step 3; V21) and the real-engine Arbiter proof (V14b) ---------------------------------
 
 
@@ -2023,10 +2701,6 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
             f"{fmt_gb(saved_baseline)}: the resident set changed since step 02; the settled figure is used")
     budget = int((ctl.status() or {}).get("budget_bytes") or 0) or DEFAULT_BUDGET_BYTES
     loaded: list[str] = []
-    # The vision engine's co-resident profile (parallel_coresident / ctx_size_coresident) is a TEMPORARY override:
-    # journalled before it is written, cleared in cleanup(); the orchestrator decides co-residency live.
-    pend_vision = pending_begin(ctx, vision_key, ["coresident"], "two-residency vision profile",
-                                clear_always=["coresident"])
     used_after: dict[str, int] = {}  # GTT used right after each load, so each unload has a measured release target
 
     def cleanup() -> list[str]:
@@ -2040,9 +2714,8 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
             out[f"release_note_{k}"] = note
             if not ok:
                 problems.append(f"{k} did not release after the two-residency test ({note})")
-        # Restore the vision engine's stand-alone rendering (8 slots); the orchestrator decides co-residency live.
-        pending_restore(ctx, pend_vision)
-        pending_end(ctx, pend_vision)
+        # Nothing to restore (S52): both units ran as rendered for production, the vision engine at its standing
+        # co-resident profile, which it keeps after this step.
         return problems
 
     def finish(v21: tuple[str, str], v14b: tuple[str, str]) -> int:
@@ -2066,16 +2739,23 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
                         f"counter and the llama-server@ units, restart {ORCH_UNIT}.service, then re-run step 03")
         return 0
 
-    tenv = ctx.render(text_key, [], ["coresident"])
-    venv = ctx.render(vision_key, [("coresident", "true")], [])  # parallel_coresident / ctx_size_coresident
-    if venv.get("ATLAS_CORESIDENT") != "1":
-        raise Infra(f"engine-env.py did not render {vision_key} with ATLAS_CORESIDENT=1")
     # Section 4.3: the vision engine runs 2 slots while co-resident "keeping the pair inside the ~22 GiB of cache the
-    # 142 GB combination leaves". The rendered profile must BE engines.json's parallel_coresident / ctx_size_coresident
-    # before anything is loaded, or the delta accepted below would be an 8-slot profile's.
+    # 142 GB combination leaves". Since S52 that is its STANDING profile, so both units are rendered exactly as
+    # production runs them (no temporary override, nothing restored afterwards) and the rendered vision profile must
+    # BE engines.json's parallel_coresident / ctx_size_coresident before anything is loaded, or the delta accepted
+    # below would be an 8-slot profile's.
     want_par, want_ctx = vspec.get("parallel_coresident"), vspec.get("ctx_size_coresident")
     if want_par is None or want_ctx is None:
         raise Infra(f"engines.json: {vision_key} has no parallel_coresident/ctx_size_coresident (Section 4.3)")
+    tenv = ctx.render(text_key)
+    venv = ctx.render(vision_key)
+    if venv.get("ATLAS_CORESIDENT") != "1":
+        if ctx.override_of(vision_key, "coresident") is False:
+            raise Infra(f"overrides.json sets coresident=false for {vision_key}: the Principal's choice of its full "
+                        "profile (S52), at which the Section 4.1 pair does not form; Phase 3 does not override it. To "
+                        f"test the pair: engine-env.py --clear-override {vision_key} coresident, then re-run step 03")
+        raise Infra(f"engine-env.py did not render {vision_key} with ATLAS_CORESIDENT=1 (its standing co-resident "
+                    "profile, S52)")
     if venv.get("ATLAS_PARALLEL") != str(int(want_par)) or venv.get("ATLAS_CTX_SIZE") != str(int(want_ctx)):
         raise Infra(f"engine-env.py rendered {vision_key} co-resident as parallel {venv.get('ATLAS_PARALLEL')}, ctx "
                     f"{venv.get('ATLAS_CTX_SIZE')}; engines.json says parallel_coresident {want_par}, "
@@ -2221,6 +2901,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--overrides", required=True, help="$ATLAS_ETC/engines/overrides.json")
     ap.add_argument("--admin-token-file", default=None,
                     help="ORCH_ADMIN_TOKEN_FILE of orchestrator.env when configured (X-Atlas-Token for /arbiter/*)")
+    ap.add_argument("--atlas-python", default=str(Path(os.environ.get("ATLAS_OPT", "/opt/atlas")) / "venv/bin/python"),
+                    help="$ATLAS_OPT/venv/bin/python: runs the Arbiter's own projection for the S52 memory record")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("prepare").set_defaults(fn=cmd_prepare)
     p = sub.add_parser("engine")
@@ -2232,6 +2914,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_finish)
     sub.add_parser("summarize").set_defaults(fn=cmd_summarize)
     sub.add_parser("table").set_defaults(fn=cmd_table)
+    sub.add_parser("memory").set_defaults(fn=cmd_memory)
     p = sub.add_parser("coresident")
     p.add_argument("--text", required=True)
     p.add_argument("--vision", required=True)
@@ -2245,7 +2928,7 @@ def main(argv: list[str] | None = None) -> int:
         ctx = Ctx(engines_path=Path(args.engines), env_dir=Path(args.env_dir), results_dir=Path(args.results_dir),
                   orch_url=args.orch_url, engine_env=Path(args.engine_env), models_dir=Path(args.models_dir),
                   slots_dir=Path(args.slots_dir), port_base=args.port_base, overrides=Path(args.overrides),
-                  admin_token=read_admin_token(args.admin_token_file))
+                  admin_token=read_admin_token(args.admin_token_file), atlas_python=args.atlas_python)
         log(f"{args.cmd}: orchestrator {args.orch_url}, GTT counter under {drm_root()}"
             + (" (admin token loaded)" if ctx.admin_token else ""))
         ctx.load_engines()

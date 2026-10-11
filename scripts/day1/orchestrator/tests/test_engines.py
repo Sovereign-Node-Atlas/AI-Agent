@@ -14,10 +14,12 @@ from atlas.engines import (
     EngineControlError,
     EngineError,
     LlamaClient,
+    SlotWindow,
     StubController,
     SystemdEngineController,
     Timings,
 )
+from stubs import counting
 
 TIMINGS = {"cache_n": 0, "prompt_n": 512, "prompt_ms": 1000.0, "prompt_per_token_ms": 1.95,
            "prompt_per_second": 512.0, "predicted_n": 128, "predicted_ms": 4000.0, "predicted_per_token_ms": 31.25,
@@ -25,7 +27,9 @@ TIMINGS = {"cache_n": 0, "prompt_n": 512, "prompt_ms": 1000.0, "prompt_per_token
 
 
 def _client(handler: Any) -> LlamaClient:
-    return LlamaClient("http://127.0.0.1:8101", transport=httpx.MockTransport(handler))
+    # Generation counts the prompt first and needs a per-slot window (S52; test_context_window.py covers both).
+    return LlamaClient("http://127.0.0.1:8101", transport=httpx.MockTransport(counting(handler)),
+                       window=SlotWindow("gpt-oss-120b", 32768, "test"))
 
 
 def test_llama_client_dials_loopback_only() -> None:

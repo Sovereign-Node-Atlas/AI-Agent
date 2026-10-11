@@ -18,9 +18,23 @@ of {"kv_type": "f16|q8_0|q4_0", "ctx_size": N, "parallel": N, "coresident": true
 ladder writes its winning cache type (and, for an f16 result, the capped ctx_size = ctx_size_f16_cap) there and re-runs
 this script, so the unit file and the env file always agree (gguf-models.md §6, §12 item 2).
 
+Standing profile (S52): an engine that defines a co-resident profile (ctx_size_coresident and/or parallel_coresident;
+today only qwen2.5-vl-72b, 2 x 32k) is rendered AT that profile with ATLAS_CORESIDENT=1 when overrides.json says
+nothing, so the unit the Arbiter projects from is the one that pairs with gpt-oss-120b (Section 4.1's everyday
+pairing). Its full profile (ctx_size x parallel, 8 x 32k) is rendered only for an explicit "coresident": false, the
+Principal's choice; Phase 3 never sets that field. orchestrator/src/atlas/config.py EngineSpec.standing_coresident
+states the same rule for the Arbiter's projection before a unit exists.
+
 Model files are located in $ATLAS_SRV/models/<key>/ by model_file_pattern (first shard). A file that is not present yet
 (Phase 2 renders the seven large engines before Phase 3 pulls them) is rendered with ATLAS_MODEL_PRESENT=0 and the
 expected path, so `systemctl start` fails loudly with llama.cpp's own "failed to load model" rather than silently.
+
+Log verbosity (S52 fix round): every chat/vision engine runs with `--verbosity 4`. At the pinned llama.cpp (b29c606)
+common_log_get_verbosity maps the library's INFO level to TRACE (common/log.cpp:532, since 67b2b7f2f) and llama-server's
+default threshold is 3 (common/common.h:534), so without it "llama_kv_cache: size =", "llama_context: flash_attn =",
+the recurrent and compressor size lines and the compute-buffer lines never reach the journal: V4's proof and the S52
+memory records (phase3/loadtest.py) read them. Exactly 4: at 5 or with -v, --fit's trial context keeps INFO
+(common/common.cpp:1326, common/fit.cpp:52) and prints a second set of K/V lines. It changes the log level only.
 
 --slot-save-path is Appendix B's single directory /srv/atlas/data/slots for every chat/vision engine (the orchestrator
 names slot files per engine); the directory is created only when installing, never in --print mode (read-only).
@@ -148,6 +162,11 @@ def check_extra_flag(token: str, key: str) -> str:
     return token
 
 
+def has_coresident_profile(eng: dict[str, Any]) -> bool:
+    """True when engines.json gives the engine a co-resident profile: its standing profile (docstring, S52)."""
+    return eng.get("ctx_size_coresident") is not None or eng.get("parallel_coresident") is not None
+
+
 def build_args(
     eng: dict[str, Any],
     ov: dict[str, Any],
@@ -159,7 +178,9 @@ def build_args(
     key = eng["key"]
     mode = eng.get("mode", "chat")
     kv_type = str(ov.get("kv_type", eng.get("kv_class", "none")))
-    coresident = bool(ov.get("coresident", False))
+    # S52 (docstring "Standing profile"): the co-resident profile, where one is defined, is the default; only an
+    # explicit overrides.json "coresident": false selects the full one.
+    coresident = bool(ov.get("coresident", has_coresident_profile(eng)))
     ctx_base = eng["ctx_size_coresident"] if coresident and "ctx_size_coresident" in eng else eng["ctx_size"]
     par_base = eng["parallel_coresident"] if coresident and "parallel_coresident" in eng else eng["parallel"]
     ctx_size = int(ov.get("ctx_size", ctx_base))
@@ -182,6 +203,11 @@ def build_args(
     if mode in CHAT_MODES:
         # Section 4.3: context shift with n_keep on; both are off/0 by default now (research conflict c).
         args += ["--keep", str(n_keep), "--context-shift"]
+        # Log verbosity 4 (S52 fix round; docstring "Log verbosity"): at the pin library INFO lines are TRACE
+        # (common/log.cpp:532, since 67b2b7f2f "logs : reduce"), so at the default 3 the V4 proof lines and the S52
+        # memory records' size and compute lines never reach the journal; V4 (phase3/loadtest.py prove_kv) and the S52
+        # records (parse_memory_lines) read them. Exactly 4, never 5 or -v (docstring). A log level only.
+        args += ["--verbosity", "4"]
         # Appendix B: `--slot-save-path /srv/atlas/data/slots`, the same directory for every engine (no per-key subdir).
         args += ["--slot-save-path", str(slots_dir)]
     if kv_type != "none":

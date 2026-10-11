@@ -353,7 +353,10 @@ DEFAULT_CROSS_CHECK_PLAN: Mapping[str, tuple[str, str]] = {"minerva": ("arthur",
 class LlamaCrossChecker:
     """9.2 strong cross-check on llama-server: a second persona on a different engine judges a held draft.
 
-    `client_for(engine_key)` returns a LlamaClient for that engine (api.py: LlamaClient.for_engine(config.engines[k]));
+    `client_for(engine_key)` returns a LlamaClient for that engine (api.py: production_llama_client(arbiter,
+    config.engines[k]), whose per-slot window follows the unit, S52: a draft plus prompt that cannot fit the engine's
+    slot, Meditron's 4096 tokens above all, raises ContextWindowExceeded, which the gate records as a failed
+    cross-check);
     `lease(engine_key, task_id)` is an optional context manager that makes the engine resident and holds the single
     generation slot for the call (the Arbiter: request_load + acquire_generation, 4.2); without it the engine must
     already be resident, and an unreachable server is an EngineError the gate records as a failed cross-check.

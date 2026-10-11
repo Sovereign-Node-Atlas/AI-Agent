@@ -115,11 +115,14 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   (pstore); XFCE + xrdp + Google Chrome (Google's apt repo, telemetry/sign-in off by policy, never a snap); Docker with GPU passthrough and the
   DOCKER-USER egress rules; WG-Easy, Cloudflare ddns, ntfy; gate.
 - **Phase 2 — engines and services** (30-60 min, no large downloads): llama.cpp Vulkan build (`-DLLAMA_OPENSSL=ON`,
-  `-DLLAMA_USE_PREBUILT_UI=OFF`); Redis, Celery, the orchestrator (`atlas` package: Arbiter, router, approval queue,
-  ledger); Open WebUI hardened offline; ChromaDB, LightRAG, the three resident small models, Docling; Kokoro,
-  Chatterbox, Whisper (speaches), PyAnnote; the Section 15.1 tools and the cross-build container; Cloudflare token
-  relocation (V23); Google OAuth (V20); the AEGIS sandbox image; restic + AEGIS timers (V13); Sentinel and prune
-  timers; the Windows share automount (skipped on Day 1); the gocryptfs vault; gate.
+  `-DLLAMA_USE_PREBUILT_UI=OFF`) and one env file per engine (`phase2/engine-env.py`; the vision engine at its standing
+  2 × 32k profile, every chat engine logging at `--verbosity 4` for V4 and the Phase 3 records, doc S52); Redis, Celery,
+  the orchestrator (`atlas` package: Arbiter, router, approval queue, ledger, and the per-slot window that keeps every
+  request to a llama-server inside one slot of its engine, doc S52, §6); Open WebUI hardened offline; ChromaDB,
+  LightRAG, the three resident small models, Docling; Kokoro, Chatterbox, Whisper (speaches), PyAnnote; the Section 15.1
+  tools and the cross-build container; Cloudflare token relocation (V23); Google OAuth (V20); the AEGIS sandbox image;
+  restic + AEGIS timers (V13); Sentinel and prune timers; the Windows share automount (skipped on Day 1); the gocryptfs
+  vault; gate.
 - **Day 1 close-out, before Phase 3 starts downloading:** copy the recovery material to the USB drive and store it
   away from the node, not beside it (Section 22, R16; D3): `/etc/atlas/secrets/restic.pass` (`sudo cat` it; shown once
   in Phase 2 step 7), the LUKS recovery key shown in Phase 1 step 2 (on-node copy under `/etc/atlas/secrets/` only when the OS volume is encrypted; otherwise your written copy is the only other one), and the
@@ -127,9 +130,12 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   burglary that takes the node takes anything beside it; the USB copy is the one that survives.
 - **Phase 3 — core LLM pull** (download-bound): the seven GGUF engines at their fixed quantisations, sha256 from the
   Hugging Face tree API into `MANIFEST.json`; per-engine load tests through the Arbiter (V4 KV proof, tok/s at 512 and
-  8k, swap time, memory returned); the two-residency test (V14b, V21); gate. The Sentinel/prune timers, the GPU Celery
-  worker and Open WebUI are quiesced during the tests and resumed afterwards: **do not use the assistant while Phase 3
-  runs** (the ntfy push says when it is done).
+  8k, swap time, memory returned), each load also recording, never as a verdict, its context memory from its own log
+  beside the Arbiter's estimate, its host RAM and whether llama-server switched context shift off (doc S52); the
+  two-residency test (V14b, V21; the vision engine at its standing 2 × 32k profile, no temporary override); gate,
+  preceded by two to-dos for you built from those records, `kv-estimates` and `cache-ram` (§6). The Sentinel/prune
+  timers, the GPU Celery worker and Open WebUI are quiesced during the tests and resumed afterwards: **do not use the
+  assistant while Phase 3 runs** (the ntfy push says when it is done).
 - **Phase 4 — multimodal engines** (build-bound): the one ROCm base image (AMD's gfx1151 wheels, ROCm 10.0.0, torch
   2.13.0, torchvision 0.28.0, torchaudio 2.11.0.2, each pinned exactly; doc S51) and its self-test (V11, which also
   checks that the installed torchaudio is the pinned build); the green engines, then the yellow ones, then PointLLM
@@ -179,7 +185,8 @@ real vault and records V18.
 | Phase logs | `/var/lib/atlas/day1/logs/<phase>-<YYYYMMDD>.log`; detached phases also in `journalctl -u atlas-day1-phase3` / `-phase4` |
 | Verification records | `/var/lib/atlas/day1/verify.jsonl` (one JSON line per `record_v`; latest per id wins) |
 | Done markers | `/var/lib/atlas/day1/done/<phase>.<step>` and `<phase>.gate` |
-| Phase 3 results | `/var/lib/atlas/day1/phase3/results/<engine>.json`; model manifests `/srv/atlas/data/manifests/`, `/srv/atlas/models/<key>/MANIFEST.json` |
+| Phase 3 results | `/var/lib/atlas/day1/phase3/results/<engine>.json` (field `memory`: each load's context memory, host RAM, cache and context-shift record, doc S52); model manifests `/srv/atlas/data/manifests/`, `/srv/atlas/models/<key>/MANIFEST.json` |
+| Engine profiles (doc S52) | `/etc/atlas/engines/<key>.env`, rendered by `phase2/engine-env.py` from `config/engines.json` and `/etc/atlas/engines/overrides.json`; the Arbiter projects exactly what these say, and charges a footprint Phase 3 measured only at the profile it was measured at, until the orchestrator restarts. The vision engine renders `--ctx-size 65536 --parallel 2` (`ATLAS_CORESIDENT=1`), its standing profile, so it pairs with gpt-oss-120b. To give it 8 slots instead (then it swaps gpt-oss out rather than pair): `sudo /opt/atlas/day1/phase2/engine-env.py --set-override qwen2.5-vl-72b coresident false`; to return: `sudo /opt/atlas/day1/phase2/engine-env.py --clear-override qwen2.5-vl-72b coresident`. Either takes effect when the unit next starts. Phase 3 never changes this field and stops its step 3 while it is `false` |
 | Phase 4 results | `/var/lib/atlas/day1/phase4/<key>.json`; logs `/var/lib/atlas/day1/logs/phase4-<key>.log`; samples `/srv/atlas/workspace/phase4-samples/<key>/`; venv freezes `/srv/atlas/engines/manifests/<key>/freeze.txt` |
 | Reports | `/var/lib/atlas/day1/reports/ATLAS_BUILD_BASELINE-<timestamp>.xlsx` (the repo copy is never touched) |
 | Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44, S48, S49: the default fits every Apex KV-ladder rung; at the larger GPU resident set, about 7-8 GiB, the f16 and q8_0 rungs fit only because Phase 1 step 4 removes kdump's 4.25 GiB crash-kernel reservation, and all of it assumes kexec handover is off (`kho=off`, step 4 too), V3a proving both; a bad value stops only `atlas-orchestrator`, which says why at start). `atlas-admin arbiter status` shows it beside the CPU-side use the Arbiter warns on (MemTotal - MemAvailable - the GPU's pages, marked when above the reserve) and MemAvailable; restart `atlas-orchestrator` after changing it |
@@ -332,11 +339,11 @@ later host FUSE mount (V18 checks it). 601, 625: sudo-rs `visudo -c -f`. 757: go
 
 **phase2/10-gate.sh** — 40, 586: the `T-<tool>` rows of step 6's soft installs (06-tools.sh), shown, never blocking.
 
-**phase2/engine-env.py** — 65: file-loading/network-path llama-server options at v0.4.1.
+**phase2/engine-env.py** — 79: file-loading/network-path llama-server options at v0.4.1.
 **phase2/voice_render.py** — 57: Chatterbox real-time factor.
 
-**phase3-models.sh** — 598: whether any of the seven repos is gated (a 401/403 stops with the licence URL).
-**phase3/loadtest.py** — 82: per-request `cache_prompt: false`. 84: DeepSeek V4 Flash's chat template emitting
+**phase3-models.sh** — 611: whether any of the seven repos is gated (a 401/403 stops with the licence URL).
+**phase3/loadtest.py** — 95: per-request `cache_prompt: false`. 97: DeepSeek V4 Flash's chat template emitting
 `<think>` by default.
 
 **phase4-engines.sh** — 356: whether stable.repo.amd.com serves a root listing (a 404 there is logged; the
@@ -366,8 +373,9 @@ fatbins on the ROCm 10.0 runtime, libamdhip64 path inside the wheels.
 dependency relaxations (transformers 4.34.1 / tokenizers 0.14), eval class names.
 **phase4/engines/clay-prithvi.sh / _test.py** — 5, 2: TerraTorch `BACKBONE_REGISTRY.build(..., pretrained=True)`.
 
-**orchestrator/src/atlas/arbiter.py** — 133-149: KV bytes-per-token figures for gpt-oss (8 KV heads), Nemotron,
-Qwen3.5 and DeepSeek (bounds from Section 4.3; remeasured in Phase 3). **tasks/aegis.py** — 38, 201: ChromaDB has no
+**orchestrator/src/atlas/arbiter.py** — 135-151: KV bytes-per-token figures for gpt-oss (8 KV heads), Nemotron,
+Qwen3.5 and DeepSeek (bounds from Section 4.3; remeasured in Phase 3, where each load's context memory is set beside
+them and raised as the to-do `kv-estimates`, doc S52). **tasks/aegis.py** — 38, 201: ChromaDB has no
 snapshot API. **tasks/sentinel.py** — 7: feed URLs. **engines.py** — 4: endpoints marked in the file. **router.py** —
 130: ~4 characters per token. **memory.py** — 1215: bge-m3 embedding dimension 1024. **config.py** — the 16 GiB
 default host reserve (doc S44, S48, S49) rests on an estimate, not a measurement: MemTotal near 187-188 GiB once Phase 1
@@ -398,7 +406,7 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 the run line (48-51).
 
 **systemd/atlas-orchestrator.service** — 40: docker client needs under the hardening. **systemd/llama-server@.service**
-— 86: whether Mesa/RADV needs AF_UNIX (kept). **systemd/srv-atlas-winpc.mount** — 10, 16: the `vers=3.1.1` and
+— 89: whether Mesa/RADV needs AF_UNIX (kept). **systemd/srv-atlas-winpc.mount** — 10, 16: the `vers=3.1.1` and
 `seal` spellings (step 9 proves them when it runs; skipped on Day 1).
 
 **verify/v03a-gtt.sh** — VERIFIED since v0.3.5: kernel 7.0.0-38 reports the requested 196608 MiB GTT pool whatever MemTotal is, and 7.0.0-39 caps it at MemTotal; both pass (S47). VERIFIED (S48, v7.0 source): `/sys/kernel/kexec_crash_size` counts both crash-kernel regions and reads 0 without a reservation (4563402752 with kdump-tools' value); the kernel finds `crashkernel=` anywhere on its command line, hence the substring check; the last `panic=` wins and `/proc/sys/kernel/panic` is the same variable. VERIFIED (S49, v7.0 source and Ubuntu's 7.0 configs): kexec handover scratch counts in the zone `cma` lines of `/proc/zoneinfo` (4 KiB pages) and never in `CmaTotal`, which counts named CMA areas only; `CmaFree` is only the free part of all CMA; Ubuntu's 7.0 configuration creates no named CMA area unless the command line asks for one, so all three read 0 once `kho=off` holds and the check cannot fail a correct node. UNKNOWN until V3a runs: the real MemTotal, expected near 187-188 GiB once the reservation is gone (the summary prints it, and the kexec handover figures beside it).
@@ -426,6 +434,35 @@ the run line (48-51).
   prefill test checks the server survives and records a warning, not a hang.
 - DeepSeek V4 Flash: quantised KV produced garbage in mid-2026; Phase 3 ladders f16 → q8_0 → q4_0 with a coherence
   check (S2) and records the winner; the GRUB line carries `amdgpu.lockup_timeout` for the DeviceLost reports.
+- Context shift (doc S52): every launch line asks for it, but the pinned llama.cpp switches it off on six of the eight
+  chat engines (both gpt-oss, Qwen3.5-122B, the router, Qwen2.5-VL, DeepSeek V4; VERIFIED in the source, Phase 3 records
+  each engine's log line); only Nemotron and Meditron keep it. A prompt longer than its slot is rejected on every
+  engine, context shift or not (it acts only during generation, so `--swa-full` would not change that), and on the six a
+  reply would stop at the slot end. So the orchestrator keeps every request inside one slot of the profile its unit
+  runs, on every engine (`atlas/engines.py` → `LlamaClient._open_chat` and `fit_to_window`, the window from
+  `atlas/api.py` → `engine_window`): the engine counts the prompt, and the oldest exchanges after the system prompt are
+  dropped only until a bounded reply reserve fits: the `max_tokens` asked for (4,096 when the request sets none), capped
+  at a quarter of the slot or 512 tokens, whichever is larger (4,096 on a 32k slot, at most 8,192 there; 2,048 on the
+  router; 1,024 on Meditron). A conversation that leaves the reserve is sent whole whatever `max_tokens` it asks for;
+  when the system prompt and the current message alone cannot leave it, every earlier exchange goes. The reply is then
+  capped to the room left, and a message that does not fit on its own is refused with status 413
+  (`context_window_exceeded`) with the engine, its window and the prompt size: the HTTP status of a non-streamed
+  request; a streamed one (Open WebUI) has already been answered HTTP 200, so the 413 arrives as the stream's error
+  chunk with the `[ATLAS] ...` text. Shorten it, or give the document to retrieval. Each trim is one line, counts and
+  the reply reserve only, in `journalctl -u atlas-orchestrator --grep 'context window engine='`. Left to the Principal:
+  the 512-token minimum reply, the quarter-slot cap on the reply reserve, no 9.4 strike for a 413, and the options not
+  adopted (`--swa-full` on gpt-oss, `--kv-unified` on Qwen3.5-122B, a smaller context anywhere).
+- Host RAM outside the Arbiter's budget (doc S52): each chat llama-server may keep up to 8 GiB of prompt cache in
+  ordinary RAM (`--cache-ram`, idle slots copied into it at every new task) and, on the sliding-window and recurrent
+  engines, up to 32 context checkpoints per slot (`--ctx-checkpoints`); only the 16 GiB host reserve covers them. Phase
+  3 measures each server's RAM and raises the to-do `cache-ram` with suggested explicit values (INFERRED); the to-do
+  `kv-estimates` sets each engine's measured context memory beside the Arbiter's estimate. The footprint Phase 3
+  registers replaces the estimate only at the profile it was measured at and only until the orchestrator restarts, so
+  after a restart the estimates decide every load and pairing again. The size lines both to-dos read, like V4's proof
+  line, are logged only at llama-server log level 4, which `engine-env.py` renders into every chat engine
+  (`--verbosity 4`, exactly 4, a log level only); a load log without them leaves the figures UNKNOWN, and `cache-ram`
+  then says checkpoints UNKNOWN, never "none made", with "at least" totals. Changing either (engines.json `extra_args`,
+  or the estimates in `atlas/arbiter.py`) is the Principal's call; Phase 3 changes no engine setting.
 - `panic=10` (doc S48) restarts the node after a kernel panic, but not after everything that can stop it: a panic before
   the kernel reads its parameters still hangs; soft and hard lockups and hung tasks only warn; a failed TPM unseal waits
   at the passphrase prompt; recovery boots keep the wait-forever default. A panic that recurs at every boot restarts the
@@ -467,3 +504,14 @@ the `config_dir` fixture in `tests/conftest.py` points `ATLAS_CONFIG_DIR` at `te
 what the `env -u CONFIG_DIR -u ATLAS_CONFIG_DIR` above removes.
 `tests/test_config.py::test_real_config_tree_loads` also loads the real `config/` tree beside the checkout, so a
 renamed engine key or a domain card outside the §8 H1 form fails there before it fails on the node.
+Doc S52 adds `tests/test_context_window.py` (31 cases: the trimming and capping rule with its bounded reply reserve,
+LightRAG's gleaning call on the router and a fitting chat asking for `max_tokens` 32768 both sent whole, the engine's
+own prompt count with image tokens, the 413, streamed and not, the window read from the unit's env file, every
+generation path driven against the stub llama-server of `tests/stubs.py`, and a scan of `atlas/` that fails when
+anything but `LlamaClient._open_chat` posts to a generation endpoint); the Phase 3 memory records, the `TODO` line
+protocol and the two to-dos in `tests/test_phase3_loadtest.py` (64 cases, 20 of them new, with fixture journals built
+from the pinned llama.cpp format strings, `--fit`'s trial lines and a default-verbosity journal among them); and the
+standing vision profile in `tests/test_engine_env.py` (24, among them the real `engine-env.py` render of the real
+`engines.json` loaded into the real Arbiter, where gpt-oss-120b and the vision engine pair at 157.7 GiB, and the
+`--verbosity 4` render) and `tests/test_arbiter.py` (42, among them a measurement charged only at the profile it was
+taken at). The package suite: 476 passed, 4 skipped.

@@ -41,10 +41,11 @@ from atlas.approval import (
     StubSender,
 )
 from atlas.config import ConfigError
-from atlas.engines import LlamaClient
+from atlas.engines import LlamaClient, SlotWindow
 from atlas.governance import DECISION_PREFIX, Register
 from atlas.ledger import Ledger
 from atlas.personas import LEAD_MINIMUM_EXTERNAL_TIER, PersonaRegistry, external_tier, load_persona_registry
+from stubs import counting
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
 
@@ -260,7 +261,9 @@ def test_verdict_less_cross_check_row_is_not_a_record(gate: Gate, ledger: Ledger
 
 
 def _fake_llama(handler: Callable[[httpx.Request], httpx.Response]) -> LlamaClient:
-    return LlamaClient("http://127.0.0.1:8102", transport=httpx.MockTransport(handler))
+    # The reviewer's call counts the prompt first and keeps to the engine's per-slot window (S52).
+    return LlamaClient("http://127.0.0.1:8102", transport=httpx.MockTransport(counting(handler)),
+                       window=SlotWindow("nemotron-3-super", 32768, "test"))
 
 
 def test_llama_cross_checker_runs_the_other_lead_on_another_engine(ledger: Ledger, personas: PersonaRegistry) -> None:

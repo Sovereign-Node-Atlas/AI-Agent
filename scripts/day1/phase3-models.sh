@@ -42,16 +42,22 @@
 #       recorded in $ATLAS_STATE/phase3/quiesced BEFORE each stop, and restarted when the step ends, on every exit
 #       path, and, when a SIGKILL/OOM/power cut skipped that, loudly at the start of the next invocation (--status
 #       included). loadtest.py also waits for the orchestrator's generation slot before each direct request.
-#   03  two-residency: gpt-oss-120b + qwen2.5-vl-72b (vision at parallel_coresident / ctx_size_coresident, asserted on
-#       the rendered env), ~142 GB of weights plus their caches (~22 GiB, Section 4.1) on the GTT counter, capped at
+#   03  two-residency: gpt-oss-120b + qwen2.5-vl-72b (vision at parallel_coresident / ctx_size_coresident, its standing
+#       profile since S52, asserted on the rendered env; no temporary override, and the vision engine keeps that
+#       profile afterwards), ~142 GB of weights plus their caches (~22 GiB, Section 4.1) on the GTT counter, capped at
 #       the Arbiter's live budget, two generation requests through the orchestrator (/internal/v1/chat/completions),
 #       the second proven to start after the first finished (V21); then, with the pair resident, the Arbiter's refusal
 #       of an over-budget load and its Deep Think downgrade against the real engine set (V14b, Section 21 V14). A
 #       rule-5 leak in its cleanup fails V21 AND stops the phase (as in step 02), so background generation is never
 #       resumed over held memory.
-#   04  gate: the Section 17 table (engine, load ok, KV type, decode 512/8k, prefill, swap s, footprint, released,
-#       control mode, notes; every engines.json baseline_deviation printed under it) and
-#       `gate phase3 V4 V10 V14b V21 -- V22`.
+#   04  gate: first the S52 Phase 3 items (`loadtest.py memory`): every load of step 02 recorded its context memory
+#       from its own log beside the Arbiter's projection for the same profile, its host RAM (VmRSS/RssAnon of the
+#       unit's MainPID, read-only) after the load and after the tests, the prompt-cache and checkpoint log lines and
+#       whether llama-server switched context shift off; the resident router's current journal and RSS are read too.
+#       Those figures are raised as the Principal's to-dos kv-estimates and cache-ram (todo_add). Measurements, never
+#       a gate: a line not found is UNKNOWN and nothing here fails the phase; no engine setting is changed. Then the
+#       Section 17 table (engine, load ok, KV type, decode 512/8k, prefill, swap s, footprint, released, control mode,
+#       notes; every engines.json baseline_deviation printed under it) and `gate phase3 V4 V10 V14b V21 -- V22`.
 #
 # Contracts relied on from other writers (CONVENTIONS.md §1; each is checked and fails loudly when absent):
 #   * config/engines.json — schema per its _meta block (key, hf_repo, subdir, files[{name,sha256,bytes,verify}],
@@ -97,7 +103,9 @@
 #     data/manifests so it is backed up too.
 # Contract this file defines for others: $ATLAS_STATE/phase3/results/<key>.json (one per engine, schema in loadtest.py;
 # the driver skips an engine on a re-run only when ok AND released are true; its resident_after tells the driver which
-# engine the next swap releases), $ATLAS_STATE/phase3/results/pending-overrides.json (loadtest.py's journal of
+# engine the next swap releases; its "memory" list holds the S52 record of each load, one per rung on the DeepSeek
+# ladder), the to-dos kv-estimates and cache-ram (step 04, re-raised with the latest figures on every run of it; only
+# the Principal closes them), $ATLAS_STATE/phase3/results/pending-overrides.json (loadtest.py's journal of
 # temporary overrides, restored on the next invocation), $ATLAS_STATE/phase3/quiesced (one "unit NAME" or
 # "container NAME" line per background generator stopped for steps 02/03, removed when they are restarted),
 # $ATLAS_STATE/phase3/revisions/<key> and <key>.after (the HF commit sha before and after the pull) and the aggregate
@@ -265,8 +273,11 @@ _p3_orch_setting() {
 }
 
 # _p3_loadtest SUBCMD ARGS... — run phase3/loadtest.py with every path it needs; its stdout carries only
-# "RECORD<TAB>ID<TAB>RESULT<TAB>MSG" lines (recorded here with record_v), its stderr the log. A non-zero exit is an
-# infrastructure error (not a failed measurement, which loadtest.py records) and stops the phase.
+# "RECORD<TAB>ID<TAB>RESULT<TAB>MSG" lines (recorded here with record_v) and, from `memory` only (S52),
+# "TODO<TAB>ID<TAB>TITLE<TAB>DETAIL" lines (raised here with todo_add); its stderr is the log. A non-zero exit is an
+# infrastructure error (not a failed measurement, which loadtest.py records) and stops the phase. --atlas-python is
+# the orchestrator's venv: loadtest.py runs the Arbiter's own projection there for the S52 memory record (that venv
+# and the package are root:atlas with no group or other write, phase2/02-orchestrator.sh).
 _p3_loadtest() {
   local sub="$1"; shift
   local orch_url out rc=0 token_file
@@ -297,7 +308,7 @@ _p3_loadtest() {
     --engines "$P3_ENGINES_JSON" --env-dir "$ATLAS_ETC/engines" --results-dir "$P3_RESULTS" \
     --orch-url "$orch_url" --engine-env "$P3_ENGINE_ENV_PY" --models-dir "$P3_MODELS_DIR" \
     --slots-dir "$ATLAS_SRV/data/slots" --port-base "${LLAMA_PORT_BASE:-8100}" \
-    --overrides "$ATLAS_ETC/engines/overrides.json" "${extra[@]}" \
+    --overrides "$ATLAS_ETC/engines/overrides.json" --atlas-python "$ATLAS_OPT/venv/bin/python" "${extra[@]}" \
     "$sub" "$@" >"$out" 2> >(tee -a "$logf" >&2) &
   pid=$!
   # shellcheck disable=SC2064  # $pid is meant to expand now: the trap must name this child
@@ -311,8 +322,10 @@ _p3_loadtest() {
   _p3_install_signal_traps
   local tag id result msg
   while IFS=$'\t' read -r tag id result msg; do
-    [[ "$tag" == "RECORD" ]] || continue
-    record_v "$id" "$result" "$msg"
+    case "$tag" in
+      RECORD) record_v "$id" "$result" "$msg" ;;
+      TODO) todo_add "$id" "$result" "$msg" ;;   # S52: the Principal's to-dos (RESULT holds the title, MSG the detail)
+    esac
   done <"$out"
   rm -f "$out"
   (( rc != 143 && rc != 130 )) || die "loadtest.py $sub was terminated (exit $rc); its temporary overrides were restored; re-run to resume"
@@ -730,6 +743,10 @@ step_03() {
 
 # --- Step 04: gate ---------------------------------------------------------------------------------------------------
 step_04() {
+  # S52 Phase 3 items (header, step 04): the measured context memory and host-RAM caches of every engine become the
+  # Principal's to-dos kv-estimates and cache-ram. loadtest.py memory reads the result files and the resident router's
+  # journal and RSS only, changes nothing and returns 0 whatever it finds (a record, never a gate).
+  _p3_loadtest memory
   log "Phase 3 load tests (Section 17 step 4 table; loadtest.py prints it to stderr, tee'd into $(_atlas_log_file)):"
   _p3_loadtest table
   # CONVENTIONS.md §6: V4 per engine, V10, V14b, V21 required; V22 recorded only (a DeepSeek failure defers it, R19).

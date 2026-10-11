@@ -291,7 +291,9 @@ class LlamaClassifier:
         self._system = CLASSIFIER_SYSTEM_PROMPT % {"codes": ", ".join(self._codes) or "(none)"}
 
     def classify(self, message: str, *, context: Mapping[str, Any] | None = None) -> ClassifierVerdict:
-        # A very long message is classified on its head and tail; the router flags it long by size anyway.
+        # A very long message is classified on its head and tail; the router flags it long by size anyway. The client
+        # keeps the call inside the router unit's per-slot window (S52, engines.fit_to_window); a message that still
+        # does not fit raises ContextWindowExceeded, an EngineError, and routing falls back as for any classifier fault.
         text = message
         if len(text) > self._max_message_chars:
             half = self._max_message_chars // 2
