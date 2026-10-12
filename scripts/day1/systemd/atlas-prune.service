@@ -8,6 +8,9 @@
 # stamp /var/lib/atlas-prune/last (touched by ExecStartPost after a successful enqueue) is older than 71 hours (find
 # -mmin +4259), so the true cadence is >= 71 h, survives reboots (Persistent=true + the stamp) and never drifts at
 # month ends the way a day-of-month calendar did. ExecCondition exit 1 is "skipped", not a failure.
+# The stamp records the ENQUEUE, not the sweep's outcome (no --wait): a sweep that fails inside the cpu worker is
+# neither retried nor noticed here before the next >= 71 h slot. The task itself pushes one ntfy line on failure
+# (atlas.tasks.prune, S53); the ledger tasks row and journalctl -u atlas-celery-cpu carry the error.
 # No docker group, no sudo: full read-only treatment (16.3 item 6 enforced, not advisory). HOME is the account's home.
 
 [Unit]

@@ -420,7 +420,8 @@ _orch_env_write() {
     # PII), so no window with the umask default. The comment block states the token-file formats (header contract).
     {
       echo "# /etc/atlas/orchestrator.env — settings of the atlas package and its units (phase2/02-orchestrator.sh writes and"
-      echo "# rewrites its own keys with ensure_kv; steps 03, 05, 06, 08, 09, 09b, 10 add theirs). root:atlas 640. No secrets:"
+      echo "# rewrites its own keys with ensure_kv; steps 03, 05, 06, 08, 09, 09b, 10 add theirs; PRUNE_WINDOW_HOURS is seeded"
+      echo "# once and never rewritten: edit it here as root, then restart the atlas-celery-* units). root:atlas 640. No secrets:"
       echo "# the Redis URLs are in secrets/redis.env; the *_TOKEN_FILE keys point at secret files whose formats differ:"
       echo "#   OPENWEBUI_ADMIN_TOKEN_FILE  bare token on the first line"
       echo "#   NTFY_TOKEN_FILE             KEY=VALUE, key NTFY_TOKEN"
@@ -455,6 +456,12 @@ _orch_env_write() {
   ensure_kv "$ORCH_ENV" SENTINEL_FEEDS "$ATLAS_OPT/day1/config/sentinel-feeds.json"
   ensure_kv "$ORCH_ENV" SENTINEL_LOG_DIR "$ATLAS_SRV/data/sentinel"
   ensure_kv "$ORCH_ENV" COLD_DIR /srv/cold
+  # PRUNE_WINDOW_HOURS (Section 9.6; S53): the fallback expiry of a temporal note whose writer gave no TTL
+  # (tasks/prune.py DEFAULT_WINDOW_HOURS). Today both temporal writers set their own TTL (chat turns 90 d, Sentinel
+  # BLUFs 366 d, D9), so the key governs no current writer; the sweep CADENCE is atlas-prune.timer (step 08), not this
+  # key. Seeded once with ensure_kv_default: a Principal-approved value, edited here as root (16.3 item 6), survives a
+  # re-run of this step, which ensure_kv would silently reset to 72. Workers read the file only at start.
+  ensure_kv_default "$ORCH_ENV" PRUNE_WINDOW_HOURS 72
   ensure_kv "$ORCH_ENV" TZ "$TZ"
   ensure_kv "$ORCH_ENV" DOMAIN "$DOMAIN"
   ensure_kv "$ORCH_ENV" PRINCIPAL_USER "$PRINCIPAL_USER"

@@ -121,8 +121,9 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   request to a llama-server inside one slot of its engine, doc S52, §6); Open WebUI hardened offline; ChromaDB,
   LightRAG, the three resident small models, Docling; Kokoro, Chatterbox, Whisper (speaches), PyAnnote; the Section 15.1
   tools and the cross-build container; Cloudflare token relocation (V23); Google OAuth (V20); the AEGIS sandbox image;
-  restic + AEGIS timers (V13); Sentinel and prune timers; the Windows share automount (skipped on Day 1); the gocryptfs
-  vault; gate.
+  restic + AEGIS timers (V13); Sentinel and prune timers (the sweep's window key seeded once into `orchestrator.env`,
+  a failed sweep pushed to your phone, graph archives carrying their text, doc S53, §4 and §6); the Windows share
+  automount (skipped on Day 1); the gocryptfs vault; gate.
 - **Day 1 close-out, before Phase 3 starts downloading:** copy the recovery material to the USB drive and store it
   away from the node, not beside it (Section 22, R16; D3): `/etc/atlas/secrets/restic.pass` (`sudo cat` it; shown once
   in Phase 2 step 7), the LUKS recovery key shown in Phase 1 step 2 (on-node copy under `/etc/atlas/secrets/` only when the OS volume is encrypted; otherwise your written copy is the only other one), and the
@@ -190,6 +191,7 @@ real vault and records V18.
 | Phase 4 results | `/var/lib/atlas/day1/phase4/<key>.json`; logs `/var/lib/atlas/day1/logs/phase4-<key>.log`; samples `/srv/atlas/workspace/phase4-samples/<key>/`; venv freezes `/srv/atlas/engines/manifests/<key>/freeze.txt` |
 | Reports | `/var/lib/atlas/day1/reports/ATLAS_BUILD_BASELINE-<timestamp>.xlsx` (the repo copy is never touched) |
 | Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44, S48, S49: the default fits every Apex KV-ladder rung; at the larger GPU resident set, about 7-8 GiB, the f16 and q8_0 rungs fit only because Phase 1 step 4 removes kdump's 4.25 GiB crash-kernel reservation, and all of it assumes kexec handover is off (`kho=off`, step 4 too), V3a proving both; a bad value stops only `atlas-orchestrator`, which says why at start). `atlas-admin arbiter status` shows it beside the CPU-side use the Arbiter warns on (MemTotal - MemAvailable - the GPU's pages, marked when above the reserve) and MemAvailable; restart `atlas-orchestrator` after changing it |
+| Retention (doc S53; 9.6, 10.4) | Three keys in `/etc/atlas/orchestrator.env` (root:atlas 640): `PRUNE_WINDOW_HOURS=72`, the fallback expiry in hours of a temporal memory note whose writer gave no TTL (it governs no current writer: chat turns carry 90 days and Sentinel BLUFs 366 days from code, D9; the sweep's cadence is `atlas-prune.timer`, a daily 03:10 check with at least 71 hours between enqueues, not this key); `COLD_DIR=/srv/cold`, the sweep's dated archives (`prune/prune-<UTC stamp>.tar.zst`: vector and graph documents with their text, read back and verified before any delete; raw chat turns are never archived, D9); `OPENWEBUI_CHAT_RETENTION_DAYS=90`, after which the nightly 04:15 task summarises an Open WebUI chat into memory and deletes it. The 90-day chat-turn TTL, the 366-day Sentinel TTL and the ledger's 30-day window are code constants fixed by D9, not settings. **To apply an approved retention change** (doc 16.3 item 6: ATLAS proposes, you apply as root): edit the file as root (`sudoedit /etc/atlas/orchestrator.env`; whether 26.04's sudo-rs provides `sudoedit` is UNVERIFIED, in which case open it in an editor run with `sudo`), then `sudo systemctl restart atlas-celery-cpu atlas-celery-gpu atlas-celery-beat` (the workers read the file only at start). A re-run of Phase 2 step 2, `--force 02` included, keeps your `PRUNE_WINDOW_HOURS`: the step writes that key only when it is absent (`ensure_kv_default`); every other key it owns is rewritten. **A failed sweep** (it raised, or finished with a read, delete or graph-delete error) pushes one ntfy line, "ATLAS prune: sweep failed" (priority high), with the task id and the error; the timer's stamp was already touched at the enqueue, so nothing retries it before the next 71-hour slot. Read `journalctl -u atlas-celery-cpu` and the ledger's task row, fix the cause, then either wait for the next slot or run it now: `sudo rm /var/lib/atlas-prune/last && sudo systemctl start atlas-prune.service` (the unit's stamp gate lets the enqueue through when no stamp exists; this follows from the unit and has not been exercised). A clean sweep pushes nothing |
 | Secrets | `/etc/atlas/secrets/` (root:atlas 710; every file 600, owned by its one reader): `hf-token.env`, `cloudflare.env`, `ntfy.env`, `smb.cred`, `restic.pass`, `redis.env`, `openwebui.env`, `wg-easy.env`, `google/` |
 | The scripts the node runs | `/opt/atlas/day1/` (a mirror of this directory) |
 | Watchdog (doc S50) | `/etc/systemd/system/atlas-watchdog-driver.service` (loads the driver step 4 chose, at every boot) and `/etc/systemd/system.conf.d/90-atlas-watchdog.conf` (systemd's two timeouts). To look, read only: `systemctl show -p RuntimeWatchdogUSec -p RebootWatchdogUSec -p WatchdogDevice -p WatchdogLastPingTimestamp`, `cat /sys/class/watchdog/watchdog0/{identity,state,timeout,bootstatus}`, `journalctl -b -o cat SYSLOG_IDENTIFIER=systemd --grep watchdog`, `journalctl -k -b -o cat --grep sp5100`, `journalctl -k -b -o cat --grep 'Previous system reset reason'`, `systemd-analyze cat-config systemd/system.conf`. Never open `/dev/watchdog*` (no `cat`, `echo` or `wdctl` on it) and never install the `watchdog` or `wd_keepalive` packages: an open starts the timer, a close without the magic 'V' leaves it running until the node resets, and only systemd may hold the device. To undo: delete the drop-in, run `systemctl daemon-reload` (systemd disarms the timer), then `systemctl disable atlas-watchdog-driver.service` |
@@ -263,7 +265,7 @@ written with the reason, shown in the table and the workbook, and never silently
 Every `UNVERIFIED` comment in the code marks a fact the research could not confirm. The step that depends on it fails
 loudly if the assumption is wrong; none skips. Line numbers are those of this commit (`grep -n UNVERIFIED <file>`).
 
-**lib/common.sh** — 693: hf_transfer ignores proxies (kept off). 735, 777: a download with no reference sha256 records
+**lib/common.sh** — 706: hf_transfer ignores proxies (kept off). 748, 790: a download with no reference sha256 records
 its computed hash as UNVERIFIED.
 
 **phase1-platform.sh / phase1/01-preflight.sh** — no UNVERIFIED marks beyond the Secure Boot decision above.
@@ -377,7 +379,7 @@ dependency relaxations (transformers 4.34.1 / tokenizers 0.14), eval class names
 Qwen3.5 and DeepSeek (bounds from Section 4.3; remeasured in Phase 3, where each load's context memory is set beside
 them and raised as the to-do `kv-estimates`, doc S52). **tasks/aegis.py** — 38, 201: ChromaDB has no
 snapshot API. **tasks/sentinel.py** — 7: feed URLs. **engines.py** — 4: endpoints marked in the file. **router.py** —
-130: ~4 characters per token. **memory.py** — 1215: bge-m3 embedding dimension 1024. **config.py** — the 16 GiB
+130: ~4 characters per token. **memory.py** — 1225: bge-m3 embedding dimension 1024. **config.py** — the 16 GiB
 default host reserve (doc S44, S48, S49) rests on an estimate, not a measurement: MemTotal near 187-188 GiB once Phase 1
 step 4 has removed the crash-kernel reservation (192 GiB less the UMA carve-out, a ~3 GiB page map and ~0.5 GiB of
 firmware and kernel); every Apex KV-ladder rung fits from about 182.3-184.3 GiB. V3a records the real MemTotal and
@@ -481,6 +483,20 @@ the run line (48-51).
   `w-drill`, so the live ATLAS raises them once Day 1 is complete. Left to the Principal: the timeout value,
   lockup panics, `CrashAction=reboot`, `watchdog.stop_on_reboot=0`, masking the sleep targets, loading the driver in
   the initramfs.
+- Pruning (doc S53, 9.6): the 72-hour sweep is a Celery task on the cpu queue that `atlas-prune.timer` enqueues (a daily
+  03:10 check, at least 71 hours between enqueues). It archives expired temporal notes under `/srv/cold` (read back and
+  verified before any delete; vector and graph documents with their text; raw chat turns purged without archive, D9),
+  leaves scars alone, and pushes one ntfy line when it fails or finishes with errors (§4). What it does not yet do, each
+  recorded as a phased item for the live ATLAS, not Day 1: apply the ledger's 30-day purge of operational rows, which is
+  written but has no caller, so those tables grow (doc R26); record collection sizes, archive bytes or which notes are
+  ever retrieved (nothing records retrieval today, and only the hemisphere collection and scars are read during chat);
+  a weekly retention report; a restore command (built only if you ever ask for a pruned note back; chat turns are never
+  recoverable, D9); and proposing a retention change through the approval queue (doc 16.2, W-RETAIN), which
+  waits for 90 days of usage data, three consistent sweeps and a real tuning question. The sweep never tunes itself
+  (doc 16.3 item 6). The pinned Chroma 1.5.9 soft-deletes, so a collection's index tracks every insert ever and only a
+  rebuild reclaims it (doc R27, W-CHROMA-REBUILD; a yearly question at most at one owner's volumes). The 72-hour window
+  governs no current writer (every temporal writer sets its own TTL) and the D9 values are code constants. Nothing has
+  run: whether the ntfy server accepts the failure push is UNKNOWN until it does, as for the vault-breach push.
 - The docker socket is host root and `atlas` is in the `docker` group: the sandbox bounds the job, not the
   orchestrator that launches it (recorded in `docker/sandbox/Dockerfile`, `phase2/README-contracts.md`).
 - Licences recorded, not argued (Section 16.5): PointLLM cc-by-nc-4.0, Rad-DINO research use, FLUX.1-dev and Stable
@@ -514,4 +530,9 @@ from the pinned llama.cpp format strings, `--fit`'s trial lines and a default-ve
 standing vision profile in `tests/test_engine_env.py` (24, among them the real `engine-env.py` render of the real
 `engines.json` loaded into the real Arbiter, where gpt-oss-120b and the vision engine pair at 157.7 GiB, and the
 `--verbosity 4` render) and `tests/test_arbiter.py` (42, among them a measurement charged only at the profile it was
-taken at). The package suite: 476 passed, 4 skipped.
+taken at). Doc S53 adds four cases to `tests/test_vault_tagging.py` (34: the graph archive carrying each document's
+text, with a pre-S53 six-column index migrated in place and its row archived as `document` null and counted in the
+manifest; the failure push on the raise path and the finished-with-errors path, driven through `prune_sweep.apply`,
+with a breaking push never masking the sweep's error, a locked ledger row neither skipping the push nor replacing
+the sweep's error, and a clean sweep pushing nothing; and the step 2 contract, `ensure_kv_default` for
+`PRUNE_WINDOW_HOURS`) and seven cases to `lib/common_test.sh` (100). The package suite: 480 passed, 4 skipped.

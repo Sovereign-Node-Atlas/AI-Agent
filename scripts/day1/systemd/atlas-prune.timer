@@ -1,5 +1,6 @@
-# /etc/systemd/system/atlas-prune.timer — every 72 hours (Section 9.6 "A Celery beat job every 72 hours"; the
-# timer enqueues, Celery executes: CONVENTIONS.md §8). Daily calendar at 03:10 local (after the 02:30 AEGIS window; the
+# /etc/systemd/system/atlas-prune.timer — every 72 hours (Section 9.6: a sweep every 72 hours, enqueued by this timer
+# and run by Celery on the cpu queue, S23/S53; the timer enqueues, Celery executes: CONVENTIONS.md §8). Daily calendar
+# at 03:10 local (after the 02:30 AEGIS window; the
 # sweep waits in the cpu queue while a freeze is on) PLUS the >= 71 h stamp condition in atlas-prune.service (fix round
 # 2): a day-of-month list gave 1-day and 4-day gaps at month ends, a monotonic OnBootSec/OnUnitActiveSec pair fired
 # after EVERY boot and ignored Persistent=. Persistent=true runs a sweep missed while the node was off; the stamp

@@ -613,6 +613,19 @@ ensure_kv() {
   rm -f "$tmp"
 }
 
+# ensure_kv_default FILE KEY VALUE — write KEY=VALUE only when FILE has no "KEY=..." line at all (through ensure_kv, so
+# the file is created and the line appended the same way). A line that exists is left exactly as it is, a blank value
+# included: this is for settings the Principal may later change by hand as root (16.3 item 6), so a re-run of the step
+# that seeds them (--force) never resets an approved value the way ensure_kv would (PRUNE_WINDOW_HOURS, step 02; S53).
+ensure_kv_default() {
+  local file="$1" key="$2" value="$3"
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "ensure_kv_default: bad key '$key'"
+  if [[ -e "$file" ]] && grep -qE "^[[:space:]]*${key}=" "$file"; then
+    return 0
+  fi
+  ensure_kv "$file" "$key" "$value"
+}
+
 # render_template [-m MODE] [-o OWNER] SRC DST [VAR...] — substitute only the named variables (envsubst SHELL-FORMAT),
 # every named variable must be set, then install DST with MODE (default 644). With no VAR given, every $VAR in SRC is
 # substituted. Uses envsubst (gettext-base) when present and an equivalent python3 substitution otherwise, so the

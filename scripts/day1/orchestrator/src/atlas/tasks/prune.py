@@ -9,15 +9,26 @@ at all, and an archive under /srv/cold is in the restic include set), and the Pr
 ("ATLAS prune: vault invariant breach"); fix round.
 
 What "temporal" means in code (atlas.memory sets the fields on every write): `temporal == True` and either
-`expires_at < now` (the writer gave a TTL) or `ts < now - PRUNE_WINDOW_HOURS` (default 72). Collections swept:
+`expires_at < now` (the writer gave a TTL) or `ts < now - PRUNE_WINDOW_HOURS` (default 72). PRUNE_WINDOW_HOURS is a
+visible setting in /etc/atlas/orchestrator.env (seeded once by phase2/02-orchestrator.sh, S53): the FALLBACK expiry of
+a temporal note whose writer gave no TTL; both temporal writers today (chat turns 90 d, Sentinel BLUFs 366 d, D9) set
+their own, so it governs no current writer, and the sweep CADENCE is atlas-prune.timer, not this key. Collections swept:
 corporate, estate, documents_corporate, documents_estate, sentinel. Graph documents come from the LightRAG index the
-memory wrapper keeps (doc ids with the same fields). Expired `chat-turn` documents (the raw turns atlas.api writes
-with D9's 90-day TTL) are DELETED WITHOUT ARCHIVE (fix round 2): D9 says summarised then purged, and /srv/cold is in
-restic's include set, so an archived turn would outlive the purge; the chat summary is the retained form.
+memory wrapper keeps (doc ids with the same fields, plus the text since S53, so graph.json is restorable like the
+collection members). Expired `chat-turn` documents (the raw turns atlas.api writes with D9's 90-day TTL) are DELETED
+WITHOUT ARCHIVE (fix round 2): D9 says summarised then purged, and /srv/cold is in restic's include set, so an
+archived turn would outlive the purge; the chat summary is the retained form.
+
+A failed sweep reaches the Principal (S53): atlas-prune.service touches its cadence stamp after a successful ENQUEUE
+(ExecStartPost, no --wait), so a sweep that raises or finishes with errors inside the cpu worker is neither retried
+nor reported by systemd before the next >= 71 h slot. `prune_sweep` therefore pushes ONE ntfy line ("ATLAS prune:
+sweep failed", priority high) through atlas.tasks.notify, the vault-breach mechanism, on either outcome; the ledger
+tasks row and the journal keep the full error as before, and the push can neither mask the exception nor block.
 
 Archive: `/srv/cold/prune/prune-<UTC stamp>.tar.zst` holding one JSON file per collection and one for the graph,
 written with Python's `compression.zstd` (3.14+) when present, else the `zstd` binary, else (fix round) stdlib
-`tarfile` in xz mode as `.tar.xz` (no Day 1 step installs zstd; Section 9.6 fixes the place, not the format). Every
+`tarfile` in xz mode as `.tar.xz` (no Day 1 step installs zstd, but the 26.04.1 server image seeds it in its base
+layer, VERIFIED from the ISO manifest, S53; Section 9.6 fixes the place, not the format). Every
 path reads the archive back and compares before anything is deleted; nothing is deleted before the archive verifies.
 The archive holds memory CONTENT in plaintext, so (fix round 4) /srv/cold/prune is created 0750 and every archive is
 CREATED 0640 through os.open(O_CREAT|O_EXCL) or a 0600 temporary file renamed into place: no process-umask window.
@@ -56,7 +67,7 @@ EXEMPT_COLLECTIONS: tuple[str, ...] = ("scars",)  # Section 9.4
 DEFAULT_WINDOW_HOURS = 72.0
 PAGE = 500
 
-__all__ = ["PruneResult", "archive_path", "is_expired", "prune_sweep", "run_sweep", "write_archive"]
+__all__ = ["PruneResult", "archive_path", "is_expired", "notify_failure", "prune_sweep", "run_sweep", "write_archive"]
 
 
 @dataclass
@@ -373,16 +384,35 @@ def run_sweep(
     for col, hits in to_move.items():
         if hits:
             members[f"{col}.json"] = [{"id": h.id, "document": h.document, "metadata": h.metadata} for h in hits]
+    graph_without_text = sum(1 for r in graph_rows if r.text is None)
     if graph_rows:
+        # `document` is the text the wrapper's index kept at insert (memory.py, S53), so a pruned graph note is
+        # restorable like a collection member. A row written before the index kept text archives as document=None and
+        # is counted in the manifest, never silently (the archive still verifies before anything is deleted).
         members["graph.json"] = [
-            {"doc_id": r.doc_id, "ts": r.ts, "hemisphere": r.hemisphere, "expires_at": r.expires_at, "meta": r.meta}
+            {
+                "doc_id": r.doc_id,
+                "document": r.text,
+                "ts": r.ts,
+                "hemisphere": r.hemisphere,
+                "expires_at": r.expires_at,
+                "meta": r.meta,
+            }
             for r in graph_rows
         ]
+        if graph_without_text:
+            log.warning(
+                "prune: %d of %d graph document(s) have no text in the index (inserted before S53); archived as "
+                "index rows only, not restorable",
+                graph_without_text,
+                len(graph_rows),
+            )
     members["manifest.json"] = {
         "ts": now,
         "window_hours": window_hours,
         "collections": {c: len(h) for c, h in to_move.items()},
         "graph": len(graph_rows),
+        "graph_without_text": graph_without_text,
         "task_id": task_id,
     }
     path = write_archive(archive_path(cold_dir, now), members)
@@ -417,6 +447,39 @@ def run_sweep(
     return result
 
 
+FAILURE_TITLE = "ATLAS prune: sweep failed"
+
+
+def _record_failed(rec: Any, error: str) -> None:
+    """The ledger row first (the vault-breach precedent), but the ledger is not the alert path: a locked or full
+    ledger must neither skip the push nor replace the sweep's own error (S53 review)."""
+    try:
+        rec.failed(error)
+    except Exception as lexc:
+        log.error("prune: ledger row not updated: %s", lexc)
+
+
+def notify_failure(task_id: str | None, error: str, notify: Callable[..., Any] | None = None) -> None:
+    """One short ntfy line when a sweep raised or finished with errors (module docstring, S53): the cadence stamp is
+    touched at enqueue, so without this push a broken sweep stays silent for three days at a time. Same mechanism and
+    priority as the vault-breach push (atlas.tasks.notify never raises; guarded anyway). Never replaces the original
+    exception: the caller re-raises after this returns, and the ledger row already holds the full error."""
+    if notify is None:
+        from atlas.tasks import notify as _notify
+
+        notify = _notify
+    try:
+        notify(
+            f"Pruning sweep failed (task {task_id}); not retried before the next timer slot, about 3 days. "
+            f"{error[:300]} See the ledger tasks row and journalctl -u atlas-celery-cpu.",
+            title=FAILURE_TITLE,
+            priority="high",
+            tags=["warning"],
+        )
+    except Exception as exc:  # the failure is already in the ledger and the log
+        log.error("prune: failure notice not sent: %s", exc)
+
+
 @shared_task(name="atlas.tasks.prune_sweep", bind=True)
 def prune_sweep(self: Any) -> dict[str, Any]:
     from atlas.memory import build_memory_store
@@ -431,9 +494,13 @@ def prune_sweep(self: Any) -> dict[str, Any]:
             store, env.get("COLD_DIR") or "/srv/cold", ledger=rec.ledger, window_hours=window, task_id=self.request.id
         )
     except Exception as exc:
-        rec.failed(f"{type(exc).__name__}: {exc}")
+        error = f"{type(exc).__name__}: {exc}"
+        _record_failed(rec, error)
+        notify_failure(self.request.id, error)
         raise
-    if result.errors:
-        rec.failed("; ".join(result.errors))
-        raise RuntimeError("prune finished with errors: " + "; ".join(result.errors))
+    if result.errors:  # a read, delete or graph-delete error, each already logged; the archive (if any) stands
+        error = "; ".join(result.errors)
+        _record_failed(rec, error)
+        notify_failure(self.request.id, error)
+        raise RuntimeError("prune finished with errors: " + error)
     return rec.done(result.as_dict())

@@ -120,7 +120,7 @@ Step files never define `main`; each defines `step_<id>()` and the driver calls 
 | `gate PHASE REQUIRED_IDS... [-- OPTIONAL_IDS...]` | prints the phase table (latest result per id) and returns 1 if any REQUIRED id is `fail` or missing; `deferred` never blocks; OPTIONAL ids are printed only |
 | `apt_install PKG...` | non-interactive, idempotent, retries 3× |
 | `retry N CMD...` | exponential backoff 2s 4s 8s … |
-| `ensure_dir PATH OWNER MODE` / `ensure_line FILE LINE` / `ensure_kv FILE KEY VALUE` | idempotent file edits |
+| `ensure_dir PATH OWNER MODE` / `ensure_line FILE LINE` / `ensure_kv FILE KEY VALUE` / `ensure_kv_default FILE KEY VALUE` | idempotent file edits; `ensure_kv` rewrites the key's value on every run, `ensure_kv_default` writes `KEY=VALUE` only when no such key exists (a blank value counts as present), so a value the Principal set by hand survives a re-run of the step: `PRUNE_WINDOW_HOURS` in step 02 (S53) |
 | `render_template SRC DST [VAR...]` | `envsubst` restricted to the named variables, then install with mode |
 | `wait_http URL TIMEOUT_S` | polls until HTTP 200 |
 | `notify MSG` | ntfy push if configured; never fails the caller |
@@ -228,4 +228,15 @@ Open WebUI on the host network (`$OPENWEBUI_PORT`) — listen on 0.0.0.0 behind 
 allow rules; squid additionally listens on the docker0 gateway for the containers. Every other listener is loopback or
 pinned to the LAN address, and the Phase 2 gate marks any further wildcard listener NOT HEALTHY. Sentinel and the 72-hour prune are systemd timers whose only job is to enqueue the Celery task
 (Section 9.3 names a timer, Section 9.7 makes Celery the executor; this satisfies both). AEGIS nightly is the
-same pattern.
+same pattern. The prune stamp is touched after the enqueue, so a sweep that fails inside the worker is not retried before
+the next >= 71 h slot; the task itself pushes the alert (S53).
+
+Retention names (Sections 9.6 and 10.4, S53): `PRUNE_WINDOW_HOURS` (`orchestrator.env`; seeded once by
+`phase2/02-orchestrator.sh` with `ensure_kv_default`, read by `atlas.tasks.prune.prune_sweep` with the fallback
+`DEFAULT_WINDOW_HOURS` 72), `COLD_DIR` (steps 02 and 08; the sweep's archive root) and `OPENWEBUI_CHAT_RETENTION_DAYS`
+(step 02; `atlas.tasks.retention`); the ntfy titles `ATLAS prune: sweep failed` (`FAILURE_TITLE`) and `ATLAS prune:
+vault invariant breach`; the archive contract: `graph.json` members carry `doc_id`, `document`, `ts`, `hemisphere`,
+`expires_at`, `meta`, collection members `id`, `document`, `metadata`, and `manifest.json` carries `graph` and
+`graph_without_text`; the graph index column `text` (`atlas.memory.GraphIndexRow.text`). The chat-turn TTL (`atlas.api`
+`CHAT_TURN_TTL_HOURS`, 90 days), the Sentinel TTL (`atlas.tasks.sentinel` `SENTINEL_KEEP_DAYS`, 366) and the ledger
+windows (`atlas.ledger` `RETENTION_S`) are code constants fixed by D9, not env keys.

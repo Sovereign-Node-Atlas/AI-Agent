@@ -749,6 +749,7 @@ class GraphIndexRow:
     hemisphere: str
     expires_at: float | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    text: str | None = None  # the document as inserted (S53); None for a row written before the index kept it
 
 
 class _LoopThread:
@@ -843,7 +844,13 @@ class LightRAGStore:
         self._lock = threading.RLock()
         self._index_ready = False
 
-    # --- our own index of what is in the graph (doc ids, temporal flags, hemisphere) -----------------------------
+    # --- our own index of what is in the graph (doc ids, temporal flags, hemisphere, the text) ---------------------
+    # `text` (S53) is the document as inserted, kept so tasks/prune.py can archive a temporal graph document with its
+    # content before deleting it (9.6 "compressed into a dated archive"; before S53 graph.json held index rows only and
+    # a pruned graph note was not restorable). LightRAG 1.5.7 keeps the same text in its own KV store
+    # (full_docs[doc_id]["content"], VERIFIED in the pinned source, lightrag/lightrag.py ~2284) but behind an internal
+    # attribute and a built per-hemisphere instance; the wrapper's index is the cheap, stable source. Same plaintext
+    # exposure as LightRAG's kv_store_full_docs.json beside it; no new one.
 
     def _index(self) -> sqlite3.Connection:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -851,8 +858,10 @@ class LightRAGStore:
         if not self._index_ready:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS docs (doc_id TEXT PRIMARY KEY, ts REAL NOT NULL, temporal INTEGER "
-                "NOT NULL, hemisphere TEXT NOT NULL, expires_at REAL, meta_json TEXT)"
+                "NOT NULL, hemisphere TEXT NOT NULL, expires_at REAL, meta_json TEXT, text TEXT)"
             )
+            if "text" not in {row[1] for row in conn.execute("PRAGMA table_info(docs)")}:
+                conn.execute("ALTER TABLE docs ADD COLUMN text TEXT")  # an index created before S53; rows stay NULL
             conn.commit()
             self._index_ready = True
         return conn
@@ -860,13 +869,13 @@ class LightRAGStore:
     def index_rows(self, *, temporal_only: bool = False) -> list[GraphIndexRow]:
         conn = self._index()
         try:
-            sql = "SELECT doc_id, ts, temporal, hemisphere, expires_at, meta_json FROM docs"
+            sql = "SELECT doc_id, ts, temporal, hemisphere, expires_at, meta_json, text FROM docs"
             if temporal_only:
                 sql += " WHERE temporal = 1"
             rows = conn.execute(sql).fetchall()
         finally:
             conn.close()
-        return [GraphIndexRow(r[0], r[1], bool(r[2]), r[3], r[4], json.loads(r[5] or "{}")) for r in rows]
+        return [GraphIndexRow(r[0], r[1], bool(r[2]), r[3], r[4], json.loads(r[5] or "{}"), r[6]) for r in rows]
 
     def hemisphere_of(self, doc_id: str) -> str | None:
         conn = self._index()
@@ -1094,7 +1103,7 @@ class LightRAGStore:
         conn = self._index()
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO docs VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO docs VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc_id,
                     now,
@@ -1102,6 +1111,7 @@ class LightRAGStore:
                     hemisphere,
                     now + ttl_hours * 3600.0 if ttl_hours is not None else None,
                     json.dumps(dict(metadata or {}), default=str),
+                    text,
                 ),
             )
             conn.commit()

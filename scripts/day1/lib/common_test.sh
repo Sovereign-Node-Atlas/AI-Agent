@@ -124,6 +124,28 @@ check "ensure_kv: appends a new key" test "$(grep '^NEWKEY=' "$kv")" = "NEWKEY=4
 check "ensure_kv: keeps comments and other keys" test "$(head -n1 "$kv")" = "# comment" -a "$(grep -c '^OTHER=x' "$kv")" -eq 1
 check "ensure_kv: idempotent line count" test "$(wc -l <"$kv")" -eq 4
 
+# --- ensure_kv_default (write-if-absent: a hand-edited value survives a re-run, S53) ------------------------------------
+kvd="$TMP/kvd.env"
+ensure_kv_default "$kvd" WINDOW 72
+check "ensure_kv_default: creates the file and appends an absent key" test "$(cat "$kvd")" = "WINDOW=72"
+ensure_kv "$kvd" WINDOW 168   # the Principal's later edit
+ensure_kv_default "$kvd" WINDOW 72
+check "ensure_kv_default: an existing key keeps its value" test "$(grep '^WINDOW=' "$kvd")" = "WINDOW=168"
+printf '  SPACED=keep\nBLANK=\n# WINDOWS=comment\n' >>"$kvd"
+ensure_kv_default "$kvd" SPACED x
+ensure_kv_default "$kvd" BLANK x
+ensure_kv_default "$kvd" WINDOWS 1
+check "ensure_kv_default: leading whitespace and a blank value still count as present" \
+  test "$(grep -c '^  SPACED=keep$' "$kvd")" -eq 1 -a "$(grep -c '^BLANK=$' "$kvd")" -eq 1
+check "ensure_kv_default: a commented key is absent; a prefix (WINDOW) is not a match" \
+  test "$(grep '^WINDOWS=' "$kvd")" = "WINDOWS=1" -a "$(grep '^WINDOW=' "$kvd")" = "WINDOW=168"
+check "ensure_kv_default: line count (one append per absent key, nothing rewritten)" test "$(wc -l <"$kvd")" -eq 5
+kvp="$TMP/kvp.env"; printf 'WINDOWS=1\n' >"$kvp"
+ensure_kv_default "$kvp" WINDOW 72
+check "ensure_kv_default: a longer key (WINDOWS) does not stand in for WINDOW" test "$(grep -c '^WINDOW=72$' "$kvp")" -eq 1
+( ensure_kv_default "$kvd" 'bad-key' 1 ) >/dev/null 2>&1; rc=$?
+check "ensure_kv_default: rejects a bad key" test "$rc" -ne 0
+
 # --- render_template --------------------------------------------------------------------------------------------------
 tpl="$TMP/unit.tpl"
 # shellcheck disable=SC2016  # the template must contain literal $VAR references for render_template to expand

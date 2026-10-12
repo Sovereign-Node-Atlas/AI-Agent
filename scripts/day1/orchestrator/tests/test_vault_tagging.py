@@ -966,3 +966,138 @@ def io_empty() -> Any:
     import io
 
     return io.BytesIO(b"")
+
+
+# --- S53: the graph archive carries text; a failed sweep reaches the Principal; the window key is seeded once --------
+
+
+def _archive_members(archive: Path) -> dict[str, Any]:
+    import tarfile
+
+    with tarfile.open(archive, mode="r:*") as tar:
+        return {n: json.loads((tar.extractfile(n) or io_empty()).read() or b"null") for n in tar.getnames()}
+
+
+def test_prune_archives_graph_documents_with_their_text(tmp_path: Path) -> None:
+    """S53: graph.json holds each pruned graph document's text (from the wrapper's own index), so a pruned graph note
+    is restorable like a collection member. An index created before the column existed is migrated in place and its
+    rows archive as document=None, counted in the manifest, never silently."""
+    import sqlite3
+    import time
+
+    from atlas.memory import DEFAULT_GRAPH_INDEX
+
+    t0 = time.time()
+    old_index = tmp_path / "graph" / DEFAULT_GRAPH_INDEX
+    old_index.parent.mkdir(parents=True)
+    with sqlite3.connect(old_index) as conn:  # the pre-S53 six-column schema with one expired temporal row
+        conn.execute(
+            "CREATE TABLE docs (doc_id TEXT PRIMARY KEY, ts REAL NOT NULL, temporal INTEGER NOT NULL, "
+            "hemisphere TEXT NOT NULL, expires_at REAL, meta_json TEXT)"
+        )
+        conn.execute("INSERT INTO docs VALUES (?, ?, 1, 'estate', ?, '{}')", ("old-pulse", t0 - 7200, t0 - 3600))
+    store, _chroma, rags, _sessions = make_store(tmp_path)
+    graph = store.graph
+    assert graph is not None
+    text = "Sentinel pulse: the vineyard pump drew 3x its usual current"
+    assert graph.insert(text, doc_id="pulse-1", hemisphere="estate", temporal=True, ttl_hours=1).written
+    assert graph.insert("permanent summary", doc_id="chat-summary-k", hemisphere="estate").written
+    rows = {r.doc_id: r for r in graph.index_rows()}
+    assert rows["pulse-1"].text == text and rows["old-pulse"].text is None and rows["chat-summary-k"].text
+    res = prune.run_sweep(store, tmp_path / "cold", now=t0 + 2 * 3600)
+    assert res.errors == [] and res.graph_moved == 2 and res.moved == {}
+    members = _archive_members(Path(res.archive))
+    by_id = {g["doc_id"]: g for g in members["graph.json"]}
+    assert by_id["pulse-1"]["document"] == text and by_id["pulse-1"]["hemisphere"] == "estate"
+    assert by_id["old-pulse"]["document"] is None
+    assert members["manifest.json"]["graph"] == 2 and members["manifest.json"]["graph_without_text"] == 1
+    assert sorted(rags.rags["estate"].deleted) == ["old-pulse", "pulse-1"]
+    assert {r.doc_id for r in graph.index_rows()} == {"chat-summary-k"}  # the permanent summary is untouched
+
+
+def test_prune_failure_push_survives_a_broken_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """S53 review: the ledger is written first but is not the alert path; a locked or full ledger must neither skip
+    the push nor replace the sweep's own error."""
+    from atlas import tasks as tasks_mod
+
+    monkeypatch.setenv("ATLAS_DB_PATH", str(tmp_path / "atlas.sqlite3"))
+    monkeypatch.setenv("COLD_DIR", str(tmp_path / "cold"))
+    notices: list[dict[str, Any]] = []
+    monkeypatch.setattr(tasks_mod, "notify", lambda msg, **kw: notices.append({"msg": msg, **kw}) or True)
+
+    def broken_build(*a: Any, **kw: Any) -> MemoryStore:
+        raise MemoryStoreError("chroma unreachable")
+
+    def locked(self: Any, error: str) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("atlas.memory.build_memory_store", broken_build)
+    monkeypatch.setattr(tasks_mod.TaskRecord, "failed", locked)
+    r = prune.prune_sweep.apply(task_id="prune-ledger-locked")
+    assert r.state == "FAILURE" and isinstance(r.result, MemoryStoreError)  # the sweep's error, not the ledger's
+    assert len(notices) == 1 and "chroma unreachable" in notices[0]["msg"] and notices[0]["priority"] == "high"
+
+
+def test_prune_failure_reaches_the_principal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """S53: the cadence stamp is touched at enqueue, so a sweep that fails inside the worker would be silent for
+    three days; the task pushes one high-priority ntfy line whether it raised or finished with errors, keeps the
+    original exception when the push itself breaks, and sends nothing after a clean sweep."""
+    from atlas import tasks as tasks_mod
+    from atlas.ledger import Ledger
+
+    db = tmp_path / "atlas.sqlite3"
+    monkeypatch.setenv("ATLAS_DB_PATH", str(db))
+    monkeypatch.setenv("COLD_DIR", str(tmp_path / "cold"))
+    notices: list[dict[str, Any]] = []
+    monkeypatch.setattr(tasks_mod, "notify", lambda msg, **kw: notices.append({"msg": msg, **kw}) or True)
+
+    def broken_build(*a: Any, **kw: Any) -> MemoryStore:
+        raise MemoryStoreError("chroma unreachable")
+
+    monkeypatch.setattr("atlas.memory.build_memory_store", broken_build)
+    r = prune.prune_sweep.apply(task_id="prune-raise")
+    assert r.state == "FAILURE" and isinstance(r.result, MemoryStoreError)
+    assert len(notices) == 1 and notices[0]["title"] == prune.FAILURE_TITLE and notices[0]["priority"] == "high"
+    assert "prune-raise" in notices[0]["msg"] and "chroma unreachable" in notices[0]["msg"]
+    assert "not retried before the next timer slot" in notices[0]["msg"]
+    ledger = Ledger(db)
+    ledger.init_db()
+    assert ledger.get_task("prune-raise")["status"] == "failed"  # type: ignore[index]
+
+    # Finished with errors (a graph read failure): the task fails as before and the push names the error.
+    store, _chroma, _rags, _sessions = make_store(tmp_path)
+
+    class _BrokenGraph:
+        def index_rows(self, **kw: Any) -> Any:
+            raise MemoryStoreError("graph index locked")
+
+    store.graph = _BrokenGraph()  # type: ignore[assignment]
+    monkeypatch.setattr("atlas.memory.build_memory_store", lambda *a, **kw: store)
+    r = prune.prune_sweep.apply(task_id="prune-errors")
+    assert r.state == "FAILURE" and "graph index locked" in str(r.result)
+    assert len(notices) == 2 and "graph index locked" in notices[1]["msg"] and notices[1]["tags"] == ["warning"]
+    assert ledger.get_task("prune-errors")["status"] == "failed"  # type: ignore[index]
+
+    # The push breaking never masks the sweep's own failure.
+    monkeypatch.setattr(tasks_mod, "notify", lambda msg, **kw: (_ for _ in ()).throw(OSError("ntfy down")))
+    r = prune.prune_sweep.apply(task_id="prune-ntfy-down")
+    assert r.state == "FAILURE" and "graph index locked" in str(r.result) and "ntfy down" not in str(r.result)
+
+    # A clean sweep: done, no push.
+    monkeypatch.setattr(tasks_mod, "notify", lambda msg, **kw: notices.append({"msg": msg, **kw}) or True)
+    store.graph = None
+    r = prune.prune_sweep.apply(task_id="prune-clean")
+    assert r.state == "SUCCESS" and len(notices) == 2
+    assert ledger.get_task("prune-clean")["status"] == "done"  # type: ignore[index]
+    ledger.close()
+
+
+def test_step02_seeds_the_prune_window_once_and_never_rewrites_it() -> None:
+    """S53 contract with phase2/02-orchestrator.sh: PRUNE_WINDOW_HOURS is written with the write-if-absent helper so a
+    Principal-approved value survives a re-run (ensure_kv would reset it to 72), and the task reads that same key."""
+    day1 = Path(__file__).resolve().parents[2]
+    step = (day1 / "phase2" / "02-orchestrator.sh").read_text(encoding="utf-8")
+    assert 'ensure_kv_default "$ORCH_ENV" PRUNE_WINDOW_HOURS 72' in step
+    assert 'ensure_kv "$ORCH_ENV" PRUNE_WINDOW_HOURS' not in step
+    assert "ensure_kv_default()" in (day1 / "lib" / "common.sh").read_text(encoding="utf-8")
+    assert prune.DEFAULT_WINDOW_HOURS == 72.0
