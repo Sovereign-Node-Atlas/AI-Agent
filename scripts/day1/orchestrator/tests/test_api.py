@@ -416,6 +416,7 @@ def test_arbiter_load_unload_and_remeasure_routes(harness: dict[str, Any]) -> No
     r = client.post("/arbiter/load", json={"engine": "gpt-oss-120b", "ctx": 32768, "parallel": 1, "task_id": "p3"})
     assert r.status_code == 200, r.text
     assert r.json()["decision"] == "granted" and r.json()["granted"] and r.json()["projected_bytes"] > 0
+    assert r.json()["evicted"] == []  # nothing was resident
     assert "gpt-oss-120b" in harness["arbiter"].resident
     assert client.post("/arbiter/load", json={"engine": "nope"}).status_code == 404
     # Resident: re-measuring is refused (4.1: the resident set is what is there with NO engine loaded).

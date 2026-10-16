@@ -1,7 +1,7 @@
 # A.T.L.A.S. Day 1 scripts
 
 `scripts/day1/` implements Section 17 (Day 1 Execution Protocol) of `docs/ATLAS_FRAMEWORK_REVIEW.md` and proves
-Section 21 (V1..V24) on the node. Four phases, one command each, every phase idempotent and resumable, every phase
+Section 21 (V1..V25) on the node. Four phases, one command each, every phase idempotent and resumable, every phase
 ending with a printed gate table and the exact next command. `CONVENTIONS.md` is the contract every file follows;
 `COVERAGE.md` maps every Section 17 step and every V item to its file. Nothing here calls a cloud AI, installs ROCm on
 the host, or lets a request leave the node except through the local allowlist proxy (`config/allowlist.txt`).
@@ -44,7 +44,7 @@ step 5b installs XFCE, xrdp and Google Chrome, and you reach the desktop from th
 | WireGuard test from your phone on mobile data (WireGuard and ntfy apps installed) | Phase 1 step 7 waits 10 minutes | V5 deferred, to-do `vpn-mobile-test` |
 | One Remote Desktop connection from the Windows PC | Phase 1 step 5b waits 10 minutes | V19 deferred, to-do `rdp-test` |
 | Your Windows PC's address, to limit Remote Desktop on the LAN to that PC (`RDP_ALLOW_FROM`) | Never asked: after a successful test from the LAN (a test over WireGuard records nothing), step 5b records the to-do `rdp-restrict` with the address your PC used and the two commands that apply it; it closes once the firewall no longer admits the whole subnet | The whole LAN subnet may reach Remote Desktop, as before |
-| Hugging Face token (read scope) with the licences accepted for `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0`, `black-forest-labs/FLUX.1-dev`, `stabilityai/stable-audio-open-1.0` | Phase 2 start, hidden input | PyAnnote (V6) and the gated Phase 4 engines deferred, to-do `input-hf-token` |
+| Hugging Face token (read scope) with the licences accepted for `pyannote/speaker-diarization-community-1` (since v0.4.0, C-06; 3.1 and `segmentation-3.0` are no longer needed), `black-forest-labs/FLUX.1-dev`, `stabilityai/stable-audio-open-1.0` | Phase 2 start, hidden input | PyAnnote (V6) and the gated Phase 4 engines deferred, to-do `input-hf-token` |
 | Google OAuth client JSON (Desktop-app type) at `/srv/atlas/staging/inbox/google-oauth-client.json`, then one sign-in per account | Phase 2 step 6c | V20 deferred, to-do `input-google-oauth-client` |
 | Voice references `alaric.*` / `gideon.*` (WAV, MP3 or M4A) in `/srv/atlas/staging/inbox/voice-references/` | Phase 2 step 5 | V7 deferred |
 | `cl100k_base.tiktoken` in `/srv/atlas/staging/inbox/` | Phase 2 step 4 | Warning with the download command |
@@ -78,7 +78,7 @@ git clone <repo> && cd <repo>/scripts/day1
 sudo ./atlas-day1.sh phase1          # Phase 1 steps 1-4, then the node reboots
 sudo ./atlas-day1.sh phase1          # after the reboot: steps 5, 5b, 6, 7, 8 (gate)
 sudo ./atlas-day1.sh phase2          # steps 1-10; a few skippable prompts (below)
-sudo ./atlas-day1.sh phase3          # detached; ~15 h of download + ~30 min of load tests
+sudo ./atlas-day1.sh phase3          # detached; ~10 h of download (~448 GB) + the load, parity and quality tests
 journalctl -fu atlas-day1-phase3     # follow it (or: tail -f /var/lib/atlas/day1/logs/phase3-<date>.log)
 sudo ./atlas-day1.sh phase4          # detached; several hours, can run overnight
 journalctl -fu atlas-day1-phase4
@@ -114,12 +114,17 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   watchdog passes, the softdog fallback is `deferred`); a read-only record of whether a kernel panic's log can be kept
   (pstore); XFCE + xrdp + Google Chrome (Google's apt repo, telemetry/sign-in off by policy, never a snap); Docker with GPU passthrough and the
   DOCKER-USER egress rules; WG-Easy, Cloudflare ddns, ntfy; gate.
-- **Phase 2 — engines and services** (30-60 min, no large downloads): llama.cpp Vulkan build (`-DLLAMA_OPENSSL=ON`,
-  `-DLLAMA_USE_PREBUILT_UI=OFF`) and one env file per engine (`phase2/engine-env.py`; the vision engine at its standing
-  2 × 32k profile, every chat engine logging at `--verbosity 4` for V4 and the Phase 3 records, doc S52); Redis, Celery,
-  the orchestrator (`atlas` package: Arbiter, router, approval queue, ledger, and the per-slot window that keeps every
+- **Phase 2 — engines and services** (30-60 min, no large downloads): llama.cpp Vulkan build at the pinned build tag
+  b11474 (commit b9acf138, v0.4.0; `-DLLAMA_OPENSSL=ON`, `-DLLAMA_USE_PREBUILT_UI=OFF`; `llama-perplexity` among the
+  binaries), the old pin v0.4.1's `llama-perplexity` beside it in `/opt/atlas/llama-parity` for the Phase 3 parity
+  test only (V25), and one env file per engine (`phase2/engine-env.py`; every unit at its own `engines.json` profile,
+  the CPU retrieval pair with `--device none`, every chat engine logging at `--verbosity 4` for V4 and the Phase 3
+  records, doc S52); Redis, Celery, the orchestrator (`atlas` package: Arbiter, one LLM seat resident at a time with
+  `ATLAS_ARBITER_MAX_RESIDENT=1` seeded once, router, approval queue, ledger, and the per-slot window that keeps every
   request to a llama-server inside one slot of its engine, doc S52, §6); Open WebUI hardened offline; ChromaDB,
-  LightRAG, the three resident small models, Docling; Kokoro, Chatterbox, Whisper (speaches), PyAnnote; the Section 15.1
+  LightRAG, the three resident small models (the Qwen3.5-4B router on the iGPU, the Qwen3 4B embedder and reranker on
+  the CPU, replacing the bge pair before any document is indexed, D-45 (a)), Docling; Kokoro, Chatterbox, Whisper
+  (speaches), pyannote community-1 (C-06); the Section 15.1
   tools and the cross-build container; Cloudflare token relocation (V23); Google OAuth (V20); the AEGIS sandbox image;
   restic + AEGIS timers (V13); Sentinel and prune timers (the sweep's window key seeded once into `orchestrator.env`,
   a failed sweep pushed to your phone, graph archives carrying their text, doc S53, §4 and §6); the Windows share
@@ -129,14 +134,20 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   in Phase 2 step 7), the LUKS recovery key shown in Phase 1 step 2 (on-node copy under `/etc/atlas/secrets/` only when the OS volume is encrypted; otherwise your written copy is the only other one), and the
   vault passphrase you chose (plus the gocryptfs master key shown once) if you initialised the vault (§3). A fire or
   burglary that takes the node takes anything beside it; the USB copy is the one that survives.
-- **Phase 3 — core LLM pull** (download-bound): the seven GGUF engines at their fixed quantisations, sha256 from the
-  Hugging Face tree API into `MANIFEST.json`; per-engine load tests through the Arbiter (V4 KV proof, tok/s at 512 and
-  8k, swap time, memory returned), each load also recording, never as a verdict, its context memory from its own log
-  beside the Arbiter's estimate, its host RAM and whether llama-server switched context shift off (doc S52); the
-  two-residency test (V14b, V21; the vision engine at its standing 2 × 32k profile, no temporary override); gate,
-  preceded by two to-dos for you built from those records, `kv-estimates` and `cache-ram` (§6). The Sentinel/prune
-  timers, the GPU Celery worker and Open WebUI are quiesced during the tests and resumed afterwards: **do not use the
-  assistant while Phase 3 runs** (the ntfy push says when it is done).
+- **Phase 3 — core LLM pull** (download-bound): the four Day 1 LLM seats of `engines.json` (v0.4.0, D-42 (b)):
+  GLM-5.3-Flash `UD-IQ4_XS` with its glm5v projector, DeepSeek-V4-Flash-0731 `UD-Q8_K_XL`, gpt-oss-120b (F16 trunk)
+  and its abliterated twin (unchanged), about 448 GB, sha256 from the Hugging Face tree API into `MANIFEST.json`;
+  per-seat load tests through the Arbiter, one seat at a time (V4 KV proof on every line the engine prints, tok/s at
+  512 and 8k recorded beside each seat's projection, swap time, memory returned; a seat fails V10 only below a decode
+  floor you set, none is set, so the to-do `decode-floors` is raised, D-33 (c)), each load also recording, never as a
+  verdict, its context memory from its own log beside the Arbiter's estimate, its host RAM and whether llama-server
+  switched context shift off (doc S52); DeepSeek's f16 cache first, `q8_0` only if f16 fails (S-42), and its own V22
+  row, as GLM-5.3-Flash has, so a failure of either is deferred (R19); step 2b, output parity of the re-pin against
+  v0.4.1 on the engines both builds load (V25, required); step 2c, a quality record per seat (to-do `kld-run`); the
+  single-residency test (V21: the Arbiter evicts gpt-oss-120b to load GLM-5.3-Flash, and a second request queues;
+  V14b with nothing resident); gate, preceded by two to-dos for you built from the load records, `kv-estimates` and
+  `cache-ram` (§6). The Sentinel/prune timers, the GPU Celery worker and Open WebUI are quiesced during the tests and
+  resumed afterwards: **do not use the assistant while Phase 3 runs** (the ntfy push says when it is done).
 - **Phase 4 — multimodal engines** (build-bound): the one ROCm base image (AMD's gfx1151 wheels, ROCm 10.0.0, torch
   2.13.0, torchvision 0.28.0, torchaudio 2.11.0.2, each pinned exactly; doc S51) and its self-test (V11, which also
   checks that the installed torchaudio is the pinned build); the green engines, then the yellow ones, then PointLLM
@@ -186,11 +197,11 @@ real vault and records V18.
 | Phase logs | `/var/lib/atlas/day1/logs/<phase>-<YYYYMMDD>.log`; detached phases also in `journalctl -u atlas-day1-phase3` / `-phase4` |
 | Verification records | `/var/lib/atlas/day1/verify.jsonl` (one JSON line per `record_v`; latest per id wins) |
 | Done markers | `/var/lib/atlas/day1/done/<phase>.<step>` and `<phase>.gate` |
-| Phase 3 results | `/var/lib/atlas/day1/phase3/results/<engine>.json` (field `memory`: each load's context memory, host RAM, cache and context-shift record, doc S52); model manifests `/srv/atlas/data/manifests/`, `/srv/atlas/models/<key>/MANIFEST.json` |
-| Engine profiles (doc S52) | `/etc/atlas/engines/<key>.env`, rendered by `phase2/engine-env.py` from `config/engines.json` and `/etc/atlas/engines/overrides.json`; the Arbiter projects exactly what these say, and charges a footprint Phase 3 measured only at the profile it was measured at, until the orchestrator restarts. The vision engine renders `--ctx-size 65536 --parallel 2` (`ATLAS_CORESIDENT=1`), its standing profile, so it pairs with gpt-oss-120b. To give it 8 slots instead (then it swaps gpt-oss out rather than pair): `sudo /opt/atlas/day1/phase2/engine-env.py --set-override qwen2.5-vl-72b coresident false`; to return: `sudo /opt/atlas/day1/phase2/engine-env.py --clear-override qwen2.5-vl-72b coresident`. Either takes effect when the unit next starts. Phase 3 never changes this field and stops its step 3 while it is `false` |
+| Phase 3 results | `/var/lib/atlas/day1/phase3/results/<engine>.json` (field `memory`: each load's context memory, host RAM, cache and context-shift record, doc S52), and since v0.4.0 `parity.json` (V25, step 2b), `quality.json` (step 2c, to-do `kld-run`) and `residency.json` (V21, V14b, step 3) beside them; model manifests `/srv/atlas/data/manifests/`, `/srv/atlas/models/<key>/MANIFEST.json` |
+| Engine profiles (doc S52) | `/etc/atlas/engines/<key>.env`, rendered by `phase2/engine-env.py` from `config/engines.json` and `/etc/atlas/engines/overrides.json`; the Arbiter projects exactly what these say, and charges a footprint Phase 3 measured only at the profile it was measured at, until the orchestrator restarts. Since v0.4.0 every unit renders its own `engines.json` profile (GLM-5.3-Flash 8 × 32k with its projector, DeepSeek-V4-Flash-0731 1 × 131,072, gpt-oss-120b 8 × 32k; S-22): the co-resident profile is gone, `--set-override <key> coresident` is refused and an old `coresident` field is ignored. The Qwen3 embedder and reranker render `--device none` (`ATLAS_PLACEMENT=cpu`). The only field Phase 3 writes is DeepSeek's `kv_type`, and only when its f16 rung fails and `q8_0` stands (S-42) |
 | Phase 4 results | `/var/lib/atlas/day1/phase4/<key>.json`; logs `/var/lib/atlas/day1/logs/phase4-<key>.log`; samples `/srv/atlas/workspace/phase4-samples/<key>/`; venv freezes `/srv/atlas/engines/manifests/<key>/freeze.txt` |
 | Reports | `/var/lib/atlas/day1/reports/ATLAS_BUILD_BASELINE-<timestamp>.xlsx` (the repo copy is never touched) |
-| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. One optional key is never written by a step: `ATLAS_ARBITER_HEADROOM_GIB` in `orchestrator.env`, the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44, S48, S49: the default fits every Apex KV-ladder rung; at the larger GPU resident set, about 7-8 GiB, the f16 and q8_0 rungs fit only because Phase 1 step 4 removes kdump's 4.25 GiB crash-kernel reservation, and all of it assumes kexec handover is off (`kho=off`, step 4 too), V3a proving both; a bad value stops only `atlas-orchestrator`, which says why at start). `atlas-admin arbiter status` shows it beside the CPU-side use the Arbiter warns on (MemTotal - MemAvailable - the GPU's pages, marked when above the reserve) and MemAvailable; restart `atlas-orchestrator` after changing it |
+| Settings | `/etc/atlas/atlas.env` (non-secret); `/etc/atlas/{orchestrator,memory,voice,docker,network,vault,proxy}.env` written by the steps. Two Arbiter keys in `orchestrator.env`, restart `atlas-orchestrator` after changing either; a bad value stops only `atlas-orchestrator`, which says why at start. `ATLAS_ARBITER_HEADROOM_GIB` is never written by a step: the memory the Engine Arbiter keeps back for CPU-side services (default 16, whole GiB from 4 to 64; doc S44, S48, S49). With the router alone on the iGPU (about 5.5 GiB) and the CPU retrieval pair charged as its own host resident set (about 9.6 GiB, v0.4.0), the default leaves about 156 GiB for the seat, enough for each Day 1 seat alone only because Phase 1 step 4 removes kdump's 4.25 GiB crash-kernel reservation and turns kexec handover off (`kho=off`), V3a proving both; GLM-5.3-Flash's margin is the thinnest, 0.9 to 1.9 GiB (doc 4.1). `ATLAS_ARBITER_MAX_RESIDENT` is seeded once by Phase 2 step 2 (`ensure_kv_default`, so your value survives a re-run): how many LLM seats may be resident at once, default 1, range 1 to 2 (D-32 (a); 2 brings back v0.3.5's pairing of seats that fit, the Apex staying exclusive). `atlas-admin arbiter status` shows both beside the CPU-side use the Arbiter warns on (MemTotal - MemAvailable - the GPU's pages, marked when above the reserve) and MemAvailable, and the LLM seats active against the limit |
 | Retention (doc S53; 9.6, 10.4) | Three keys in `/etc/atlas/orchestrator.env` (root:atlas 640): `PRUNE_WINDOW_HOURS=72`, the fallback expiry in hours of a temporal memory note whose writer gave no TTL (it governs no current writer: chat turns carry 90 days and Sentinel BLUFs 366 days from code, D9; the sweep's cadence is `atlas-prune.timer`, a daily 03:10 check with at least 71 hours between enqueues, not this key); `COLD_DIR=/srv/cold`, the sweep's dated archives (`prune/prune-<UTC stamp>.tar.zst`: vector and graph documents with their text, read back and verified before any delete; raw chat turns are never archived, D9); `OPENWEBUI_CHAT_RETENTION_DAYS=90`, after which the nightly 04:15 task summarises an Open WebUI chat into memory and deletes it. The 90-day chat-turn TTL, the 366-day Sentinel TTL and the ledger's 30-day window are code constants fixed by D9, not settings. **To apply an approved retention change** (doc 16.3 item 6: ATLAS proposes, you apply as root): edit the file as root (`sudoedit /etc/atlas/orchestrator.env`; whether 26.04's sudo-rs provides `sudoedit` is UNVERIFIED, in which case open it in an editor run with `sudo`), then `sudo systemctl restart atlas-celery-cpu atlas-celery-gpu atlas-celery-beat` (the workers read the file only at start). A re-run of Phase 2 step 2, `--force 02` included, keeps your `PRUNE_WINDOW_HOURS`: the step writes that key only when it is absent (`ensure_kv_default`); every other key it owns is rewritten. **A failed sweep** (it raised, or finished with a read, delete or graph-delete error) pushes one ntfy line, "ATLAS prune: sweep failed" (priority high), with the task id and the error; the timer's stamp was already touched at the enqueue, so nothing retries it before the next 71-hour slot. Read `journalctl -u atlas-celery-cpu` and the ledger's task row, fix the cause, then either wait for the next slot or run it now: `sudo rm /var/lib/atlas-prune/last && sudo systemctl start atlas-prune.service` (the unit's stamp gate lets the enqueue through when no stamp exists; this follows from the unit and has not been exercised). A clean sweep pushes nothing |
 | Secrets | `/etc/atlas/secrets/` (root:atlas 710; every file 600, owned by its one reader): `hf-token.env`, `cloudflare.env`, `ntfy.env`, `smb.cred`, `restic.pass`, `redis.env`, `openwebui.env`, `wg-easy.env`, `google/` |
 | The scripts the node runs | `/opt/atlas/day1/` (a mirror of this directory) |
@@ -200,7 +211,7 @@ real vault and records V18.
 
 Every step is wrapped in `run_step`: when its done marker exists it is skipped. Re-running a phase therefore resumes
 after the last completed step; a step that failed has no marker and runs again. `--force STEP` clears one marker
-first (ids are the Section 17 numbers: `01`, `05b`, `06c`, `09b`; Phase 3 and 4 use `01`..`06`). Downloads resume
+first (ids are the Section 17 numbers: `01`, `05b`, `06c`, `09b`; Phase 3 uses `01`, `02`, `02b`, `02c`, `03`, `04`; Phase 4 `01`..`06`). Downloads resume
 (`hf_download` skips files whose sha256 already matches), builds skip when the artefact exists, and Phases 3 and 4 are
 resumable per file and per engine.
 
@@ -221,7 +232,7 @@ gate marker only when no required id is `fail` or missing. `deferred` never bloc
 |---|---|---|
 | 1 | V2, V3a, V5, V19, V24 | V1 (info); V24 `deferred` when step 4 found no hardware watchdog and softdog stands in (to-do `watchdog`) |
 | 2 | V3b, V6, V12, V13, V14a, V15, V16, V17, V18, V20, V23, and every service healthy | V7, V10a (the Phase 2 half of V10); V18 `deferred` until the real vault is initialised |
-| 3 | V4 per engine, V10, V14b, V21 | V22 (DeepSeek, R19) |
+| 3 | V4 per engine, V10, V14b, V21, V25 | V22 (the Apex and GLM-5.3-Flash, each on its own row, R19 generalised) |
 | 4 | V11 | V8, V9, the per-engine table |
 
 The Phase 2 gate also checks every service by name (units active, containers healthy, authenticated Redis, HTTP health,
@@ -229,9 +240,9 @@ the bind rule, the sandbox image labels, secrets unreadable to group/world) and 
 table. Fix what it names and run `phase2` again: only the gate step is left.
 
 **"deferred"** means the proof could not be made yet for a reason Section 17 or 22 allows, and nothing depends on it
-today: V7 without the reference recordings, V18 until the vault is initialised, V22 when DeepSeek V4 Flash fails to load
-or no KV rung is coherent, V8/V9 and the yellow Phase 4 engines when their build or test fails, V24 when this board has
-no usable hardware watchdog and softdog is armed in its place (to-do `watchdog`, doc S50). A deferred row is
+today: V7 without the reference recordings, V18 until the vault is initialised, V22 when DeepSeek-V4-Flash-0731 or
+GLM-5.3-Flash fails to load or no KV rung is coherent, V25 when the old build v0.4.1 cannot load a file to compare,
+V8/V9 and the yellow Phase 4 engines when their build or test fails, V24 when this board has no usable hardware watchdog and softdog is armed in its place (to-do `watchdog`, doc S50). A deferred row is
 written with the reason, shown in the table and the workbook, and never silently upgraded to pass.
 
 ## 6. Known limits
@@ -246,6 +257,56 @@ written with the reason, shown in the table and the workbook, and never silently
 - Section 11 and Appendix C name `vault/cipher` (backed up) and `vault/open` (never backed up).
 - Section 21 declares `V10a`, the `T-<tool>` and `P4-wheels` recorded-only rows, and the Day 2 scope of V15's send
   channels; Section 23 S24–S29 list what the build added, deferred to Day 2, or admitted to the allowlist.
+
+### What v0.4.0 changed, and what it leaves phased (`docs/ATLAS_FRAMEWORK_REVIEW.md` v0.4.0)
+
+On 2026-10-16 the Principal approved every row of the action register (D-25 (a), D-26 (c)). Day 1 now takes:
+
+- **The pin.** llama.cpp build tag b11474 (commit b9acf138a1e28ce1fc23b5a4fc4b12444b50f7ea, 2026-10-07, CMake version
+  0.6.0), with v0.4.1 (b29c606e) kept buildable beside it only for V25 (`phase2/01-llama.sh`; doc 3.4).
+- **The roster.** GLM-5.3-Flash `UD-IQ4_XS` with its glm5v projector (Ren, Gideon, Silas, Helena, Minerva, Victor,
+  Alaric, Eleanor's persona work, vision, long documents, the Deep Think generator), DeepSeek-V4-Flash-0731
+  `UD-Q8_K_XL` (Arthur, the Apex, the Deep Think adversary), gpt-oss-120b F16-trunk (fast utility and fallback
+  floor, the Day 1 Deep Think third opinion), the router unchanged. Each persona file records a `fallback_engine`
+  (D-40 (a)), a record only, never picked at run time. Qwen2.5-VL-72B, Meditron-70B, Qwen3.5-122B-A10B and the bge
+  pair are retired (doc 5.1, 5.3).
+- **The Arbiter.** Exact file bytes in GiB (D-31), one LLM seat resident at a time (D-32), the KV, per-slot state
+  and compute-buffer terms (S-17), the CPU retrieval pair as a host resident set (D-14 (e)).
+- **Phase 3.** The four-repository pull, V10 recorded beside projections, the f16-first ladder, V22 per newer
+  engine, step 2b (V25), step 2c (`kld-run`), and step 3 as single residency (doc 17).
+- **The one exception approved for now.** pyannote speaker-diarization-community-1 replaces 3.1 (C-06).
+
+Phased after Day 1, each with its to-do and the event that brings it in (doc 5.1, 5.3, 4.4, 6.3, 14.1, 15.2, 15.5):
+
+- the specialist seats Intern-S1, Ling-3.0-flash-Fin, Baichuan-M3 and Qwen3-Coder-Next;
+- the Qwen3.8-Flash-Next and Nemotron 3 Super pulls, and the EmbeddingGemma 2 side index (all recorded in
+  `engines.json` `phased`, which nothing reads);
+- slot save and restore, and batching queued work by engine;
+- the speech, image and OCR companions, and the drafters;
+- the DeepSeek V4.1 trial.
+
+Where an approved row leaves an input to the Principal, its default is built and the input is a to-do:
+
+- the decode floors (D-47; none, `decode-floors`);
+- DeepSeek's context target (131,072 tokens), GLM's cache type and slot profile (f16 at 8 × 32k) and the
+  long-document trigger (24,000 tokens) (D-48, S-30; `seat-profiles`);
+- the D-16 context targets of the phased medical and science seats (`Q5_K_S` at about 23K tokens; `context-targets`);
+- the D-46 trial task set (`trial-task-set`) and the D-49 test sets (`seat-test-sets`);
+- each seat's fixed reasoning setting (D-30 (b); provisional settings in `engines.json`; in the detail of `kld-run`).
+
+Phase 3 step 2 (`loadtest.py summarize`) raises `decode-floors`, `context-targets`, `trial-task-set`, `seat-test-sets`
+and `seat-profiles` on the live to-do list (`atlas-day1.sh status`), with the defaults read from the shipped config.
+
+The uncensored-seat items (D-07, D-08, D-09, D-58, N-10, P-05, P-17, S-05) are unchanged by this revision and remain
+the Principal's to configure. Not built in v0.4.0, and left to the Principal (doc 4.2 rule 5, 9.1):
+
+- the memory measures beyond the Arbiter: an explicit `--cache-ram` on the seats, a lower Celery cpu concurrency, a
+  smaller `/tmp`, memory limits on the voice and Docling containers, `OOMScoreAdjust`, and stopping a seat whose
+  start failed.
+
+D-43 (a) is built: the deep Deep Think tier runs only on the Principal's explicit `[DEEP THINK:DEEP]`; a classifier
+depth of `deep` (the task-weight trigger, or a `[DEEP THINK: ...]` that types no depth) runs at standard, with the
+reason `deep-think:deep->standard(D-43: explicit acceptance required)` in the routing ledger (`atlas/router.py`).
 
 ### Versions without a research pin (rule §7.9)
 
@@ -299,21 +360,24 @@ driver option. 152: WG-Easy v15 `INIT_*` unattended setup and the minimal capabi
 `/user/tokens/verify` endpoint name. 280: ntfy CLI non-tty password read. 325, 350: `ntfy token add` output format.
 373, 382: probing ntfy from inside the wg-easy container (no wget in the image; check from the phone).
 
-**phase2/01-llama.sh** — 138: install layout of every llama.cpp tool. 220, 233: sudo-rs `visudo -c -f`. 246, 247:
-sudo-rs `-l COMMAND` and `listpw`.
+**phase2/01-llama.sh** — 313, 326: sudo-rs `visudo -c -f`. 339, 340: sudo-rs `-l COMMAND` and `listpw`. VERIFIED
+since v0.4.0 (pin facts at b11474): the install layout of the tools the step installs, and that the cmake flags are
+unchanged from v0.4.1 (the top-level CMakeLists.txt differs only in its version lines).
 
 **phase2/02-orchestrator.sh** — 340: uv fetching python-build-standalone from github.com.
 
 **phase2/03-openwebui.sh** — 248: API-key creation path (`ENABLE_API_KEYS`). 269: the model-list path.
 
-**phase2/04-memory.sh** — 136, 912: `+cpu` cp312 torch/torchvision wheels on download.pytorch.org. 324, 327: a tree
-entry without `lfs.oid`; research snippet sha256 vs tree API. 416, 426, 432: sudo-rs `-l COMMAND` fallback.
-563, 593: ChromaDB telemetry variable names for the Rust server (DOCKER-USER drop is the belt). 654, 663: Chroma v2
+**phase2/04-memory.sh** — 155, 990: `+cpu` cp312 torch/torchvision wheels on download.pytorch.org. 360: a tree
+entry without `lfs.oid` (a pinned `verify=research-snippet` sha256 the tree API contradicts stops the pull since v0.4.0,
+no longer a warning). 458, 468, 474: sudo-rs `-l COMMAND` fallback.
+616, 646: ChromaDB telemetry variable names for the Rust server (DOCKER-USER drop is the belt). 707, 716: Chroma v2
 REST collection paths.
 
-**phase2/05-voice.sh** — 152: torchcodec 0.8.x / torch 2.9.x compatibility row. 158: whether pyannote.audio 4.0.7
-loads the legacy 3.1 pipeline (V6 decides). 290: §2.4 latency figure (recorded, not asserted). 319: which
-large-v3-turbo id speaches' registry offers. 439, 536: CPU wheels for torch 2.6.0 cp311 / 2.9.1 on the CPU index.
+**phase2/05-voice.sh** — 158: torchcodec 0.8.x / torch 2.9.x compatibility row. 296: §2.4 latency figure (recorded,
+not asserted). 325: which large-v3-turbo id speaches' registry offers. 445, 542: CPU wheels for torch 2.6.0 cp311 /
+2.9.1 on the CPU index. Since v0.4.0 (C-06) the pipeline is community-1, the pipeline of pyannote.audio 4.x itself, so
+v0.3.5's open question (whether 4.0.7 loads the legacy 3.1 pipeline) no longer decides V6.
 
 **phase2/06-tools.sh** — 147: Blender `--offline-mode` on 4.5. 153: Bonsai import pattern. 177, 514, 541, 550:
 extensions.blender.org API and Bonsai zip name; repo id for `--repo`. 183, 191, 269: tool tarball URLs without vendor
@@ -341,12 +405,15 @@ later host FUSE mount (V18 checks it). 601, 625: sudo-rs `visudo -c -f`. 757: go
 
 **phase2/10-gate.sh** — 40, 586: the `T-<tool>` rows of step 6's soft installs (06-tools.sh), shown, never blocking.
 
-**phase2/engine-env.py** — 79: file-loading/network-path llama-server options at v0.4.1.
+**phase2/engine-env.py** — none since v0.4.0: the reserved flag and env lists were re-read against `common/arg.cpp`
+at b11474 (VERIFIED, pin facts).
 **phase2/voice_render.py** — 57: Chatterbox real-time factor.
 
-**phase3-models.sh** — 611: whether any of the seven repos is gated (a 401/403 stops with the licence URL).
-**phase3/loadtest.py** — 95: per-request `cache_prompt: false`. 97: DeepSeek V4 Flash's chat template emitting
-`<think>` by default.
+**phase3-models.sh** — none since v0.4.0: none of the four repositories is gated (`research_notes/ATLAS v0.4.0 build record/engine_data.md`); a 401/403
+still stops the pull with the licence URL.
+**phase3/loadtest.py** — 130: per-request `cache_prompt: false`. 132: DeepSeek-V4-Flash-0731's chat template emitting
+`<think>` by default. INFERRED, not UNVERIFIED: V25's thresholds (mean KLD at most 0.01, top-1 at least 98%, no fewer
+correct tasks; no published build-to-build figure exists).
 
 **phase4-engines.sh** — 356: whether stable.repo.amd.com serves a root listing (a 404 there is logged; the
 per-project pages decide). 457: cp-tag list of AMD's torch wheels; whether the AMD index mirrors torch's third-party
@@ -375,29 +442,34 @@ fatbins on the ROCm 10.0 runtime, libamdhip64 path inside the wheels.
 dependency relaxations (transformers 4.34.1 / tokenizers 0.14), eval class names.
 **phase4/engines/clay-prithvi.sh / _test.py** — 5, 2: TerraTorch `BACKBONE_REGISTRY.build(..., pretrained=True)`.
 
-**orchestrator/src/atlas/arbiter.py** — 135-151: KV bytes-per-token figures for gpt-oss (8 KV heads), Nemotron,
-Qwen3.5 and DeepSeek (bounds from Section 4.3; remeasured in Phase 3, where each load's context memory is set beside
-them and raised as the to-do `kv-estimates`, doc S52). **tasks/aegis.py** — 38, 201: ChromaDB has no
-snapshot API. **tasks/sentinel.py** — 7: feed URLs. **engines.py** — 4: endpoints marked in the file. **router.py** —
-130: ~4 characters per token. **memory.py** — 1225: bge-m3 embedding dimension 1024. **config.py** — the 16 GiB
-default host reserve (doc S44, S48, S49) rests on an estimate, not a measurement: MemTotal near 187-188 GiB once Phase 1
-step 4 has removed the crash-kernel reservation (192 GiB less the UMA carve-out, a ~3 GiB page map and ~0.5 GiB of
-firmware and kernel); every Apex KV-ladder rung fits from about 182.3-184.3 GiB. V3a records the real MemTotal and
-fails on a surviving reservation; `ATLAS_ARBITER_HEADROOM_GIB` changes the reserve if the node needs it. MemTotal is
-the real limit only because step 4 also puts `kho=off` on the kernel line (doc S49): with kexec handover on, an
-estimated 13 GiB of MemTotal (12.8-13.8, INFERRED) would be CMA scratch that GTT pages can never use, and the Apex f16
-and q8_0 rungs would likely fail with a Vulkan out-of-memory in Phase 3 although granted. V3a fails while any of it
-is set aside; `kho=off` does not change MemTotal.
+**orchestrator/src/atlas/arbiter.py** — no UNVERIFIED mark since v0.4.0: the KV bytes per token (133-159) are
+read from the GGUF headers and the cache code at b11474 (VERIFIED, `research_notes/ATLAS v0.4.0 build record/engine_data.md`); the per-slot state (160-173) is
+INFERRED by arithmetic from those code paths, and the compute-buffer allowance (180-187: 2 GiB per LLM seat, 0.5 GiB
+per companion) is an INFERRED planning figure. Phase 3 sets each engine's logged figures beside them (the to-do
+`kv-estimates`, doc S52), and a measured footprint replaces the whole projection (rule 1). **tasks/aegis.py** — 38,
+201: ChromaDB has no snapshot API. **tasks/sentinel.py** — 7: feed URLs. **engines.py** — 4: endpoints marked in the
+file. **router.py** — 140: ~4 characters per token. **memory.py** — 350: the wording of the query instruction for the
+Qwen3 embedder (T-15 measures retrieval on the node). **config.py** — the 16 GiB default host reserve (doc S44, S48,
+S49; 33-56) rests on an estimate, not a measurement: MemTotal near 187-188 GiB once Phase 1 step 4 has removed the
+crash-kernel reservation (192 GiB less the UMA carve-out, a ~3 GiB page map and ~0.5 GiB of firmware and kernel). With
+the router alone on the iGPU and the CPU pair charged as the host resident set (v0.4.0), each Day 1 seat fits alone
+on the expected node: GLM-5.3-Flash needs MemTotal of about 186.1 GiB, DeepSeek-V4-Flash-0731 about 184.7 GiB, and a
+surviving reservation (about 183.5 GiB) refuses both (INFERRED, doc 4.1). V3a records the real MemTotal and fails on a
+surviving reservation; `ATLAS_ARBITER_HEADROOM_GIB` changes the reserve if the node needs it. MemTotal is the real
+limit only because step 4 also puts `kho=off` on the kernel line (doc S49): with kexec handover on, an estimated 13 GiB
+of MemTotal (12.8-13.8, INFERRED) would be CMA scratch that GTT pages can never use, and the large seats would likely
+fail with a Vulkan out-of-memory in Phase 3 although granted. V3a fails while any of it is set aside; `kho=off` does
+not change MemTotal.
 
-**config/engines.json** — 13 (env_rule wording), 167 (DeepSeek f16 rung at half the pool), 291 (bge-m3 GGUF file
-name; enumerated case-insensitively). **config/phase4-engines.json** — 6, 78, 120, 149, 209, 237, 238, 278, 304,
-338, 426, 447, 479, 480, 526: per-engine research notes (sizes, repo ids by snippet, licence notes for Rad-DINO and
+**config/engines.json** — 16 (env_rule wording). v0.3.5's DeepSeek f16-rung and bge-m3 file-name marks went with
+those entries; every Day 1 file now carries the exact bytes and sha256 the tree API gave on 2026-10-16.
+**config/phase4-engines.json** — 7, 79, 121, 150, 210, 238, 239, 279, 305, 339, 427, 448, 480, 481, 527: per-engine research notes (sizes, repo ids by snippet, licence notes for Rad-DINO and
 PointLLM, TRELLIS shims, Blender tarball pattern, Prithvi build call). **config/allowlist.txt** — 117, 124, 141, 152,
 162, 167, 172, 180: Blender extensions API host, Playwright CDN hosts, Drive discovery hosts, Wix/pay.com/RewardPay
 hosts, Sentinel feed hosts. **config/sentinel-feeds.json** — 4, 31, 53, 75, 95, 116, 136: every feed URL (`verified=false`).
 
 **docker/core/compose.yml** — 84, 87, 95: redis 8.10.2 entrypoint name and minimal capability set. 142, 152, 153,
-171: ChromaDB data-dir needs, telemetry variable names, capability set. 221, 223, 224, 248, 256: Open WebUI
+171: ChromaDB data-dir needs, telemetry variable names, capability set. 221, 223, 224, 251, 259: Open WebUI
 `ENABLE_EVALUATION_ARENA_MODELS`, library telemetry switches, lazy fetches, Docling 2.0 requirement vs docling-serve
 1.34. **docker/core/compose.voice.yml** — 73, 89, 155: curl in the Kokoro image, speaches writable paths, docling-serve
 `/health` (uses `/docs`). **docker/wg-easy/compose.yml** — 5, 32, 83: v15 entrypoint needs, capability set, bridge-name
@@ -408,12 +480,13 @@ the build-time assumption list (each fails the build loudly), Blender's shared-l
 the run line (48-51).
 
 **systemd/atlas-orchestrator.service** — 40: docker client needs under the hardening. **systemd/llama-server@.service**
-— 89: whether Mesa/RADV needs AF_UNIX (kept). **systemd/srv-atlas-winpc.mount** — 10, 16: the `vers=3.1.1` and
+— 94: whether Mesa/RADV needs AF_UNIX (kept). **systemd/srv-atlas-winpc.mount** — 10, 16: the `vers=3.1.1` and
 `seal` spellings (step 9 proves them when it runs; skipped on Day 1).
 
 **verify/v03a-gtt.sh** — VERIFIED since v0.3.5: kernel 7.0.0-38 reports the requested 196608 MiB GTT pool whatever MemTotal is, and 7.0.0-39 caps it at MemTotal; both pass (S47). VERIFIED (S48, v7.0 source): `/sys/kernel/kexec_crash_size` counts both crash-kernel regions and reads 0 without a reservation (4563402752 with kdump-tools' value); the kernel finds `crashkernel=` anywhere on its command line, hence the substring check; the last `panic=` wins and `/proc/sys/kernel/panic` is the same variable. VERIFIED (S49, v7.0 source and Ubuntu's 7.0 configs): kexec handover scratch counts in the zone `cma` lines of `/proc/zoneinfo` (4 KiB pages) and never in `CmaTotal`, which counts named CMA areas only; `CmaFree` is only the free part of all CMA; Ubuntu's 7.0 configuration creates no named CMA area unless the command line asks for one, so all three read 0 once `kho=off` holds and the check cannot fail a correct node. UNKNOWN until V3a runs: the real MemTotal, expected near 187-188 GiB once the reservation is gone (the summary prints it, and the kexec handover figures beside it).
 
-**verify/v06-pyannote.sh** — 19: whether current pyannote loads the legacy 3.1 pipeline (a fail blocks the gate).
+**verify/v06-pyannote.sh** — none since v0.4.0 (C-06): V6 passes only when community-1 loads; when pyannote.audio
+refuses it V6 fails, with a diagnostic of whether 3.1 still loads (never the pass path).
 **verify/v17-sandbox.sh** — 14: exit 137 convention. **verify/v23-cloudflare-token.sh** — 89: `/user/tokens/verify`.
 
 ### Open hardware and upstream risks flagged for the Principal (no Day 1 action)
@@ -432,20 +505,29 @@ the run line (48-51).
   is not in `-security` today but has been on other releases): after a kernel ABI change or a GPU firmware update,
   re-run V11 by hand with `sudo ./atlas-day1.sh phase4 --force 01` (it reuses the built image;
   no Day 1 script does this on its own).
-- Nemotron 3 Super on Vulkan has an open GPU memory fault report at ~20k-token prompts (llama.cpp #20732); the 8k
-  prefill test checks the server survives and records a warning, not a hang.
-- DeepSeek V4 Flash: quantised KV produced garbage in mid-2026; Phase 3 ladders f16 → q8_0 → q4_0 with a coherence
-  check (S2) and records the winner; the GRUB line carries `amdgpu.lockup_timeout` for the DeviceLost reports.
-- Context shift (doc S52): every launch line asks for it, but the pinned llama.cpp switches it off on six of the eight
-  chat engines (both gpt-oss, Qwen3.5-122B, the router, Qwen2.5-VL, DeepSeek V4; VERIFIED in the source, Phase 3 records
-  each engine's log line); only Nemotron and Meditron keep it. A prompt longer than its slot is rejected on every
-  engine, context shift or not (it acts only during generation, so `--swa-full` would not change that), and on the six a
-  reply would stop at the slot end. So the orchestrator keeps every request inside one slot of the profile its unit
+- The re-pin (doc R29): b11474 is 510 commits after v0.4.1, and the Vulkan fixes between them touch the KV rows
+  without flash attention and flash attention itself, so results can depend on `-fa`. V25 compares the two builds on
+  the engines both load before anything is trusted; GLM-5.3-Flash cannot be compared, since v0.4.1 cannot load it,
+  and its V22 row and the `kld-run` record carry it instead.
+- GLM-5.3-Flash on Vulkan at the pin (T-04): whether flash attention stays on and its new operations run on the GPU is
+  settled by its Phase 3 load (V4's two proof lines, V22); its only fitting rung is lossy (doc R30), so its seats are
+  provisional until the KLD run (to-do `kld-run`).
+- Nemotron 3 Super (phased since v0.4.0) has an open GPU memory fault report at ~20k-token prompts on Vulkan (llama.cpp
+  #20732); T-12 tests it at its pull. The alive check after the 8k prefill stays on every engine, and a server that
+  died is a V10 fail.
+- DeepSeek-V4-Flash-0731: quantised KV produced garbage in mid-2026; Phase 3 loads its f16 cache first and keeps it
+  when it loads and is coherent, tries `q8_0` only when f16 fails, never `q4_0` (S-42, D-29 (a)), and records the rung
+  that stood; the GRUB line carries `amdgpu.lockup_timeout` for the DeviceLost reports.
+- Context shift (doc S52): every launch line asks for it, but the pinned llama.cpp switches it off on every Day 1 chat
+  engine (both gpt-oss, the router, DeepSeek-V4-Flash-0731, and GLM-5.3-Flash, whose unit always loads its projector;
+  re-VERIFIED at b11474, Phase 3 records each engine's log line). A prompt longer than its slot is rejected on every
+  engine, context shift or not (it acts only during generation, so `--swa-full` would not change that), and on every one
+  of them a reply would stop at the slot end. So the orchestrator keeps every request inside one slot of the profile its unit
   runs, on every engine (`atlas/engines.py` → `LlamaClient._open_chat` and `fit_to_window`, the window from
   `atlas/api.py` → `engine_window`): the engine counts the prompt, and the oldest exchanges after the system prompt are
   dropped only until a bounded reply reserve fits: the `max_tokens` asked for (4,096 when the request sets none), capped
   at a quarter of the slot or 512 tokens, whichever is larger (4,096 on a 32k slot, at most 8,192 there; 2,048 on the
-  router; 1,024 on Meditron). A conversation that leaves the reserve is sent whole whatever `max_tokens` it asks for;
+  router). A conversation that leaves the reserve is sent whole whatever `max_tokens` it asks for;
   when the system prompt and the current message alone cannot leave it, every earlier exchange goes. The reply is then
   capped to the room left, and a message that does not fit on its own is refused with status 413
   (`context_window_exceeded`) with the engine, its window and the prompt size: the HTTP status of a non-streamed
@@ -453,14 +535,17 @@ the run line (48-51).
   chunk with the `[ATLAS] ...` text. Shorten it, or give the document to retrieval. Each trim is one line, counts and
   the reply reserve only, in `journalctl -u atlas-orchestrator --grep 'context window engine='`. Left to the Principal:
   the 512-token minimum reply, the quarter-slot cap on the reply reserve, no 9.4 strike for a 413, and the options not
-  adopted (`--swa-full` on gpt-oss, `--kv-unified` on Qwen3.5-122B, a smaller context anywhere).
+  adopted (`--swa-full` on gpt-oss, a smaller context anywhere); `--kv-unified` on GLM-5.3-Flash's 8 slots is a Phase 3
+  measurement after Day 1 (D-48).
 - Host RAM outside the Arbiter's budget (doc S52): each chat llama-server may keep up to 8 GiB of prompt cache in
-  ordinary RAM (`--cache-ram`, idle slots copied into it at every new task) and, on the sliding-window and recurrent
-  engines, up to 32 context checkpoints per slot (`--ctx-checkpoints`); only the 16 GiB host reserve covers them. Phase
+  ordinary RAM (`--cache-ram`, idle slots copied into it at every new task, `--cache-idle-slots` on by default at
+  b11474) and, on the sliding-window and recurrent engines, up to 32 context checkpoints per slot
+  (`--ctx-checkpoints`); only the 16 GiB host reserve covers them. Since v0.4.0 the CPU retrieval pair runs with
+  `--cache-ram 0` and is charged as its own host resident set; the seats and the router keep the default. Phase
   3 measures each server's RAM and raises the to-do `cache-ram` with suggested explicit values (INFERRED); the to-do
   `kv-estimates` sets each engine's measured context memory beside the Arbiter's estimate. The footprint Phase 3
   registers replaces the estimate only at the profile it was measured at and only until the orchestrator restarts, so
-  after a restart the estimates decide every load and pairing again. The size lines both to-dos read, like V4's proof
+  after a restart the estimates decide every load again. The size lines both to-dos read, like V4's proof
   line, are logged only at llama-server log level 4, which `engine-env.py` renders into every chat engine
   (`--verbosity 4`, exactly 4, a log level only); a load log without them leaves the figures UNKNOWN, and `cache-ram`
   then says checkpoints UNKNOWN, never "none made", with "at least" totals. Changing either (engines.json `extra_args`,
@@ -506,7 +591,9 @@ the run line (48-51).
 ## 7. Developing
 
 `bash -n` and `shellcheck -x` on every `.sh`, `python3 -m py_compile` on every `.py`, `ruff check orchestrator phase2
-phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold, step 5's kernel-line record that closes or refreshes the to-do, and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash phase1/crash_params_test.sh` (the `zzz-atlas-crash.cfg` drop-in under grub-mkconfig's own sourcing lines, dash and `set -e`, with the real `kdump-tools.cfg`, `kho=` words included; `_grub_params` end to end with its `panic=10` and `kho=off` checks and the kexec handover scratch record; `_kdump_off` and `_panic_log_record` against stubbed `dpkg-query`/debconf/`systemctl`/`kdump-config`/`sysctl`/`findmnt`; doc S48, S49; needs dash), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47, its crash-kernel and panic checks, doc S48, and its `kho=off` and CMA checks against a `/proc/zoneinfo` fixture, doc S49), `bash phase1/watchdog_test.sh` (step 4's watchdog probe, driver unit and systemd drop-in against stubbed `modprobe`/`dmesg`/`systemctl` with every node path under a temp dir, the unit under `systemd-analyze verify` when it is installed, step 5's V24 hand-off and its to-do `w-drill`, the Phase 1 gate with V24 pass, deferred, fail and missing, and `tools/fill-workbook.py`'s V24 row when openpyxl is installed; doc S50), `bash verify/v24_watchdog_test.sh` (V24's pass, deferred and fail cases against a fake sysfs, `/proc` and stubbed `systemctl`/`journalctl`; doc S50; neither watchdog test opens a real `/dev/watchdog*`), and the package tests (Python 3.12+):
+phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase2/pull_engine_files_test.sh` (Phase 2 step 4's pull refuses a
+`verify=research-snippet` sha256 the tree API contradicts before any byte moves; an unverified hash only warns; stubbed
+tree and download; v0.4.0), `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold, step 5's kernel-line record that closes or refreshes the to-do, and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash phase1/crash_params_test.sh` (the `zzz-atlas-crash.cfg` drop-in under grub-mkconfig's own sourcing lines, dash and `set -e`, with the real `kdump-tools.cfg`, `kho=` words included; `_grub_params` end to end with its `panic=10` and `kho=off` checks and the kexec handover scratch record; `_kdump_off` and `_panic_log_record` against stubbed `dpkg-query`/debconf/`systemctl`/`kdump-config`/`sysctl`/`findmnt`; doc S48, S49; needs dash), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47, its crash-kernel and panic checks, doc S48, and its `kho=off` and CMA checks against a `/proc/zoneinfo` fixture, doc S49), `bash phase1/watchdog_test.sh` (step 4's watchdog probe, driver unit and systemd drop-in against stubbed `modprobe`/`dmesg`/`systemctl` with every node path under a temp dir, the unit under `systemd-analyze verify` when it is installed, step 5's V24 hand-off and its to-do `w-drill`, the Phase 1 gate with V24 pass, deferred, fail and missing, and `tools/fill-workbook.py`'s V24 row when openpyxl is installed; doc S50), `bash verify/v24_watchdog_test.sh` (V24's pass, deferred and fail cases against a fake sysfs, `/proc` and stubbed `systemctl`/`journalctl`; doc S50; neither watchdog test opens a real `/dev/watchdog*`), and the package tests (Python 3.12+):
 
 ```
 cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest
@@ -527,12 +614,24 @@ generation path driven against the stub llama-server of `tests/stubs.py`, and a 
 anything but `LlamaClient._open_chat` posts to a generation endpoint); the Phase 3 memory records, the `TODO` line
 protocol and the two to-dos in `tests/test_phase3_loadtest.py` (64 cases, 20 of them new, with fixture journals built
 from the pinned llama.cpp format strings, `--fit`'s trial lines and a default-verbosity journal among them); and the
-standing vision profile in `tests/test_engine_env.py` (24, among them the real `engine-env.py` render of the real
-`engines.json` loaded into the real Arbiter, where gpt-oss-120b and the vision engine pair at 157.7 GiB, and the
-`--verbosity 4` render) and `tests/test_arbiter.py` (42, among them a measurement charged only at the profile it was
-taken at). Doc S53 adds four cases to `tests/test_vault_tagging.py` (34: the graph archive carrying each document's
+engine renders in `tests/test_engine_env.py` (the `--verbosity 4` render among them) and `tests/test_arbiter.py` (a
+measurement charged only at the profile it was taken at among them). Doc S53 adds four cases to `tests/test_vault_tagging.py` (34: the graph archive carrying each document's
 text, with a pre-S53 six-column index migrated in place and its row archived as `document` null and counted in the
 manifest; the failure push on the raise path and the finished-with-errors path, driven through `prune_sweep.apply`,
 with a breaking push never masking the sweep's error, a locked ledger row neither skipping the push nor replacing
 the sweep's error, and a clean sweep pushing nothing; and the step 2 contract, `ensure_kv_default` for
-`PRUNE_WINDOW_HOURS`) and seven cases to `lib/common_test.sh` (100). The package suite: 480 passed, 4 skipped.
+`PRUNE_WINDOW_HOURS`) and seven cases to `lib/common_test.sh` (100). v0.4.0 rewrites the engine-bound tests for the
+Day 1 set, deleting none: `tests/test_arbiter.py` (51: exact-byte footprints, the KV, per-slot state and compute
+terms, each Day 1 seat fitting alone and no pair fitting, one-seat eviction, every seat exclusive, the seat-limit
+setting, the CPU pair charged its weights plus its measured anonymous memory, never below its projection, with the pids read outside the state lock and one headroom rule for the Arbiter and `atlas-admin`, the Deep Think pair), `tests/test_engine_env.py` (38: `cpu`
+placement, the b11474 reserved flags and env names, the co-resident profile gone, the real render of the real
+`engines.json` loaded into the real Arbiter running one LLM seat), `tests/test_phase3_loadtest.py` (89: decode beside
+the projections, the f16-first ladder, V22 per newer engine, `parity`, `quality` and `residency` end to end with fake
+tools, `residency` failing at a limit other than 1 or without the Arbiter's `evicted`, the input to-dos), `tests/test_config.py` (the real tree is the approved Day 1 map, the uncensored entry byte-identical to
+v0.3.5), `tests/test_vault_tagging.py` (36: the 1024-dim truncation, the query form and LightRAG's 4,096-token limit) and
+`tests/test_router.py` (47: D-43's deep-to-standard hold, the long-document window rule). `tools/build_workbook_test.sh`
+(v0.4.0, D-27; 20 cases, the workbook ones skipped without openpyxl) rebuilds the workbook into a temp directory and
+checks that every D, C, R, V and Section 22 row of the document reaches it in order, that the risks left open for
+acknowledgement start blank, that the committed workbook is the one the committed document builds (rebuild it with
+`python3 tools/build-baseline-workbook.py` after a document change), that a test build never touches it, that a
+missing section stops the builder, and that no scratch path is left in it. The package suite: 531 passed, 4 skipped.

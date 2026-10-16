@@ -85,11 +85,12 @@ from atlas.config import (
     AtlasConfig,
     ConfigError,
     DomainCard,
+    EngineSpec,
     RouterRules,
     TaskForce,
     owner_persona_key,
 )
-from atlas.engines import EngineError, LlamaClient
+from atlas.engines import EngineError, LlamaClient, SlotWindow, window_for
 from atlas.ledger import Ledger
 from atlas.personas import HEMISPHERE_LEADS, PersonaRegistry
 
@@ -121,6 +122,9 @@ __all__ = [
 
 TIER_ORDER: dict[str, int] = {t: i for i, t in enumerate(TIERS)}  # routine < standard < sensitive
 DEEP_THINK_DEPTHS: tuple[str, ...] = ("quick", "standard", "deep")  # 9.1
+# D-43 (a): the reason a classifier-chosen "deep" is run at "standard" (the deep tier costs 3-4 swaps between the
+# large seats, 9.1); the Principal accepts that latency only by typing [DEEP THINK:DEEP].
+DEEP_TIER_GATE = "D-43: explicit acceptance required"
 FAMILY_NAME_CATEGORY = "family-name"  # what a FAMILY_NAMES hit is called outside the ledger (10.4; module docstring)
 # D-38 (approved 2026-10-16): the long-document engine is GLM-5.3-Flash (AA-LCR 80.0, MRCR 128K 62.9), the default seat
 # of most directors, so a long-document dispatch usually costs no swap; it replaces Qwen3.5-122B-A10B (retired, S-11).
@@ -654,13 +658,18 @@ class Router:
     returns a 5xx and the outage is a strike, never a silently routed answer (4.1 keeps the 4B model resident; V10,
     whose Phase 2 gate half is the resident 4B router model, Section 21, proves it; CONVENTIONS.md §7.4). "arthur" /
     "ren" are explicit degraded-mode opt-ins that route to that lead with the outage in the reason.
+
+    `window_of` gives an engine's per-slot window, which the long-document trigger compares (D-38, D-48): production
+    passes atlas.api.engine_window (the profile the unit runs); the default is engines.window_for (engines.json).
     """
 
     def __init__(self, config: AtlasConfig, classifier: Classifier, ledger: Ledger, *,
-                 personas: PersonaRegistry | None = None, on_classifier_error: str = "raise") -> None:
+                 personas: PersonaRegistry | None = None, on_classifier_error: str = "raise",
+                 window_of: Callable[[EngineSpec], SlotWindow] | None = None) -> None:
         if on_classifier_error not in {"arthur", "ren", "raise"}:
             raise ValueError("on_classifier_error must be 'arthur', 'ren' or 'raise'")
         self.config = config
+        self.window_of: Callable[[EngineSpec], SlotWindow] = window_of or window_for
         self.rules: RouterRules = config.router_rules
         self.classifier = classifier
         self.ledger = ledger
@@ -682,6 +691,30 @@ class Router:
             raise ConfigError(f"router-rules.json hard_keyword_route {self._hard_route!r} has no route")
         configured = getattr(self.rules, "sensitive_keywords", None)  # see SENSITIVE_KEYWORDS: config hook
         self.sensitive_keywords: tuple[str, ...] = tuple(configured) if configured else SENSITIVE_KEYWORDS
+
+    # --- internals ----------------------------------------------------------------------------------------------------
+
+    def _slot_tokens(self, engine_key: str) -> int | None:
+        """The per-slot window of `engine_key` (None for a key engines.json lacks; route() refuses it later)."""
+        spec = self.config.engines.get(engine_key)
+        if spec is None:
+            return None
+        try:
+            return self.window_of(spec).tokens
+        except Exception as exc:  # an unreadable unit env file must not stop routing; engines.json's figure stands in
+            log.warning("router: window of %s unreadable (%s); using engines.json's", engine_key, exc)
+            return window_for(spec).tokens
+
+    def _long_document_fits(self, current: str, target: str) -> tuple[bool, str]:
+        """D-38 sends a long document to GLM-5.3-Flash for its long-context strength, but only where that costs no
+        room: the move is taken when the target's per-slot window is at least the current engine's. v0.3.5's engines
+        all had 32k slots; on Day 1 Arthur's DeepSeek-V4-Flash-0731 holds 131,072 tokens in one slot and GLM 32,768 at
+        8 slots, so a long document moved to GLM would be refused (engines.fit_to_window) where DeepSeek holds it.
+        Until D-48 gives GLM a longer profile, the document stays on the larger window. Returns (move, why-kept)."""
+        cur_w, tgt_w = self._slot_tokens(current), self._slot_tokens(target)
+        if cur_w is None or tgt_w is None or tgt_w >= cur_w:
+            return True, ""
+        return False, f"kept on {current} (slot {cur_w} > {target} slot {tgt_w}; D-38, D-48 pending)"
 
     # --- public -------------------------------------------------------------------------------------------------------
 
@@ -841,8 +874,14 @@ class Router:
         long_doc = bool(verdict and verdict.long_document) or est_tokens >= self.rules.long_document_tokens
         if long_doc:
             if route == "arthur" and LONG_DOCUMENT_ROUTE in self.rules.routes:
-                route = LONG_DOCUMENT_ROUTE
-                reasons.append(f"long-document:{LONG_DOCUMENT_ROUTE}")
+                # The typed [ARTHUR:LONG] prefix is the Principal's order and never reaches this branch (route is
+                # already arthur-long); the automatic trigger moves the document only when it keeps its room.
+                move, kept = self._long_document_fits(self.rules.routes[route], self.rules.routes[LONG_DOCUMENT_ROUTE])
+                if move:
+                    route = LONG_DOCUMENT_ROUTE
+                    reasons.append(f"long-document:{LONG_DOCUMENT_ROUTE}")
+                else:
+                    reasons.append(f"long-document:{kept}")
             else:
                 # No corporate long-document route exists in router-rules.json (7.1 names it for Arthur only); the
                 # engine stays as routed and the flag is carried for the caller (a director's 6.2 override is below).
@@ -852,14 +891,24 @@ class Router:
         # depth; the Principal can force any depth with a prefix." A typed prefix wins; with no override at all the
         # classifier's depth is the task-weight trigger, but only on text the Principal typed: an inbound document
         # rated "deep" must not commandeer the Apex engine (9.1 sanctions the estimate for the Principal's messages).
+        # D-43 (a), approved 2026-10-16: the swap-heavy deep tier runs only on the Principal's explicit acceptance, so
+        # a classifier depth of "deep" is capped at "standard"; only the typed [DEEP THINK:DEEP] reaches the deep route.
         if command == "deep-think" and depth is None and verdict and verdict.deep_think_depth:
             depth = verdict.deep_think_depth
-            reasons.append(f"deep-think:{depth}(classifier)")
+            if depth == "deep":
+                depth = "standard"
+                reasons.append(f"deep-think:deep->standard({DEEP_TIER_GATE})")
+            else:
+                reasons.append(f"deep-think:{depth}(classifier)")
         elif command == "deep-think":
             reasons.append(f"deep-think:{depth or 'unset'}")
         elif allow_overrides and ov is None and verdict and verdict.deep_think_depth:
             command, depth = "deep-think", verdict.deep_think_depth
-            reasons.append(f"deep-think:{depth}(classifier task-weight, 9.1)")
+            if depth == "deep":
+                depth = "standard"
+                reasons.append(f"deep-think:deep->standard({DEEP_TIER_GATE})")
+            else:
+                reasons.append(f"deep-think:{depth}(classifier task-weight, 9.1)")
         elif not allow_overrides and verdict and verdict.deep_think_depth:
             reasons.append(f"deep-think-ignored:{verdict.deep_think_depth}(not a Principal-typed message)")
 
@@ -896,15 +945,20 @@ class Router:
             dispatch_engine = self.personas.engine_for(dispatch_persona, tf.engine or None)
             reasons.append(f"dispatch:{dispatch_persona}@{dispatch_engine}(8.5 step 4)")
             # 6.2 "Override" column (D-38): a director bound to the long-document engine as an override runs a
-            # long-document dispatch on it (a director whose default it is already does); the Apex
-            # engine of a preset is never displaced.
+            # long-document dispatch on it (a director whose default it is already does), when its per-slot window
+            # is no smaller than the director's own engine's (_long_document_fits); the Apex engine of a preset is
+            # never displaced. A director whose default is GLM keeps it (6.2: "long contracts stay on GLM").
             if (
                 long_doc
                 and not tf.engine
                 and LONG_DOCUMENT_ENGINE in self.personas.binding(dispatch_persona).override_engines
             ):
-                dispatch_engine = self.personas.engine_for(dispatch_persona, LONG_DOCUMENT_ENGINE)
-                reasons.append(f"long-document:{dispatch_persona}@{LONG_DOCUMENT_ENGINE}(6.2 override)")
+                move, kept = self._long_document_fits(dispatch_engine, LONG_DOCUMENT_ENGINE)
+                if move:
+                    dispatch_engine = self.personas.engine_for(dispatch_persona, LONG_DOCUMENT_ENGINE)
+                    reasons.append(f"long-document:{dispatch_persona}@{LONG_DOCUMENT_ENGINE}(6.2 override)")
+                else:
+                    reasons.append(f"long-document:{dispatch_persona} {kept}")
 
         # 6. domain cards (8.4), before the tier: a security-adjacent card makes the dispatch sensitive (8.2)
         keyword_hits: dict[int, str] = {}

@@ -18,7 +18,7 @@
 # GTT/VRAM sizes but not the same counter as mem_info_gtt_total (llama-cpp-vulkan.md §3, conflict 3), so the check is a
 # floor, "at least 160000 MiB", and the number (total and free) is recorded rather than asserted equal to anything. It
 # shows that llama.cpp's Vulkan backend sees the large GTT pool V3a checked; it is not the engine budget, which the
-# Arbiter computes from the GTT total, MemTotal, the resident set and its host reserve (Section 4.1, ~164 GiB expected).
+# Arbiter computes from the GTT total, MemTotal, the resident set and its host reserve (Section 4.1, ~156 GiB expected).
 # T-01 settles on the node whether the usable heap is the 176-189 GiB the 192 GiB request allows or the vendor's 160 GB
 # (149.01 GiB) cap; a heap under the floor shuts the largest seat out, which is what this check is for (B-31).
 # Output format (VERIFIED, common/arg.cpp): "  Vulkan0: AMD Radeon Graphics (RADV GFX1151) (NNNNN MiB, MMMMM MiB free)".

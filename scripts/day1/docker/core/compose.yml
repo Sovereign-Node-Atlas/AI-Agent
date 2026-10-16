@@ -171,7 +171,7 @@ services:
   # five its start-up needs to own and read its data dir (UNVERIFIED minimal set: CHOWN, SETUID, SETGID, DAC_OVERRIDE,
   # FOWNER — step 03's 300 s /health wait fails loudly if the image needs more), no-new-privileges, a pid and a memory
   # ceiling. The network fence is the atlas-openwebui-egress unit (header). redis and chromadb carry the same kind of
-  # caps below (fix round 3): a runaway in either would otherwise compete with the ~164 GiB engine budget (Section 4.1).
+  # caps below (fix round 3): a runaway in either would otherwise compete with the ~156 GiB engine budget (Section 4.1).
   # JWT_EXPIRES_IN=30d (fix round 3): the default -1 made every browser session JWT (the admin's, over LAN and
   # WireGuard) permanent and revocable only by rotating WEBUI_SECRET_KEY; one re-login a month is the cost.
   open-webui:

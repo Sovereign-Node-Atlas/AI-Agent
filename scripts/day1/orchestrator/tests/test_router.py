@@ -29,8 +29,8 @@ import httpx
 import pytest
 
 from atlas.arbiter import APEX_KEY as APEX
-from atlas.config import AtlasConfig, ConfigError, Settings, load_config, owner_persona_key
-from atlas.engines import LlamaClient, SlotWindow
+from atlas.config import AtlasConfig, ConfigError, EngineSpec, Settings, load_config, owner_persona_key
+from atlas.engines import LlamaClient, SlotWindow, window_for
 from atlas.ledger import Ledger
 from atlas.personas import PersonaRegistry
 from atlas.prompts import GOVERNANCE_BLOCK, PromptBuilder, build_system_prompt
@@ -404,7 +404,8 @@ def test_classifier_depth_is_ignored_on_text_the_principal_did_not_type(config: 
     assert d.command is None and d.deep_think_depth is None and d.engine == "glm-5.3-flash"
     assert "deep-think-ignored:deep(not a Principal-typed message)" in d.reason
     typed = router.route("Should we enter the Singapore market?", allow_overrides=True)
-    assert typed.command == "deep-think" and typed.engine == "deepseek-v4-flash"
+    # D-43 (a): typed by the Principal, the classifier's "deep" still runs at standard (only [DEEP THINK:DEEP] is deep).
+    assert typed.command == "deep-think" and typed.deep_think_depth == "standard" and typed.engine == "glm-5.3-flash"
 
 
 def test_overrides_are_default_deny(config: AtlasConfig, ledger: Ledger) -> None:
@@ -486,11 +487,31 @@ def test_classifier_task_weight_triggers_deep_think(config: AtlasConfig, ledger:
     assert weighed.command == "deep-think" and weighed.deep_think_depth == "standard"
     assert "deep-think:standard(classifier task-weight, 9.1)" in weighed.reason
     assert weighed.engine == "glm-5.3-flash" and weighed.override is None
-    apex = Router(config, StubClassifier(ClassifierVerdict(hemisphere="corporate", deep_think_depth="deep")),
-                  ledger).route("Should we enter the Singapore market?", context=typed)
-    assert apex.command == "deep-think" and apex.engine == "deepseek-v4-flash"
     unweighed = make_router(config, ledger, REN).route("Should we enter the Singapore market?", context=typed)
     assert unweighed.command is None
+
+
+def test_classifier_deep_is_capped_at_standard_without_explicit_acceptance(config: AtlasConfig,
+                                                                           ledger: Ledger) -> None:
+    # D-43 (a), approved 2026-10-16: the swap-heavy deep tier (3-4 swaps between the large seats, 9.1) runs only on
+    # the Principal's explicit acceptance. The classifier's "deep" is run at standard in both of its branches: the
+    # task-weight trigger and a [DEEP THINK: problem] that types no depth. Only [DEEP THINK:DEEP] reaches the Apex.
+    typed = {"principal_typed": True}
+    deep = ClassifierVerdict(hemisphere="corporate", deep_think_depth="deep")
+    weighed = Router(config, StubClassifier(deep), ledger).route("Should we enter the Singapore market?",
+                                                                 context=typed)
+    assert weighed.command == "deep-think" and weighed.deep_think_depth == "standard"
+    assert weighed.engine == "glm-5.3-flash"
+    assert "deep-think:deep->standard(D-43: explicit acceptance required)" in weighed.reason
+    untyped_depth = Router(config, StubClassifier(deep), ledger).route("[DEEP THINK: Should we enter Singapore?]",
+                                                                       context=typed)
+    assert untyped_depth.command == "deep-think" and untyped_depth.deep_think_depth == "standard"
+    assert untyped_depth.engine == "glm-5.3-flash"
+    assert "deep-think:deep->standard(D-43: explicit acceptance required)" in untyped_depth.reason
+    accepted = Router(config, StubClassifier(deep), ledger).route("[DEEP THINK:DEEP] Should we enter Singapore?",
+                                                                  context=typed)
+    assert accepted.command == "deep-think" and accepted.deep_think_depth == "deep"
+    assert accepted.engine == "deepseek-v4-flash" and "D-43" not in accepted.reason
 
 
 def test_parse_override_longest_key_wins() -> None:
@@ -612,7 +633,7 @@ def test_verdict_naming_a_director_falls_back_to_the_hemisphere(config: AtlasCon
 
 def _fake_llama(handler: Callable[[httpx.Request], httpx.Response]) -> LlamaClient:
     # The classifier's verdict counts the prompt first and keeps to the router's per-slot window (S52).
-    return LlamaClient("http://127.0.0.1:8108", transport=httpx.MockTransport(counting(handler)),
+    return LlamaClient("http://127.0.0.1:8105", transport=httpx.MockTransport(counting(handler)),
                        window=SlotWindow("router-qwen3.5-4b", 8192, "test"))
 
 
@@ -691,13 +712,44 @@ def test_llama_classifier_takes_the_first_object_and_ignores_what_follows() -> N
     assert LlamaClassifier(_fake_llama(array)).classify("x").hemisphere == "estate"  # the first object inside
 
 
-def test_long_document_moves_arthur_to_the_long_document_engine(config: AtlasConfig, ledger: Ledger) -> None:
-    router = make_router(config, ledger, ClassifierVerdict(hemisphere="estate", persona="arthur", long_document=True))
-    d = router.route("Read the attached family trust deed and summarise it.")
-    assert d.route == "arthur-long" and d.engine == "glm-5.3-flash" and d.long_document
-    big = "word " * (ROUTER_RULES["long_document_tokens"] * 4 // 5 + 10)
-    by_size = make_router(config, ledger, ARTHUR).route("Summarise the estate ledger: " + big)
-    assert by_size.route == "arthur-long"
+def _windows(**tokens: int) -> Callable[[EngineSpec], SlotWindow]:
+    """A Router `window_of` that renders the named engines at the given per-slot windows (others from engines.json)."""
+    def window_of(spec: EngineSpec) -> SlotWindow:
+        if spec.key in tokens:
+            return SlotWindow(spec.key, tokens[spec.key], "test unit profile")
+        return window_for(spec)
+    return window_of
+
+
+def test_long_document_moves_arthur_only_to_a_window_no_smaller_than_his_own(config: AtlasConfig,
+                                                                             ledger: Ledger) -> None:
+    # D-38 sends a long document to GLM-5.3-Flash, but on Day 1 Arthur's DeepSeek-V4-Flash-0731 holds 131,072 tokens
+    # in one slot and GLM 32,768 at 8 slots: a 40,000-token document moved to GLM would be refused (fit_to_window)
+    # where DeepSeek holds it, so the automatic trigger keeps it on DeepSeek until D-48 gives GLM a longer profile.
+    long_arthur = ClassifierVerdict(hemisphere="estate", persona="arthur", long_document=True)
+    d = make_router(config, ledger, long_arthur).route("Read the attached family trust deed and summarise it.")
+    assert d.route == "arthur" and d.engine == "deepseek-v4-flash" and d.long_document
+    assert ("long-document:kept on deepseek-v4-flash (slot 131072 > glm-5.3-flash slot 32768; D-38, D-48 pending)"
+            in d.reason)
+    big = "word " * (40_000 * 4 // 5 + 10)  # about 40,000 tokens at the 4-characters-per-token estimate
+    rendered = make_router(config, ledger, ARTHUR, window_of=_windows(**{"glm-5.3-flash": 32768}))
+    by_size = rendered.route("Summarise the estate ledger: " + big)
+    assert by_size.route == "arthur" and by_size.engine == "deepseek-v4-flash" and by_size.long_document
+    # The typed [ARTHUR:LONG] is the Principal's order: it goes to GLM whatever the windows.
+    typed = rendered.route("[ARTHUR:LONG] Summarise the estate ledger: " + big, allow_overrides=True)
+    assert typed.route == "arthur-long" and typed.engine == "glm-5.3-flash"
+    # Once GLM's slot is no smaller (a D-48 profile, as v0.3.5's equal 32k slots were), the trigger moves it.
+    pooled = make_router(config, ledger, ARTHUR, window_of=_windows(**{"glm-5.3-flash": 131072}))
+    moved = pooled.route("Summarise the estate ledger: " + big)
+    assert moved.route == "arthur-long" and moved.engine == "glm-5.3-flash"
+    assert "long-document:arthur-long" in moved.reason
+
+    # An unreadable unit profile never stops routing: engines.json's figures stand in (DeepSeek's slot is larger).
+    def broken(spec: EngineSpec) -> SlotWindow:
+        raise ValueError("bad env file")
+
+    fallback = make_router(config, ledger, ARTHUR, window_of=broken).route("Summarise the estate ledger: " + big)
+    assert fallback.route == "arthur" and fallback.engine == "deepseek-v4-flash"
 
 
 def test_long_document_moves_a_bound_director_to_the_long_document_engine(tmp_path: Path, ledger: Ledger) -> None:
@@ -722,12 +774,23 @@ def test_long_document_moves_a_bound_director_to_the_long_document_engine(tmp_pa
     long_arthur = ClassifierVerdict(hemisphere="estate", persona="arthur", long_document=True)
     minerva = make_router(config, ledger, long_arthur).route("Summarise the longevity records attached.")
     assert minerva.dispatch_persona == "minerva" and minerva.dispatch_engine == "glm-5.3-flash"
-    assert minerva.route == "arthur-long" and "long-document:minerva" not in minerva.reason  # the lead's 7.1 route
+    assert "long-document:minerva" not in minerva.reason
+    # The lead's 7.1 route keeps Arthur's larger DeepSeek slot (the window rule above); Minerva dispatches on GLM.
+    assert minerva.route == "arthur" and "long-document:kept on deepseek-v4-flash" in minerva.reason
     victor = make_router(config, ledger, long_arthur).route("Read the hotel booking terms attached.")
     assert victor.dispatch_persona == "victor" and victor.dispatch_engine == "glm-5.3-flash"
     assert "long-document:victor" not in victor.reason
     omega = make_router(config, ledger, long_ren).route("Everything.", task_force="TF_OMEGA")
     assert omega.dispatch_engine == "deepseek-v4-flash"  # the Apex engine of a preset is never displaced
+    # A director whose own engine has the larger slot keeps it: the override is taken only to a window no smaller.
+    deep_gideon = config.personas["gideon"].model_copy(update={"default_engine": "deepseek-v4-flash",
+                                                               "override_engines": [LONG_DOCUMENT_ENGINE]})
+    kept_personas = PersonaRegistry({**config.personas, "gideon": deep_gideon}, config.engines)
+    kept = Router(config, StubClassifier(long_ren), ledger, personas=kept_personas).route(
+        "Review the attached 80-page vendor contract.")
+    assert kept.dispatch_persona == "gideon" and kept.dispatch_engine == "deepseek-v4-flash"
+    assert ("long-document:gideon kept on deepseek-v4-flash (slot 131072 > glm-5.3-flash slot 32768; D-38, D-48 "
+            "pending)") in kept.reason
 
 
 def test_stale_arthur_qwen_route_is_refused_with_its_new_name(tmp_path: Path, ledger: Ledger) -> None:

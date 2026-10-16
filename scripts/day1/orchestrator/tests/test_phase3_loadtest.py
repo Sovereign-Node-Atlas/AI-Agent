@@ -329,6 +329,31 @@ def test_summarize_counts_missing_and_off_band(tmp_path: Path, capsys: pytest.Ca
     assert "gpt-oss-120b" not in detail
 
 
+def test_summarize_raises_the_defaulted_input_todos(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """v0.4.0: each approved row that leaves an input to the Principal is built with its stated default AND raised on
+    the live to-do list (D-16, D-46, D-49, D-48 / S-30), every summarize, with the defaults read from the config."""
+    ctx = _ctx(tmp_path, ENGINES)
+    (tmp_path / "router-rules.json").write_text(json.dumps({"long_document_tokens": 24000}), encoding="utf-8")
+    _good().save(ctx)
+    lt.cmd_summarize(ctx, None)
+    _, todos = _lines(capsys)
+    assert {"context-targets", "trial-task-set", "seat-test-sets", "seat-profiles"} <= set(todos)
+    assert "D-16" in todos["context-targets"][0] and "Q5_K_S" in todos["context-targets"][1]
+    assert "D-46" in todos["trial-task-set"][0] and "30 to 50" in todos["trial-task-set"][0]
+    assert "D-49" in todos["seat-test-sets"][0] and "Australian law" in todos["seat-test-sets"][1]
+    profiles = todos["seat-profiles"][1]
+    assert "deepseek-v4-flash f16 at 1 x 131,072 tokens" in profiles
+    assert "glm-5.3-flash f16 at 1 x 262,144 tokens" in profiles  # the fixture's profile, read as given
+    assert "long-document trigger 24000 tokens" in profiles
+    # The real config: GLM at 8 x 32,768 and DeepSeek at one 131,072-token slot.
+    real = _real_ctx(tmp_path)
+    lt.raise_input_todos(real)
+    real_profiles = _lines(capsys)[1]["seat-profiles"][1]
+    assert "deepseek-v4-flash f16 at 1 x 131,072 tokens (--ctx-size 131,072 --parallel 1" in real_profiles
+    assert "glm-5.3-flash f16 at 8 x 32,768 tokens (--ctx-size 262,144 --parallel 8" in real_profiles
+    assert "long-document trigger 24000 tokens" in real_profiles
+
+
 def test_summarize_raises_no_floor_todo_once_every_seat_has_a_floor(tmp_path: Path,
                                                                     capsys: pytest.CaptureFixture[str]) -> None:
     engines = [{**e, "decode_floor_tok_s": 5} if e["arbiter_class"] in ("core", "apex") else e for e in ENGINES]
@@ -672,6 +697,19 @@ def test_record_line_protocol(capsys: pytest.CaptureFixture[str]) -> None:
 # --- fix round: residency window, cumulative release, rule-3 belt, queued retry --------------------------------------
 
 
+def test_engine_weights_bytes_matches_what_the_arbiter_budgets() -> None:
+    """D-31: exact files[].bytes when every file has a positive count, else footprint_gb read as GiB, the same reading
+    as config.EngineSpec.footprint_bytes (so the V21 window matches the Arbiter's charge)."""
+    from atlas.config import EngineSpec
+
+    assert lt.engine_weights_bytes({"files": [{"bytes": 3}, {"bytes": "4"}], "footprint_gb": 9}) == 7
+    fallback = {"footprint_gb": 63.0, "files": [{"name": "a.gguf"}, {"name": "b.gguf", "bytes": 5}]}
+    assert lt.engine_weights_bytes(fallback) == int(63.0 * lt.GIB)
+    assert lt.engine_weights_bytes({"footprint_gb": 2.5, "files": [{"bytes": 0}]}) == int(2.5 * lt.GIB)
+    spec = EngineSpec(key="x-test", arbiter_class="core", kv_class="q8_0", footprint_gb=63.0, ctx_size=4096)
+    assert lt.engine_weights_bytes({"footprint_gb": 63.0}) == spec.footprint_bytes
+
+
 def test_residency_bounds_are_capped_at_the_budget() -> None:
     weights = 142 * lt.GB
     low, high = lt.residency_bounds(weights, 170 * lt.GB)
@@ -819,8 +857,10 @@ class _ResControl:
 
     mode = "orchestrator"
 
-    def __init__(self, evict: bool = True) -> None:
+    def __init__(self, evict: bool = True, max_resident: int = 1, report_evicted: bool = True) -> None:
         self.evict = evict
+        self.max_resident = max_resident
+        self.report_evicted = report_evicted
         self.ledger: list[str] = []
         self.loads: list[str] = []
         self.unloads: list[str] = []
@@ -830,13 +870,14 @@ class _ResControl:
         return list(self.ledger)
 
     def status(self) -> dict[str, Any]:
-        return {"budget_bytes": 164 * lt.GB, "max_resident": 1, "generation_queue": []}
+        return {"budget_bytes": 164 * lt.GB, "max_resident": self.max_resident, "generation_queue": []}
 
     def load(self, key: str, _ctx: int, _par: int, _port: int) -> float:
         evicted = [k for k in self.ledger if self.evict]
         self.ledger = [key] if self.evict else [*self.ledger, key]
         self.loads.append(key)
-        self.last_decision = {"decision": "granted", "reason": f"fits after evicting {evicted or 'nothing'}"}
+        self.last_decision = {"decision": "granted", "reason": f"fits after evicting {evicted or 'nothing'}",
+                              "evicted": evicted if self.report_evicted else []}
         return 30.0
 
     def unload(self, key: str) -> str:
@@ -894,11 +935,41 @@ def test_residency_proves_the_arbiter_evicts_the_first_seat(tmp_path: Path, monk
     assert [r[:2] for r in recs] == [("V21", "pass"), ("V14b", "pass")]
     v21 = recs[0][2]
     assert "loading glm-5.3-flash evicted gpt-oss-120b (ledger ['glm-5.3-flash']" in v21 and "limit 1" in v21
+    assert "Arbiter evicted ['gpt-oss-120b']" in v21
     assert "GTT delta 145.0 GB for glm-5.3-flash alone (weights 140.0 GB" in v21
     assert "queued behind the first" in v21 and "slot save and restore across the swap: phased" in v21
     saved = json.loads((ctx.results_dir / "residency.json").read_text())
     assert saved["single"] is True and saved["memory_ok"] is True and saved["ledger_after_second"] == ["glm-5.3-flash"]
+    assert saved["evicted_by_second"] == ["gpt-oss-120b"] and saved["limit_ok"] is True
     assert saved["v14b"][0] == "pass"
+
+
+def test_residency_fails_at_a_limit_other_than_one_even_when_the_budget_evicts(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """D-32 (a): gpt-oss-120b (68.3 GiB) and GLM-5.3-Flash (155.1 GiB) never fit the ~156 GiB budget together, so the
+    Arbiter evicts the first at ATLAS_ARBITER_MAX_RESIDENT=2 as well: V21 must check the limit itself."""
+    import argparse
+
+    ctl = _ResControl(max_resident=2)
+    ctx, _ = _residency_harness(tmp_path, monkeypatch, ctl)
+    assert lt.cmd_residency(ctx, argparse.Namespace(first="gpt-oss-120b", second="glm-5.3-flash")) == 0
+    recs = _records(capsys)
+    assert recs[0][:2] == ("V21", "fail")
+    assert "limit is 2, D-32 (a) expects 1 (ATLAS_ARBITER_MAX_RESIDENT)" in recs[0][2]
+
+
+def test_residency_needs_the_arbiter_to_name_the_eviction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    """The ledger alone could hold SECOND because FIRST failed or was stopped by something else: the grant of SECOND
+    must list FIRST in its `evicted` (api._decision_dict)."""
+    import argparse
+
+    ctl = _ResControl(report_evicted=False)
+    ctx, _ = _residency_harness(tmp_path, monkeypatch, ctl)
+    assert lt.cmd_residency(ctx, argparse.Namespace(first="gpt-oss-120b", second="glm-5.3-flash")) == 0
+    recs = _records(capsys)
+    assert recs[0][:2] == ("V21", "fail")
+    assert "NOT single residency after loading glm-5.3-flash" in recs[0][2] and "Arbiter evicted []" in recs[0][2]
 
 
 def test_residency_fails_when_both_seats_stay_resident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1412,11 +1483,21 @@ def test_memory_todos_word_an_unknown_total_as_at_least(capsys: pytest.CaptureFi
     kv, cache = todos["kv-estimates"][1], todos["cache-ram"][1]
     assert "could hold at worst at least " in cache and "checkpoints UNKNOWN for at least one engine" in cache
     assert "could hold up to " not in cache
-    # An UNKNOWN engine ranked out of the two largest still makes the total a lower bound (S52 fix round).
+    # An UNKNOWN engine ranked out of the largest still makes the total a lower bound (S52 fix round). D-32 (a): one
+    # LLM seat resident, so the worst case is the largest seat alone (an evicted server's caches go with it).
     lt.raise_memory_todos([("gpt-oss-120b", "", known, None), ("gpt-oss-120b-abliterated", "", known, None),
                            ("nemotron-3-super", "", unknown, None)])
     cache = _todos(capsys.readouterr().out)["cache-ram"][1]
-    assert "could hold at worst at least " in cache and "may be larger than the two ranked here" in cache
+    assert "could hold at worst at least " in cache and "may be larger than the one ranked here" in cache
+    assert "The largest LLM seat plus the resident chat engine(s)" in cache
+    assert "(Section 4.2 rule 3, D-32: one LLM seat resident; an evicted server's prompt cache" in cache
+    assert "at most two engines resident" not in cache
+    # At ATLAS_ARBITER_MAX_RESIDENT=2 (D-32 option (b)) the two largest are summed and the limit is named.
+    lt.raise_memory_todos([("gpt-oss-120b", "", known, None), ("gpt-oss-120b-abliterated", "", known, None),
+                           ("nemotron-3-super", "", unknown, None)], max_resident=2)
+    cache2 = _todos(capsys.readouterr().out)["cache-ram"][1]
+    assert "The 2 largest LLM seats plus the resident chat engine(s)" in cache2
+    assert "may be larger than the 2 ranked here" in cache2 and "the Arbiter's limit is 2 LLM seats" in cache2
     assert ("nemotron-3-super 262144 x 8 q4_0: context UNKNOWN GiB measured (no K/V size line in the load log: TRACE "
             "at the pin, printed only at -lv 4)") in kv
     lt.raise_memory_todos([("gpt-oss-120b", "", known, None)])
@@ -1427,6 +1508,26 @@ def test_memory_todos_word_an_unknown_total_as_at_least(capsys: pytest.CaptureFi
     assert "only at the profile it was measured at and only until the orchestrator restarts" in kv
     assert "a corrected figure changes real Arbiter decisions" in kv and "on paper only" not in kv
     assert "already replaces" not in kv
+    # v0.4.0: the pin's name, and no pairing (D-32 (a)).
+    assert "lines of llama.cpp b11474)" in kv and "b29c606" not in kv
+    assert "every load and eviction" in kv and "pairing" not in kv
+
+
+def test_arbiter_max_resident_reads_the_status_and_defaults_to_one(tmp_path: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _real_ctx(tmp_path)
+    answers: list[Any] = [(200, {"max_resident": 2}), (200, {"max_resident": True}), (503, "down"),
+                          lt.HttpFail("refused")]
+
+    def fake_http(method: str, url: str, *_a: Any, **_k: Any) -> tuple[int, Any]:
+        assert method == "GET" and url.endswith("/arbiter/status")
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(lt, "http", fake_http)
+    assert [lt.arbiter_max_resident(ctx) for _ in range(4)] == [2, 1, 1, 1]
 
 
 def _todos(stdout: str) -> dict[str, tuple[str, str]]:
@@ -1469,7 +1570,10 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
     monkeypatch.setattr(lt, "host_memory", lambda _k: _host(3, 5.0, 0.9))
     monkeypatch.setattr(ctx, "env", lambda _k: {**env, "ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "4",
                                                 "ATLAS_KV_TYPE": "q8_0"})
+    asked: list[Any] = []
+    monkeypatch.setattr(lt, "arbiter_max_resident", lambda c: asked.append(c) or 1)
     assert lt.cmd_memory(ctx, None) == 0
+    assert asked == [ctx]  # the limit is read from /arbiter/status, never assumed
     cap = capsys.readouterr()
     todos = _todos(cap.out)
     assert set(todos) == {"kv-estimates", "cache-ram"}
@@ -1487,6 +1591,7 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
         assert retired not in kv  # S-11: only engines.json's Phase 3 engines are listed
     assert "router-qwen3.5-4b (resident, not loaded by Phase 3" in kv and "(resident: never charged, Section 4.1)" in kv
     assert "Updating the figures is the Principal's call" in kv
+    assert "B-03 (approved 2026-10-16): these measurements are adopted" in kv
     cache_title, cache = todos["cache-ram"]
     assert cache_title.startswith("Set --cache-ram and --ctx-checkpoints explicitly")
     assert ("gpt-oss-120b: RSS 3.00 GiB after the load, 3.50 after the tests (RssAnon 1.00 -> 1.50, +512 MiB); "
@@ -1497,7 +1602,7 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
     assert "deepseek-v4-flash (ladder rung q8_0, the rung that stands)" in cache and "rung f16)" not in cache
     assert ("router-qwen3.5-4b (resident, not loaded by Phase 3: current journal and RSS, read-only): RSS 5.00 GiB "
             "now (RssAnon 0.90)") in cache and "Phase 3 changed no engine setting" in cache
-    assert "The two largest engines plus the resident chat engine(s) could hold up to" in cache
+    assert "The largest LLM seat plus the resident chat engine(s) could hold up to" in cache
     assert "router-qwen3.5-4b: memory (S52) resident:" in cap.err and "context shift disabled" in cap.err
     # A record that could not be taken is UNKNOWN with the reason, and the to-dos still go out.
     lt.EngineResult(key="gpt-oss-120b", memory=[{"label": "", "error": "OSError: boom", "unknown": []}]).save(ctx)
@@ -1510,6 +1615,7 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
 def test_cmd_memory_never_fails_and_still_raises_both_todos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                             capsys: pytest.CaptureFixture[str]) -> None:
     ctx = _real_ctx(tmp_path)
+    monkeypatch.setattr(lt, "arbiter_max_resident", lambda _c: 1)  # no orchestrator in the tests
 
     def unreadable(_ctx: Any) -> Any:
         raise json.JSONDecodeError("bad", "x", 0)
@@ -1744,7 +1850,9 @@ def test_parse_ppl_kld_and_hellaswag() -> None:
                  "ppl_q": 7.120001, "ppl_base": 7.110002}
     assert lt.parse_kld("Mean    KLD:   0.000412 ±   0.000012\n") is None  # no top-1 line: the run did not finish
     hs = lt.parse_hellaswag("hellaswag_score: calculating\n" + _hs_lines([True, False, True, True]) + "\n\n")
-    assert hs == {"n": 4, "correct": 3, "acc_pct": 75.0, "answers": [True, False, True, True]}
+    assert hs == {"n": 4, "correct": 3, "acc_pct": 75.0, "answers": [True, False, True, True],
+                  "answers_order": lt.HS_ANSWERS_ORDER}
+    assert "not file order" in hs["answers_order"] and "seed 1" in hs["answers_order"]  # F7: the tool always shuffles
     assert lt.parse_hellaswag("1\t100.00000000%\t[0%, 100%]\n3\t66.66666667%\t[0%, 100%]") is None  # numbering skips
     assert lt.parse_hellaswag("nothing") is None
     other = lt.parse_hellaswag(_hs_lines([True, True, False, True]))
@@ -1809,7 +1917,7 @@ def test_parity_tasks_file_has_the_hellaswag_shape() -> None:
     assert len(lines) % 6 == 0 and len(lines) // 6 >= 20 and all(ln.strip() for ln in lines)
     gold = [lines[i] for i in range(1, len(lines), 6)]
     assert set(gold) == {"0", "1", "2", "3"}  # every answer position is used
-    assert len(lines) // 6 < 1000  # --hellaswag-tasks 1000 takes them all, in file order
+    assert len(lines) // 6 < 1000  # --hellaswag-tasks 1000 takes them all (shuffled by the tool, HS_ANSWERS_ORDER)
 
 
 def _fake_tool(path: Path, which: str, kld_on: float = 0.0004, answers: list[bool] | None = None,
@@ -1939,6 +2047,8 @@ def test_cmd_quality_records_each_seat_and_raises_the_kld_todo(tmp_path: Path, m
     assert "gpt-oss-120b (q8_0 KV, -fa on): corpus PPL 7.11, tasks 4 of 6; reference: the F16-trunk GGUF" in detail
     assert "glm-5.3-flash (f16 KV, -fa on)" in detail and "deepseek-v4-flash (f16 KV, -fa on)" in detail
     assert "abliterated" not in detail and "router" not in detail and "embed" not in detail
+    # D-30 (b): the per-seat reasoning setting is fixed with the KLD run; the provisional settings are named.
+    assert "D-30 (b)" in detail and "DeepSeek-V4-Flash-0731 reasoning on at high effort" in detail
     calls = _calls(tool)
     gpt = [c for c in calls if "/m/gpt-oss-120b.gguf" in c]
     assert len(gpt) == 2 and all(c[c.index("--cache-type-k") + 1] == "q8_0" and c[c.index("-fa") + 1] == "on"

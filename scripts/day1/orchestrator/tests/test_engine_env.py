@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -399,6 +400,10 @@ def test_reserved_lists_are_mirrored_in_engines_json_meta(engine_env: ModuleType
     for name in ("LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_MODEL", "LLAMA_ARG_RPC", "LLAMA_ARG_HF_REPO",
                  "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_UI", "LLAMA_ARG_TOOLS", "LLAMA_ARG_AGENT"):
         assert name in engine_env.RESERVED_ENV
-    if isinstance(meta, dict) and "extra_args_rule" in meta:
-        assert "--rpc" in str(meta["extra_args_rule"]) or "reserved" in str(meta["extra_args_rule"]).lower()
+    # Every enforced name is written out in _meta, as whole tokens (a substring test would pass "-a" anywhere).
+    flag_tokens = set(re.findall(r"(?<![\w-])-{1,2}[A-Za-z][A-Za-z0-9-]*", str(meta["extra_args_rule"])))
+    env_tokens = set(re.findall(r"\bLLAMA_ARG_[A-Z0-9_]+\b", str(meta["env_rule"])))
+    assert sorted(set(engine_env.RESERVED_FLAGS) - flag_tokens) == []
+    assert sorted(set(engine_env.RESERVED_ENV) - env_tokens) == []
+    assert "UNVERIFIED against common/arg.cpp at v0.4.1" not in meta["env_rule"]  # re-read at b11474 (v0.4.0)
     assert os.access(SCRIPT, os.R_OK)

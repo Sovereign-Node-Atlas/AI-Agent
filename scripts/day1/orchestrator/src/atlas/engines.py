@@ -121,8 +121,8 @@ MIN_REPLY_TOKENS = 512
 # vision engine at the pin. v0.4.0 (D-20, S-10): the vision engine is GLM-5.3-Flash with its glm5v mmproj, whose header
 # gives image_max_pixels 6,272,000, patch_size 14 and merge 2, so one image is at most 6,272,000 / (14 x 14 x 2 x 2) =
 # 8,000 tokens, wrapped in <|begin_of_image|> ... <|end_of_image|>, 2 more (tools/mtmd/clip.cpp:1782-1794, 4217-4225;
-# mtmd-image.cpp:801-840; mtmd.cpp:871-876; VERIFIED at b11474, v040 pin_facts.md). engines.json passes no
-# --image-max-tokens. The primary count (COUNT_PATH) includes image tokens exactly.
+# mtmd-image.cpp:801-840; mtmd.cpp:871-876; VERIFIED at b11474, research_notes/ATLAS v0.4.0 build record/pin_facts.md).
+# engines.json passes no --image-max-tokens. The primary count (COUNT_PATH) includes image tokens exactly.
 IMAGE_TOKENS_ESTIMATE = 8000 + 2
 PREFIX_ROLES: frozenset[str] = frozenset({"system", "developer"})  # the stable layered prefix (Section 4.4)
 

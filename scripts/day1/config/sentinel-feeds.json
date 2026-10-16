@@ -208,7 +208,7 @@
   "detection": {
     "history_window": 24,
     "rule": "statistics first; thresholds above; a model is invoked only when a threshold trips (Section 9.3)",
-    "escalation": "resident engine (router-qwen3.5-4b) first; a large engine (v0.4.0: gpt-oss-120b, the Sentinel escalation engine, D-12) only on anomaly, requested through the Engine Arbiter (4.2)"
+    "escalation": "resident router (router-qwen3.5-4b) writes every BLUF; on an anomaly, the resident LLM seat (gpt-oss-120b, the Sentinel escalation engine, D-12, only when it is the resident seat); Sentinel never forces a swap, and the Engine Arbiter queues it (S-06, 4.2, 9.3); no Day 1 code escalates past the router"
   },
   "alert": {
     "format": "BLUF",

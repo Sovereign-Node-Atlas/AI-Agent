@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "purpose": "Test fixture: config/engines.json for the v0.4.0 Day 1 set (approved 2026-10-16) trimmed to the fields the atlas package reads; keys, order, classes, files[] bytes (Hugging Face tree sizes, D-31), placement (D-14 (e)) and KV types (D-29) as the orchestrator expects them (CONVENTIONS.md §8; v040 log_code.md). The gpt-oss-120b-abliterated entry is the v0.3.5 one, unchanged."
+    "purpose": "Test fixture: config/engines.json for the v0.4.0 Day 1 set (approved 2026-10-16) trimmed to the fields the atlas package reads; keys, order, classes, files[] bytes (Hugging Face tree sizes, D-31), placement (D-14 (e)) and KV types (D-29) as the orchestrator expects them (CONVENTIONS.md §8). The gpt-oss-120b-abliterated entry is the v0.3.5 one, unchanged."
   },
   "engines": [
     {

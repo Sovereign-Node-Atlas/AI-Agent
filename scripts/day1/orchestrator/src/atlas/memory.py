@@ -341,6 +341,11 @@ def stub_embedding_fn(texts: Sequence[str]) -> list[list[float]]:
 
 DEFAULT_EMBEDDING_MODEL = "embed-qwen3-4b"  # CONVENTIONS.md §8 key (engines.json), the llama-server alias
 DEFAULT_EMBEDDING_DIM = 1024  # S-41: the Chroma and LightRAG schema, kept from bge-m3 by truncation
+# The longest input the embedder unit accepts: engines.json embed-qwen3-4b ctx_size 4096 at --parallel 1 (pooling LAST
+# lets llama-server split it across its 2048-token ubatches; a longer one is refused, server-context.cpp at b11474).
+# C-02 recommended -ub 8192 (v0.3.5's bge-m3 took 8,192); D-14 (e) right-sized the CPU pair to 4,096 tokens to keep
+# both Day 1 seats loadable (doc 5.3, D16; T-15 re-checks), so LightRAG is told the same limit.
+EMBEDDING_MAX_TOKENS = 4096
 # The Qwen3-Embedding card's query form, get_detailed_instruct(): f"Instruct: {task}\nQuery:{query}"; documents carry
 # no prefix. The task wording is ATLAS's (UNVERIFIED for retrieval quality; T-15 measures the pair on the node).
 DEFAULT_QUERY_INSTRUCTION = "Given a question or a note, retrieve the stored passages that answer or relate to it"
@@ -1010,7 +1015,8 @@ class LightRAGStore:
             working_dir=str(self.working_dir),
             workspace=hemisphere,  # 10.1 binding for the graph: one isolated storage set per hemisphere
             llm_model_func=llm_func,
-            embedding_func=EmbeddingFunc(embedding_dim=self.embedding_dim, max_token_size=8192, func=embed_func),
+            embedding_func=EmbeddingFunc(embedding_dim=self.embedding_dim, max_token_size=EMBEDDING_MAX_TOKENS,
+                                         func=embed_func),
             tiktoken_model_name=TIKTOKEN_MODEL_NAME,
         )
         self._run(rag.initialize_storages())  # README: forgetting this is the common mistake (VERIFIED)

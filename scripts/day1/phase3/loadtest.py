@@ -289,8 +289,9 @@ RESIDENCY_CACHE_BYTES = 28 * GB
 RESIDENCY_SLACK_BYTES = 10 * GB  # allocator overhead on top of the caches before the delta is out of tolerance
 RESIDENCY_LOW_FACTOR = 0.85  # less than this fraction of the weights on the counter = the seat is not resident
 # Fallback only, when /arbiter/status carries no budget_bytes (the Arbiter has not measured its resident set, and then
-# it grants nothing). 170e9 bytes = 158.3 GiB, the v0.3.4 "~170 GB" figure, below the ~164 GiB Section 4.1 now
-# expects: the stricter bound, kept rather than raised to a figure this script cannot measure.
+# it grants nothing). 170e9 bytes = 158.3 GiB, the v0.3.4 "~170 GB" figure, ABOVE the ~156 GiB Section 4.1 expects since
+# v0.4.0 (the Qwen3 pair on the CPU): not a stricter bound, and harmless only because it applies when the Arbiter
+# grants nothing, so no load this script makes is measured against it.
 DEFAULT_BUDGET_BYTES = 170 * GB
 TASK_ID = "phase3-loadtest"
 UNIT_PREFIX = "llama-server@"
@@ -314,13 +315,24 @@ PARITY_PIN_BUILD = 10964
 DEEP_THINK_GENERATOR = "glm-5.3-flash"  # atlas/arbiter.py DEEP_THINK_GENERATOR: the V14b probe of choice (both tiers)
 DECODE_FLOOR_TODO_ID = "decode-floors"
 KLD_TODO_ID = "kld-run"
+# v0.4.0: the inputs an approved row leaves to the Principal, each built with its stated default and raised as a to-do
+# (raise_input_todos, from summarize in step 02, beside decode-floors); only the Principal closes them.
+CONTEXT_TARGETS_TODO_ID = "context-targets"  # D-16
+TRIAL_TASK_SET_TODO_ID = "trial-task-set"  # D-46
+SEAT_TEST_SETS_TODO_ID = "seat-test-sets"  # D-49
+SEAT_PROFILES_TODO_ID = "seat-profiles"  # D-48, S-30, T-04
 # S-02 (V25) and S-03: llama-perplexity runs. A 512-token window over 16 chunks of the fixed corpus (about 8k tokens,
 # the domain profiles under config/domains, present on the node) keeps the base-logits file near 1-2 GB per engine; the
 # deterministic task set is the HellaSwag-format file beside this script (6 lines per task: context, gold index, four
 # endings; tools/perplexity/perplexity.cpp hellaswag_score, identical at both pins), scored by log-likelihood, so no
 # sampling and no chat template is involved and both builds see byte-identical input. The file holds 24 commonsense
 # tasks written for this project (no third-party data; six per gold index), no comments and no blank lines (the tool
-# refuses a line count that is not a multiple of 6), and --hellaswag-tasks 1000 above the count keeps the file order.
+# refuses a line count that is not a multiple of 6), and --hellaswag-tasks 1000 above the count takes every task. The
+# tool ALWAYS shuffles them (perplexity.cpp: randomize_tasks = true unconditionally, std::mt19937 seeded 1, a
+# uniform_int_distribution draw per task; VERIFIED at both pins), so the per-task answers are in that shuffled order,
+# not file order: identical on both builds only because they share the node's toolchain (libstdc++ defines the
+# distribution), which is all V25's comparison needs. The records say so (HS_ANSWERS_ORDER); never read them by line.
+HS_ANSWERS_ORDER = "perplexity.cpp shuffle (std::mt19937 seed 1, the node's libstdc++), not file order"
 PARITY_CTX = 512
 PARITY_CHUNKS = 16
 PARITY_TASK_CTX = 2048
@@ -2300,6 +2312,55 @@ def raise_decode_floor_todo(ctx: Ctx) -> None:
              "Null (the default) is record only. Phase 3 changed no engine setting.")
 
 
+def _router_rules(ctx: Ctx) -> dict[str, Any]:
+    try:
+        data = json.loads((ctx.engines_path.parent / "router-rules.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _profile_text(ctx: Ctx, key: str) -> str:
+    if key not in ctx.engines:
+        return f"{key}: not in engines.json"
+    spec = ctx.spec(key)
+    ctx_size, parallel = int(spec.get("ctx_size") or 0), max(1, int(spec.get("parallel") or 1))
+    return (f"{key} {spec.get('kv_class', '?')} at {parallel} x {ctx_size // parallel:,} tokens "
+            f"(--ctx-size {ctx_size:,} --parallel {parallel}, no --kv-unified)")
+
+
+def raise_input_todos(ctx: Ctx) -> None:
+    """v0.4.0: the stated defaults of the approved rows that leave an input to the Principal (doc 4.3, 5.1, 9.1,
+    Section 22), each a to-do on the live list so `atlas-day1.sh status` shows it; re-raised by every summarize, closed
+    only by the Principal. The defaults are read from the shipped config where it holds them."""
+    todo(CONTEXT_TARGETS_TODO_ID,
+         "State a context target for the phased medical and science seats (D-16)",
+         "Default built: Q5_K_S (Baichuan-M3 150.76 GiB, Intern-S1 150.84 GiB), about 23K tokens after a 9 GiB "
+         "allowance at the register's ~164 GiB budget; at the ~156 GiB Section 4.1 now expects they leave about 3 GiB "
+         "for context, short of that default (doc 4.1, phased seats). Q4_K_M (133.91 / 132.86 GiB) is the rung for a "
+         "longer context. Neither seat is pulled on Day 1 (D-26 (c)); the answer is needed before their pull.")
+    todo(TRIAL_TASK_SET_TODO_ID,
+         "Supply the 30 to 50 blind-scored tasks for the DeepSeek V4.1 Flash trial (D-46 (b), T-30)",
+         "Default built: no trial (evaluation-only, after Day 1, outside the routed roster); DeepSeek-V4-Flash-0731 "
+         "stays the Apex. The trial needs the Principal's private Deep Think and TF_OMEGA-style tasks, scored blind "
+         "by the Principal or a director, and the deep-tier speed floor of D-47 (to-do decode-floors) (doc 5.1, 9.1).")
+    todo(SEAT_TEST_SETS_TODO_ID,
+         "Supply test sets for the seats no benchmark covers (D-49 (a), T-27)",
+         "Default built: GLM-5.3-Flash on those seats, unproven: Australian law, HR, aviation, logistics, AEC, SCADA, "
+         "game design, growth marketing, customer success and physical security / OSINT (Victor, Alaric and the "
+         "domains of 8.2). Their quality can only be settled on the Principal's own work (doc 5.1, Section 22).")
+    rules = _router_rules(ctx)
+    trigger = rules.get("long_document_tokens", "UNKNOWN (router-rules.json unreadable)")
+    todo(SEAT_PROFILES_TODO_ID,
+         "Set each seat's slot and context profile from the Phase 3 measurements (D-48, S-30, T-04)",
+         "Defaults built: " + _profile_text(ctx, "deepseek-v4-flash") + " (its native 1,048,576 needs 6.72 GiB of f16 "
+         "KV the budget does not have beside its weights); " + _profile_text(ctx, "glm-5.3-flash") + " (T-04 settles "
+         f"its cache type; D-48 (b) --kv-unified or (c) one large slot); the long-document trigger {trigger} tokens "
+         "(router-rules.json long_document_tokens, D-38, S-30). While GLM's slot is smaller than DeepSeek's, the "
+         "trigger keeps Arthur's long documents on DeepSeek (atlas/router.py). See the to-do kv-estimates for the "
+         "measured context memory (doc 4.3). Phase 3 changed no engine setting.")
+
+
 def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
     failed: list[str] = []
     warned: list[str] = []
@@ -2353,6 +2414,7 @@ def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
         record("V22", verdict, f"summary: {', '.join(v22_lines)} (newer architectures and the Apex, R19 "
                "generalised, S-26: a deferred engine never blocks the phase; its seats use their D-40 fallback)")
     raise_decode_floor_todo(ctx)
+    raise_input_todos(ctx)
     return 0
 
 
@@ -2610,45 +2672,67 @@ CACHE_TODO_TITLE = ("Set --cache-ram and --ctx-checkpoints explicitly on each ch
                     "Arbiter's budget (S52)")
 
 
-def raise_memory_todos(entries: Sequence[MemoryEntry], note: str = "") -> None:
-    """Pure apart from the two TODO lines: kv-estimates and cache-ram with the measured figures in their detail."""
+def arbiter_max_resident(ctx: Ctx) -> int:
+    """The LLM-seat residency limit the Arbiter runs with (/arbiter/status max_resident, D-32), read once and never
+    fatal: 1 (the D-32 (a) default) when the orchestrator cannot be asked or gives no usable figure."""
+    headers = {ADMIN_TOKEN_HEADER: ctx.admin_token} if ctx.admin_token else {}
+    try:
+        code, body = http("GET", f"{ctx.orch_url.rstrip('/')}/arbiter/status", timeout=10, headers=headers)
+    except (HttpFail, OSError):
+        return 1
+    value = body.get("max_resident") if code == 200 and isinstance(body, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 1
+
+
+def raise_memory_todos(entries: Sequence[MemoryEntry], note: str = "", max_resident: int = 1) -> None:
+    """Pure apart from the two TODO lines: kv-estimates and cache-ram with the measured figures in their detail.
+    `max_resident` is the Arbiter's LLM-seat limit (D-32 (a): 1): the worst case sums that many of the largest seats,
+    since an evicted server's prompt cache and checkpoints go with its process."""
     lead = f"{note}. " if note else ""
     kv_items = " | ".join(kv_item(k, role, rec, fp) for k, role, rec, fp in entries) or "no record"
     todo(KV_TODO_ID, KV_TODO_TITLE,
          lead + "Measured from each load's own log (the llama_kv_cache, llama_memory_recurrent and "
-         "llama_dsv4_comp_state 'size =' lines of llama.cpp b29c606) beside the Arbiter's projection for the same "
+         "llama_dsv4_comp_state 'size =' lines of llama.cpp b11474) beside the Arbiter's projection for the same "
          "profile (arbiter.py projected_footprint, estimate): " + kv_items + ". The estimates are "
          "orchestrator/src/atlas/arbiter.py KV_BYTES_PER_TOKEN_F16 (an engines.json kv_bytes_per_token_f16 overrides "
          "one engine's) and err high on purpose (an out-of-memory backstop). The GTT footprint Phase 3 registered "
          "(POST /arbiter/register, Section 4.2 rule 1) replaces the projection only at the profile it was measured at "
          "and only until the orchestrator restarts: the Arbiter keeps it in memory (arbiter.py Arbiter.measured) and "
          "nothing replays it or re-measures an ordinary load (VERIFIED in the source). After any restart or reboot "
-         "the estimates govern every load, pairing and eviction, at every profile (another context size, a KV-ladder "
+         "the estimates govern every load and eviction, at every profile (another context size, a KV-ladder "
          "rung, the Deep Think plans), so a corrected figure changes real Arbiter decisions. The implied figure is "
          "the measured context memory over ctx x the K/V type's size factor; recurrent state, sliding-window cells "
          "and compressor state are per slot and do not scale with ctx, so it holds at the measured profile only. "
-         "Updating the figures is the Principal's call; Phase 3 changed nothing.")
+         "B-03 (approved 2026-10-16): these measurements are adopted into the estimates for every kept engine before "
+         "any long context is used. Updating the figures is the Principal's call; Phase 3 changed nothing.")
     by_engine: dict[str, tuple[str, dict[str, Any] | None]] = {}
     for k, role, rec, _ in entries:
         if k not in by_engine or "the rung that stands" in role:  # one per engine: the ladder's standing rung
             by_engine[k] = cache_item(k, role, rec)
     # (worst at the defaults, worst at the suggested values, checkpoints UNKNOWN: then both are lower bounds)
+    seats = max(1, int(max_resident))
     heavy = sorted((s["worst_default_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
-                   for k, (_, s) in by_engine.items() if s and is_weight_bearing(k, entries))[-2:]
+                   for k, (_, s) in by_engine.items() if s and is_weight_bearing(k, entries))[-seats:]
     light = [(s["worst_default_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
              for k, (_, s) in by_engine.items() if s and not is_weight_bearing(k, entries)]
     total = ""
     if heavy:
         d, s = (sum(w[i] for w in heavy + light) / 1024 for i in (0, 1))
-        # every record, not only the summed ones: an UNKNOWN engine ranked out of the two largest may be larger
+        # every record, not only the summed ones: an UNKNOWN engine ranked out of the largest may be larger
         lower = any(s and not s["checkpoints_known"] for _, s in by_engine.values())
         bound, least = ("at worst at least", "at least ") if lower else ("up to", "")
-        total = (f" The two largest engines plus the resident chat engine(s) could hold {bound} {d:.1f} GiB of host "
+        which = "The largest LLM seat" if seats == 1 else f"The {seats} largest LLM seats"
+        ranked = "the one ranked here" if seats == 1 else f"the {seats} ranked here"
+        rule = ("Section 4.2 rule 3, D-32: one LLM seat resident; an evicted server's prompt cache and checkpoints "
+                "go with its process" if seats == 1 else
+                f"Section 4.2 rule 3: the Arbiter's limit is {seats} LLM seats (ATLAS_ARBITER_MAX_RESIDENT; D-32 (a) "
+                "is 1)")
+        total = (f" {which} plus the resident chat engine(s) could hold {bound} {d:.1f} GiB of host "
                  f"RAM at the defaults and {least}{s:.1f} GiB at the suggested values"
                  + (" (checkpoints UNKNOWN for at least one engine, whose checkpoints are left out of the sum "
-                    "and which may be larger than the two ranked here)" if lower else "")
+                    f"and which may be larger than {ranked})" if lower else "")
                  + ", against the host reserve (16 GiB, S44) that also carries about 12 GB of CPU-side services "
-                 "(Section 4.2 rule 3: at most two engines resident).")
+                 f"({rule}).")
     todo(CACHE_TODO_ID, CACHE_TODO_TITLE,
          lead + "Each chat llama-server keeps a prompt cache in host RAM (--cache-ram, default 8192 MiB per server; "
          "idle slots are copied into it at every new task, --cache-idle-slots on) and, where its cache cannot roll "
@@ -2681,7 +2765,7 @@ def cmd_memory(ctx: Ctx, _args: argparse.Namespace) -> int:
         if role.startswith("resident"):
             log(f"{key}: {memory_line(rec)}")
     try:
-        raise_memory_todos(entries, note)
+        raise_memory_todos(entries, note, arbiter_max_resident(ctx))
     except Terminated:
         raise
     except Exception as exc:  # S52: the to-dos go out with the reason rather than not at all
@@ -2745,7 +2829,7 @@ def pick_probe_key(ctx: Ctx, exclude: Sequence[str]) -> str:
 def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: dict[str, Any],
                           loaded: list[str]) -> tuple[bool, str]:
     """Section 21 V14, real engines: the Arbiter refuses an over-budget load and downgrades a Deep Think depth when
-    the projected footprint exceeds budget. On a healthy node every engine fits the ~164 GiB budget alone (Section
+    the projected footprint exceeds budget. On a healthy node every engine fits the ~156 GiB budget alone (Section
     4.1) and the Arbiter EVICTS to make room rather than refusing, so an honest over-budget projection is produced
     the way the Arbiter itself reads it: the probe engine's unit env file (phase2/engine-env.py, root) is rendered
     with a ctx_size override doubled until /internal/deep-think/plan says the standard tier no longer fits; then
@@ -2826,20 +2910,33 @@ def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: d
 
 
 def engine_weights_bytes(spec: dict[str, Any]) -> int:
-    """The weights the Arbiter budgets (D-31): the exact sum of files[].bytes when every file has one, else
-    footprint_gb read as decimal GB (the unchanged abliterated entry, enumerated files)."""
+    """The weights the Arbiter budgets (D-31): the exact sum of files[].bytes when every file has a positive one
+    (as config._exact_bytes requires), else footprint_gb read as GiB, as config.EngineSpec.footprint_bytes and the
+    v03b floor read it (the unchanged abliterated entry, enumerated files)."""
     files = spec.get("files") or []
-    if files and all(f.get("bytes") for f in files):
+    if files and all(_positive_int(f.get("bytes")) for f in files):
         return sum(int(f["bytes"]) for f in files)
-    return int(float(spec.get("footprint_gb") or 0) * GB)
+    return int(float(spec.get("footprint_gb") or 0) * GIB)
+
+
+def _positive_int(value: Any) -> bool:
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def cmd_residency(ctx: Ctx, args: argparse.Namespace) -> int:
     """Section 17 step 3 as v0.4.0 restates it (S-24; D-32 option (a): one LLM seat resident at a time; replaces the
     v0.3.5 two-residency test): FIRST is loaded through the Arbiter, then SECOND, and the Arbiter must evict FIRST to
-    make room (rule 3 at limit 1, rule 7 for every seat): the ledger holds SECOND alone, FIRST's unit is stopped and
-    the GTT delta is SECOND's alone (residency_bounds). Then two generation requests through the orchestrator to the
-    resident seat; the second must start after the first finished (rules 3, 4). Slot save and restore across the
+    make room (rule 3 at limit 1, rule 7 for every seat): the Arbiter runs at limit 1 (/arbiter/status max_resident),
+    its grant of SECOND names FIRST among the seats it evicted (/arbiter/load `evicted`), the ledger holds SECOND alone,
+    FIRST's unit is stopped and the GTT delta is SECOND's alone (residency_bounds). No Day 1 pair of non-abliterated
+    seats fits the budget together (gpt-oss-120b 68.3 + GLM-5.3-Flash 155.1 GiB against about 156 GiB), so with the
+    shipped pair the budget alone would force this eviction at limit 2 too: the seat limit itself is proven by V14a
+    (test_one_seat_limit_evicts_the_resident_seat); V21 proves the real swap at that limit. Then two generation
+    requests through the orchestrator to the resident seat; the second must start after the first finished (rules 3,
+    4). Slot save and restore across the
     swap is phased after Day 1 (S-35, T-13), so V21 says so instead of testing it. Then, with nothing resident, the
     real-engine refusal and Deep Think downgrade of Section 21 V14 (V14b)."""
     first, second = args.first, args.second
@@ -2933,16 +3030,26 @@ def cmd_residency(ctx: Ctx, args: argparse.Namespace) -> int:
         log(f"residency: {key} loaded in {secs[key]:.0f}s (ctx {env['ATLAS_CTX_SIZE']}, parallel "
             f"{env['ATLAS_PARALLEL']}); GTT used {fmt_gb(gtt_used_bytes())}; Arbiter: "
             f"{short(ctl.last_decision.get('reason', ''), 200)}")
-    # Rule 3 at limit 1 / rule 7 (D-32 (a)): the grant of SECOND must have evicted FIRST.
+    # Rule 3 at limit 1 / rule 7 (D-32 (a)): the grant of SECOND must have evicted FIRST, by the Arbiter's own account
+    # (/arbiter/load `evicted`), at limit 1. No Day 1 non-abliterated pair fits the budget together, so the eviction
+    # alone does not prove the limit (V14a does); a limit other than 1 is a V21 failure (D-32 (a)).
     ledger = [k for k in ctl.resident_keys() if k in ctx.core_keys()]
     first_gone = first not in ledger and not unit_active(first)
-    single = ledger == [second] and first_gone
+    decision_second = out.get(f"decision_{second}") or {}
+    evicted = [str(k) for k in (decision_second.get("evicted") or [])]
+    limit_ok = out["max_resident"] == 1
+    single = ledger == [second] and first_gone and first in evicted
     out["ledger_after_second"] = ledger
-    reason = str((out.get(f"decision_{second}") or {}).get("reason", ""))
-    one_msg = (f"loading {second} evicted {first} (ledger {ledger}; Arbiter: {short(reason, 160)}; limit "
-               f"{out['max_resident'] if out['max_resident'] is not None else '?'})" if single else
+    out["evicted_by_second"] = evicted
+    out["limit_ok"] = limit_ok
+    reason = str(decision_second.get("reason", ""))
+    one_msg = (f"loading {second} evicted {first} (ledger {ledger}; Arbiter evicted {evicted}: {short(reason, 160)}; "
+               f"limit {out['max_resident'] if out['max_resident'] is not None else '?'})" if single else
                f"NOT single residency after loading {second}: ledger {ledger}, {first} unit "
-               f"{'still active' if unit_active(first) else 'stopped'} (Arbiter: {short(reason, 160)})")
+               f"{'still active' if unit_active(first) else 'stopped'}, Arbiter evicted {evicted} "
+               f"(Arbiter: {short(reason, 160)})")
+    if not limit_ok:
+        one_msg += f"; limit is {out['max_resident']}, D-32 (a) expects 1 (ATLAS_ARBITER_MAX_RESIDENT)"
     time.sleep(5)
     used = gtt_used_bytes()
     delta = used - baseline
@@ -3008,7 +3115,7 @@ def cmd_residency(ctx: Ctx, args: argparse.Namespace) -> int:
         proof += f"; Arbiter status showed a generation queue ({seen_queue[0]})"
     log(f"residency: queueing {'PROVEN' if ok else 'NOT proven'}: {proof}")
     verb = "queued behind" if ok else "did NOT wait for"
-    passed = ok and single and memory_ok
+    passed = ok and single and memory_ok and limit_ok
     return finish(("pass" if passed else "fail",
                    f"{one_msg}; {mem_msg}; the second generation request to {second} {verb} the first; {proof}; "
                    "slot save and restore across the swap: phased after Day 1 (S-35, T-13), not tested"
@@ -3054,8 +3161,9 @@ def parse_kld(text: str) -> dict[str, float] | None:
 
 def parse_hellaswag(text: str) -> dict[str, Any] | None:
     """Per-task correctness from the running acc_norm lines (task i: round(acc_i * i) - round(acc_(i-1) * (i-1))),
-    in file order (every task is taken, see PARITY_TASKS_FILE; a shuffled subset would use std::mt19937 seeded 1,
-    identical at both pins). None when no task line was printed or the numbering skips."""
+    in the order the tool scored them: every task is taken (PARITY_TASKS_FILE), but always shuffled with std::mt19937
+    seeded 1 (HS_ANSWERS_ORDER, recorded beside the answers), the same order on both builds of one toolchain, never
+    file order. None when no task line was printed or the numbering skips."""
     accs: list[float] = []
     for ln in text.splitlines():
         if m := HS_LINE_RE.match(ln.strip("\r")):
@@ -3069,7 +3177,8 @@ def parse_hellaswag(text: str) -> dict[str, Any] | None:
         now = round(acc * i / 100.0)
         correct.append(now - prev == 1)
         prev = now
-    return {"n": len(accs), "correct": sum(correct), "acc_pct": accs[-1], "answers": correct}
+    return {"n": len(accs), "correct": sum(correct), "acc_pct": accs[-1], "answers": correct,
+            "answers_order": HS_ANSWERS_ORDER}
 
 
 def changed_answers(a: dict[str, Any] | None, b: dict[str, Any] | None) -> int | None:
@@ -3342,6 +3451,9 @@ def cmd_quality(ctx: Ctx, args: argparse.Namespace) -> int:
          "deterministic task set phase3/parity-tasks.txt): " + out["summary"] + ". These are the figures a reference "
          "run compares against. The KLD itself needs a reference file per seat that Day 1 does not pull (T-03, D-02: "
          "GLM's seats stay provisional until it runs); the changed-answer count is taken against the same task set. "
+         "With it, fix each seat's reasoning setting (D-30 (b): a fixed setting per seat, chosen after the refusal and "
+         "KLD tests; provisional Day 1 settings: DeepSeek-V4-Flash-0731 reasoning on at high effort, gpt-oss-120b "
+         "reasoning_effort high, GLM-5.3-Flash its template default; engines.json extra_args and env). "
          "Phase 3 changed no engine setting; only the Principal closes this to-do.")
     if out.get("leaks"):
         raise Infra(f"quality: memory not released after a llama-perplexity run ({' | '.join(out['leaks'])}): the "

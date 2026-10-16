@@ -20,6 +20,7 @@ from atlas import celery_app
 from atlas import vault as vault_mod
 from atlas.memory import (
     COLLECTION_HEMISPHERES,
+    EMBEDDING_MAX_TOKENS,
     HemisphereViolation,
     LightRAGStore,
     MemoryFrozen,
@@ -80,7 +81,7 @@ def make_store(tmp_path: Path) -> tuple[MemoryStore, StubChroma, GraphDoubles, S
         tmp_path / "graph",
         llm_base_url="http://127.0.0.1:8800/internal/v1",
         llm_model="router-qwen3.5-4b",
-        embedding_url="http://127.0.0.1:8109/v1",
+        embedding_url="http://127.0.0.1:8106/v1",
         embedding_model="embed-qwen3-4b",
         embedding_dim=8,
         sessions=sessions,
@@ -89,6 +90,15 @@ def make_store(tmp_path: Path) -> tuple[MemoryStore, StubChroma, GraphDoubles, S
     )
     store = MemoryStore(chroma, stub_embedding_fn, sessions=sessions, freeze_flag=None, graph=graph)
     return store, chroma, rags, sessions
+
+
+def test_lightrag_embedding_limit_matches_the_embedder_unit() -> None:
+    """C-02 / D-14 (e): the embedder is served at a 4,096-token context (one slot), so LightRAG's max_token_size must
+    not promise more: an input of 4,097 to 8,192 tokens would pass LightRAG and be refused by llama-server."""
+    from atlas.config import load_engines
+
+    spec = load_engines(Path(__file__).resolve().parents[2] / "config")["embed-qwen3-4b"]
+    assert EMBEDDING_MAX_TOKENS == spec.ctx_size // spec.parallel == 4096
 
 
 def test_vault_tagged_session_write_is_dropped_everywhere(tmp_path: Path) -> None:
@@ -237,7 +247,7 @@ def test_graph_writes_during_the_freeze_wait_then_spool_and_the_thaw_replays_the
         tmp_path / "graph",
         llm_base_url="http://127.0.0.1:8800/internal/v1",
         llm_model="router-qwen3.5-4b",
-        embedding_url="http://127.0.0.1:8109/v1",
+        embedding_url="http://127.0.0.1:8106/v1",
         embedding_model="embed-qwen3-4b",
         embedding_dim=8,
         sessions=SessionTags(),
@@ -400,7 +410,7 @@ def test_aegis_thaw_replays_graph_lines_with_a_graph_equipped_store(tmp_path: Pa
         tmp_path / "graph",
         llm_base_url="http://127.0.0.1:8800/internal/v1",
         llm_model="router-qwen3.5-4b",
-        embedding_url="http://127.0.0.1:8109/v1",
+        embedding_url="http://127.0.0.1:8106/v1",
         embedding_model="embed-qwen3-4b",
         embedding_dim=8,
         sessions=SessionTags(),
@@ -577,7 +587,7 @@ def test_build_memory_store_disables_chromadb_telemetry(monkeypatch: pytest.Monk
     monkeypatch.setitem(sys.modules, "chromadb", chromadb)
     monkeypatch.setitem(sys.modules, "chromadb.config", config)
     store = build_memory_store(
-        {"CHROMA_URL": "http://127.0.0.1:8000", "EMBEDDING_URL": "http://127.0.0.1:8109/v1"},
+        {"CHROMA_URL": "http://127.0.0.1:8000", "EMBEDDING_URL": "http://127.0.0.1:8106/v1"},
         sessions=SessionTags(),
         with_graph=False,
     )

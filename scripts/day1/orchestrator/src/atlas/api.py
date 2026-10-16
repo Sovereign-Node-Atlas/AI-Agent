@@ -172,7 +172,9 @@ log = logging.getLogger("atlas.api")
 
 MODELS: tuple[str, ...] = ("atlas", "ren", "arthur")  # Section 12.1
 LEAD_OVERRIDE: dict[str, str] = {"ren": "[REN]", "arthur": "[ARTHUR]"}  # router-rules.json override keys
-DEFAULT_LOAD_WAIT_S = 900.0  # a swap is 15-45 s (4.2 rule 4); a queued load waits behind a running generation
+# A swap between the large seats is about 50-85 s plus re-prefill (4.2 rule 4, T-14); a queued load waits behind a
+# running generation.
+DEFAULT_LOAD_WAIT_S = 900.0
 # How long a request waits for the single generation slot (ATLAS_GENERATION_WAIT_S). A Celery task that generates
 # through /internal (atlas.tasks.OrchestratorClient) may spend this whole time queued behind a running generation
 # BEFORE its own generation starts, so that client's read timeout is this value plus a generation
@@ -971,6 +973,9 @@ def build_app(deps: AppDeps) -> FastAPI:
             "reason": dec.reason,
             "projected_bytes": int(getattr(dec, "projected_bytes", 0) or 0),
             "task_id": dec.task_id,
+            # The seats this grant evicted (rule 7): V21 (phase3/loadtest.py cmd_residency) checks the FIRST seat is
+            # among them, so the proof rests on the Arbiter's own account, not on the ledger alone.
+            "evicted": list(getattr(dec, "evicted", ()) or ()),
         }
 
     @app.post("/arbiter/register", dependencies=admin)
@@ -1730,7 +1735,9 @@ def build_production_deps() -> AppDeps:
     classifier = LlamaClassifier(
         production_llama_client(arbiter, classifier_spec), task_force_codes=tuple(config.task_forces)
     )
-    router = Router(config, classifier, ledger, personas=personas)
+    # The long-document trigger compares the per-slot windows the units really run (D-38, D-48; engine_window).
+    router = Router(config, classifier, ledger, personas=personas,
+                    window_of=lambda spec: engine_window(arbiter, spec))
     approval = ApprovalQueue(ledger, NoChannelSender(), NtfyNotifier(notify), personas=personas)
     log.warning("approval queue: no outbound channel is wired (Section 13); approving records it and fails the send")
 

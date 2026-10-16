@@ -37,7 +37,14 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from atlas.arbiter import GIB, ArbiterError, SysfsMemoryProbe, host_used_bytes
+from atlas.arbiter import (
+    GIB,
+    ArbiterError,
+    SysfsMemoryProbe,
+    host_unreserved_bytes,
+    host_used_bytes,
+    measure_host_companions,
+)
 from atlas.config import (
     ConfigError,
     EngineSpec,
@@ -195,6 +202,12 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
         if meminfo[2] is not None or "used_bytes" in out["gtt"]:
             out["host"]["host_used_bytes"] = host_used_bytes(meminfo[0], meminfo[1], meminfo[2],
                                                              out["gtt"].get("used_bytes", 0))
+            # S44 by the Arbiter's own rule (arbiter.host_unreserved_bytes): the CPU companions' anonymous share is
+            # taken out (their weights are clean file pages, already counted as available), measured the way the
+            # Arbiter measures it (arbiter.measure_host_companions: RssAnon + RssShmem of each unit's MainPID).
+            companions = measure_host_companions(engines, pid_of=controller.main_pid)
+            out["host"]["companion_anon_bytes"] = sum(d["anon_bytes"] for d in companions.values())
+            out["host"]["unreserved_bytes"] = host_unreserved_bytes(out["host"]["host_used_bytes"], companions)
     active: list[EngineSpec] = []
     for spec in engines.values():
         state = _unit_state(controller, spec.key, spec)
@@ -220,8 +233,11 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
         line += f" [orchestrator.env: {host['error']}]"
     if "host_used_bytes" in host:
         gpu_from = "(GPUActive + GPUReclaim)" if "gpu_pages_bytes" in host else "GTT used"
-        line += (f"; CPU-side use {host['host_used_bytes'] / GIB:.2f} GiB (MemTotal - MemAvailable - {gpu_from}"
-                 f"{', ABOVE the headroom' if host['host_used_bytes'] > host['headroom_bytes'] else ''})")
+        over = host["unreserved_bytes"] > host["headroom_bytes"]
+        line += (f"; CPU-side use {host['host_used_bytes'] / GIB:.2f} GiB (MemTotal - MemAvailable - {gpu_from}), "
+                 f"{host['unreserved_bytes'] / GIB:.2f} GiB beside the CPU companions' "
+                 f"{host['companion_anon_bytes'] / GIB:.2f} GiB of anonymous memory"
+                 f"{', ABOVE the headroom' if over else ''}")
     if "mem_total_bytes" in host:
         line += (f"; MemAvailable {host['mem_available_bytes'] / GIB:.2f} GiB of MemTotal "
                  f"{host['mem_total_bytes'] / GIB:.2f} GiB")

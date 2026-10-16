@@ -1,0 +1,2301 @@
+{
+ "_meta": {
+  "collected": "2026-10-16",
+  "collector": "v0.4.0 restructure, Inform phase (data collection only; no repository edits)",
+  "units": "GB = 10^9 bytes, GiB = 2^30 bytes, rounded to 2 places; bytes and sha256 are exact (HF tree API lfs.size / lfs.oid)",
+  "llama_cpp_pin": {
+   "tag": "b11474",
+   "commit": "b9acf138a1e28ce1fc23b5a4fc4b12444b50f7ea",
+   "date": "2026-10-07",
+   "cmake_version": "0.6.0",
+   "old_pin": {
+    "tag": "v0.4.1",
+    "build": "b10964",
+    "commit": "b29c606e28a01b1bc8c1351026a0fa6e616bf6c4"
+   }
+  },
+  "kv_method": "Bytes per token computed from the GGUF headers read today and the b11474 cache code (src/llama-model.cpp create_memory, llama-kv-cache.cpp, llama-memory-hybrid-idx.cpp, llama-kv-cache-dsv4.cpp, llama-hparams.cpp n_embd_r/n_embd_s). Block sizes: f16 2 B/element; q8_0 34 B per 32; q4_0 18 B per 32. Recurrent/SSM state is f32, per sequence, independent of context. Compute buffers are not included (Phase 3 measures them).",
+  "sources": {
+   "tree_api": "https://huggingface.co/api/models/<repo>/tree/main?recursive=true (2026-10-16)",
+   "headers": "HTTP range reads of https://huggingface.co/<repo>/resolve/main/<file> (first 4-25 MB; GLM/DSV4/Flash-Next/Nemotron first shards read whole), parsed locally",
+   "cards_configs": "https://huggingface.co/<repo>/raw/main/{README.md,config.json,generation_config.json}; /api/models/<repo>; /api/models/<repo>/paths-info/main (last-commit dates)",
+   "llama_cpp": "git tree b9acf138 in the session clone (scratchpad lcpp.git); first-support tags by git tag --contains",
+   "gorse_conversion": "https://huggingface.co/gorse-io/Qwen3-Reranker-{8B,4B}-GGUF/raw/main/{conversion.json,convert.log}"
+  },
+  "engines_json_fields": "Each Day 1 entry gives the inputs for engines.json: hf_repo, subdir, arch, licence, files[] (path, bytes, sha256), model_file_pattern, mmproj, quant, footprint (GB/GiB), native context, kv bytes/token, sampling for extra_args, min_llama_cpp_tag. files[].path is the repo path (existing entries keep the subdir prefix in name, e.g. \"UD-Q4_K_XL/...\").",
+  "verify_value": "All Day 1 sha256 values come from the tree API read today. files_rule knows verify=unverified|research-snippet only; a tree-API-read hash is closest to research-snippet (compare at pull time, log a mismatch loudly) unless a new value is added to files_rule.",
+  "exclusion": "No uncensored or abliterated engine was sourced; gpt-oss-120b-abliterated is out of scope and unchanged."
+ },
+ "day1": {
+  "glm-5.3-flash": {
+   "tier": "day1",
+   "suggested_key": "glm-5.3-flash",
+   "role_per_fixed_choices": "Ren, Gideon, Silas, Helena, Minerva, Victor, Alaric; vision engine (glm5v mmproj); long-document route; Deep Think generator; Eleanor persona work (P-10)",
+   "hf_repo": "unsloth/GLM-5.3-Flash-GGUF",
+   "subdir": "UD-IQ4_XS",
+   "quant": "UD-IQ4_XS",
+   "files": [
+    {
+     "path": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+     "basename": "GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+     "bytes": 9429984,
+     "sha256": "c2f3b6ab98d3df844f322ea376059202d2eaeedcee1f0eff455345b86a137dbd"
+    },
+    {
+     "path": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+     "basename": "GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+     "bytes": 49989334176,
+     "sha256": "7d64cf0395672c4322012841abec502ea7e20518299bb5e3069003f06f9e6de9"
+    },
+    {
+     "path": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00003-of-00005.gguf",
+     "basename": "GLM-5.3-Flash-UD-IQ4_XS-00003-of-00005.gguf",
+     "bytes": 49607025280,
+     "sha256": "7c2c63c9c30f8060428fdf2ac935dbf2ee9ad8f771d62b6ae47a7f7f2c1520e7"
+    },
+    {
+     "path": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00004-of-00005.gguf",
+     "basename": "GLM-5.3-Flash-UD-IQ4_XS-00004-of-00005.gguf",
+     "bytes": 49486530144,
+     "sha256": "06c90f191871317c92dd9d25a353b687aed44c50f3ac6c713e9fe410bc2d26dd"
+    },
+    {
+     "path": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00005-of-00005.gguf",
+     "basename": "GLM-5.3-Flash-UD-IQ4_XS-00005-of-00005.gguf",
+     "bytes": 7729791616,
+     "sha256": "66ebf9ec85e04d3f44af674ae4f694acbc89cc53db75e42f2f4d3646bf321c0d"
+    }
+   ],
+   "total": {
+    "bytes": 156822111200,
+    "GB": 156.82,
+    "GiB": 146.05
+   },
+   "model_file_pattern": "GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+   "mmproj": {
+    "recommended": {
+     "path": "mmproj-F16.gguf",
+     "basename": "mmproj-F16.gguf",
+     "bytes": 1128047296,
+     "sha256": "922b809664d6a89cc1e40bfeaa63618000edc6651baf4082ce0718a784adf947"
+    },
+    "alternative": {
+     "path": "mmproj-BF16.gguf",
+     "basename": "mmproj-BF16.gguf",
+     "bytes": 1164010176,
+     "sha256": "82b7adb44411dbb298b1c689567804e5ed0790d80f308ed8b5b6b8ac0527d2ac"
+    },
+    "why_f16": "F16 is the conservative choice on Vulkan (BF16 shader support is device/driver dependent); both carry clip.projector_type = glm5v, 564M parameters, 348 tensors.",
+    "header": {
+     "clip.projector_type": "glm5v",
+     "clip.vision.block_count": 24,
+     "clip.vision.image_size": 448,
+     "clip.vision.patch_size": 14,
+     "clip.vision.spatial_merge_size": 2,
+     "clip.vision.image_min_pixels": 12544,
+     "clip.vision.image_max_pixels": 6272000,
+     "clip.vision.projection_dim": 4096
+    }
+   },
+   "arch": "glm5-next",
+   "gguf_header": {
+    "general.architecture": "glm5-next",
+    "block_count": 46,
+    "trunk_layers": 45,
+    "nextn_predict_layers": 1,
+    "context_length": 1048576,
+    "embedding_length": 4096,
+    "attention.head_count": 64,
+    "attention.key_length": 512,
+    "attention.key_length_mla": 256,
+    "attention.kv_lora_rank": 512,
+    "rope.dimension_count": 0,
+    "attention.indexer.head_count": 32,
+    "attention.indexer.key_length": 128,
+    "attention.indexer.top_k": 2048,
+    "attention.indexer.kpool": 4,
+    "kda.head_dim": 128,
+    "ssm.conv_kernel": 4,
+    "hyper_connection.count": 4,
+    "expert_count": 288,
+    "expert_used_count": 8,
+    "split.count": 5,
+    "split.tensors.count": 1412,
+    "general.file_type": 30,
+    "general.sampling.temp": 1.0,
+    "general.sampling.top_p": 0.95,
+    "general.license": "mit",
+    "tensor_types_shard2": {
+     "Q6_K": 3,
+     "F32": 220,
+     "Q8_0": 226,
+     "IQ4_XS": 13,
+     "IQ3_S": 24
+    },
+    "shard1_tensors": 0,
+    "mtp_tensors_present": "blk.45.nextn.* (eh_proj, enorm, hnorm, shared_head_norm) in shard 5"
+   },
+   "native_context": {
+    "gguf_context_length": 1048576,
+    "config_max_position_embeddings": 1048576
+   },
+   "kv": {
+    "layout": "llama_memory_hybrid_idx (src/llama-model.cpp L2468-L2511 at b11474): 34 KDA layers recurrent (f32 state), 11 DSA layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43] with a K-only MLA cache (512 per token) plus an indexer cache (128 x kpool_row 3 = 384 per token, K-only, type_k). The NextN layer 45 is excluded from the main context (filter il < n_layer()).",
+    "bytes_per_token": {
+     "f16": 19712,
+     "q8_0": 10472,
+     "q4_0": 5544
+    },
+    "derivation": "11 x (row(512) + row(384)); f16 = 11 x 896 x 2",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 0.602,
+      "q8_0": 0.32,
+      "q4_0": 0.169
+     },
+     "131072": {
+      "f16": 2.406,
+      "q8_0": 1.278,
+      "q4_0": 0.677
+     },
+     "262144": {
+      "f16": 4.812,
+      "q8_0": 2.557,
+      "q4_0": 1.354
+     },
+     "524288": {
+      "f16": 9.625,
+      "q8_0": 5.113,
+      "q4_0": 2.707
+     },
+     "1048576": {
+      "f16": 19.25,
+      "q8_0": 10.227,
+      "q4_0": 5.414
+     }
+    },
+    "recurrent_state": {
+     "bytes_per_sequence": 152633344,
+     "MiB_per_sequence": 145.6,
+     "formula": "34 recurrent layers x (r 73728 + s 1048576) f32 elements x 4 B"
+    },
+    "matches_register": "N-03 / D-29 quote 19,712 B/token f16: confirmed by the b11474 code path."
+   },
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "source": "zai-org/GLM-5.3-Flash generation_config.json (temperature 1.0, top_p 0.95) and GGUF general.sampling.*; card evaluations use temp 1.0 with top_p 0.95 or 1.0",
+    "chat_template": "reasoning_effort in ['low','high'] else 'max' (default max, rendered as a 'Reasoning Effort:' system line); clear_thinking kwarg (default false). At b11474 --reasoning-effort LEVEL sets the template kwarg (common/arg.cpp L3718)."
+   },
+   "licence": {
+    "id": "mit",
+    "sources": [
+     "zai-org/GLM-5.3-Flash card front matter license: mit",
+     "GGUF general.license = mit"
+    ],
+    "register": "D-35 (a) accepted"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b11279",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": false,
+    "note": "glm5-next arch (#27773, 649dcb103, first tag b11279). GLM MTP (#29928) is the pin commit itself (b11474). Later glm5 fixes in the pin: #29745 (b11302), #30042 gather path removed (b11453). Vulkan supports the DSV4_HC_PRE/POST/COMB ops GLM uses for hc=4 with F32 inputs (ggml-vulkan.cpp supports_op at b11474); GATED_DELTA_NET (KDA) has a Vulkan path.",
+    "mtp": "Embedded NextN block (nextn_predict_layers 1); speculative use via --spec-type draft-mtp is a phased item (D-61)."
+   },
+   "file_dates": {
+    "shard1": "2026-10-05 \"Update shards due to upstream changes\" (metadata-only shard, 0 tensors, rewritten after mainline #27773)",
+    "shards2_5": "2026-08-27 (tensor data)",
+    "mmproj": "2026-10-05"
+   },
+   "repo": {
+    "repo_sha": "a38483c8cd5df544f53d70fb281afe97369d5ab6",
+    "last_modified": "2026-10-05T22:23:39.000Z",
+    "gated": false,
+    "card_licence": "mit",
+    "card_licence_name": null
+   },
+   "speed_research": {
+    "projected_decode_tok_s": [
+     12.5,
+     14.0
+    ],
+    "measured_reference": "17.4 tok/s Vulkan at 3.84 bpw on a PRO 495 (not this file)",
+    "source": "research_notes/ATLAS specialist LLM arsenal/single_engine_performance.md L12"
+   },
+   "caveats": [
+    "The repo also carries Shard_Rewrite/*.gguf_file copies (same sha256 as the live first shards); do not pull them: select the UD-IQ4_XS/ folder only.",
+    "Register D-20/S-10 quote the glm5v mmproj as 0.65 GB; the published files are 1,128,047,296 B (F16) and 1,164,010,176 B (BF16). Use the measured size.",
+    "D-48: multi-slot GLM may need --kv-unified (claim from #27773 review); no assertion enforcing it was found in src at b11474. T-04 settles it.",
+    "A separate vision engines.json key on the same weights would, under layout_rule (models/<key>/), download the 156.82 GB set twice unless the pull shares the directory."
+   ]
+  },
+  "deepseek-v4-flash": {
+   "tier": "day1",
+   "suggested_key": "deepseek-v4-flash (keep the existing key; change subdir, files, quant, footprint)",
+   "role_per_fixed_choices": "Arthur; Apex / TF_OMEGA engine; Deep Think pair adversary",
+   "hf_repo": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+   "subdir": "UD-Q8_K_XL",
+   "quant": "UD-Q8_K_XL",
+   "files": [
+    {
+     "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+     "basename": "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+     "bytes": 5257408,
+     "sha256": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa"
+    },
+    {
+     "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00002-of-00005.gguf",
+     "basename": "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00002-of-00005.gguf",
+     "bytes": 49215492960,
+     "sha256": "3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610"
+    },
+    {
+     "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf",
+     "basename": "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf",
+     "bytes": 49700372160,
+     "sha256": "7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce"
+    },
+    {
+     "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00004-of-00005.gguf",
+     "basename": "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00004-of-00005.gguf",
+     "bytes": 49466495968,
+     "sha256": "6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3"
+    },
+    {
+     "path": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00005-of-00005.gguf",
+     "basename": "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00005-of-00005.gguf",
+     "bytes": 13481997024,
+     "sha256": "ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea"
+    }
+   ],
+   "total": {
+    "bytes": 161869615520,
+    "GB": 161.87,
+    "GiB": 150.75
+   },
+   "model_file_pattern": "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+   "arch": "deepseek4",
+   "gguf_header": {
+    "general.architecture": "deepseek4",
+    "block_count": 43,
+    "context_length": 1048576,
+    "embedding_length": 4096,
+    "attention.head_count": 64,
+    "attention.head_count_kv": 1,
+    "attention.key_length": 512,
+    "rope.dimension_count": 64,
+    "attention.sliding_window": 128,
+    "rope.scaling": "yarn x16 from 65536",
+    "attention.indexer.head_count": 64,
+    "attention.indexer.key_length": 128,
+    "attention.indexer.top_k": 512,
+    "compress_ratios_first_43": [
+     0,
+     0,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4,
+     128,
+     4
+    ],
+    "expert_count": 256,
+    "expert_used_count": 6,
+    "hyper_connection.count": 4,
+    "hash_layer_count": 3,
+    "split.count": 5,
+    "split.tensors.count": 1328,
+    "general.file_type": 38,
+    "general.sampling.temp": 1.0,
+    "general.sampling.top_p": 1.0,
+    "tensor_types_shard2": {
+     "BF16": 160,
+     "F32": 183,
+     "MXFP4": 38,
+     "I32": 3
+    },
+    "nextn_or_mtp": "none (0731 ships a DSpark drafter, not an MTP head)"
+   },
+   "native_context": {
+    "gguf_context_length": 1048576,
+    "note": "yarn factor 16 over original 65,536"
+   },
+   "kv": {
+    "layout": "llama_kv_cache_dsv4 (src/llama-kv-cache-dsv4.cpp L1213-L1333): every layer is SWA (window 128) with a K-only raw cache; 21 CSA layers (ratio 4) [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42] keep a compressed K (512 per 4 tokens) plus a lightning-indexer K (128 per 4 tokens); 20 HCA layers (ratio 128) keep 512 per 128 tokens; layers [0, 1] are window-only. All caches use type_k.",
+    "bytes_per_token": {
+     "f16": 6880.0,
+     "q8_0": 3655.0,
+     "q4_0": 1935.0
+    },
+    "derivation": "21 x (row(512)/4 + row(128)/4) + 20 x row(512)/128; f16 = 21 x 320 + 20 x 8",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 0.21,
+      "q8_0": 0.112,
+      "q4_0": 0.059
+     },
+     "131072": {
+      "f16": 0.84,
+      "q8_0": 0.446,
+      "q4_0": 0.236
+     },
+     "262144": {
+      "f16": 1.68,
+      "q8_0": 0.892,
+      "q4_0": 0.472
+     },
+     "524288": {
+      "f16": 3.359,
+      "q8_0": 1.785,
+      "q4_0": 0.945
+     },
+     "1048576": {
+      "f16": 6.719,
+      "q8_0": 3.569,
+      "q4_0": 1.89
+     }
+    },
+    "fixed_per_sequence": {
+     "raw_swa_k_cache_f16_bytes": 33816576,
+     "raw_swa_cells": 768,
+     "raw_q8_0_bytes": 17965056,
+     "raw_note": "43 layers x 512 x 2 B x 768 cells per stream (GGML_PAD(128 + n_ubatch 512, 256)); scales with -ub and type_k",
+     "compressor_state_f32_bytes": 12206080,
+     "compressor_note": "csa/hca/lid states: kv + score f32 tensors [n_embd_state, state_size, n_stream x (1 + n_rs_seq)] (llama-kv-cache-dsv4.cpp L968-L969); estimate per stream with n_rs_seq 0"
+    },
+    "matches_register": "N-01 / D-29 quote about 6,880 B/token: confirmed (f16 exactly 6,880).",
+    "ladder_note": "Approved D-29 (a) / S-42: highest-precision coherent rung that fits (f16, then q8_0, never q4_0)."
+   },
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_p_agentic": 0.95,
+    "source": "deepseek-ai/DeepSeek-V4-Flash-0731 README \"How to Run Locally\": temperature 1.0, top_p 0.95 for agentic scenarios and 1.0 otherwise; max output 384K for high/max effort; generation_config.json temperature 1.0, top_p 1.0",
+    "chat_template": "unsloth template: thinking = thinking or enable_thinking kwarg, default FALSE; reasoning_effort none|high|max (high/max prepend long effort prompts). At b11474 --reasoning on sets enable_thinking=true and --reasoning-effort high|max sets reasoning_effort."
+   },
+   "licence": {
+    "id": "mit",
+    "sources": [
+     "deepseek-ai/DeepSeek-V4-Flash-0731 card license: mit (LICENSE)",
+     "GGUF general.license = mit"
+    ],
+    "register": "D-34 accepted"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b9840",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "deepseek4 arch (#24162, first tag b9840); quantised-KV fix #25202 (b9905); vision input #28154 (b10766); Vulkan DSV4 HC fused ops #26578 (b10844). --parallel must be explicit (#26654, existing known_issue)."
+   },
+   "drafter_phased": {
+    "recommended_file": {
+     "path": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf",
+     "basename": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf",
+     "bytes": 10896057440,
+     "sha256": "2c7ac54b0b64a99df1f139a9f1371a00198265e1d6a614b77597d20a655a4249"
+    },
+    "bf16_alternative": {
+     "path": "dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf",
+     "basename": "dspark-DeepSeek-V4-Flash-0731-BF16.gguf",
+     "bytes": 11314832480,
+     "sha256": "df7a182b1f62acee6e9e33f11a03876db8031d9d147419309a448d0e776f82d8"
+    },
+    "arch": "dflash (mainline LLM_ARCH_DFLASH; 81 tensors, block_count 3, dflash.block_size 5, target_layers [41,42,43])",
+    "min_llama_cpp_tag": "b10228 (DSV4 DSpark #25784); avoid b10259-b10268 (unsloth dspark/README)",
+    "usage": "-md <file> --spec-type draft-dspark --spec-draft-n-max <=5; --fit off recommended; drafter borrows target embeddings/output (do not pin -devd)",
+    "not_pulled_day1": "Root-level file; the UD-Q8_K_XL/ subdir pull does not include it.",
+    "lucebox_variant": {
+     "repo": "Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF",
+     "file": "DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf",
+     "bytes": 10648656160,
+     "unusable_on_mainline": "general.architecture = deepseek4-dflash-draft and tensor type id 101 (Lucebox ROCm FP4 type): not a mainline arch/type"
+    }
+   },
+   "file_dates": {
+    "all_shards": "2026-08-01 (super-squash)"
+   },
+   "repo": {
+    "repo_sha": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",
+    "last_modified": "2026-08-06T14:54:45.000Z",
+    "gated": false,
+    "card_licence": "mit",
+    "card_licence_name": null
+   },
+   "speed_research": {
+    "projected_decode_tok_s": 7,
+    "note": "about 7 tok/s UD-Q8_K_XL on mainline Vulkan (projection; T-06 measures)",
+    "source": "research_notes/ATLAS specialist LLM arsenal/single_engine_performance.md L12; register T-06"
+   },
+   "caveats": [
+    "Bit-exact to the official weights per N-01 (UD-Q8_K_XL: BF16 + MXFP4 experts; tensor types BF16/F32/MXFP4/I32 in shard 2).",
+    "Fit: 150.75 GiB of weights. At the D-14 (a) 8B companion pair the budget is about 150 GiB, so this file does not fit; it needs the 4B pair (about 157 GiB) or on-demand/CPU companions (see residency_arithmetic)."
+   ]
+  },
+  "gpt-oss-120b": {
+   "tier": "day1",
+   "suggested_key": "gpt-oss-120b (keep the key; repo and file change per D-59 (b))",
+   "role_per_fixed_choices": "Fast utility, drafting, Sentinel escalation; fallback floor for every seat (D-40 (a)) where the runner-up is phased",
+   "hf_repo": "unsloth/gpt-oss-120b-GGUF",
+   "subdir": null,
+   "quant": "F16 trunk + native MXFP4 experts (general.file_type 1)",
+   "files": [
+    {
+     "path": "gpt-oss-120b-F16.gguf",
+     "basename": "gpt-oss-120b-F16.gguf",
+     "bytes": 65369017728,
+     "sha256": "2d1f0298ae4b6c874d5a468598c5ce17c1763b3fea99de10b1a07df93cef014f"
+    }
+   ],
+   "total": {
+    "bytes": 65369017728,
+    "GB": 65.37,
+    "GiB": 60.88
+   },
+   "model_file_pattern": "gpt-oss-120b-F16.gguf",
+   "arch": "gpt-oss",
+   "gguf_header": {
+    "general.architecture": "gpt-oss",
+    "block_count": 36,
+    "context_length": 131072,
+    "embedding_length": 2880,
+    "attention.head_count": 64,
+    "attention.head_count_kv": 8,
+    "attention.key_length": 64,
+    "attention.sliding_window": 128,
+    "rope.scaling": "yarn x32 from 4096",
+    "expert_count": 128,
+    "expert_used_count": 4,
+    "n_tensors": 687,
+    "tensor_type_counts": {
+     "MXFP4": 108,
+     "F32": 433,
+     "F16": 146
+    },
+    "trunk": "token_embd, output and all attention weights F16; 108 expert tensors MXFP4 (unchanged from release)"
+   },
+   "native_context": {
+    "gguf_context_length": 131072
+   },
+   "kv": {
+    "layout": "iSWA (models/openai-moe.cpp load_swa_pattern(ml, 2)): 18 SWA layers (window 128, fixed size) and 18 full-attention layers; 8 KV heads x 64; attention sinks.",
+    "bytes_per_token": {
+     "f16": 36864,
+     "q8_0": 19584,
+     "q4_0": 10368
+    },
+    "derivation": "18 full layers x (K 512 + V 512)",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 1.125,
+      "q8_0": 0.598,
+      "q4_0": 0.316
+     },
+     "131072": {
+      "f16": 4.5,
+      "q8_0": 2.391,
+      "q4_0": 1.266
+     },
+     "262144": {
+      "f16": 9.0,
+      "q8_0": 4.781,
+      "q4_0": 2.531
+     },
+     "524288": {
+      "f16": 18.0,
+      "q8_0": 9.562,
+      "q4_0": 5.062
+     },
+     "1048576": {
+      "f16": 36.0,
+      "q8_0": 19.125,
+      "q4_0": 10.125
+     }
+    },
+    "fixed_per_sequence": "SWA layers: 18 x 1024 x bytes x GGML_PAD(128 + n_ubatch, 256) cells per stream (f16, -ub 2048: 2,304 cells = 81 MiB)",
+    "kv_proof_lines": 2
+   },
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "source": "github.com/openai/gpt-oss README L576 \"We recommend sampling with temperature=1.0 and top_p=1.0\"",
+    "chat_template": "reasoning_effort default \"medium\"; existing entry sets {\"reasoning_effort\":\"high\"} via LLAMA_ARG_CHAT_TEMPLATE_KWARGS (at b11474 --reasoning-effort high is equivalent)"
+   },
+   "licence": {
+    "id": "apache-2.0",
+    "sources": [
+     "openai/gpt-oss-120b card",
+     "GGUF general.license = apache-2.0"
+    ]
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b6096",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "gpt-oss arch (#15091, first tag b6096)"
+   },
+   "file_dates": {
+    "file": "2025-08-08"
+   },
+   "repo": {
+    "repo_sha": "ff1a82da6ad466e32284fa3d2b86694db3204789",
+    "last_modified": "2025-08-25T02:27:41.000Z",
+    "gated": false,
+    "card_licence": "apache-2.0",
+    "card_licence_name": null
+   },
+   "speed_research": {
+    "projected_decode_tok_s": [
+     57,
+     60
+    ],
+    "measured_reference": "53.8-55.6 tok/s on 128 GB Ryzen AI Max+ 395 boxes (MXFP4 file)",
+    "source": "register N-09"
+   },
+   "caveats": [
+    "The register gives F16-trunk 65.37 GB / 60.88 GiB: confirmed (65,369,017,728 B).",
+    "Replaces ggml-org/gpt-oss-120b-GGUF MXFP4 (3 shards). The gpt-oss-120b-abliterated entry is out of scope and stays as in v0.3.5."
+   ]
+  },
+  "router-qwen3.5-4b": {
+   "tier": "day1",
+   "suggested_key": "router-qwen3.5-4b (unchanged; P-10: classification only)",
+   "role_per_fixed_choices": "Always-resident router / classifier; Eleanor uses it for classification only (P-10)",
+   "hf_repo": "unsloth/Qwen3.5-4B-GGUF",
+   "subdir": null,
+   "quant": "Q8_0",
+   "files": [
+    {
+     "path": "Qwen3.5-4B-Q8_0.gguf",
+     "basename": "Qwen3.5-4B-Q8_0.gguf",
+     "bytes": 4482403488,
+     "sha256": "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1"
+    }
+   ],
+   "total": {
+    "bytes": 4482403488,
+    "GB": 4.48,
+    "GiB": 4.17
+   },
+   "model_file_pattern": "Qwen3.5-4B-Q8_0.gguf",
+   "arch": "qwen35",
+   "gguf_header": {
+    "block_count": 32,
+    "context_length": 262144,
+    "embedding_length": 2560,
+    "attention.head_count": 16,
+    "attention.head_count_kv": 4,
+    "attention.key_length": 256,
+    "full_attention_interval": 4,
+    "ssm.inner_size": 4096,
+    "ssm.state_size": 128,
+    "ssm.group_count": 16,
+    "n_tensors": 426
+   },
+   "native_context": {
+    "gguf_context_length": 262144
+   },
+   "kv": {
+    "layout": "8 full-attention layers (every 4th) + 24 Gated DeltaNet layers",
+    "bytes_per_token": {
+     "f16": 32768,
+     "q8_0": 17408,
+     "q4_0": 9216
+    },
+    "derivation": "8 x (K 4x256 + V 4x256)",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 1.0,
+      "q8_0": 0.531,
+      "q4_0": 0.281
+     },
+     "131072": {
+      "f16": 4.0,
+      "q8_0": 2.125,
+      "q4_0": 1.125
+     },
+     "262144": {
+      "f16": 8.0,
+      "q8_0": 4.25,
+      "q4_0": 2.25
+     },
+     "524288": {
+      "f16": 16.0,
+      "q8_0": 8.5,
+      "q4_0": 4.5
+     },
+     "1048576": {
+      "f16": 32.0,
+      "q8_0": 17.0,
+      "q4_0": 9.0
+     }
+    },
+    "recurrent_state": {
+     "bytes_per_sequence": 52690944,
+     "MiB_per_sequence": 50.2,
+     "formula": "24 recurrent layers x (r 24576 + s 524288) f32 elements x 4 B"
+    }
+   },
+   "sampling": {
+    "non_thinking_general": {
+     "temperature": 0.7,
+     "top_p": 0.8,
+     "top_k": 20,
+     "min_p": 0.0,
+     "presence_penalty": 1.5
+    },
+    "existing_entry": "--reasoning off --temp 0.2 (classification; keep)",
+    "source": "Qwen/Qwen3.5-4B card L835-L838"
+   },
+   "licence": {
+    "id": "apache-2.0",
+    "sources": [
+     "Qwen/Qwen3.5-4B card",
+     "GGUF general.license"
+    ]
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b7990",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "qwen35 (#19468, first tag b7990)"
+   },
+   "repo": {
+    "repo_sha": "e87f176479d0855a907a41277aca2f8ee7a09523",
+    "last_modified": "2026-03-02T14:08:17.000Z",
+    "gated": false,
+    "card_licence": "apache-2.0",
+    "card_licence_name": null
+   },
+   "caveats": [
+    "Existing entry has sha256 null; tree API gives the hash below. The mmproj files in the repo are not needed (text router)."
+   ]
+  },
+  "embed-qwen3-8b": {
+   "tier": "day1",
+   "suggested_key": "embed-qwen3-8b",
+   "role_per_fixed_choices": "Primary embedder replacing bge-m3 before Day 1 (D-45 (a)); the 8B/4B choice follows D-14",
+   "hf_repo": "Qwen/Qwen3-Embedding-8B-GGUF",
+   "subdir": null,
+   "quant": "Q8_0",
+   "files": [
+    {
+     "path": "Qwen3-Embedding-8B-Q8_0.gguf",
+     "basename": "Qwen3-Embedding-8B-Q8_0.gguf",
+     "bytes": 8047105824,
+     "sha256": "d20ddc71e8a5c4344f2343481e242233a997dc5eaff442427a945836c97b4deb"
+    }
+   ],
+   "total": {
+    "bytes": 8047105824,
+    "GB": 8.05,
+    "GiB": 7.49
+   },
+   "model_file_pattern": "Qwen3-Embedding-8B-Q8_0.gguf",
+   "f16_alternative": {
+    "path": "Qwen3-Embedding-8B-f16.gguf",
+    "basename": "Qwen3-Embedding-8B-f16.gguf",
+    "bytes": 15141156384,
+    "sha256": "9a2dfcc2e867828909456dd52a69e3775b677bdce1816f7cc55f3657393e7e53",
+    "GiB": 14.1
+   },
+   "arch": "qwen3",
+   "gguf_header": {
+    "block_count": 36,
+    "context_length": 40960,
+    "embedding_length": 4096,
+    "attention.head_count_kv": 8,
+    "attention.key_length": 128,
+    "pooling_type": 3,
+    "pooling_name": "LAST",
+    "n_tensors": 398
+   },
+   "embedding_dim": 4096,
+   "native_context": {
+    "gguf_context_length": 40960
+   },
+   "kv": {
+    "layout": "causal qwen3: a normal KV cache is allocated even in --embedding mode",
+    "bytes_per_token": {
+     "f16": 147456,
+     "q8_0": 78336,
+     "q4_0": 41472
+    },
+    "derivation": "36 x (K 8x128 + V 8x128)",
+    "GiB_at_context": {
+     "8192": {
+      "f16": 1.125,
+      "q8_0": 0.598,
+      "q4_0": 0.316
+     },
+     "16384": {
+      "f16": 2.25,
+      "q8_0": 1.195,
+      "q4_0": 0.633
+     },
+     "32768": {
+      "f16": 4.5,
+      "q8_0": 2.391,
+      "q4_0": 1.266
+     }
+    }
+   },
+   "server_flags": "--embedding --pooling last -ub 8192 (card); pooling_type 3 is baked in, so --pooling may be omitted; /v1/embeddings",
+   "sampling": "n/a (embedding)",
+   "licence": {
+    "id": "apache-2.0",
+    "sources": [
+     "Qwen/Qwen3-Embedding-8B card",
+     "GGUF general.license"
+    ]
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b6063",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "Qwen3-Embedding support (#15023, first tag b6063)"
+   },
+   "repo": {
+    "repo_sha": "69d0e58a13e463cd99a9b83e3f5fee7c10265fab",
+    "last_modified": "2025-07-15T02:30:41.000Z",
+    "gated": false,
+    "card_licence": "apache-2.0",
+    "card_licence_name": null
+   },
+   "caveats": [
+    "Instruction-aware: queries take an \"Instruct: ...\\nQuery: ...\" prefix per the Qwen card; documents none.",
+    "Matryoshka: output dimension can be truncated (32-4096 for 8B, 32-2560 for 4B) but vectors are not interchangeable with bge-m3 (D-45)."
+   ]
+  },
+  "embed-qwen3-4b": {
+   "tier": "day1",
+   "suggested_key": "embed-qwen3-4b",
+   "role_per_fixed_choices": "Primary embedder replacing bge-m3 before Day 1 (D-45 (a)); the 8B/4B choice follows D-14",
+   "hf_repo": "Qwen/Qwen3-Embedding-4B-GGUF",
+   "subdir": null,
+   "quant": "Q8_0",
+   "files": [
+    {
+     "path": "Qwen3-Embedding-4B-Q8_0.gguf",
+     "basename": "Qwen3-Embedding-4B-Q8_0.gguf",
+     "bytes": 4279660224,
+     "sha256": "b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d"
+    }
+   ],
+   "total": {
+    "bytes": 4279660224,
+    "GB": 4.28,
+    "GiB": 3.99
+   },
+   "model_file_pattern": "Qwen3-Embedding-4B-Q8_0.gguf",
+   "f16_alternative": {
+    "path": "Qwen3-Embedding-4B-f16.gguf",
+    "basename": "Qwen3-Embedding-4B-f16.gguf",
+    "bytes": 8049889824,
+    "sha256": "e8b4e85c8fcc26079d27418cf8d6a16df1a09890cba0966324a97280f91e782c",
+    "GiB": 7.5
+   },
+   "arch": "qwen3",
+   "gguf_header": {
+    "block_count": 36,
+    "context_length": 40960,
+    "embedding_length": 2560,
+    "attention.head_count_kv": 8,
+    "attention.key_length": 128,
+    "pooling_type": 3,
+    "pooling_name": "LAST",
+    "n_tensors": 398
+   },
+   "embedding_dim": 2560,
+   "native_context": {
+    "gguf_context_length": 40960
+   },
+   "kv": {
+    "layout": "causal qwen3: a normal KV cache is allocated even in --embedding mode",
+    "bytes_per_token": {
+     "f16": 147456,
+     "q8_0": 78336,
+     "q4_0": 41472
+    },
+    "derivation": "36 x (K 8x128 + V 8x128)",
+    "GiB_at_context": {
+     "8192": {
+      "f16": 1.125,
+      "q8_0": 0.598,
+      "q4_0": 0.316
+     },
+     "16384": {
+      "f16": 2.25,
+      "q8_0": 1.195,
+      "q4_0": 0.633
+     },
+     "32768": {
+      "f16": 4.5,
+      "q8_0": 2.391,
+      "q4_0": 1.266
+     }
+    }
+   },
+   "server_flags": "--embedding --pooling last -ub 8192 (card); pooling_type 3 is baked in, so --pooling may be omitted; /v1/embeddings",
+   "sampling": "n/a (embedding)",
+   "licence": {
+    "id": "apache-2.0",
+    "sources": [
+     "Qwen/Qwen3-Embedding-4B card",
+     "GGUF general.license"
+    ]
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b6063",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "Qwen3-Embedding support (#15023, first tag b6063)"
+   },
+   "repo": {
+    "repo_sha": "f4602530db1d980e16da9d7d3a70294cf5c190be",
+    "last_modified": "2025-08-03T14:37:22.000Z",
+    "gated": false,
+    "card_licence": "apache-2.0",
+    "card_licence_name": null
+   },
+   "caveats": [
+    "Instruction-aware: queries take an \"Instruct: ...\\nQuery: ...\" prefix per the Qwen card; documents none.",
+    "Matryoshka: output dimension can be truncated (32-4096 for 8B, 32-2560 for 4B) but vectors are not interchangeable with bge-m3 (D-45)."
+   ]
+  },
+  "rerank-qwen3-8b": {
+   "tier": "day1",
+   "suggested_key": "rerank-qwen3-8b",
+   "role_per_fixed_choices": "Primary reranker replacing bge-reranker-v2-m3 (D-14 / D-45)",
+   "official_gguf": "none: Qwen publishes no Qwen3-Reranker GGUF (Qwen/Qwen3-Reranker-8B-GGUF returns 401/not found; author=Qwen search lists only safetensors). The only ggml-org reranker GGUF is Qwen3-Reranker-0.6B-Q8_0.",
+   "published_files_with_rank_head": [
+    {
+     "hf_repo": "Voodisss/Qwen3-Reranker-8B-GGUF-llama_cpp",
+     "path": "Qwen3-Reranker-8B.Q8_0.gguf",
+     "basename": "Qwen3-Reranker-8B.Q8_0.gguf",
+     "bytes": 8047134304,
+     "sha256": "13815d68c755c6293161a9aebc986976af90b35a7c9ffd2e074e58d28ddfe4ae",
+     "GiB": 7.494,
+     "header": {
+      "general.architecture": "qwen3",
+      "qwen3.pooling_type": 4,
+      "qwen3.classifier.output_labels": [
+       "yes",
+       "no"
+      ],
+      "tokenizer.chat_template.rerank": true,
+      "cls.output.weight": [
+       "cls.output.weight",
+       [
+        4096,
+        2
+       ],
+       "Q8_0"
+      ],
+      "n_tensors": 399,
+      "n_kv": 41
+     },
+     "rank_head_present": true,
+     "provenance": "card: official convert_hf_to_gguf.py, converted 2026-03-09 (card typo says 2025-03-09); uploader reports relevance 0.99 vs 0.00 on a two-document test; source revision pre-dates the 2026-04-16 sentence-transformers commit (weights unchanged)",
+     "repo": {
+      "repo_sha": "646e3a1fc04936cab940ad02e18ee6b14af46263",
+      "last_modified": "2026-03-10T19:59:33.000Z",
+      "gated": false,
+      "card_licence": "apache-2.0",
+      "card_licence_name": null
+     }
+    },
+    {
+     "hf_repo": "gorse-io/Qwen3-Reranker-8B-GGUF",
+     "path": "Qwen3-Reranker-8B-Q8_0.gguf",
+     "basename": "Qwen3-Reranker-8B-Q8_0.gguf",
+     "bytes": 8047134336,
+     "sha256": "7ad83063f1639b393d5cd9c54a65a461ec3a3109fd57e827614207162ae24304",
+     "GiB": 7.494,
+     "header": {
+      "general.architecture": "qwen3",
+      "qwen3.pooling_type": 4,
+      "qwen3.classifier.output_labels": [
+       "yes",
+       "no"
+      ],
+      "tokenizer.chat_template.rerank": true,
+      "cls.output.weight": [
+       "cls.output.weight",
+       [
+        4096,
+        2
+       ],
+       "Q8_0"
+      ],
+      "n_tensors": 399,
+      "n_kv": 41
+     },
+     "rank_head_present": true,
+     "provenance": "conversion.json: llama.cpp d81235049 (b11429), source revision 77d193c791ed (8B); 8B used a \"low-memory rowwise reranker head\" adapter (conversion_adapter.py, not the stock path); metadata checked, inference not run (their note)",
+     "repo": {
+      "repo_sha": "ea939d43590e5362bd8e331eeffde1dcc08cd97f",
+      "last_modified": "2026-10-10T21:57:18.000Z",
+      "gated": false,
+      "card_licence": "apache-2.0",
+      "card_licence_name": null
+     }
+    },
+    {
+     "hf_repo": "giladgd/Qwen3-Reranker-8B-GGUF",
+     "path": "Qwen3-Reranker-8B.Q8_0.gguf",
+     "basename": "Qwen3-Reranker-8B.Q8_0.gguf",
+     "bytes": 8047134336,
+     "sha256": "0f062cc2d6b013c2bd708549dcf36a153043323bc37e17b3b993d95fa0a2105d",
+     "GiB": 7.494,
+     "header": {
+      "general.architecture": "qwen3",
+      "qwen3.pooling_type": 4,
+      "qwen3.classifier.output_labels": [
+       "yes",
+       "no"
+      ],
+      "tokenizer.chat_template.rerank": true,
+      "cls.output.weight": [
+       "cls.output.weight",
+       [
+        4096,
+        2
+       ],
+       "Q8_0"
+      ],
+      "n_tensors": 399,
+      "n_kv": 41
+     },
+     "rank_head_present": true,
+     "provenance": "node-llama-cpp uploader, 2025-09-27, converter build not stated",
+     "repo": {
+      "repo_sha": "3398b1b2ee1220b29dd7658210a12f500eac1fdf",
+      "last_modified": "2025-09-27T09:58:23.000Z",
+      "gated": false,
+      "card_licence": "apache-2.0",
+      "card_licence_name": null
+     }
+    }
+   ],
+   "recommended_published": "Voodisss/Qwen3-Reranker-8B-GGUF-llama_cpp/Qwen3-Reranker-8B.Q8_0.gguf",
+   "hf_repo": "Voodisss/Qwen3-Reranker-8B-GGUF-llama_cpp",
+   "subdir": null,
+   "files": [
+    {
+     "path": "Qwen3-Reranker-8B.Q8_0.gguf",
+     "basename": "Qwen3-Reranker-8B.Q8_0.gguf",
+     "bytes": 8047134304,
+     "sha256": "13815d68c755c6293161a9aebc986976af90b35a7c9ffd2e074e58d28ddfe4ae"
+    }
+   ],
+   "total": {
+    "bytes": 8047134304,
+    "GB": 8.05,
+    "GiB": 7.49
+   },
+   "model_file_pattern": "Qwen3-Reranker-8B.Q8_0.gguf",
+   "recommendation_reason": "Header verified today (pooling_type 4 RANK, labels [yes,no], tokenizer.chat_template.rerank, cls.output.weight [n_embd,2] Q8_0, 399 tensors); stock converter; uploader-tested scores. gorse-io is the newest conversion (b11429) but its 8B used a custom head adapter. Pin the sha256 below either way.",
+   "rejected": {
+    "hf_repo": "mradermacher/Qwen3-Reranker-8B-GGUF",
+    "finding": "8B Q8_0 (8,707,188,736 B) read 2026-10-14: no pooling_type/labels/template, plain causal qwen3 with output.weight: unusable",
+    "also_unusable_or_unverified": "QuantFactory 8B Q8_0 is 8,707,188,288 B (same full-lm_head size as mradermacher; not header-checked); DevQuasar 4B is reported broken by Voodisss"
+   },
+   "arch": "qwen3",
+   "quant": "Q8_0",
+   "native_context": {
+    "gguf_context_length": 40960,
+    "config_max_position_embeddings": 40960
+   },
+   "kv": {
+    "bytes_per_token": {
+     "f16": 147456,
+     "q8_0": 78336,
+     "q4_0": 41472
+    },
+    "derivation": "36 x (K 8x128 + V 8x128)",
+    "GiB_at_context": {
+     "8192": {
+      "f16": 1.125,
+      "q8_0": 0.598,
+      "q4_0": 0.316
+     },
+     "16384": {
+      "f16": 2.25,
+      "q8_0": 1.195,
+      "q4_0": 0.633
+     },
+     "32768": {
+      "f16": 4.5,
+      "q8_0": 2.391,
+      "q4_0": 1.266
+     }
+    }
+   },
+   "server_flags": "--reranking / --rerank (sets embedding=true and pooling_type=RANK; common/arg.cpp L3494-L3499 at b11474); endpoints /v1/rerank, /rerank, /reranking. At b11474 RANK inputs may exceed n_ubatch (batch split #28876, b11223); before that the query+document had to fit -ub.",
+   "local_conversion_recipe": {
+    "when": "Only if the published file is rejected or a reproducible in-house build is wanted.",
+    "source": "Qwen/Qwen3-Reranker-8B at revision 77d193c791ed757ca307ee72715aa132723da912 (apache-2.0, not gated; safetensors 16.38 GB, tie_word_embeddings false: cls built from lm_head)",
+    "tool": "convert_hf_to_gguf.py and gguf-py from the pinned tree b9acf138 (conversion/qwen.py Qwen3Model L160-L255)",
+    "python_requirements": "requirements/requirements-convert_hf_to_gguf.txt at the pin: torch==2.11.0 (CPU index), transformers==4.57.6, numpy~=2.2.6, sentencepiece>=0.1.98,<0.3.0, protobuf>=4.21.0,<5.0.0, gguf (install the pinned ./gguf-py). transformers is required: _find_rerank_config calls AutoTokenizer to find the \"yes\"/\"no\" token ids.",
+    "detection": "Reranker mode fires when the source README.md contains \"# qwen3-reranker\" (the Qwen card heading \"# Qwen3-Reranker-8B\" does), or the directory name / _name_or_path / model_type contains \"qwen3-reranker\", or the HF arch contains SequenceClassification. Keep the original README.md in the snapshot directory and name the directory Qwen3-Reranker-<size>.",
+    "command": "python3 convert_hf_to_gguf.py <dir>/Qwen3-Reranker-8B --outtype q8_0 --outfile Qwen3-Reranker-8B-Q8_0.gguf   (or --outtype bf16, then llama-quantize ... Q8_0)",
+    "writes": "qwen3.pooling_type = 4 (RANK), qwen3.classifier.output_labels = [yes, no], tokenizer.chat_template.rerank, cls.output.weight = stack(lm_head[yes], lm_head[no]) shape [n_embd, 2]; 399 tensors",
+    "verify_after": "Parse the header: pooling_type 4, labels [yes,no], cls.output.weight present; then POST /v1/rerank with one relevant and one irrelevant document and require a clear score gap."
+   },
+   "licence": {
+    "id": "apache-2.0",
+    "sources": [
+     "Qwen/Qwen3-Reranker-8B card",
+     "GGUF general.license (Voodisss, gorse-io)"
+    ],
+    "register": "D-35 (a)"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b6578",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "qwen3 reranker support (#15824, first tag b6578); RANK batch splitting for causal rerankers #28876 (b11223)"
+   },
+   "sampling": "n/a (reranker)"
+  },
+  "rerank-qwen3-4b": {
+   "tier": "day1",
+   "suggested_key": "rerank-qwen3-4b",
+   "role_per_fixed_choices": "Primary reranker replacing bge-reranker-v2-m3 (D-14 / D-45)",
+   "official_gguf": "none: Qwen publishes no Qwen3-Reranker GGUF (Qwen/Qwen3-Reranker-4B-GGUF returns 401/not found; author=Qwen search lists only safetensors). The only ggml-org reranker GGUF is Qwen3-Reranker-0.6B-Q8_0.",
+   "published_files_with_rank_head": [
+    {
+     "hf_repo": "Voodisss/Qwen3-Reranker-4B-GGUF-llama_cpp",
+     "path": "Qwen3-Reranker-4B.Q8_0.gguf",
+     "basename": "Qwen3-Reranker-4B.Q8_0.gguf",
+     "bytes": 4279678912,
+     "sha256": "102ac400d68f02877c2fdfecf0732872652298448352b6faf28ec7f8dca8c913",
+     "GiB": 3.986,
+     "header": {
+      "general.architecture": "qwen3",
+      "qwen3.pooling_type": 4,
+      "qwen3.classifier.output_labels": [
+       "yes",
+       "no"
+      ],
+      "tokenizer.chat_template.rerank": true,
+      "cls.output.weight": [
+       "cls.output.weight",
+       [
+        2560,
+        2
+       ],
+       "Q8_0"
+      ],
+      "n_tensors": 399,
+      "n_kv": 41
+     },
+     "rank_head_present": true,
+     "provenance": "card: official convert_hf_to_gguf.py, converted 2026-03-09 (card typo says 2025-03-09); uploader reports relevance 0.99 vs 0.00 on a two-document test; source revision pre-dates the 2026-04-16 sentence-transformers commit (weights unchanged)",
+     "repo": {
+      "repo_sha": "1b452c803342e73ac3644551b727dfd51a09fd5b",
+      "last_modified": "2026-03-10T20:10:46.000Z",
+      "gated": false,
+      "card_licence": "apache-2.0",
+      "card_licence_name": null
+     }
+    },
+    {
+     "hf_repo": "gorse-io/Qwen3-Reranker-4B-GGUF",
+     "path": "Qwen3-Reranker-4B-Q8_0.gguf",
+     "basename": "Qwen3-Reranker-4B-Q8_0.gguf",
+     "bytes": 4279678944,
+     "sha256": "2cf26934b45414d51cb1e1fc68378da02f8a1ae2893b70ccb13c381ec1ec9398",
+     "GiB": 3.986,
+     "header": {
+      "general.architecture": "qwen3",
+      "qwen3.pooling_type": 4,
+      "qwen3.classifier.output_labels": [
+       "yes",
+       "no"
+      ],
+      "tokenizer.chat_template.rerank": true,
+      "cls.output.weight": [
+       "cls.output.weight",
+       [
+        2560,
+        2
+       ],
+       "Q8_0"
+      ],
+      "n_tensors": 399,
+      "n_kv": 41
+     },
+     "rank_head_present": true,
+     "provenance": "conversion.json: llama.cpp d81235049 (b11429), source revision 22e683669bc0 (4B); stock converter path; metadata checked, inference not run (their note)",
+     "repo": {
+      "repo_sha": "32fad5e90719a2830a299e855d38179e646e5b31",
+      "last_modified": "2026-10-10T14:55:05.000Z",
+      "gated": false,
+      "card_licence": "apache-2.0",
+      "card_licence_name": null
+     }
+    },
+    {
+     "hf_repo": "giladgd/Qwen3-Reranker-4B-GGUF",
+     "path": "Qwen3-Reranker-4B.Q8_0.gguf",
+     "basename": "Qwen3-Reranker-4B.Q8_0.gguf",
+     "bytes": 4279678944,
+     "sha256": "d060a1bfb805debcd6c2258c70ba21c56ee1ea837bc23b0bc49e09d13115987c",
+     "GiB": 3.986,
+     "header": {
+      "general.architecture": "qwen3",
+      "qwen3.pooling_type": 4,
+      "qwen3.classifier.output_labels": [
+       "yes",
+       "no"
+      ],
+      "tokenizer.chat_template.rerank": true,
+      "cls.output.weight": [
+       "cls.output.weight",
+       [
+        2560,
+        2
+       ],
+       "Q8_0"
+      ],
+      "n_tensors": 399,
+      "n_kv": 41
+     },
+     "rank_head_present": true,
+     "provenance": "node-llama-cpp uploader, 2025-09-27, converter build not stated",
+     "repo": {
+      "repo_sha": "618ca919a196583806708d695f64dc002bd229a3",
+      "last_modified": "2025-09-27T09:43:17.000Z",
+      "gated": false,
+      "card_licence": "apache-2.0",
+      "card_licence_name": null
+     }
+    }
+   ],
+   "recommended_published": "Voodisss/Qwen3-Reranker-4B-GGUF-llama_cpp/Qwen3-Reranker-4B.Q8_0.gguf",
+   "hf_repo": "Voodisss/Qwen3-Reranker-4B-GGUF-llama_cpp",
+   "subdir": null,
+   "files": [
+    {
+     "path": "Qwen3-Reranker-4B.Q8_0.gguf",
+     "basename": "Qwen3-Reranker-4B.Q8_0.gguf",
+     "bytes": 4279678912,
+     "sha256": "102ac400d68f02877c2fdfecf0732872652298448352b6faf28ec7f8dca8c913"
+    }
+   ],
+   "total": {
+    "bytes": 4279678912,
+    "GB": 4.28,
+    "GiB": 3.99
+   },
+   "model_file_pattern": "Qwen3-Reranker-4B.Q8_0.gguf",
+   "recommendation_reason": "Header verified today (pooling_type 4 RANK, labels [yes,no], tokenizer.chat_template.rerank, cls.output.weight [n_embd,2] Q8_0, 399 tensors); stock converter; uploader-tested scores. gorse-io is the newest conversion (b11429) but its 8B used a custom head adapter. Pin the sha256 below either way.",
+   "rejected": {
+    "hf_repo": "mradermacher/Qwen3-Reranker-4B-GGUF",
+    "finding": "4B Q8_0 header read today: no pooling_type, no classifier labels, no rerank template, no cls.output.weight (398 tensors): unusable as a reranker",
+    "also_unusable_or_unverified": "QuantFactory 8B Q8_0 is 8,707,188,288 B (same full-lm_head size as mradermacher; not header-checked); DevQuasar 4B is reported broken by Voodisss"
+   },
+   "arch": "qwen3",
+   "quant": "Q8_0",
+   "native_context": {
+    "gguf_context_length": 40960,
+    "config_max_position_embeddings": 40960
+   },
+   "kv": {
+    "bytes_per_token": {
+     "f16": 147456,
+     "q8_0": 78336,
+     "q4_0": 41472
+    },
+    "derivation": "36 x (K 8x128 + V 8x128)",
+    "GiB_at_context": {
+     "8192": {
+      "f16": 1.125,
+      "q8_0": 0.598,
+      "q4_0": 0.316
+     },
+     "16384": {
+      "f16": 2.25,
+      "q8_0": 1.195,
+      "q4_0": 0.633
+     },
+     "32768": {
+      "f16": 4.5,
+      "q8_0": 2.391,
+      "q4_0": 1.266
+     }
+    }
+   },
+   "server_flags": "--reranking / --rerank (sets embedding=true and pooling_type=RANK; common/arg.cpp L3494-L3499 at b11474); endpoints /v1/rerank, /rerank, /reranking. At b11474 RANK inputs may exceed n_ubatch (batch split #28876, b11223); before that the query+document had to fit -ub.",
+   "local_conversion_recipe": {
+    "when": "Only if the published file is rejected or a reproducible in-house build is wanted.",
+    "source": "Qwen/Qwen3-Reranker-4B at revision 22e683669bc0f0bd69640a1354a6d0aebcfeede5 (apache-2.0, not gated; safetensors about 8.0 GB, tie_word_embeddings true: cls built from embed_tokens)",
+    "tool": "convert_hf_to_gguf.py and gguf-py from the pinned tree b9acf138 (conversion/qwen.py Qwen3Model L160-L255)",
+    "python_requirements": "requirements/requirements-convert_hf_to_gguf.txt at the pin: torch==2.11.0 (CPU index), transformers==4.57.6, numpy~=2.2.6, sentencepiece>=0.1.98,<0.3.0, protobuf>=4.21.0,<5.0.0, gguf (install the pinned ./gguf-py). transformers is required: _find_rerank_config calls AutoTokenizer to find the \"yes\"/\"no\" token ids.",
+    "detection": "Reranker mode fires when the source README.md contains \"# qwen3-reranker\" (the Qwen card heading \"# Qwen3-Reranker-8B\" does), or the directory name / _name_or_path / model_type contains \"qwen3-reranker\", or the HF arch contains SequenceClassification. Keep the original README.md in the snapshot directory and name the directory Qwen3-Reranker-<size>.",
+    "command": "python3 convert_hf_to_gguf.py <dir>/Qwen3-Reranker-4B --outtype q8_0 --outfile Qwen3-Reranker-4B-Q8_0.gguf   (or --outtype bf16, then llama-quantize ... Q8_0)",
+    "writes": "qwen3.pooling_type = 4 (RANK), qwen3.classifier.output_labels = [yes, no], tokenizer.chat_template.rerank, cls.output.weight = stack(lm_head[yes], lm_head[no]) shape [n_embd, 2]; 399 tensors",
+    "verify_after": "Parse the header: pooling_type 4, labels [yes,no], cls.output.weight present; then POST /v1/rerank with one relevant and one irrelevant document and require a clear score gap."
+   },
+   "licence": {
+    "id": "apache-2.0",
+    "sources": [
+     "Qwen/Qwen3-Reranker-4B card",
+     "GGUF general.license (Voodisss, gorse-io)"
+    ],
+    "register": "D-35 (a)"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b6578",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "qwen3 reranker support (#15824, first tag b6578); RANK batch splitting for causal rerankers #28876 (b11223)"
+   },
+   "sampling": "n/a (reranker)"
+  }
+ },
+ "phased": {
+  "qwen3.8-flash-next": {
+   "tier": "phased",
+   "suggested_key": "qwen3.8-flash-next",
+   "hf_repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+   "subdir": "UD-Q6_K_XL",
+   "quant": "UD-Q6_K_XL",
+   "files": [
+    {
+     "path": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf",
+     "basename": "Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf",
+     "bytes": 10946624,
+     "sha256": "8bdc6bad55b6699f46f60708829932ff4018d7ac9bd309c388534fa31753bdb7"
+    },
+    {
+     "path": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00002-of-00006.gguf",
+     "basename": "Qwen3.8-Flash-Next-UD-Q6_K_XL-00002-of-00006.gguf",
+     "bytes": 682434912,
+     "sha256": "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e"
+    },
+    {
+     "path": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf",
+     "basename": "Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf",
+     "bytes": 54400261312,
+     "sha256": "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20"
+    },
+    {
+     "path": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00004-of-00006.gguf",
+     "basename": "Qwen3.8-Flash-Next-UD-Q6_K_XL-00004-of-00006.gguf",
+     "bytes": 49814108512,
+     "sha256": "0ea4b599880a5a52fcd9c188ba1443f646c69c96571904ddbd6a79246a01a997"
+    },
+    {
+     "path": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf",
+     "basename": "Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf",
+     "bytes": 49419317344,
+     "sha256": "9948e81ae8368144b135a7403d8c0f2cf9a6c2f9f692313865855b2832e696c9"
+    },
+    {
+     "path": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf",
+     "basename": "Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf",
+     "bytes": 14838313984,
+     "sha256": "e4ae255234f42b18012f6d6eec5bf615b57479b7e0a0233c47436a321ffeec3f"
+    }
+   ],
+   "total": {
+    "bytes": 169165382688,
+    "GB": 169.17,
+    "GiB": 157.55
+   },
+   "model_file_pattern": "Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf",
+   "mtp": {
+    "recommended_for_mainline": {
+     "path": "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+     "basename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+     "bytes": 4137429120,
+     "sha256": "58a47d6a216307e9b97172d5bfdc3436a8994b632f5e436b9bb6edf8951da8d1"
+    },
+    "root_copy_same_sha": {
+     "path": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+     "basename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+     "bytes": 4137429120,
+     "sha256": "58a47d6a216307e9b97172d5bfdc3436a8994b632f5e436b9bb6edf8951da8d1"
+    },
+    "shared_variant_fork_only": {
+     "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+     "basename": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+     "bytes": 2786568256,
+     "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+    },
+    "notes": "Self-contained head (qwen4exp, block_count 49, nextn_predict_layers 1, 34 tensors incl. blk.48.nextn.eh_proj [5120,2560]) re-uploaded 2026-10-05 \"due to upstream changes\" after mainline #29761 (b11330); tensor names match src/models/qwen4exp.cpp L295-L301. The shared-* heads set qwen4exp.nextn_shared_target_tensors (unknown to mainline; need the unsloth fork). The MTP/README.md (2026-09-02) saying stock llama.cpp cannot use the heads predates #29761. Unverified on the node. Usage: -md <head> --spec-type draft-mtp --spec-draft-n-max 2; MTP is a net loss at concurrency 8 (README)."
+   },
+   "mmproj": {
+    "recommended": {
+     "path": "mmproj-F16.gguf",
+     "basename": "mmproj-F16.gguf",
+     "bytes": 904004000,
+     "sha256": "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980"
+    },
+    "alternative": {
+     "path": "mmproj-BF16.gguf",
+     "basename": "mmproj-BF16.gguf",
+     "bytes": 907542944,
+     "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
+    },
+    "projector_type": "qwen3vl_merger",
+    "params": "449M",
+    "note": "Register D-20 quotes 0.62 GB; the F16 file is 904,004,000 B."
+   },
+   "arch": "qwen4exp",
+   "gguf_header": {
+    "block_count": 48,
+    "context_length": 262144,
+    "embedding_length": 2560,
+    "attention.head_count": 24,
+    "attention.head_count_kv": 2,
+    "attention.key_length": 256,
+    "full_attention_interval": 4,
+    "attention.indexer.head_count": 4,
+    "attention.indexer.key_length": 128,
+    "attention.indexer.top_k": 2048,
+    "compress_ratio": 4,
+    "expert_count": 512,
+    "expert_used_count": 10,
+    "hyper_connection.count": 4,
+    "ple (n-gram table)": "per_layer_token_embd.weight [160, 320001536] Q8_0 in shard 3 (54.4 GB)",
+    "split.count": 6
+   },
+   "native_context": {
+    "gguf_context_length": 262144,
+    "card": "262,144 natively, extensible to 1,000,000"
+   },
+   "kv": {
+    "layout": "12 QSA full-attention layers (K 2x256 + V 2x256) + indexer K-only 128 x kpool_row 2 (raw | pooled) per layer; 36 Gated DeltaNet layers recurrent",
+    "bytes_per_token": {
+     "f16": 30720,
+     "q8_0": 16320,
+     "q4_0": 8640
+    },
+    "derivation": "12 x (512 + 512 + 256)",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 0.938,
+      "q8_0": 0.498,
+      "q4_0": 0.264
+     },
+     "131072": {
+      "f16": 3.75,
+      "q8_0": 1.992,
+      "q4_0": 1.055
+     },
+     "262144": {
+      "f16": 7.5,
+      "q8_0": 3.984,
+      "q4_0": 2.109
+     },
+     "524288": {
+      "f16": 15.0,
+      "q8_0": 7.969,
+      "q4_0": 4.219
+     },
+     "1048576": {
+      "f16": 30.0,
+      "q8_0": 15.938,
+      "q4_0": 8.438
+     }
+    },
+    "recurrent_state": {
+     "bytes_per_sequence": 117669888,
+     "MiB_per_sequence": 112.2,
+     "formula": "36 recurrent layers x (r 30720 + s 786432) f32 elements x 4 B"
+    }
+   },
+   "sampling": {
+    "thinking": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 20,
+     "min_p": 0.0,
+     "presence_penalty": 0.0
+    },
+    "non_thinking": {
+     "temperature": 0.7,
+     "top_p": 0.8,
+     "top_k": 20,
+     "min_p": 0.0,
+     "presence_penalty": 1.5
+    },
+    "source": "Qwen/Qwen3.8-Flash-Next card L342-L343; generation_config temp 1.0 top_p 0.95 top_k 20",
+    "chat_template": "reasoning_effort default 'xhigh' (low/high/xhigh); enable_thinking false disables thinking"
+   },
+   "licence": {
+    "id": "qwen-community-1.0 (license: other)",
+    "register": "D-03"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b11330",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": false,
+    "note": "qwen4exp arch #27742 (b10660); Vulkan hc ops #28988 (b11012); attention fix #29751 and MTP #29761 (b11330, the register floor); mask/indexer optimisations #29824 (b11352), #29825 (b11372)"
+   },
+   "repo": {
+    "repo_sha": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+    "last_modified": "2026-10-06T05:31:22.000Z",
+    "gated": false,
+    "card_licence": "other",
+    "card_licence_name": "qwen-community-1.0"
+   }
+  },
+  "nemotron-3-super": {
+   "tier": "phased",
+   "suggested_key": "nemotron-3-super (existing key; pull deferred)",
+   "hf_repo": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+   "subdir": "Q8_0",
+   "quant": "Q8_0",
+   "files": [
+    {
+     "path": "Q8_0/NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00001-of-00004.gguf",
+     "basename": "NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00001-of-00004.gguf",
+     "bytes": 7872576,
+     "sha256": "7efc3a9c77a65929897e2fed1d1d670d514297508485f80996e77004f5e81332"
+    },
+    {
+     "path": "Q8_0/NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00002-of-00004.gguf",
+     "basename": "NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00002-of-00004.gguf",
+     "bytes": 49004160864,
+     "sha256": "1dd0a70006703d67ab63a07b49c5ef97cf3081b94549daef6eb792ce225a48b9"
+    },
+    {
+     "path": "Q8_0/NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00003-of-00004.gguf",
+     "basename": "NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00003-of-00004.gguf",
+     "bytes": 49284659200,
+     "sha256": "31dea2f2172a5ce5456ee5d55f4d4cc2bf18e5ddc6c3e6d512281fe65163deba"
+    },
+    {
+     "path": "Q8_0/NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00004-of-00004.gguf",
+     "basename": "NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00004-of-00004.gguf",
+     "bytes": 30176299040,
+     "sha256": "4962476f3703a5f9e613b431b866d0344ac361ccae61a0e7e21ed8f8b47b5d3b"
+    }
+   ],
+   "total": {
+    "bytes": 128472991680,
+    "GB": 128.47,
+    "GiB": 119.65
+   },
+   "model_file_pattern": "NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0-00001-of-00004.gguf",
+   "arch": "nemotron_h_moe",
+   "gguf_header": {
+    "block_count": 88,
+    "attention_layers": [
+     7,
+     16,
+     25,
+     36,
+     47,
+     58,
+     69,
+     78
+    ],
+    "mamba_layers": 40,
+    "moe_layers": 40,
+    "context_length": 1048576,
+    "attention.head_count_kv": 2,
+    "attention.key_length": 128,
+    "expert_count": 512,
+    "expert_used_count": 22,
+    "moe_latent_size": 1024,
+    "nextn": "none in this GGUF (no nextn_predict_layers key)",
+    "split.count": 4
+   },
+   "native_context": {
+    "gguf_context_length": 1048576
+   },
+   "kv": {
+    "bytes_per_token": {
+     "f16": 8192,
+     "q8_0": 4352,
+     "q4_0": 2304
+    },
+    "derivation": "8 x (K 2x128 + V 2x128)",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 0.25,
+      "q8_0": 0.133,
+      "q4_0": 0.07
+     },
+     "131072": {
+      "f16": 1.0,
+      "q8_0": 0.531,
+      "q4_0": 0.281
+     },
+     "262144": {
+      "f16": 2.0,
+      "q8_0": 1.062,
+      "q4_0": 0.562
+     },
+     "524288": {
+      "f16": 4.0,
+      "q8_0": 2.125,
+      "q4_0": 1.125
+     },
+     "1048576": {
+      "f16": 8.0,
+      "q8_0": 4.25,
+      "q4_0": 2.25
+     }
+    },
+    "recurrent_state": {
+     "bytes_per_sequence": 172687360,
+     "MiB_per_sequence": 164.7,
+     "formula": "40 recurrent layers x (r 30720 + s 1048576) f32 elements x 4 B"
+    }
+   },
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "source": "nvidia card L79 \"Use temperature=1.0 and top_p=0.95 across all tasks\"; generation_config",
+    "note": "existing entry uses temp 0.6 top_p 0.95; the card now says 1.0/0.95"
+   },
+   "licence": {
+    "id": "nvidia-nemotron-open-model-license (license: other)",
+    "register": "D-04"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b8295",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "Nemotron 3 Super #20411 first tag b8295 (document closes b8297, S6); MTP extension #29018 (b11025)"
+   },
+   "repo": {
+    "repo_sha": "036038fb30334a2d56a146c6f0d4871ab5edccbb",
+    "last_modified": "2026-03-20T13:30:50.000Z",
+    "gated": false,
+    "card_licence": "other",
+    "card_licence_name": "nvidia-nemotron-open-model-license"
+   },
+   "caveats": [
+    "#20732 Vulkan fault near 20K-token prompts (closed, not planned) stands (T-12)."
+   ]
+  },
+  "intern-s1": {
+   "tier": "phased",
+   "suggested_key": "intern-s1",
+   "hf_repo": "bartowski/internlm_Intern-S1-GGUF",
+   "official_gguf": "internlm/Intern-S1-GGUF carries Q8_0 (9 shards) and f16 only; Q5_K_S / Q4_K_M come from bartowski",
+   "rungs": {
+    "Q5_K_S": {
+     "subdir": "internlm_Intern-S1-Q5_K_S",
+     "files": [
+      {
+       "path": "internlm_Intern-S1-Q5_K_S/internlm_Intern-S1-Q5_K_S-00001-of-00005.gguf",
+       "basename": "internlm_Intern-S1-Q5_K_S-00001-of-00005.gguf",
+       "bytes": 39794912672,
+       "sha256": "611e9cd218d75f5b3d167fb7234a9efe7f12cc2b014ca15d118782ca72095122"
+      },
+      {
+       "path": "internlm_Intern-S1-Q5_K_S/internlm_Intern-S1-Q5_K_S-00002-of-00005.gguf",
+       "basename": "internlm_Intern-S1-Q5_K_S-00002-of-00005.gguf",
+       "bytes": 39999792736,
+       "sha256": "5b3cebaabce690deeecece54e95ccbdd7b1f86162f4c39c8f3be8a86b23d54e6"
+      },
+      {
+       "path": "internlm_Intern-S1-Q5_K_S/internlm_Intern-S1-Q5_K_S-00003-of-00005.gguf",
+       "basename": "internlm_Intern-S1-Q5_K_S-00003-of-00005.gguf",
+       "bytes": 39949967552,
+       "sha256": "f875461c09dd8ca6c1aae93f2b1ea9766d6f264ae9ae44ee03f9bea40d95a6ae"
+      },
+      {
+       "path": "internlm_Intern-S1-Q5_K_S/internlm_Intern-S1-Q5_K_S-00004-of-00005.gguf",
+       "basename": "internlm_Intern-S1-Q5_K_S-00004-of-00005.gguf",
+       "bytes": 39952081216,
+       "sha256": "cc6ae181fd03e0abf93ff7115bad56bd9b22f00fab6a2ae42e486235c27a4991"
+      },
+      {
+       "path": "internlm_Intern-S1-Q5_K_S/internlm_Intern-S1-Q5_K_S-00005-of-00005.gguf",
+       "basename": "internlm_Intern-S1-Q5_K_S-00005-of-00005.gguf",
+       "bytes": 2266531776,
+       "sha256": "7d00243428b7d8b4e474d449528e22df97e1af543f1f61ad74d398fcecb61bcc"
+      }
+     ],
+     "total": {
+      "bytes": 161963285952,
+      "GB": 161.96,
+      "GiB": 150.84
+     }
+    },
+    "Q4_K_M": {
+     "subdir": "internlm_Intern-S1-Q4_K_M",
+     "files": [
+      {
+       "path": "internlm_Intern-S1-Q4_K_M/internlm_Intern-S1-Q4_K_M-00001-of-00004.gguf",
+       "basename": "internlm_Intern-S1-Q4_K_M-00001-of-00004.gguf",
+       "bytes": 39863615936,
+       "sha256": "c5f7f589ec4bd8b210ecb66baa5911184fe241f4178a809297cbf8c533f7fbdf"
+      },
+      {
+       "path": "internlm_Intern-S1-Q4_K_M/internlm_Intern-S1-Q4_K_M-00002-of-00004.gguf",
+       "basename": "internlm_Intern-S1-Q4_K_M-00002-of-00004.gguf",
+       "bytes": 39847230560,
+       "sha256": "35db7feb3c40a53afdea3fc33d5fd1563c4716cb4a22ff260fd270f04889d5a4"
+      },
+      {
+       "path": "internlm_Intern-S1-Q4_K_M/internlm_Intern-S1-Q4_K_M-00003-of-00004.gguf",
+       "basename": "internlm_Intern-S1-Q4_K_M-00003-of-00004.gguf",
+       "bytes": 39847230560,
+       "sha256": "be80ae90435dac96b8f8014a00de22248532ab1b3c49daa26686f91a905038d0"
+      },
+      {
+       "path": "internlm_Intern-S1-Q4_K_M/internlm_Intern-S1-Q4_K_M-00004-of-00004.gguf",
+       "basename": "internlm_Intern-S1-Q4_K_M-00004-of-00004.gguf",
+       "bytes": 23096107744,
+       "sha256": "2e5295fe745a056205b06e08f7983fbb4283b8a512c35f79f7c059e526a2ba89"
+      }
+     ],
+     "total": {
+      "bytes": 142654184800,
+      "GB": 142.65,
+      "GiB": 132.86
+     }
+    }
+   },
+   "mmproj_optional": {
+    "path": "mmproj-internlm_Intern-S1-f16.gguf",
+    "basename": "mmproj-internlm_Intern-S1-f16.gguf",
+    "bytes": 11221608064,
+    "sha256": "29e36a0642bd920e9d10289ea42558829db18483dfe190fc20381aa2a79f313d"
+   },
+   "arch": "qwen3moe",
+   "gguf_header": {
+    "block_count": 94,
+    "context_length": 40960,
+    "attention.head_count_kv": 4,
+    "attention.key_length": 128,
+    "expert_count": 128,
+    "expert_used_count": 8,
+    "vocab": 153216
+   },
+   "native_context": {
+    "gguf_context_length": 40960
+   },
+   "kv": {
+    "bytes_per_token": {
+     "f16": 192512,
+     "q8_0": 102272,
+     "q4_0": 54144
+    },
+    "derivation": "94 x (K 4x128 + V 4x128)",
+    "GiB_at_context": {
+     "16384": {
+      "f16": 2.938,
+      "q8_0": 1.561,
+      "q4_0": 0.826
+     },
+     "23552": {
+      "f16": 4.223,
+      "q8_0": 2.243,
+      "q4_0": 1.188
+     },
+     "32768": {
+      "f16": 5.875,
+      "q8_0": 3.121,
+      "q4_0": 1.652
+     },
+     "40960": {
+      "f16": 7.344,
+      "q8_0": 3.901,
+      "q4_0": 2.065
+     }
+    }
+   },
+   "context_target_default (D-16)": "Q5_K_S if about 20-23K tokens is enough, Q4_K_M otherwise: raise a to-do for the Principal; the stated default is Q5_K_S at about 23K (Q5_K_S 150.84 GiB + 23,552 x 192,512 B = 4.22 GiB f16).",
+   "sampling": {
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "top_k": 50,
+    "min_p": 0.0,
+    "source": "internlm/Intern-S1 card L90-L93"
+   },
+   "licence": {
+    "id": "apache-2.0",
+    "register": "D-34"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b6113",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "intern-s1 support #14875 (b6113); text path is qwen3moe"
+   },
+   "repo": {
+    "repo_sha": "d31647416d0fee6e92d8b8b2ee3c3e5a2119f153",
+    "last_modified": "2025-08-14T20:56:54.000Z",
+    "gated": false,
+    "card_licence": null,
+    "card_licence_name": null
+   }
+  },
+  "ling-3.0-flash-fin": {
+   "tier": "phased",
+   "suggested_key": "ling-3.0-flash-fin",
+   "hf_repo": "bartowski/Ling-3.0-flash-Fin-GGUF",
+   "subdir": "Ling-3.0-flash-Fin-Q8_0",
+   "quant": "Q8_0",
+   "files": [
+    {
+     "path": "Ling-3.0-flash-Fin-Q8_0/Ling-3.0-flash-Fin-Q8_0-00001-of-00004.gguf",
+     "basename": "Ling-3.0-flash-Fin-Q8_0-00001-of-00004.gguf",
+     "bytes": 39386128800,
+     "sha256": "650a507efdae86353d949fde757fcdd8771b655a64c5828279f8f11e0f3cb088"
+    },
+    {
+     "path": "Ling-3.0-flash-Fin-Q8_0/Ling-3.0-flash-Fin-Q8_0-00002-of-00004.gguf",
+     "basename": "Ling-3.0-flash-Fin-Q8_0-00002-of-00004.gguf",
+     "bytes": 39383925568,
+     "sha256": "9de157f0745f1811ce5b2adce10e9f6f43dff772ef19812b34702fc30744b92f"
+    },
+    {
+     "path": "Ling-3.0-flash-Fin-Q8_0/Ling-3.0-flash-Fin-Q8_0-00003-of-00004.gguf",
+     "basename": "Ling-3.0-flash-Fin-Q8_0-00003-of-00004.gguf",
+     "bytes": 39383925568,
+     "sha256": "e85a59a58f18ead26dbad2f94048e30fc4c0c82df3e96971e4c56c716406cc19"
+    },
+    {
+     "path": "Ling-3.0-flash-Fin-Q8_0/Ling-3.0-flash-Fin-Q8_0-00004-of-00004.gguf",
+     "basename": "Ling-3.0-flash-Fin-Q8_0-00004-of-00004.gguf",
+     "bytes": 17479393280,
+     "sha256": "55979aa1c19de742e7cbe833c4449c4fb621824dedc7dd1e73c9487a5a545e06"
+    }
+   ],
+   "total": {
+    "bytes": 135633373216,
+    "GB": 135.63,
+    "GiB": 126.32
+   },
+   "model_file_pattern": "Ling-3.0-flash-Fin-Q8_0-00001-of-00004.gguf",
+   "arch": "bailingmoe3",
+   "gguf_header": {
+    "block_count": 43,
+    "mla_layers_incl_nextn": [
+     5,
+     11,
+     17,
+     23,
+     29,
+     35,
+     41,
+     42
+    ],
+    "kda_layers": 35,
+    "context_length": 262144,
+    "attention.key_length": 576,
+    "kv_lora_rank": 512,
+    "rope.dimension_count": 64,
+    "nextn_predict_layers": 1,
+    "expert_count": 512,
+    "expert_used_count": 8
+   },
+   "native_context": {
+    "gguf_context_length": 262144
+   },
+   "kv": {
+    "layout": "K-only MLA cache (576 per layer) on the MLA layers; the default hybrid filter keeps the NextN layer 42 in the main cache",
+    "bytes_per_token": {
+     "f16": 9216,
+     "q8_0": 4896,
+     "q4_0": 2592
+    },
+    "derivation": "8 x row(576) (7 trunk + 1 NextN; 8,064 B f16 if NextN excluded)",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 0.281,
+      "q8_0": 0.149,
+      "q4_0": 0.079
+     },
+     "131072": {
+      "f16": 1.125,
+      "q8_0": 0.598,
+      "q4_0": 0.316
+     },
+     "262144": {
+      "f16": 2.25,
+      "q8_0": 1.195,
+      "q4_0": 0.633
+     },
+     "524288": {
+      "f16": 4.5,
+      "q8_0": 2.391,
+      "q4_0": 1.266
+     },
+     "1048576": {
+      "f16": 9.0,
+      "q8_0": 4.781,
+      "q4_0": 2.531
+     }
+    },
+    "recurrent_state": {
+     "bytes_per_sequence": 78561280,
+     "MiB_per_sequence": 74.9,
+     "formula": "35 recurrent layers x (r 36864 + s 524288) f32 elements x 4 B"
+    }
+   },
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "source": "inclusionAI/Ling-3.0-flash-Fin card L45 (thinking on by default)"
+   },
+   "licence": {
+    "id": "mit",
+    "note": "card front matter only; no LICENSE file",
+    "register": "D-34"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b10470",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "bailingmoe3 #26608 (b10470); dedicated Ling 3.0 chat parser #28682 (b11057)"
+   },
+   "repo": {
+    "repo_sha": "a792b6bd51d2cb47b5aa8687ff5dd4f2974acdb4",
+    "last_modified": "2026-09-04T01:08:35.000Z",
+    "gated": false,
+    "card_licence": "mit",
+    "card_licence_name": null
+   }
+  },
+  "baichuan-m3-235b": {
+   "tier": "phased",
+   "suggested_key": "baichuan-m3-235b",
+   "rungs": {
+    "Q4_K_M_official": {
+     "hf_repo": "baichuan-inc/Baichuan-M3-235B-Q4_K_M-GGUF",
+     "files": [
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00001-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00001-of-00010.gguf",
+       "bytes": 16933868960,
+       "sha256": "87ca69b63c5ccfb52b0e23610bb36f6239ce216491f2d647e2ce8a84021082e5"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00002-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00002-of-00010.gguf",
+       "bytes": 14801829984,
+       "sha256": "3ba92f1da0830c4936370d963e604faa3b0c79f096c503a86e31a10aefa65cad"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00003-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00003-of-00010.gguf",
+       "bytes": 14636418560,
+       "sha256": "18138252f9a76030d28d6c9ed4a6178703590a26e69fc4aacabab9b09ef606f1"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00004-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00004-of-00010.gguf",
+       "bytes": 14636418560,
+       "sha256": "d00f7d4c2db5913a57906b581fa4cb79bb1d8c00befa51d25bc605405773f22c"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00005-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00005-of-00010.gguf",
+       "bytes": 14844577280,
+       "sha256": "1a8e51645ea68700b9adf50107eb0593f199c0814c3e1cf61831cdcbae676f25"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00006-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00006-of-00010.gguf",
+       "bytes": 14636418560,
+       "sha256": "6a52ac23b06341351177f796a5e08ed207224ca6cdfd1613f7d3cf1f55698531"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00007-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00007-of-00010.gguf",
+       "bytes": 14636418560,
+       "sha256": "5036ba6a53d96738292be8f8c1d53487a7ad47d4d7e858a087432eeb80b20b89"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00008-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00008-of-00010.gguf",
+       "bytes": 14844577280,
+       "sha256": "b54cb0a2e62511eec86184b35f4f0c229e87c7466115bb85339a47d309cdca4c"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00009-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00009-of-00010.gguf",
+       "bytes": 15677212160,
+       "sha256": "3c2cee2d1854fc6c0f5fa71ce63911baf089831a229d9ca431bd1ff9bcb43fd5"
+      },
+      {
+       "path": "baichuan-m3-235b-q4_k_m-00010-of-00010.gguf",
+       "basename": "baichuan-m3-235b-q4_k_m-00010-of-00010.gguf",
+       "bytes": 8135089472,
+       "sha256": "0d414040f43c94d439a8de37a48a2915d365f9b2a9920a22aca4fb01ac5c19b3"
+      }
+     ],
+     "total": {
+      "bytes": 143782829376,
+      "GB": 143.78,
+      "GiB": 133.91
+     },
+     "note": "stock Q4_K_M, token_embd BF16; general.sampling temp 0.6 top_p 0.95 top_k 20"
+    },
+    "Q5_K_S_mradermacher": {
+     "hf_repo": "mradermacher/Baichuan-M3-235B-GGUF",
+     "files": [
+      {
+       "path": "Baichuan-M3-235B.Q5_K_S.gguf",
+       "basename": "Baichuan-M3-235B.Q5_K_S.gguf",
+       "bytes": 161881426240,
+       "sha256": "f9608a9cda2bc372d3cb78142a41df95aaec07cb6c22b31ea4b15be993a8579f"
+      }
+     ],
+     "total": {
+      "bytes": 161881426240,
+      "GB": 161.88,
+      "GiB": 150.76
+     },
+     "note": "no official Q5_K_S exists (baichuan-inc publishes only the Q4_K_M GGUF)"
+    }
+   },
+   "arch": "qwen3moe",
+   "gguf_header": {
+    "block_count": 94,
+    "context_length": 40960,
+    "attention.head_count_kv": 4,
+    "attention.key_length": 128,
+    "rope.freq_base": 5000000.0,
+    "expert_count": 128,
+    "expert_used_count": 8
+   },
+   "native_context": {
+    "gguf_context_length": 40960
+   },
+   "kv": {
+    "bytes_per_token": {
+     "f16": 192512,
+     "q8_0": 102272,
+     "q4_0": 54144
+    },
+    "derivation": "94 x (K 4x128 + V 4x128)",
+    "GiB_at_context": {
+     "16384": {
+      "f16": 2.938,
+      "q8_0": 1.561,
+      "q4_0": 0.826
+     },
+     "23552": {
+      "f16": 4.223,
+      "q8_0": 2.243,
+      "q4_0": 1.188
+     },
+     "32768": {
+      "f16": 5.875,
+      "q8_0": 3.121,
+      "q4_0": 1.652
+     },
+     "40960": {
+      "f16": 7.344,
+      "q8_0": 3.901,
+      "q4_0": 2.065
+     }
+    }
+   },
+   "context_target_default (D-16)": "Q5_K_S if about 20-23K is enough (default), Q4_K_M otherwise; to-do for the Principal.",
+   "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "source": "baichuan-inc/Baichuan-M3-235B generation_config.json; card example temperature 0.6"
+   },
+   "licence": {
+    "id": "apache-2.0",
+    "register": "D-34"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b6113",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "qwen3moe has been supported since 2025; any recent build"
+   },
+   "repo": {
+    "official": {
+     "repo_sha": "fd5eabb69a21da20935c7dce0c2565f6cc20fc1e",
+     "last_modified": "2026-02-09T12:20:29.000Z",
+     "gated": false,
+     "card_licence": "apache-2.0",
+     "card_licence_name": null
+    },
+    "mradermacher": {
+     "repo_sha": "63f86a127c4c1eab97611214846dd09c0a539826",
+     "last_modified": "2026-01-13T14:09:41.000Z",
+     "gated": false,
+     "card_licence": "apache-2.0",
+     "card_licence_name": null
+    }
+   },
+   "caveats": [
+    "Register D-16 gives Baichuan official Q4_K_M as 133.91 GiB: confirmed (143,782,829,376 B). The mradermacher Q4_K_M is a different file (142,154,074,432 B = 132.39 GiB)."
+   ]
+  },
+  "qwen3-coder-next": {
+   "tier": "phased",
+   "suggested_key": "qwen3-coder-next",
+   "hf_repo": "Qwen/Qwen3-Coder-Next-GGUF",
+   "subdir": "Qwen3-Coder-Next-Q8_0",
+   "quant": "Q8_0",
+   "files": [
+    {
+     "path": "Qwen3-Coder-Next-Q8_0/Qwen3-Coder-Next-Q8_0-00001-of-00004.gguf",
+     "basename": "Qwen3-Coder-Next-Q8_0-00001-of-00004.gguf",
+     "bytes": 26190321568,
+     "sha256": "30b7554fc0c846a5dc3ecf585884c77471f73e3da698a8ba4fabd8e7868c6533"
+    },
+    {
+     "path": "Qwen3-Coder-Next-Q8_0/Qwen3-Coder-Next-Q8_0-00002-of-00004.gguf",
+     "basename": "Qwen3-Coder-Next-Q8_0-00002-of-00004.gguf",
+     "bytes": 26212935584,
+     "sha256": "3f96379de5a5c4655cb378710ea571d5e9cc96f260120a44a6477198efcdc27d"
+    },
+    {
+     "path": "Qwen3-Coder-Next-Q8_0/Qwen3-Coder-Next-Q8_0-00003-of-00004.gguf",
+     "basename": "Qwen3-Coder-Next-Q8_0-00003-of-00004.gguf",
+     "bytes": 26047157792,
+     "sha256": "5dd1ce07eaae95ee430331dc9c6f3120ff88e4211ad3a0cceeaa963f25328504"
+    },
+    {
+     "path": "Qwen3-Coder-Next-Q8_0/Qwen3-Coder-Next-Q8_0-00004-of-00004.gguf",
+     "basename": "Qwen3-Coder-Next-Q8_0-00004-of-00004.gguf",
+     "bytes": 6361641024,
+     "sha256": "76730702c630bf76305139165cb85421858604030851dfd64fe96a5e67cda99d"
+    }
+   ],
+   "total": {
+    "bytes": 84812055968,
+    "GB": 84.81,
+    "GiB": 78.99
+   },
+   "model_file_pattern": "Qwen3-Coder-Next-Q8_0-00001-of-00004.gguf",
+   "arch": "qwen3next",
+   "gguf_header": {
+    "block_count": 48,
+    "context_length": 262144,
+    "attention.head_count_kv": 2,
+    "attention.key_length": 256,
+    "expert_count": 512,
+    "expert_used_count": 10,
+    "general.version": "0129"
+   },
+   "native_context": {
+    "gguf_context_length": 262144
+   },
+   "kv": {
+    "bytes_per_token": {
+     "f16": 24576,
+     "q8_0": 13056,
+     "q4_0": 6912
+    },
+    "derivation": "12 full-attention layers x (K 2x256 + V 2x256)",
+    "GiB_at_context": {
+     "32768": {
+      "f16": 0.75,
+      "q8_0": 0.398,
+      "q4_0": 0.211
+     },
+     "131072": {
+      "f16": 3.0,
+      "q8_0": 1.594,
+      "q4_0": 0.844
+     },
+     "262144": {
+      "f16": 6.0,
+      "q8_0": 3.188,
+      "q4_0": 1.688
+     },
+     "524288": {
+      "f16": 12.0,
+      "q8_0": 6.375,
+      "q4_0": 3.375
+     },
+     "1048576": {
+      "f16": 24.0,
+      "q8_0": 12.75,
+      "q4_0": 6.75
+     }
+    },
+    "recurrent_state": {
+     "bytes_per_sequence": 79036416,
+     "MiB_per_sequence": 75.4,
+     "formula": "36 recurrent layers x (r 24576 + s 524288) f32 elements x 4 B"
+    }
+   },
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 40,
+    "source": "Qwen/Qwen3-Coder-Next card L194; generation_config"
+   },
+   "licence": {
+    "id": "apache-2.0",
+    "note": "card only; LICENSE file missing (D-34)"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b7186",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": true,
+    "note": "qwen3next #16095 (b7186)"
+   },
+   "repo": {
+    "repo_sha": "b82fb7382639d97b38fa7672e526c760c2fb358e",
+    "last_modified": "2026-02-04T04:26:16.000Z",
+    "gated": false,
+    "card_licence": "apache-2.0",
+    "card_licence_name": null
+   }
+  },
+  "embeddinggemma-2": {
+   "tier": "phased",
+   "suggested_key": "embed-embeddinggemma-2 (side index, D-60)",
+   "hf_repo": "ggml-org/embeddinggemma-2-GGUF",
+   "quant": "Q8_0",
+   "files": [
+    {
+     "path": "embeddinggemma-2-Q8_0.gguf",
+     "basename": "embeddinggemma-2-Q8_0.gguf",
+     "bytes": 309855456,
+     "sha256": "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"
+    }
+   ],
+   "total": {
+    "bytes": 309855456,
+    "GB": 0.31,
+    "GiB": 0.29
+   },
+   "model_file_pattern": "embeddinggemma-2-Q8_0.gguf",
+   "bf16_alternative": {
+    "path": "embeddinggemma-2-BF16.gguf",
+    "basename": "embeddinggemma-2-BF16.gguf",
+    "bytes": 557950176,
+    "sha256": "68bae29d62fb8c7d23e98d21fd4662753ddd636e6b62b8a70dfe059a9844f216"
+   },
+   "mmproj_for_image_audio": {
+    "q8_0": {
+     "path": "mmproj-embeddinggemma-2-Q8_0.gguf",
+     "basename": "mmproj-embeddinggemma-2-Q8_0.gguf",
+     "bytes": 554821024,
+     "sha256": "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f"
+    },
+    "bf16": {
+     "path": "mmproj-embeddinggemma-2-BF16.gguf",
+     "basename": "mmproj-embeddinggemma-2-BF16.gguf",
+     "bytes": 982074784,
+     "sha256": "d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766"
+    }
+   },
+   "arch": "gemma-embedding2",
+   "gguf_header": {
+    "block_count": 24,
+    "context_length_header": 262144,
+    "embedding_length_out": 768,
+    "attention.causal": false,
+    "pooling_type": 1,
+    "pooling_name": "MEAN",
+    "sliding_window": 1024,
+    "size_label": "271M"
+   },
+   "native_context": {
+    "note": "header says 262144 (duplicate key overwritten in convert.log); the card states 8,192 tokens"
+   },
+   "kv": {
+    "bytes_per_token": {
+     "f16": 0,
+     "q8_0": 0,
+     "q4_0": 0
+    },
+    "layout": "non-causal embedding arch: create_memory returns no cache (llama-model.cpp L2384)"
+   },
+   "sampling": "n/a (embedding)",
+   "licence": {
+    "id": "apache-2.0",
+    "register": "D-35 (if kept, D-60)"
+   },
+   "llama_cpp": {
+    "min_llama_cpp_tag": "b11452",
+    "satisfied_by_b11474": true,
+    "loads_on_old_pin_b10964": false,
+    "note": "embeddinggemma2 text+vision+audio #30054 (b11452); ggml-org file converted on a branch build 0.6.0-dev b11451 commit 1e91a0b05 (research note)"
+   },
+   "repo": {
+    "repo_sha": "bfcd298762cc34d0357ece5ebdd31791a3a374d8",
+    "last_modified": "2026-10-06T16:08:10.000Z",
+    "gated": false,
+    "card_licence": "apache-2.0",
+    "card_licence_name": null
+   }
+  }
+ },
+ "residency_arithmetic": {
+  "note": "Weights only; resident companions also hold KV (Qwen3 embed/rerank: 147,456 B/token f16, 1.125 GiB per 8,192-token pool each) and compute buffers. The Arbiter subtracts the measured resident set and 16 GiB headroom (D-14 why).",
+  "resident_weights_GiB": {
+   "router Qwen3.5-4B Q8_0": 4.17,
+   "Qwen3-Embedding-8B Q8_0": 7.49,
+   "Qwen3-Reranker-8B Q8_0": 7.49,
+   "Qwen3-Embedding-4B Q8_0": 3.99,
+   "Qwen3-Reranker-4B Q8_0": 3.99,
+   "8B pair total": 14.99,
+   "4B pair total": 7.97
+  },
+  "register_budgets": "D-14: about 150 GiB with the 8B pair resident (a), about 157 GiB with the 4B pair (b); bge pair today 1.3 GiB.",
+  "engine_weights_GiB": {
+   "GLM-5.3-Flash UD-IQ4_XS": 146.05,
+   "GLM + mmproj-F16": 147.1,
+   "DeepSeek-V4-Flash-0731 UD-Q8_K_XL": 150.75,
+   "gpt-oss-120b F16-trunk": 60.88
+  },
+  "finding": "With the 8B pair resident (budget about 150 GiB) DeepSeek-V4-Flash UD-Q8_K_XL (150.75 GiB weights) cannot load; the fixed Day 1 Apex choice therefore needs the 4B pair (D-14 (b), about 157 GiB: 150.75 + KV, f16 6,880 B/token = 1.68 GiB at 256K, 6.72 GiB at 1M) or on-demand / CPU companions (D-14 (d)/(e)). GLM fits either way at moderate context (146.05 + 4.81 GiB f16 KV at 256K; +1.05 GiB mmproj for vision)."
+ },
+ "findings": [
+  "Rank head: published Qwen3-Reranker-8B/4B GGUFs WITH the rank head exist (Voodisss, gorse-io, giladgd): qwen3.pooling_type = 4, qwen3.classifier.output_labels [yes,no], tokenizer.chat_template.rerank, cls.output.weight [n_embd,2]. Qwen publishes none; mradermacher (8B and 4B) lacks the head.",
+  "DSV4 UD-Q8_K_XL (150.75 GiB) does not fit the D-14 (a) 8B companion pair budget (about 150 GiB); the 4B pair (b) or on-demand companions are required for the fixed Apex choice.",
+  "Register mmproj sizes are low: glm5v mmproj F16 is 1,128,047,296 B (register 0.65 GB); Flash-Next mmproj F16 904,004,000 B (register 0.62 GB).",
+  "KV figures confirmed against b11474 code: GLM 19,712 B/token f16 (10,472 q8_0); DSV4 6,880 B/token f16 (3,655 q8_0); 235B-class 192,512 B/token f16.",
+  "Qwen3-Embedding/Reranker are causal qwen3 models: each allocates a KV cache of 147,456 B/token f16 (1.125 GiB per 8,192-token pool), unlike the non-causal bge pair.",
+  "DSV4 chat template defaults to thinking OFF; pass --reasoning on (enable_thinking) and --reasoning-effort high|max for Apex/Deep Think. GLM defaults to reasoning_effort max.",
+  "DSV4 card sampling: temperature 1.0 with top_p 1.0 (top_p 0.95 for agentic); Nemotron card now says temperature 1.0 / top_p 0.95 (existing entry 0.6).",
+  "Flash-Next self-contained MTP head (mtp-Qwen3.8-Flash-Next-Q8_0.gguf) was re-uploaded after mainline #29761 and matches mainline tensor names; shared-* heads need the unsloth fork. Unverified on the node.",
+  "unsloth GLM repo carries Shard_Rewrite/*.gguf_file duplicates; pull only the UD-IQ4_XS/ folder.",
+  "Lucebox DSpark drafter uses a non-mainline arch and tensor type; the mainline drafter is unsloth dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf (repo root, b10228+).",
+  "Old pin v0.4.1 (b10964) cannot load glm5-next (b11279) or gemma-embedding2 (b11452); it loads deepseek4, gpt-oss, qwen35, qwen3 embed/rerank, qwen3moe, nemotron_h_moe, bailingmoe3, qwen3next and qwen4exp (but not its Vulkan hc ops, b11012, or MTP, b11330). The S-02/V25 parity test can therefore cover gpt-oss-120b, DeepSeek-V4-Flash, the router and the Qwen3 embed/rerank pair, not GLM."
+ ]
+}

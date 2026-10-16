@@ -93,8 +93,9 @@
 #     hf_tree_lfs is anonymous first and loads the token only on a 401/403 (gated repo), so for the four public
 #     repos the secret is never read; its gated-repo path dies with the licence URL (16.3 item 8).
 #     Contract gap, stated for its writer: pull_engine_files pins revision `main`
-#     (hf_download's rev argument is not threaded through) and downgrades a research-snippet sha256 mismatch to a
-#     warning; this driver therefore checks the snippet hashes against the tree itself BEFORE the pull (fatal), records
+#     (hf_download's rev argument is not threaded through). It stops on a verify=research-snippet sha256 that the tree
+#     contradicts (v0.4.0), and this driver also checks the pinned hashes against the tree itself BEFORE planning the
+#     pull (fatal, so the free-space plan never counts a file it will refuse), records
 #     the repo commit sha before and after every pull in the aggregate manifest (revision_sha, revision_sha_after) and,
 #     when a repo moved during a pull, re-lists the tree and dies only if a WANTED file's oid or size differs from what
 #     was pulled (every byte was sha256-verified against the plan; an unrelated commit is a warning, not a 10-hour redo).
@@ -127,7 +128,8 @@
 # the driver skips an engine on a re-run only when ok AND released are true; its resident_after tells the driver which
 # engine the next swap releases; its "memory" list holds the S52 record of each load, one per rung on the DeepSeek
 # ladder), residency.json (step 03), parity.json (step 02b) and quality.json (step 02c) beside them, the to-dos
-# kv-estimates and cache-ram (step 04), decode-floors (step 02, D-33 (c)) and kld-run (step 02c, S-03), each re-raised
+# kv-estimates and cache-ram (step 04), decode-floors, context-targets (D-16), trial-task-set (D-46), seat-test-sets
+# (D-49) and seat-profiles (D-48, S-30) (step 02) and kld-run (step 02c, S-03), each re-raised
 # with the latest figures on every run of its step (only the Principal closes them), $ATLAS_STATE/phase3/results/pending-overrides.json (loadtest.py's journal of
 # temporary overrides, restored on the next invocation), $ATLAS_STATE/phase3/quiesced (one "unit NAME" or
 # "container NAME" line per background generator stopped for steps 02 to 03, removed when they are restarted),
@@ -636,7 +638,7 @@ step_01() {
     die "phase2/04-memory.sh pull_engine_files no longer downloads through hf_download_public: with $ATLAS_ETC/secrets/hf-token.env present, lib/common.sh hf_download would expose HF_TOKEN on curl's command line (/proc/<pid>/cmdline) for the whole pull; fix that first (header: SECRETS ON ARGV)"
   fi
   if [[ ! -s "$ATLAS_ETC/secrets/hf-token.env" ]]; then
-    warn "no Hugging Face token in $ATLAS_ETC/secrets/hf-token.env; none of the four repos is known to be gated (v0.4.0 engine data), a 401/403 will stop the pull with the licence URL"
+    warn "no Hugging Face token in $ATLAS_ETC/secrets/hf-token.env; none of the four repos is known to be gated (research_notes/ATLAS v0.4.0 build record/engine_data.md), a 401/403 will stop the pull with the licence URL"
   fi
   # D-42 (b): the announced size is the engines.json footprint_gb sum of the seats pulled here, never a fixed figure.
   local footprint
@@ -761,7 +763,8 @@ step_02() {
   # The last engine is still resident on purpose (its unload + release is the measurement): finish it now.
   _p3_loadtest finish ${prev:+--previous "$prev"}
   # V10 per engine, the V10 summary the gate reads, V22 per newer-architecture engine and the Apex (R19 generalised,
-  # S-26) and its summary, and the to-do decode-floors while any seat has no floor (D-33 (c)), from the result files.
+  # S-26) and its summary, and the to-do decode-floors while any seat has no floor (D-33 (c)), from the result files;
+  # then the to-dos for the inputs the approved rows leave to the Principal, with their built defaults (v0.4.0).
   _p3_loadtest summarize
   _p3_resume_background
   _p3_notify "Phase 3 step 2 done: load tests recorded (see verify.jsonl V4/V10/V22)"

@@ -102,7 +102,8 @@ EXTERNAL_MODE = "external"
 # Arbiter projects.
 KV_CLASSES: frozenset[str] = frozenset({"f16", "q8_0", "q4_0", "none"})
 LLM_MODES: frozenset[str] = frozenset({"chat", "vision"})
-# D-14 option (e), approved 2026-10-16 (answers.md section 2): where a llama-server runs. `gpu` (the default) is on the
+# D-14 option (e), approved 2026-10-16 (research_notes/ATLAS v0.4.0 build record/answers.md §2): where a llama-server
+# runs. `gpu` (the default) is on the
 # iGPU and shows on mem_info_gtt_used; `cpu` (phase2/engine-env.py renders --device none) is host memory the GTT counter
 # never shows, so the Arbiter budgets it as a host resident set. Only an always-resident companion may run on the CPU.
 PLACEMENTS: frozenset[str] = frozenset({"gpu", "cpu"})

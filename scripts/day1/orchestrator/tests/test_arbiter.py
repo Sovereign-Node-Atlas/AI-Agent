@@ -36,13 +36,16 @@ from atlas.arbiter import (
     UnknownEngine,
     build_arbiter,
     compute_buffer_bytes,
+    host_unreserved_bytes,
     host_used_bytes,
     kv_estimate_bytes,
     kv_state_bytes,
+    measure_host_companions,
+    process_anon_bytes,
     process_rss_bytes,
     read_unit_profile,
 )
-from atlas.config import ConfigError, EngineSpec, load_phase4_engines
+from atlas.config import ConfigError, EngineSpec, load_engines, load_phase4_engines
 from atlas.engines import EngineControlError, EngineError, StubController
 from atlas.ledger import Ledger
 
@@ -141,10 +144,10 @@ def test_kv_estimate_uses_the_total_pool_not_per_slot(engines: dict[str, EngineS
 
 
 def test_kv_model_is_the_day1_table_with_per_slot_state_and_a_compute_term(engines: dict[str, EngineSpec]) -> None:
-    """S-17 (v040 engine_data.md, b11474 cache code): GLM-5.3-Flash 19,712 B/token f16 (10,472 at q8_0), DeepSeek V4
-    6,880 (3,655), gpt-oss-120b 36,864 (full-attention layers only), the Qwen3 retrieval pair 147,456; the per-slot
-    state that does not grow with context is charged once per slot; every LLM projection carries the compute-buffer
-    term."""
+    """S-17 (research_notes/ATLAS v0.4.0 build record/engine_data.md, b11474 cache code): GLM-5.3-Flash 19,712 B/token
+    f16 (10,472 at q8_0), DeepSeek V4 6,880 (3,655), gpt-oss-120b 36,864 (full-attention layers only), the Qwen3
+    retrieval pair 147,456; the per-slot state that does not grow with context is charged once per slot; every LLM
+    projection carries the compute-buffer term."""
     glm, dsv4, oss = engines[GLM], engines[APEX_KEY], engines["gpt-oss-120b"]
     assert kv_estimate_bytes(glm, 32768, 1, "f16") == 19_712 * 32768
     assert kv_estimate_bytes(glm, 32768, 1, "q8_0") == 10_472 * 32768
@@ -381,8 +384,12 @@ def test_headroom_reserves_the_cpu_side_and_host_use_is_observed_not_budgeted(
     """Section 4.1 (S44): mem_info_gtt_used never shows CPU processes, so the budget keeps `headroom_bytes` back for
     them. /proc/meminfo is read at each measurement and reported (status, one WARNING when CPU-side use outgrows the
     reserve), but never subtracted, so a transient CPU job cannot change a grant. The CPU retrieval pair (D-14 (e)) is
-    inside the CPU-side figure but already charged as the host resident set, so the warning looks past it."""
+    charged in full as the host resident set, but only its anonymous memory (KV + compute) is inside the CPU-side
+    figure: its weights are clean file pages, which the kernel counts as available. The warning looks past that
+    anonymous share alone (host_unreserved_bytes)."""
     host = host_set(engines)
+    weights = sum(s.footprint_bytes for s in engines.values() if s.is_resident and s.placement == "cpu")
+    anon = host - weights  # the pair's projected KV + compute: the part of the host set inside MemTotal - MemAvailable
     total = RESIDENT_SET + 186 * GIB + host
     probe = StubProbe(total_bytes=total, used_bytes=RESIDENT_SET, mem_total_bytes=total, mem_available_bytes=total)
     controller = StubController(engines=engines, probe=probe)
@@ -390,27 +397,30 @@ def test_headroom_reserves_the_cpu_side_and_host_use_is_observed_not_budgeted(
     arb = Arbiter(engines, controller, probe, headroom_bytes=16 * GIB, poll_interval_s=1.0, clock=clock,
                   sleep=clock.sleep)
     # CPU side at 12 GiB beside the pair (MemTotal - MemAvailable - GTT resident set): inside the reserve, no warning.
-    probe.mem_available_bytes = total - RESIDENT_SET - host - 12 * GIB
+    probe.mem_available_bytes = total - RESIDENT_SET - anon - 12 * GIB
     with caplog.at_level(logging.WARNING, logger="atlas.arbiter"):
         arb.measure_resident_set()
     assert arb.budget_bytes == 170 * GIB
     st = arb.status()
-    assert st["headroom_bytes"] == 16 * GIB and st["host_used_bytes"] == host + 12 * GIB
+    assert st["headroom_bytes"] == 16 * GIB and st["host_used_bytes"] == anon + 12 * GIB
     assert st["budget_bytes"] == 170 * GIB and st["host_resident_set_bytes"] == host
+    assert host_unreserved_bytes(st["host_used_bytes"], st["host_resident"]) == 12 * GIB
     assert "headroom" not in caplog.text
     # The Apex engine (153.6 GiB projected at its Day 1 profile) still fits the reserved budget on its own.
     assert arb.projected_footprint(APEX_KEY).total_bytes <= arb.budget_bytes
     # CPU side grows to 20 GiB beside the pair: reported and warned once, budget unchanged; a re-measure is quiet.
-    probe.mem_available_bytes = total - RESIDENT_SET - host - 20 * GIB
+    probe.mem_available_bytes = total - RESIDENT_SET - anon - 20 * GIB
     with caplog.at_level(logging.WARNING, logger="atlas.arbiter"):
         arb.measure_resident_set()
         arb.measure_resident_set()
-    assert arb.budget_bytes == 170 * GIB and arb.status()["host_used_bytes"] == host + 20 * GIB
+    assert arb.budget_bytes == 170 * GIB and arb.status()["host_used_bytes"] == anon + 20 * GIB
     assert caplog.text.count("ATLAS_ARBITER_HEADROOM_GIB") == 1
     # Back inside the reserve, then over again: warned again (a new episode, not a repeat).
-    probe.mem_available_bytes = total - RESIDENT_SET - host - 10 * GIB
+    probe.mem_available_bytes = total - RESIDENT_SET - anon - 10 * GIB
     arb.measure_resident_set()
-    probe.mem_available_bytes = total - RESIDENT_SET - host - 30 * GIB
+    # 17 GiB beside the pair: above 16. Subtracting the whole host set (weights included) would hide it (S44, F3).
+    probe.mem_available_bytes = total - RESIDENT_SET - anon - 17 * GIB
+    assert 17 * GIB - weights < 16 * GIB
     with caplog.at_level(logging.WARNING, logger="atlas.arbiter"):
         arb.measure_resident_set()
     assert caplog.text.count("ATLAS_ARBITER_HEADROOM_GIB") == 2
@@ -603,17 +613,27 @@ def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path,
 
     monkeypatch.setattr(admin, "SysfsMemoryProbe", Probe)
     monkeypatch.setattr(admin, "_unit_state", lambda *a, **k: "inactive")
+    # No unit is running: each CPU companion's anonymous share is its projection, as in the Arbiter.
+    monkeypatch.setattr(admin.SystemdEngineController, "main_pid", lambda self, key: None)
+    engines = load_engines(config_dir)
+    companions = measure_host_companions(engines, pid_of=None)
+    anon = sum(d["anon_bytes"] for d in companions.values())
+    assert 0 < anon < GIB * 2
     assert admin.main(["arbiter", "status", "--json"]) == 0
     host = json.loads(capsys.readouterr().out)["host"]
-    # CPU-side use: MemTotal 187 - MemAvailable 165 - GPU pages 6 = 16 GiB.
+    # CPU-side use: MemTotal 187 - MemAvailable 165 - GPU pages 6 = 16 GiB; the headroom covers it less the pair's
+    # anonymous share (S44: the Arbiter's own rule, host_unreserved_bytes).
     assert host == {"headroom_bytes": 20 * GIB, "mem_total_bytes": 187 * GIB, "mem_available_bytes": 165 * GIB,
-                    "gpu_pages_bytes": 6 * GIB, "host_used_bytes": 16 * GIB}
+                    "gpu_pages_bytes": 6 * GIB, "host_used_bytes": 16 * GIB, "companion_anon_bytes": anon,
+                    "unreserved_bytes": 16 * GIB - anon}
     assert admin.main(["arbiter", "status"]) == 0
     text = capsys.readouterr().out
     assert ("host: Arbiter headroom 20 GiB (ATLAS_ARBITER_HEADROOM_GIB); CPU-side use 16.00 GiB (MemTotal - "
-            "MemAvailable - (GPUActive + GPUReclaim)); MemAvailable 165.00 GiB of MemTotal 187.00 GiB") in text
-    # The same figure the Arbiter computes for the same counters.
+            f"MemAvailable - (GPUActive + GPUReclaim)), {(16 * GIB - anon) / GIB:.2f} GiB beside the CPU companions' "
+            f"{anon / GIB:.2f} GiB of anonymous memory; MemAvailable 165.00 GiB of MemTotal 187.00 GiB") in text
+    # The same figures the Arbiter computes for the same counters.
     assert host["host_used_bytes"] == host_used_bytes(187 * GIB, 165 * GIB, 6 * GIB, 6 * GIB)
+    assert host["unreserved_bytes"] == host_unreserved_bytes(16 * GIB, companions)
     # A kernel without GPUActive: the GTT counter stands in, as in the Arbiter; above the headroom it says so.
     Probe.gpu_pages = None
     monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "12")
@@ -621,7 +641,15 @@ def test_admin_arbiter_status_shows_the_headroom_the_unit_uses(config_dir: Path,
     host = json.loads(capsys.readouterr().out)["host"]
     assert host["host_used_bytes"] == 16 * GIB and "gpu_pages_bytes" not in host
     assert admin.main(["arbiter", "status"]) == 0
-    assert "CPU-side use 16.00 GiB (MemTotal - MemAvailable - GTT used, ABOVE the headroom)" in capsys.readouterr().out
+    assert ("CPU-side use 16.00 GiB (MemTotal - MemAvailable - GTT used), "
+            f"{(16 * GIB - anon) / GIB:.2f} GiB beside the CPU companions' {anon / GIB:.2f} GiB of anonymous memory, "
+            "ABOVE the headroom") in capsys.readouterr().out
+    # 16 GiB of CPU-side use, under 15 GiB of it beside the pair, with a 15 GiB headroom: inside it. The verdict follows
+    # the unreserved figure the Arbiter warns on, not the raw CPU-side use (S44, one rule for both).
+    assert 16 * GIB - anon < 15 * GIB
+    monkeypatch.setenv("ATLAS_ARBITER_HEADROOM_GIB", "15")
+    assert admin.main(["arbiter", "status"]) == 0
+    assert "ABOVE the headroom" not in capsys.readouterr().out
     # Neither GPU figure readable: no CPU-side figure rather than a wrong one.
     Probe.gtt_error = True
     assert admin.main(["arbiter", "status", "--json"]) == 0
@@ -661,13 +689,15 @@ def test_build_arbiter_wires_the_engines_env_dir_from_settings(engines: dict[str
     assert build_arbiter(engines, engines_env_dir=tmp_path / "x").engines_env_dir == tmp_path / "x"
 
 
-def test_cpu_companions_are_charged_their_measured_rss_never_below_their_weights(
+def test_cpu_companions_are_charged_their_weights_plus_measured_anonymous_memory(
         engines: dict[str, EngineSpec]) -> None:
     """D-14 (e): the CPU retrieval pair is host memory the GTT counter never shows. measure_resident_set() charges each
-    companion the VmRSS of its unit's MainPID (pid_of + rss_of) when it can read it, never below the bytes of its
-    weights (file-backed pages the kernel may drop and re-read), else its projection; the budget follows."""
+    companion the bytes of its weights in full (file-backed pages the kernel may drop and re-read, so VmRSS can show
+    less than the file) plus the RssAnon + RssShmem of its unit's MainPID (pid_of + anon_of: the KV cache and compute
+    buffers, never reclaimable), never below its projection; without a pid, the projection; the budget follows."""
     pids = {"embed-qwen3-4b": 4101, "rerank-qwen3-4b": None}
     rss = {4101: 2 * GIB}
+    anon = {4101: GIB // 4}
 
     def pid_of(key: str) -> int | None:
         if key == "boom":
@@ -676,30 +706,107 @@ def test_cpu_companions_are_charged_their_measured_rss_never_below_their_weights
 
     probe = StubProbe(total_bytes=RESIDENT_SET + 170 * GIB, used_bytes=RESIDENT_SET)
     arb = Arbiter(engines, StubController(engines=engines, probe=probe), probe, pid_of=pid_of,
-                  rss_of=lambda pid: rss.get(pid))
+                  rss_of=lambda pid: rss.get(pid), anon_of=lambda pid: anon.get(pid))
     arb.measure_resident_set()
     embed, rerank = engines["embed-qwen3-4b"], engines["rerank-qwen3-4b"]
     detail = arb.status()["host_resident"]
-    # RSS 2 GiB is below the embedder's 3.99 GiB of weights: the weights are charged.
-    assert detail["embed-qwen3-4b"]["charged_bytes"] == embed.footprint_bytes
-    assert "measured VmRSS 2.00 GiB of pid 4101" in detail["embed-qwen3-4b"]["source"]
+    embed_projection = arb.companion_projection("embed-qwen3-4b").total_bytes
+    # VmRSS 2 GiB (some weight pages reclaimed) and 0.25 GiB anonymous, below the projected KV + compute: the charge
+    # is the projection, never the bare weights the v0.4.0 draft charged (which dropped the anonymous memory).
+    assert detail["embed-qwen3-4b"]["charged_bytes"] == embed_projection > embed.footprint_bytes
+    assert detail["embed-qwen3-4b"]["anon_bytes"] == embed_projection - embed.footprint_bytes
+    assert "measured RssAnon+RssShmem 0.25 GiB of pid 4101" in detail["embed-qwen3-4b"]["source"]
     # No pid (unit not running): the projection (weights + q8_0 KV at 4096 tokens + 0.5 GiB of compute buffers).
     projection = arb.companion_projection("rerank-qwen3-4b")
     assert projection.total_bytes == (rerank.footprint_bytes + int(147_456 * 4096 * 8.5 / 16)
                                       + int(DEFAULT_COMPANION_COMPUTE_BUFFER_GIB * GIB))
     assert detail["rerank-qwen3-4b"]["charged_bytes"] == projection.total_bytes
-    assert arb.host_resident_set_bytes == embed.footprint_bytes + projection.total_bytes
+    assert arb.host_resident_set_bytes == embed_projection + projection.total_bytes
     assert arb.budget_bytes == 170 * GIB - arb.host_resident_set_bytes
-    # A larger RSS than the weights is charged as measured; the re-measure (nothing resident) picks it up.
+    # More anonymous memory than projected is charged as measured, on top of the full weights, whatever the VmRSS
+    # shows; the re-measure (nothing resident) picks it up.
+    anon[4101] = 2 * GIB
+    arb.measure_resident_set()
+    assert arb.status()["host_resident"]["embed-qwen3-4b"]["charged_bytes"] == embed.footprint_bytes + 2 * GIB
+    # A kernel without RssAnon: the VmRSS stands in, never below the projection.
+    anon.clear()
     rss[4101] = 6 * GIB
     arb.measure_resident_set()
     assert arb.status()["host_resident"]["embed-qwen3-4b"]["charged_bytes"] == 6 * GIB
+    rss[4101] = 2 * GIB
+    arb.measure_resident_set()
+    assert arb.status()["host_resident"]["embed-qwen3-4b"]["charged_bytes"] == embed_projection
     # A pid reader that fails never stops a measurement: the projection stands in.
     arb._pid_of = lambda key: (_ for _ in ()).throw(RuntimeError("systemctl show failed"))
     arb.measure_resident_set()
     assert arb.host_resident_set_bytes == host_set(engines)
     # The GPU companion (the router) is never in the host set: the GTT counter measures it.
     assert "router-qwen3.5-4b" not in arb.status()["host_resident"]
+
+
+def test_process_anon_bytes_reads_rssanon_and_rssshmem(tmp_path: Path) -> None:
+    (tmp_path / "77").mkdir()
+    (tmp_path / "77" / "status").write_text("Name:\tllama-server\nVmRSS:\t 2097152 kB\nRssAnon:\t  262144 kB\n"
+                                            "RssFile:\t 1835008 kB\nRssShmem:\t    1024 kB\n")
+    assert process_anon_bytes(77, tmp_path) == (262144 + 1024) * 1024
+    (tmp_path / "78").mkdir()
+    (tmp_path / "78" / "status").write_text("Name:\told\nVmRSS:\t 1024 kB\n")
+    assert process_anon_bytes(78, tmp_path) is None  # neither field: the caller falls back to VmRSS
+    assert process_anon_bytes(79, tmp_path) is None  # gone
+
+
+def test_companion_pids_are_read_outside_the_state_lock(engines: dict[str, EngineSpec]) -> None:
+    """The module's locking contract: the state lock is never held across controller I/O. main_pid is a systemctl
+    subprocess (30 s timeout, once per CPU companion), so measure_resident_set() resolves the pids and /proc figures
+    before it takes the lock: status() (/health) answers while they are read."""
+    probe = StubProbe(total_bytes=RESIDENT_SET + 170 * GIB, used_bytes=RESIDENT_SET)
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_pid_of(key: str) -> int | None:
+        entered.set()
+        assert release.wait(5)
+        return None
+
+    arb = Arbiter(engines, StubController(engines=engines, probe=probe), probe, pid_of=slow_pid_of)
+    worker = threading.Thread(target=arb.measure_resident_set)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        done = threading.Event()
+        threading.Thread(target=lambda: (arb.status(), done.set())).start()
+        assert done.wait(2), "status() blocked behind the companions' pid reads"
+    finally:
+        release.set()
+        worker.join(5)
+    assert arb.host_resident_set_bytes == host_set(engines)
+    # Measured while nothing is resident; a seat that becomes resident during the reads stops the commit.
+    entered.clear()
+    release.clear()
+    arb2 = Arbiter(engines, StubController(engines=engines, probe=probe), probe, pid_of=slow_pid_of)
+    errors: list[Exception] = []
+
+    def measure() -> None:
+        try:
+            arb2.measure_resident_set()
+        except ArbiterError as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=measure)
+    worker.start()
+    assert entered.wait(5)
+    with arb2._cv:
+        arb2.resident["gpt-oss-120b"] = object()  # type: ignore[assignment]  # a load landed meanwhile
+    release.set()
+    worker.join(5)
+    assert errors and "became resident" in str(errors[0])
+
+
+def test_measure_host_companions_is_the_rule_atlas_admin_shares(engines: dict[str, EngineSpec]) -> None:
+    detail = measure_host_companions(engines, pid_of=None)
+    assert set(detail) == {"embed-qwen3-4b", "rerank-qwen3-4b"}
+    assert sum(d["charged_bytes"] for d in detail.values()) == host_set(engines)
+    anon = sum(d["anon_bytes"] for d in detail.values())
+    assert host_unreserved_bytes(anon + 5 * GIB, detail) == 5 * GIB
 
 
 def test_status_and_generation_release_answer_while_a_load_is_in_flight(engines: dict[str, EngineSpec]) -> None:

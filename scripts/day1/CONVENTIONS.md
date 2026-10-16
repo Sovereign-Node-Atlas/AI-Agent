@@ -11,7 +11,8 @@ scripts/day1/
   atlas-day1.sh                entry point: sudo ./atlas-day1.sh <phase1|phase2|phase3|phase4|status|report>
   lib/common.sh                the shared library; every script sources it first
   config/atlas.env.example     non-secret settings; installed to /etc/atlas/atlas.env on first run
-  config/engines.json          the 7 GGUF engines + 3 resident small models (Sections 5.1, 5.3, 4.3)
+  config/engines.json          the v0.4.0 Day 1 engines: 4 LLM seats + 3 resident companions (Sections 5.1, 5.3, 4.3), and
+                               the record-only `phased` list (nothing reads it; D-26 (c))
   config/phase4-engines.json   the Phase 4 engines with tier, repos, build script, footprint (Section 15.2)
   config/allowlist.txt         outbound domain allowlist, one per line (Section 12.5)
   config/sentinel-feeds.json   the D6 feeds
@@ -27,7 +28,8 @@ scripts/day1/
                                06b-cloudflare-token, 06c-google-oauth, 06d-sandbox, 07-restic, 08-sentinel, 09-windows-share,
                                09b-vault, 10-gate). 06d (AEGIS sandbox image, Section 16.4; V17) and 09b (gocryptfs vault,
                                Section 11; V18) are gap-fills: Section 17 names neither step, the gate needs both
-  phase3-models.sh             Phase 3 driver (detached under systemd); phase3/loadtest.py does the measuring
+  phase3-models.sh             Phase 3 driver (detached under systemd); phase3/loadtest.py does the measuring;
+                               phase3/parity-tasks.txt is the V25 task set (24 tasks, written for this project)
   phase4-engines.sh            Phase 4 driver (detached); phase4/engines/<name>.sh builds and tests one engine
   verify/vNN-<name>.sh         standalone checks for Section 21; see §5
   systemd/                     unit files installed verbatim to /etc/systemd/system (templated by render_template)
@@ -40,6 +42,8 @@ scripts/day1/
   docker/sandbox/Dockerfile    the AEGIS sandbox image (Section 16.4)
   orchestrator/                Python package `atlas` (pyproject.toml, src/atlas/..., tests/)
   tools/fill-workbook.py       reads verify.jsonl and fills sheet 4 of docs/ATLAS_BUILD_BASELINE.xlsx
+  tools/build-baseline-workbook.py  rebuilds docs/ATLAS_BUILD_BASELINE.xlsx from docs/ATLAS_FRAMEWORK_REVIEW.md (D-27;
+                               run in the repository, never on the node)
   README.md                    how to run, in order, and what to have ready
 ```
 
@@ -57,7 +61,8 @@ scripts/day1/
 | `/etc/atlas/secrets/restic.pass` | restic repository passphrase, printed once for off-node storage (D3) | root:root 600 |
 | `/var/lib/atlas/day1/` | state: `done/<phase>.<step>` markers, `verify.jsonl`, `logs/` | root:root 755 |
 | `/opt/atlas/day1/` | a copy of `scripts/day1/` taken by `atlas-day1.sh` on every run | root:root 755 |
-| `/opt/atlas/llama.cpp/` | llama.cpp source and build; binaries symlinked into `/usr/local/bin` | root |
+| `/opt/atlas/llama.cpp/` | llama.cpp source and build at the pin b11474; binaries symlinked into `/usr/local/bin` | root |
+| `/opt/atlas/llama-parity/{src,dist}` | the old pin v0.4.1, a git worktree of the same clone, built as `llama-perplexity` only for the Phase 3 parity test (V25, S-02); never symlinked, never a unit | root |
 | `/opt/atlas/orchestrator/` + `/opt/atlas/venv/` | the `atlas` package and its venv | atlas |
 | `/srv/atlas/{models,engines,data,workspace,sandbox,vault,staging}` | 8 TB data volume (Section 3.5). `vault/cipher` is the gocryptfs container (backed up as ciphertext), `vault/open` the plaintext view (never backed up); `staging/vault-test-cipher` (atlas:atlas 700) is the gate's throw-away test vault, excluded with all of staging | atlas:atlas |
 | `/srv/atlas/staging/inbox/` | where the Principal drops files: `voice-references/alaric.*`, `voice-references/gideon.*` (WAV, MP3 or M4A; Phase 2 step 5 normalises them to 16 kHz mono WAV under `staging/voice-references-normalised/`) and `google-oauth-client.json` | principal:atlas 2770 |
@@ -113,9 +118,9 @@ Step files never define `main`; each defines `step_<id>()` and the driver calls 
 | `require_root` | exits unless EUID 0 |
 | `load_env` | installs `config/atlas.env.example` to `/etc/atlas/atlas.env` if missing (auto-detecting what it can), then sources it; dies only on blank auto-detected keys (`LAN_IFACE`, `LAN_CIDR`, `DATA_DISK`); each blank Principal key is asked once, else recorded as a to-do (§3) |
 | `ask VAR PROMPT [secret]` | one plain question on `/dev/tty`, 300 s; no terminal or no answer leaves VAR empty and the caller records a to-do instead of stopping. `ATLAS_ASK_ANSWER` is the scripted answer (tests) |
-| `todo_add ID TITLE [DETAIL]` / `todo_done ID` / `todo_list` | the live ATLAS to-do list, `/var/lib/atlas/day1/todo.jsonl` (`ATLAS_TODO_FILE`), one JSON line per event; `todo_list` prints the open items and `atlas-day1.sh status` shows it. IDs: `input-google-accounts`, `input-family-names`, `input-android-sdk-licence`, `input-windows-share`, `input-smb-cred`, `input-google-oauth-client`, `input-hf-token`, `secure-boot`, `os-volume-encryption`, `ssh-key`, `cloudflare-token`, `cloudflare-zone-id`, `vpn-mobile-test`, `rdp-test`, `rdp-restrict`, `time-sync`, `kernel-line` (Phase 1 steps 4 and 5, doc S45: the node is not on the GA 7.0 kernel line; raised by step 4, and by step 5 again with each boot's state while the line is not GA; closed by step 4 when it finds or makes the line GA, or by step 5 on GA), `watchdog` (Phase 1 step 4, doc S50: no hardware watchdog was found, so softdog stands in, which restarts a frozen or crashed systemd but not reliably a hard lockup of the whole kernel; raised by every step 4 run that falls back to softdog, with that run's findings and the re-run command; closed by step 4 once it finds a hardware watchdog; step 5 and V24 never change it), `w-drill` (Phase 1 step 5, doc 3.7 W-DRILL: the crash and watchdog tests the live ATLAS runs once Day 1 is complete, with the Principal present and agreeing to each; raised by step 5 unless already open, so a rerun of step 5 raises it again after the live ATLAS closed it; only the live ATLAS closes it, once the results are recorded), `kv-estimates` (Phase 3 step 4, doc S52: each engine's context memory measured from its own load log beside the Arbiter's estimate for the same profile, and whether to correct the estimates in `atlas/arbiter.py`; raised by every run of step 4 with the latest figures, or with the reason they are UNKNOWN; only the Principal closes it), `cache-ram` (Phase 3 step 4, doc S52: each chat llama-server's host RAM and what its log says of the prompt cache and the context checkpoints, which sit outside the Arbiter's budget, with suggested explicit `--cache-ram` and `--ctx-checkpoints` values, INFERRED; raised and closed like `kv-estimates`), `tool-<name>` |
+| `todo_add ID TITLE [DETAIL]` / `todo_done ID` / `todo_list` | the live ATLAS to-do list, `/var/lib/atlas/day1/todo.jsonl` (`ATLAS_TODO_FILE`), one JSON line per event; `todo_list` prints the open items and `atlas-day1.sh status` shows it. IDs: `input-google-accounts`, `input-family-names`, `input-android-sdk-licence`, `input-windows-share`, `input-smb-cred`, `input-google-oauth-client`, `input-hf-token`, `secure-boot`, `os-volume-encryption`, `ssh-key`, `cloudflare-token`, `cloudflare-zone-id`, `vpn-mobile-test`, `rdp-test`, `rdp-restrict`, `time-sync`, `kernel-line` (Phase 1 steps 4 and 5, doc S45: the node is not on the GA 7.0 kernel line; raised by step 4, and by step 5 again with each boot's state while the line is not GA; closed by step 4 when it finds or makes the line GA, or by step 5 on GA), `watchdog` (Phase 1 step 4, doc S50: no hardware watchdog was found, so softdog stands in, which restarts a frozen or crashed systemd but not reliably a hard lockup of the whole kernel; raised by every step 4 run that falls back to softdog, with that run's findings and the re-run command; closed by step 4 once it finds a hardware watchdog; step 5 and V24 never change it), `w-drill` (Phase 1 step 5, doc 3.7 W-DRILL: the crash and watchdog tests the live ATLAS runs once Day 1 is complete, with the Principal present and agreeing to each; raised by step 5 unless already open, so a rerun of step 5 raises it again after the live ATLAS closed it; only the live ATLAS closes it, once the results are recorded), `kv-estimates` (Phase 3 step 4, doc S52: each engine's context memory measured from its own load log beside the Arbiter's estimate for the same profile, and whether to correct the estimates in `atlas/arbiter.py`; raised by every run of step 4 with the latest figures, or with the reason they are UNKNOWN; only the Principal closes it), `cache-ram` (Phase 3 step 4, doc S52: each chat llama-server's host RAM and what its log says of the prompt cache and the context checkpoints, which sit outside the Arbiter's budget, with suggested explicit `--cache-ram` and `--ctx-checkpoints` values, INFERRED; raised and closed like `kv-estimates`), `decode-floors` (Phase 3 step 2, v0.4.0, D-33 (c), D-47: every LLM seat whose `decode_floor_tok_s` is null, with its measured decode beside its projection; re-raised by every run of step 2 while any floor is null; only the Principal closes it, by setting the floors), `kld-run` (Phase 3 step 2c, v0.4.0, S-03, T-03: each seat's corpus perplexity and task score on the pin with its reference status; the reference-based KLD needs files Day 1 does not pull; with it the Principal fixes each seat's reasoning setting, D-30 (b); raised by every run of step 2c, only the Principal closes it), `context-targets` (D-16), `trial-task-set` (D-46), `seat-test-sets` (D-49) and `seat-profiles` (D-48, S-30, T-04: DeepSeek's one 131,072-token slot, GLM's f16 8 × 32k, the 24,000-token long-document trigger) (Phase 3 step 2, v0.4.0: the inputs an approved row leaves to the Principal, each with its built default in the detail; re-raised by every run of step 2, only the Principal closes them), `tool-<name>` |
 | `run_step PHASE STEP FUNC` | idempotency: if `/var/lib/atlas/day1/done/PHASE.STEP` exists, logs "skip" and returns 0; else runs `FUNC`, and on success creates the marker. STEP is the two-digit-plus-letter id from Section 17 (`01`, `05b`, `06c`) |
-| `record_v ID RESULT MSG` | appends `{"ts","phase","id","result","msg"}` to `verify.jsonl`. RESULT ∈ `pass fail deferred info`. IDs are `V1`..`V24`, with halves `V3a`/`V3b` and `V14a`/`V14b`, plus `V10a` (the Phase 2 resident-router half of V10; V10 itself is written only by the Phase 3 load test). Two recorded-only id families are also accepted and never gate: `T-<tool>` (Phase 2 step 6 soft installs, result deferred) and `P4-wheels` (the Phase 4 wheel-index pre-flight, result info) |
+| `record_v ID RESULT MSG` | appends `{"ts","phase","id","result","msg"}` to `verify.jsonl`. RESULT ∈ `pass fail deferred info`. IDs are `V1`..`V25` (V25 new in v0.4.0, S-02), with halves `V3a`/`V3b` and `V14a`/`V14b`, plus `V10a` (the Phase 2 resident-router half of V10; V10 itself is written only by the Phase 3 load test). Two recorded-only id families are also accepted and never gate: `T-<tool>` (Phase 2 step 6 soft installs, result deferred) and `P4-wheels` (the Phase 4 wheel-index pre-flight, result info) |
 | `run_verify ID SCRIPT [ARGS]` | runs `verify/SCRIPT`, maps exit 0/1/2/3 → pass/fail/deferred/info, records its one-line stdout as MSG |
 | `gate PHASE REQUIRED_IDS... [-- OPTIONAL_IDS...]` | prints the phase table (latest result per id) and returns 1 if any REQUIRED id is `fail` or missing; `deferred` never blocks; OPTIONAL ids are printed only |
 | `apt_install PKG...` | non-interactive, idempotent, retries 3× |
@@ -140,8 +145,8 @@ One per Section 21 item where the check is standalone: `v01-network.sh v02-tpm.s
 v05-wireguard.sh v06-pyannote.sh v07-voice-listen.sh v10a-router-resident.sh v11-rocm-selftest.sh v12-openwebui-offline.sh
 v13-restic.sh v14a-arbiter-stubs.sh v15-approval-gate.sh v16-router-hard-rule.sh v17-sandbox.sh v18-vault.sh v19-xrdp.sh
 v20-google.sh v23-cloudflare-token.sh v24-watchdog.sh`. V14a, V15 and V16 run the orchestrator's unit tests through those three scripts.
-V4, V8, V9, V10, V14b, V21, V22 are produced inside their phase (load tests, engine builds) and recorded with
-`record_v` directly (Phase 3 through loadtest.py's RECORD lines, Phase 4 by the driver). loadtest.py's `memory` subcommand (Phase 3 step 4, doc S52) alone also prints `TODO<TAB>ID<TAB>TITLE<TAB>DETAIL` lines, which the driver raises with `todo_add`; they never reach `verify.jsonl`.
+V4, V8, V9, V10, V14b, V21, V22, V25 are produced inside their phase (load tests, engine builds) and recorded with
+`record_v` directly (Phase 3 through loadtest.py's RECORD lines, Phase 4 by the driver). Three loadtest.py subcommands also print `TODO<TAB>ID<TAB>TITLE<TAB>DETAIL` lines, which the driver raises with `todo_add`: `summarize` (Phase 3 step 2, `decode-floors`, `context-targets`, `trial-task-set`, `seat-test-sets` and `seat-profiles`, v0.4.0), `quality` (step 2c, `kld-run`, v0.4.0) and `memory` (step 4, `kv-estimates` and `cache-ram`, doc S52); they never reach `verify.jsonl`.
 Contract: exit **0 pass, 1 fail, 2 deferred, 3 info**; print exactly one line of evidence on stdout;
 never prompt; never take longer than 10 minutes; safe to re-run.
 
@@ -151,7 +156,7 @@ never prompt; never take longer than 10 minutes; safe to re-run.
 |---|---|---|
 | 1 | V2, V3a, V5, V19, V24 | V1 (info). V2 is `deferred` (to-do `os-volume-encryption`) when the only gap is an unencrypted OS volume. V5/V19 are required-deferrable: a wait for the Principal's phone/PC that times out is `deferred` + to-do (`vpn-mobile-test`, `rdp-test`), a real failure is `fail`. V24 (doc S50) is `deferred` (to-do `watchdog`, raised by step 4) when step 4 found no hardware watchdog and systemd has armed the softdog fallback exactly as configured; no watchdog device at all, or one not armed by systemd with step 4's timeouts, is `fail` (step 5 has then already stopped) |
 | 2 | V3b, V6, V12, V13, V14a, V15, V16, V17, V18, V20, V23, and every service healthy | V7 (deferred if the reference recordings are absent), V10a (resident router; also fatal to step 4), V18 is `deferred` until the real vault is initialised (`ATLAS_VAULT_INIT=1`). V6 (no HF token or licence not accepted), V20 (no Google accounts or no OAuth client file) and V23 (no `CLOUDFLARE.txt`) are `deferred` + to-do while the Principal's input is missing |
-| 3 | V4 per engine, V10, V14b, V21 | V22 (a DeepSeek failure defers it, R19) |
+| 3 | V4 per engine, V10, V14b, V21, V25 (v0.4.0: V21 is single residency, S-24; V25 the output parity of the re-pin, S-02) | V22: one row per engine newer than v0.4.1's b10964 (`glm-5.3-flash` on Day 1) and one for the Apex, each failure deferred, never blocking (R19 generalised, S-26) |
 | 4 | V11 | V8, V9 (deferred on failure), per-engine pass/fail/deferred table |
 
 ## 7. Rules for the scripts
@@ -195,12 +200,27 @@ never prompt; never take longer than 10 minutes; safe to re-run.
 ## 8. Names that must agree across every file
 
 Engine keys (used in `config/engines.json`, `llama-server@<key>.service`, persona front-matter, router routes,
-the Arbiter ledger, phase 3 tables): `gpt-oss-120b`, `gpt-oss-120b-abliterated`, `nemotron-3-super`,
-`qwen3.5-122b`, `deepseek-v4-flash`, `qwen2.5-vl-72b`, `meditron-70b`; resident small models:
-`router-qwen3.5-4b`, `embed-bge-m3`, `rerank-bge-v2-m3`. KV classes: `q8_0` (nemotron-3-super, qwen3.5-122b,
-qwen2.5-vl-72b, meditron-70b), `q4_0` (gpt-oss-120b, gpt-oss-120b-abliterated, deepseek-v4-flash). Arbiter
-classes: `core`, `apex` (deepseek-v4-flash, exclusive), `vision`, `crosscheck` (meditron), `resident` (small
-models, never counted against the engine budget), `phase4`.
+the Arbiter ledger, phase 3 tables), the v0.4.0 Day 1 set in `engines.json` order (approved by the Principal on
+2026-10-16; `orchestrator/src/atlas/config.py` `ENGINE_KEYS`): LLM seats `gpt-oss-120b` (fast utility and fallback
+floor, F16-trunk GGUF), `gpt-oss-120b-abliterated` (the v0.3.5 entry, unchanged), `glm-5.3-flash` (Ren, Gideon,
+Silas, Helena, Minerva, Victor, Alaric, Eleanor's persona work, the vision engine through its glm5v mmproj, the
+long-document route), `deepseek-v4-flash` (DeepSeek-V4-Flash-0731 `UD-Q8_K_XL`: Arthur and the Apex); resident
+companions: `router-qwen3.5-4b` (classification only, P-10), `embed-qwen3-4b`, `rerank-qwen3-4b`; external (no unit,
+port 0): `chatterbox`. Retired in v0.4.0 and absent from `engines[]` and from every persona, route and preset (one that
+still names one is refused as an unknown key): `qwen3.5-122b`, `qwen2.5-vl-72b`, `meditron-70b`, `embed-bge-m3`,
+`rerank-bge-v2-m3`; `nemotron-3-super` leaves `engines[]` and is recorded as a phased `planned_key`. The phased engines are recorded in `engines.json` `phased`
+under `planned_key` only (`qwen3.8-flash-next`, `nemotron-3-super`, `intern-s1`, `ling-3.0-flash-fin`, `baichuan-m3-235b`, `qwen3-coder-next`, `embeddinggemma-2`);
+no persona, route or preset names one until it is appended to `engines[]` after index 7 at its pull. Router routes:
+`ren`, `arthur`, `arthur-long` (v0.3.5's `arthur-qwen`, now refused), `ren-abliterated`, `arthur-abliterated`,
+`deep-think:deep`. KV classes: `f16` (glm-5.3-flash, deepseek-v4-flash; D-29 (a); DeepSeek's ladder is f16 then
+q8_0, never q4_0), `q8_0` (gpt-oss-120b, router-qwen3.5-4b, embed-qwen3-4b, rerank-qwen3-4b), `q4_0`
+(gpt-oss-120b-abliterated, unchanged). Arbiter classes: `core` (gpt-oss-120b, its abliterated twin, glm-5.3-flash),
+`apex` (deepseek-v4-flash, exclusive), `resident` (the three companions, never counted against the engine budget:
+the router is in the measured GPU resident set, the CPU pair in the host resident set), `phase4`, `external`
+(chatterbox); `vision` and `crosscheck` stay valid classes with no Day 1 entry (the vision engine is glm-5.3-flash,
+`mode: vision`, class core). Placement: `gpu` (default) or `cpu`, which only a `resident` entry may take (the Qwen3
+pair, rendered `--device none`; D-14 (e)). LLM seats (mode chat or vision, never resident, external or phase4): one
+resident at a time, `ATLAS_ARBITER_MAX_RESIDENT` in `orchestrator.env`, default 1, range 1..2 (D-32 (a)).
 
 Persona keys: `ren`, `arthur`, `gideon`, `silas`, `valerie`, `helena`, `eleanor`, `alaric`, `minerva`, `victor`.
 Hemispheres: `corporate`, `estate`. Tiers: `routine`, `standard`, `sensitive`. Task-force codes as Section 8.3.
@@ -213,13 +233,17 @@ deliberate; the full profile's `Owner:` line is the verbatim 8.2 form and is the
 Memory collections (Section 10.1): `corporate`, `estate`, `scars`, `documents_corporate`, `documents_estate`, `sentinel`.
 
 Ports (host): Open WebUI `$OPENWEBUI_PORT` (3000), orchestrator `$ORCH_PORT` (8800), llama-server engines
-`$LLAMA_PORT_BASE + index` in engines.json order (8101..8110), Kokoro 8880, speaches (Whisper) 8881,
+`$LLAMA_PORT_BASE + index` in engines.json order, index 1..20 (8101..8120, S-33; the Day 1 set uses 8101..8107:
+gpt-oss-120b 8101, gpt-oss-120b-abliterated 8102, glm-5.3-flash 8103, deepseek-v4-flash 8104, router-qwen3.5-4b
+8105, embed-qwen3-4b 8106, rerank-qwen3-4b 8107; a phased engine is appended, so no Day 1 port moves; v0.3.5's
+router, embedder and reranker ports were 8108..8110), Kokoro 8880, speaches (Whisper) 8881,
 ChromaDB 8000, Redis 6379 (loopback only), ntfy 8090, Cockpit 9090, xrdp 3389, WG-Easy admin 51821, squid 3128
 (loopback only). Everything except WireGuard UDP 51820 binds to loopback, LAN and WireGuard addresses only.
 
 Control path: the orchestrator runs as `atlas` and starts/stops engines with `sudo systemctl {start,stop,restart}
-llama-server@<key>`; the sudoers fragment `/etc/sudoers.d/atlas-engines` allows exactly those commands and
-nothing else on the engine side. The vault button needs a second, equally narrow root path: `/etc/sudoers.d/atlas-vault`
+llama-server@<key>`; the sudoers fragment `/etc/sudoers.d/atlas-engines` allows exactly those commands, for the keys
+of `config/engines.json`, and nothing else on the engine side (the CPU pair's MainPID is read with
+`systemctl show -p MainPID --value llama-server@<key>`, which needs no sudo). The vault button needs a second, equally narrow root path: `/etc/sudoers.d/atlas-vault`
 allows exactly `atlas-vault open|lock|status` (passphrase on stdin, never an argument). No other NOPASSWD grant exists;
 `phase2/07-restic.sh` proves that no fragment lets `atlas` touch `atlas-aegis.service`.
 

@@ -136,7 +136,8 @@
 #   * hf_tree_lfs / engine_tree_lfs / pull_engine_files below are the reference implementation of the
 #     manifest-at-pull-time rule; the Phase 3 driver extracts them (it never runs step_04) and calls
 #     pull_engine_files <key> for the LLM seats (it handles enumerate_pattern, join_into, a root-level file of a subdir
-#     entry such as glm-5.3-flash's mmproj-F16.gguf, and the research-snippet hash comparison).
+#     entry such as glm-5.3-flash's mmproj-F16.gguf, and the research-snippet hash comparison: a verify=research-snippet
+#     hash that the tree API contradicts stops the pull before any byte moves, for the Phase 2 companions too).
 
 ATLAS_RESIDENT_KEYS=(router-qwen3.5-4b embed-qwen3-4b rerank-qwen3-4b)
 MEM_EMBED_MODEL="embed-qwen3-4b"                     # S-41 / D-45 (a): EMBEDDING_MODEL, the llama-server alias
@@ -314,7 +315,8 @@ pull_engine_files() {
   [[ -n "$tree" ]] || die "pull_engine_files: $repo${subdir:+/$subdir} lists no files"
   mapfile -t tree_lines <<<"$tree"
 
-  # wanted: "path<TAB>research_sha256|-" — literal names from files[] (basename matched against the tree) or the pattern.
+  # wanted: "path<TAB>research_sha256|-<TAB>verify|-" — literal names from files[] (basename matched against the tree)
+  # or the pattern (no pinned hash).
   local wanted=() line
   if [[ -n "$pattern" ]]; then
     mapfile -t wanted < <(python3 - "$pattern" "${tree_lines[@]}" <<'PY'
@@ -323,28 +325,29 @@ pat = sys.argv[1].lower()
 for line in sys.argv[2:]:
     path = line.split("\t")[0]
     if fnmatch.fnmatch(path.rsplit("/", 1)[-1].lower(), pat):
-        print(f"{path}\t-")
+        print(f"{path}\t-\t-")
 PY
 )
     (( ${#wanted[@]} > 0 )) || die "pull_engine_files: no file in $repo${subdir:+/$subdir} matches enumerate_pattern '$pattern'; tree: $(printf '%s ' "${tree_lines[@]%%$'\t'*}")"
   else
-    local f name sha
+    local f name sha verify
     while IFS= read -r f; do
       [[ -n "$f" ]] || continue
       name="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["name"])' "$f")"
       sha="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("sha256") or "-")' "$f")"
+      verify="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("verify") or "-")' "$f")"
       local base="${name##*/}" found=""
       for line in "${tree_lines[@]}"; do
         [[ "${line%%$'\t'*}" == "$name" || "${line%%$'\t'*}" == "${subdir:+$subdir/}$base" || "${line%%$'\t'*}" == "$base" ]] && { found="${line%%$'\t'*}"; break; }
       done
       [[ -n "$found" ]] || die "pull_engine_files: $repo has no file '$name' (research name is wrong or the repo changed); tree: $(printf '%s ' "${tree_lines[@]%%$'\t'*}")"
-      wanted+=("$found"$'\t'"$sha")
+      wanted+=("$found"$'\t'"$sha"$'\t'"$verify")
     done < <(ej "$key" files)
   fi
 
-  local manifest_entries=() w path research_sha bytes oid dest base have_size
+  local manifest_entries=() w path research_sha research_verify bytes oid dest base have_size
   for w in "${wanted[@]}"; do
-    path="${w%%$'\t'*}"; research_sha="${w#*$'\t'}"
+    IFS=$'\t' read -r path research_sha research_verify <<<"$w"
     bytes=""; oid=""
     for line in "${tree_lines[@]}"; do
       if [[ "${line%%$'\t'*}" == "$path" ]]; then
@@ -356,8 +359,14 @@ PY
     if [[ "$oid" == none ]]; then
       warn "pull_engine_files: $repo/$path has no lfs.oid (not an LFS object); hf_download will record its computed hash (UNVERIFIED)"
     fi
-    if [[ "$research_sha" != "-" && "$oid" != none && "${research_sha,,}" != "$oid" ]]; then
-      warn "pull_engine_files: research snippet sha256 for $path ($research_sha) differs from the tree API ($oid); using the tree value (gguf-models.md §0: snippets were UNVERIFIED)"
+    if [[ "$research_sha" != "-" && "$oid" != none && "${research_sha,,}" != "${oid,,}" ]]; then
+      # engines.json files_rule (v0.4.0): a verify=research-snippet hash is the pin (the tree API's lfs.oid of
+      # 2026-10-16, which the Arbiter's files[].bytes budget rests on, D-31); a mismatch stops the pull before any byte
+      # moves, as phase3-models.sh's pre-check does for the LLM seats. Only a verify=unverified hash is advisory.
+      if [[ "$research_verify" == research-snippet ]]; then
+        die "pull_engine_files: $key: sha256 of $path pinned in engines.json ($research_sha) differs from the Hugging Face tree API ($oid); verify on https://huggingface.co/$repo/blob/main/$path and correct engines.json before pulling"
+      fi
+      warn "pull_engine_files: unverified sha256 for $path ($research_sha) differs from the tree API ($oid); using the tree value (engines.json files_rule: verify=unverified)"
     fi
     base="${path##*/}"
     dest="$dest_dir/$base"

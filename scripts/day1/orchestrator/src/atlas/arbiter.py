@@ -33,20 +33,23 @@ by that much; V3a fails while any of it is set aside. The GPU resident set is wh
 engine is loaded, measured by `measure_resident_set()` at startup and again whenever nothing is resident: GPU buffer
 objects, i.e. the router (v0.4.0: the only companion left on the iGPU) and whatever else sits there. The host resident
 set (D-14 option (e), approved 2026-10-16) is the always-resident companions with placement "cpu", the Qwen3 4B
-retrieval pair: their memory is host RAM the GTT counter never shows, so each is charged its measured VmRSS (the unit's
-MainPID, when the controller can name it), never below the bytes of its weights (they are file-backed pages the kernel
-may drop and re-read, so they are budgeted in full), else its projection (weights + KV + compute buffers at its
-engines.json profile); it is re-measured with the GPU set. Ordinary CPU memory (Ubuntu, XFCE, Docker, Open WebUI,
+retrieval pair: their memory is host RAM the GTT counter never shows, so each is charged the bytes of its weights in
+full (file-backed pages the kernel may drop and re-read, so VmRSS can show less than the file) plus its anonymous memory
+(RssAnon + RssShmem of the unit's MainPID, when the controller can name it: the KV cache and compute buffers, which are
+never reclaimable), never below its projection (weights + KV + compute buffers at its engines.json profile), which
+stands in when the unit cannot be measured (`measure_host_companions`); it is re-measured with the GPU set, the pids
+and /proc reads outside the state lock. Ordinary CPU memory (Ubuntu, XFCE, Docker, Open WebUI,
 ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but appears on neither counter
 (only memory a process hands the GPU through userptr or a dma-buf import shows on the GTT one), so `headroom_bytes`
 reserves it (v0.3.5, S44: Settings.arbiter_headroom_bytes, default config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set
 by build_arbiter; the constructor's 0 is for the stub tests only).
 Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - (GPUActive + GPUReclaim where
 the kernel reports them, else gtt_used) is the CPU-side use at that moment (`host_used_bytes()`, which `atlas-admin
-arbiter status` prints too), shown in status() as host_used_bytes and logged at WARNING when, less the host resident
-set the budget already charges, it exceeds the headroom (the reserve is then too small for this node: raise
-ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from, so a transient CPU job cannot shrink the budget
-between two identical requests.
+arbiter status` prints too), shown in status() as host_used_bytes and logged at WARNING when, less the CPU companions'
+anonymous share of the host resident set (their clean file pages count as available, so only the anonymous share is
+inside that figure; `host_unreserved_bytes`, one rule for both), it exceeds the headroom (the reserve is then too small
+for this node: raise ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from, so a transient CPU job cannot
+shrink the budget between two identical requests.
 
 Phase 4 engines (Section 15.2, CONVENTIONS.md §8 class `phase4`). build_arbiter() merges config/phase4-engines.json into
 the Arbiter's engine map so Phase 4 step 5 (POST /arbiter/register) records each container engine's measured footprint
@@ -130,10 +133,10 @@ APEX_KEY = "deepseek-v4-flash"  # CONVENTIONS.md §8 arbiter class `apex`: DeepS
 # --- KV-cache size model (Section 4.3; S-17, v0.4.0) -----------------------------------------------------------------
 #
 # Bytes of K+V per token of the TOTAL pool at f16, read from the GGUF headers and the cache code of the pinned
-# llama.cpp (b11474 = b9acf138; v040 engine_data.md, 2026-10-16, VERIFIED against src/llama-model.cpp create_memory,
-# llama-kv-cache.cpp, llama-memory-hybrid-idx.cpp, llama-kv-cache-dsv4.cpp). The projection is an OOM backstop (4.3
-# "Hard pre-flight"), replaced by the measured footprint once an engine has been loaded (rule 1), and Phase 3 step 4's
-# kv-estimates to-do sets it beside each engine's own load log.
+# llama.cpp (b11474 = b9acf138; research_notes/ATLAS v0.4.0 build record/engine_data.md, 2026-10-16, VERIFIED against
+# src/llama-model.cpp create_memory, llama-kv-cache.cpp, llama-memory-hybrid-idx.cpp, llama-kv-cache-dsv4.cpp). The
+# projection is an OOM backstop (4.3 "Hard pre-flight"), replaced by the measured footprint once an engine has been
+# loaded (rule 1), and Phase 3 step 4's kv-estimates to-do sets it beside each engine's own load log.
 #   glm-5.3-flash: hybrid_idx; 11 DSA layers keep a K-only MLA cache (512) plus an indexer cache (384) per token:
 #       11 x 896 x 2 B = 19,712 B/token f16 (10,472 at q8_0); the NextN layer is outside the main context.
 #   deepseek-v4-flash: dsv4; 21 CSA layers (compressed K 512/4 + indexer K 128/4 per token) and 20 HCA layers (512/128):
@@ -155,12 +158,13 @@ KV_BYTES_PER_TOKEN_F16: dict[str, int] = {
     "rerank-qwen3-4b": 147_456,
 }
 # Context memory that does not grow with the context, charged once per slot (llama.cpp sizes it by n_seq_max =
-# --parallel), at f16 for the K parts and f32 for the recurrent and compressor states (engine_data.md, VERIFIED code
-# paths, sizes INFERRED by arithmetic): GLM's 34 KDA recurrent layers (152,633,344 B per sequence); DeepSeek's raw
-# sliding-window K (43 layers x 512 x 2 B x 768 cells at -ub 512: 33,816,576 B) plus its compressor states (12,206,080
-# B); gpt-oss's 18 sliding-window layers (18 x 1024 x 2 B x 2,304 cells at -ub 2048: 84,934,656 B). The window parts
-# grow with -ub (cells = GGML_PAD(window + n_ubatch, 256)); the figures are the Day 1 defaults, an estimate that the
-# Phase 3 memory record checks against the load log. engines.json kv_state_bytes_per_sequence overrides a key.
+# --parallel), at f16 for the K parts and f32 for the recurrent and compressor states (build record engine_data.md,
+# VERIFIED code paths, sizes INFERRED by arithmetic): GLM's 34 KDA recurrent layers (152,633,344 B per sequence);
+# DeepSeek's raw sliding-window K (43 layers x 512 x 2 B x 768 cells at -ub 512: 33,816,576 B) plus its compressor
+# states (12,206,080 B); gpt-oss's 18 sliding-window layers (18 x 1024 x 2 B x 2,304 cells at -ub 2048: 84,934,656 B).
+# The window parts grow with -ub (cells = GGML_PAD(window + n_ubatch, 256)); the figures are the Day 1 defaults, an
+# estimate that the Phase 3 memory record checks against the load log. engines.json kv_state_bytes_per_sequence
+# overrides a key.
 KV_STATE_BYTES_PER_SEQUENCE: dict[str, int] = {
     "glm-5.3-flash": 152_633_344,
     "deepseek-v4-flash": 33_816_576 + 12_206_080,
@@ -243,6 +247,33 @@ def process_rss_bytes(pid: int, proc_root: Path = Path("/proc")) -> int | None:
             if len(parts) >= 2 and parts[1].isdigit():
                 return int(parts[1]) * 1024
     return 0
+
+
+def process_anon_bytes(pid: int, proc_root: Path = Path("/proc")) -> int | None:
+    """RssAnon + RssShmem of a live process in bytes (/proc/<pid>/status, kB there; the fields phase3/loadtest.py's
+    read_proc_status records): the memory the kernel cannot drop and re-read from a file. For a CPU-placed companion
+    that is its KV cache and compute buffers; its Q8_0 weights stay file-backed (mmap). None once /proc/<pid> is gone
+    or when the kernel reports neither field."""
+    try:
+        text = (proc_root / str(int(pid)) / "status").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    total, found = 0, False
+    for line in text.splitlines():
+        name, _, value = line.partition(":")
+        if name in ("RssAnon", "RssShmem"):
+            parts = value.split()
+            if parts and parts[0].isdigit():
+                total += int(parts[0]) * 1024
+                found = True
+    return total if found else None
+
+
+def host_unreserved_bytes(host_used: int, host_resident: dict[str, dict[str, Any]]) -> int:
+    """The CPU-side use the headroom must cover (S44): `host_used_bytes` less the CPU companions' anonymous share
+    (`anon_bytes` of measure_host_companions). Their weights are clean file pages, which the kernel counts as available,
+    so they were never inside host_used. One rule for the Arbiter (`_observe_host`) and `atlas-admin arbiter status`."""
+    return host_used - sum(max(0, int(d.get("anon_bytes", 0))) for d in host_resident.values())
 
 
 class SysfsMemoryProbe:
@@ -491,6 +522,56 @@ def compute_buffer_bytes(spec: EngineSpec) -> int:
     return int(DEFAULT_COMPANION_COMPUTE_BUFFER_GIB * GIB)
 
 
+def companion_projection(spec: EngineSpec) -> Footprint:
+    """A CPU-placed companion at its engines.json profile: weights (exact bytes, D-31) + KV + per-slot state +
+    compute buffers (D-14 (e), S-17): what the host resident set charges while the unit cannot be measured."""
+    kv = kv_estimate_bytes(spec, spec.ctx_size, spec.parallel) + kv_state_bytes(spec, spec.parallel)
+    return Footprint(spec.footprint_bytes, kv, spec.ctx_size, spec.parallel, spec.kv_class,
+                     compute_bytes=compute_buffer_bytes(spec))
+
+
+def measure_host_companions(engines: dict[str, EngineSpec], *, pid_of: Callable[[str], int | None] | None,
+                            anon_of: Callable[[int], int | None] = process_anon_bytes,
+                            rss_of: Callable[[int], int | None] = process_rss_bytes) -> dict[str, dict[str, Any]]:
+    """The host resident set of the always-resident companions with placement "cpu" (D-14 (e)), per companion:
+    `charged_bytes`, `projected_bytes`, `anon_bytes` (charged less the weights: the share that is anonymous memory)
+    and `source`. The weights are file-backed (mmap on the CPU backend), so VmRSS falls below weights + anonymous
+    memory once the kernel reclaims some of their pages (a 146-151 GiB seat load streams through the page cache):
+    they are charged in full by bytes, and the anonymous memory as measured (RssAnon + RssShmem of the unit's MainPID),
+    never below its projection (KV + compute). Without those fields the VmRSS stands in, never below the projection;
+    without a pid, the projection. It does I/O (`pid_of` is SystemdEngineController.main_pid, a systemctl subprocess),
+    so the Arbiter calls it outside its state lock; `atlas-admin arbiter status` calls it too."""
+    detail: dict[str, dict[str, Any]] = {}
+    for spec in engines.values():
+        if not (spec.is_resident and spec.placement == "cpu"):
+            continue
+        weights = spec.footprint_bytes
+        projection = companion_projection(spec).total_bytes
+        projected_anon = projection - weights
+        pid: int | None = None
+        if pid_of is not None:
+            try:
+                pid = pid_of(spec.key)
+            except Exception as exc:  # a status read must never stop a measurement; the projection stands in
+                log.warning("arbiter: MainPID of %s unreadable (%s); charging its projection", spec.key, exc)
+        anon = anon_of(pid) if pid else None
+        rss = rss_of(pid) if pid and anon is None else None
+        if anon is not None:
+            charged = weights + max(anon, projected_anon)
+            source = (f"weights {weights / GIB:.2f} GiB (file-backed, budgeted in full) + measured RssAnon+RssShmem "
+                      f"{anon / GIB:.2f} GiB of pid {pid}, never below its projected KV + compute "
+                      f"{projected_anon / GIB:.2f} GiB")
+        elif rss is not None:
+            charged = max(rss, projection)
+            source = (f"measured VmRSS {rss / GIB:.2f} GiB of pid {pid} (no RssAnon), never below its projection "
+                      f"{projection / GIB:.2f} GiB")
+        else:
+            charged, source = projection, "projected (weights + KV + compute; unit not running or pid unknown)"
+        detail[spec.key] = {"charged_bytes": charged, "projected_bytes": projection,
+                            "anon_bytes": charged - weights, "source": source}
+    return detail
+
+
 class Arbiter:
     def __init__(self, engines: dict[str, EngineSpec], controller: EngineController, probe: MemoryProbe, *,
                  ledger: Ledger | None = None, release_timeout_s: float = 60.0,
@@ -500,7 +581,8 @@ class Arbiter:
                  engines_env_dir: Path | None = None, max_resident: int = MAX_RESIDENT,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
                  rss_of: Callable[[int], int | None] = process_rss_bytes,
-                 pid_of: Callable[[str], int | None] | None = None) -> None:
+                 pid_of: Callable[[str], int | None] | None = None,
+                 anon_of: Callable[[int], int | None] = process_anon_bytes) -> None:
         if max_resident < 1:
             raise ArbiterError(f"max_resident {max_resident} must be >= 1 LLM seat (Section 4.2 rule 3, D-32)")
         self.engines = engines
@@ -508,9 +590,10 @@ class Arbiter:
         self.probe = probe
         self.max_resident = max_resident  # rule 3: LLM seats resident at once (D-32; build_arbiter reads the setting)
         self._rss_of = rss_of  # /proc/<pid> VmRSS: the release counter of a class-external process (rule 5)
-        # The MainPID of a companion's unit (SystemdEngineController.main_pid): its VmRSS is the measured host resident
-        # set of a CPU-placed companion (D-14 (e)); None (the stub tests) charges the projection.
+        # The MainPID of a companion's unit (SystemdEngineController.main_pid): its RssAnon + RssShmem (anon_of) is the
+        # measured anonymous share of a CPU-placed companion (D-14 (e)); None (the stub tests) charges the projection.
         self._pid_of = pid_of
+        self._anon_of = anon_of
         self.ledger = ledger
         self.release_timeout_s = release_timeout_s  # research §6.3: time-box 60 s
         self.release_tolerance_bytes = release_tolerance_bytes  # research §6.3: within ~1 GiB of the baseline
@@ -554,12 +637,22 @@ class Arbiter:
 
     def measure_resident_set(self) -> int:
         """Record what the GTT counter shows before any engine loads: the always-resident GPU set (Section 4.1 table),
-        and beside it the host resident set of the CPU-placed companions (D-14 (e); module docstring "Budget")."""
+        and beside it the host resident set of the CPU-placed companions (D-14 (e); module docstring "Budget").
+
+        The companions' pids and /proc figures are read OUTSIDE the state lock (module docstring: the lock is never
+        held across controller I/O; main_pid is a systemctl subprocess with a 30 s timeout, once per companion), then
+        committed under it after re-checking that nothing became resident meanwhile."""
         with self._cv:
             if self.resident:
                 raise ArbiterError("measure_resident_set() must run before any engine is resident")
+        companions = measure_host_companions(self.engines, pid_of=self._pid_of, anon_of=self._anon_of,
+                                             rss_of=self._rss_of)
+        with self._cv:
+            if self.resident:
+                raise ArbiterError("measure_resident_set(): an engine became resident while the companions were read")
             self._resident_set_bytes = self.probe.gtt_used_bytes()
-            self._measure_host_resident()
+            self._host_resident = companions
+            self._host_resident_bytes = sum(d["charged_bytes"] for d in companions.values())
             self._observe_host()
             host = "n/a" if self._host_used_bytes is None else f"{self._host_used_bytes / GIB:.2f}"
             log.info("arbiter resident_set_gib=%.2f host_resident_set_gib=%.2f gtt_total_gib=%.2f pool_gib=%.2f "
@@ -570,39 +663,8 @@ class Arbiter:
             return self._resident_set_bytes
 
     def companion_projection(self, key: str) -> Footprint:
-        """A CPU-placed companion at its engines.json profile: weights (exact bytes, D-31) + KV + per-slot state +
-        compute buffers (D-14 (e), S-17): what the host resident set charges while the unit cannot be measured."""
-        spec = self.spec(key)
-        kv = kv_estimate_bytes(spec, spec.ctx_size, spec.parallel) + kv_state_bytes(spec, spec.parallel)
-        return Footprint(spec.footprint_bytes, kv, spec.ctx_size, spec.parallel, spec.kv_class,
-                         compute_bytes=compute_buffer_bytes(spec))
-
-    def _measure_host_resident(self) -> None:
-        """Under the lock: charge every always-resident companion with placement "cpu" its measured VmRSS (the unit's
-        MainPID through pid_of), never below its weights' bytes, else its projection."""
-        total, detail = 0, {}
-        for spec in self.engines.values():
-            if not (spec.is_resident and spec.placement == "cpu"):
-                continue
-            projection = self.companion_projection(spec.key).total_bytes
-            pid: int | None = None
-            if self._pid_of is not None:
-                try:
-                    pid = self._pid_of(spec.key)
-                except Exception as exc:  # a status read must never stop a measurement; the projection stands in
-                    log.warning("arbiter: MainPID of %s unreadable (%s); charging its projection", spec.key, exc)
-            rss = self._rss_of(pid) if pid else None
-            if rss is not None:
-                # The weights are file-backed (mmap on the CPU backend): the kernel may drop and re-read them, so the
-                # RSS can show less than the file; they are budgeted in full (answers.md 2.1, measure 11).
-                charged = max(rss, spec.footprint_bytes)
-                source = (f"measured VmRSS {rss / GIB:.2f} GiB of pid {pid}, never below its weights "
-                          f"{spec.footprint_bytes / GIB:.2f} GiB")
-            else:
-                charged, source = projection, "projected (weights + KV + compute; unit not running or pid unknown)"
-            total += charged
-            detail[spec.key] = {"charged_bytes": charged, "projected_bytes": projection, "source": source}
-        self._host_resident_bytes, self._host_resident = total, detail
+        """A CPU-placed companion at its engines.json profile (module-level companion_projection)."""
+        return companion_projection(self.spec(key))
 
     def _observe_host(self) -> None:
         """Records MemTotal (it caps the pool) and the CPU-side use beside the GPU's pages: TTM pages backing GTT
@@ -616,15 +678,18 @@ class Arbiter:
         # GPUActive + GPUReclaim when the kernel reports them; else the GTT counter, which measure_resident_set() has
         # just read into the resident set (nothing is resident then).
         self._host_used_bytes = host_used_bytes(mem_total, mem_available, gpu_pages, self._resident_set_bytes or 0)
-        # The CPU-placed companions are inside that figure but already charged as the host resident set (D-14 (e)).
-        unreserved = self._host_used_bytes - self._host_resident_bytes
+        # The CPU-placed companions' anonymous memory is inside that figure but already charged as the host resident
+        # set (D-14 (e)); their weights are clean file pages the kernel counts as available, so only the anonymous
+        # share is taken out (host_unreserved_bytes, the rule atlas-admin arbiter status applies too).
+        unreserved = host_unreserved_bytes(self._host_used_bytes, self._host_resident)
+        anon = self._host_used_bytes - unreserved
         over = unreserved > self.headroom_bytes
         if over and not self._host_over:
-            log.warning("arbiter: CPU-side memory in use is %.2f GiB (%.2f GiB beside the %.2f GiB host resident set), "
-                        "above the %.2f GiB headroom the budget reserves for it (Section 4.1); engines may be granted "
-                        "memory the host needs. Raise ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env and restart "
-                        "atlas-orchestrator", self._host_used_bytes / GIB, unreserved / GIB,
-                        self._host_resident_bytes / GIB, self.headroom_bytes / GIB)
+            log.warning("arbiter: CPU-side memory in use is %.2f GiB (%.2f GiB beside the CPU companions' %.2f GiB of "
+                        "anonymous memory in the host resident set), above the %.2f GiB headroom the budget reserves "
+                        "for it (Section 4.1); engines may be granted memory the host needs. Raise "
+                        "ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env and restart atlas-orchestrator",
+                        self._host_used_bytes / GIB, unreserved / GIB, anon / GIB, self.headroom_bytes / GIB)
         self._host_over = over
 
     @property
