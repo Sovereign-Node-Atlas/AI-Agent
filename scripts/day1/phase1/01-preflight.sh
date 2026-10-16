@@ -103,12 +103,13 @@ step_01() {
     || die "pre-flight: /etc/systemd/tpm2-pcr-public-key.pem exists; systemd-cryptenroll would also bind to a PCR 11 signature that GRUB boots cannot satisfy. Remove it (it belongs to UKI/systemd-boot setups) and re-run."
   # --- Secure Boot vs the PCR 7 binding. S9 fixes the TPM2 enrolment to PCR 7. With Secure Boot off, PCR 7 measures
   # only the SecureBoot=0/PK/KEK/db/dbx variables and no image-authority event, so the TPM would unseal both volumes'
-  # keys to anyone who boots their own OS on the node. D15 (2026-10-05) closes it: the Principal enables Secure Boot
-  # in the BIOS (a precondition in README §1); until then the state is a warning, a note in every V2 row and a to-do.
+  # keys to anyone who boots their own OS on the node. D15 (2026-10-05) closes it: Secure Boot is required, and the
+  # Principal confirmed it enabled in the BIOS on 2026-10-13 (README §1 precondition); this check verifies that on
+  # Day 1. Only when it is found off: a warning, a note in every V2 row and a to-do (register B-28, B-29).
   local sb; sb="$(phase1_secure_boot_state)"
-  log "secure boot: $sb (D15: to be enabled in the BIOS; step 2 binds the TPM2 tokens to PCR 7, S9)"
+  log "secure boot: $sb (D15: Secure Boot required, enabled by the Principal 2026-10-13; step 2 binds the TPM2 tokens to PCR 7, S9)"
   if [[ "$sb" != enabled ]]; then
-    # D15 (decided 2026-10-05): the Principal enables Secure Boot in the BIOS. Until then the PCR 7 binding of step 2
+    # D15 (decided 2026-10-05; enabled by the Principal 2026-10-13): found off on this boot, the PCR 7 binding of step 2
     # does not tie the TPM unlock to this OS image (any OS booted on this hardware could unseal). Policy v0.3.3: this is
     # a to-do, never a stop; V2 records the Secure Boot state in its message.
     warn "pre-flight: Secure Boot is $sb. Enable it in the BIOS (D15); until then the TPM binding protects against disk removal only, not theft of the whole node. Enrolment proceeds."

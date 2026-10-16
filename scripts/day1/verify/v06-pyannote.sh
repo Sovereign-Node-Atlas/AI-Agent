@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# verify/v06-pyannote.sh — V6: PyAnnote 3.1 gated model accepted and loading (Sections 14.1, 21; Phase 2 step 5).
+# verify/v06-pyannote.sh — V6: the PyAnnote gated diarisation pipeline accepted and loading (Sections 14.1, 21; Phase 2
+# step 5). Since v0.4.0 the pipeline is pyannote/speaker-diarization-community-1 (register C-06, approved by the
+# Principal 2026-10-16: switched from 3.1 now, on the same pyannote.audio 4.0.7 install).
 # Contract (CONVENTIONS.md §5): exit 0 pass / 1 fail / 2 deferred / 3 info; exactly one line on stdout; never prompts;
-# safe to re-run; well under 10 minutes (two ~30 MB model files, a 10-second CPU diarisation, twice).
+# safe to re-run; well under 10 minutes (about 33 MB of model files, a 10-second CPU diarisation, twice).
 #
-#   1. The HF token (secrets/hf-token.env) must get HTTP 200 on a file HEAD of BOTH gated repos the 3.1 pipeline
-#      needs (voice-stt.md §5.2): pyannote/speaker-diarization-3.1 (config.yaml) and pyannote/segmentation-3.0
-#      (pytorch_model.bin). 401/403 = licence not accepted -> the two URLs the Principal must visit; exit 2 (deferred,
-#      policy v0.3.3: a Principal input never fails a gate). No token at all -> exit 2 as well.
+#   1. The HF token (secrets/hf-token.env) must get HTTP 200 on a file HEAD of the one gated repo community-1 needs: it
+#      is self-contained (config.yaml plus segmentation/, embedding/ and plda/; HF tree API read 2026-10-16, CC-BY-4.0,
+#      gated with an auto-approved form), so config.yaml and segmentation/pytorch_model.bin are both checked there.
+#      401/403 = licence not accepted -> the URL the Principal must visit; exit 2 (deferred, policy v0.3.3: a Principal
+#      input never fails a gate). No token at all -> exit 2 as well.
 #      The bearer header is read by curl from a mode-600 file (-H @file), never placed on argv where /proc/<pid>/cmdline
 #      shows it to every local account (fix round). The token file is PARSED (awk), never sourced: CONVENTIONS §2 makes
 #      it atlas:atlas, and this script runs as root (fix round 2: no root execution of an atlas-writable file).
@@ -14,27 +17,25 @@
 #      into HF_HOME) and once with HF_HUB_OFFLINE=1 (proves the cache loads without network, Section 12.5). Both runs
 #      execute as the atlas service account (runuser) when this script runs as root, so the HF cache entries and lock
 #      files are owned by the account that uses them at run time (CONVENTIONS.md §2: /srv/atlas is atlas:atlas).
-#   3. Section 21 defines V6 as "PyAnnote 3.1 ... loading" and Section 14.1 fixes 3.1. The pin is pyannote.audio 4.0.7
-#      (voice-stt.md §5.1 VERIFIED: the release current in 2026, the only line receiving fixes; the research names no 3.x
-#      release and calls 3.1 the "legacy" pipeline under 4.x, UNVERIFIED whether 4.0.7 loads it, §6 conflict 1). V6
-#      PASSES ONLY WHEN 3.1 LOADS (fix round 6 restores the round-4 verdict; CONVENTIONS.md line 4: the document wins over
-#      the research, and no Section 23 row amends 14.1/21). When the installed pyannote.audio REFUSES the 3.1 id (exit 3
-#      below: a load error, not a run error and not a licence refusal) V6 is a FAIL whose message carries a DIAGNOSTIC:
-#      whether the research's 4.x fallback (pyannote/speaker-diarization-community-1, gated too) loads under the same
-#      install, so the Principal can decide between pinning a 3.1-loading release and amending 14.1/21 (a Section 23 row)
-#      to name the community pipeline, after which phase2/05-voice.sh may switch PYANNOTE_PIPELINE; the scripts never
-#      switch it themselves (Section 16.3 item 6). Neither loads -> FAIL too (never deferred; CONVENTIONS.md §7.4);
-#      3.1's licence not accepted -> FAIL naming the URLs (Section 14.1 fixes 3.1, the fallback is not a way around it).
-# Usage: v06-pyannote.sh [VENV=/opt/atlas/venv-pyannote] [HF_HOME=/srv/atlas/engines/hf] [PIPELINE=pyannote/speaker-diarization-3.1]
-#                        [FALLBACK=pyannote/speaker-diarization-community-1   (diagnostic only, header item 3)]
+#   3. Section 21 defines V6 as the PyAnnote pipeline "accepted and loading" and Section 14.1 (v0.4.0, C-06) fixes
+#      community-1, the pipeline of pyannote.audio 4.x itself (the pin 4.0.7, voice-stt.md §5.1 VERIFIED: the release
+#      current in 2026, the only line receiving fixes). V6 PASSES ONLY WHEN community-1 LOADS. When the installed
+#      pyannote.audio REFUSES that id (exit 3 below: a load error, not a run error and not a licence refusal) V6 is a
+#      FAIL whose message carries a DIAGNOSTIC: whether the previous pipeline (pyannote/speaker-diarization-3.1, gated
+#      too, with segmentation-3.0) loads under the same install, so the Principal can decide between pinning another
+#      pyannote.audio and amending 14.1/21 back; the scripts never switch PYANNOTE_PIPELINE themselves (Section 16.3
+#      item 6). Neither loads -> FAIL too (never deferred; CONVENTIONS.md §7.4).
+# Usage: v06-pyannote.sh [VENV=/opt/atlas/venv-pyannote] [HF_HOME=/srv/atlas/engines/hf]
+#                        [PIPELINE=pyannote/speaker-diarization-community-1]
+#                        [FALLBACK=pyannote/speaker-diarization-3.1   (diagnostic only, header item 3)]
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
 source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
 venv="${1:-$ATLAS_OPT/venv-pyannote}"
 hf_home="${2:-$ATLAS_SRV/engines/hf}"
-pipeline="${3:-pyannote/speaker-diarization-3.1}"
-fallback="${4:-pyannote/speaker-diarization-community-1}"
+pipeline="${3:-pyannote/speaker-diarization-community-1}"
+fallback="${4:-pyannote/speaker-diarization-3.1}"
 tokf="$ATLAS_ETC/secrets/hf-token.env"
 entry="${ATLAS_ENTRY:-./atlas-day1.sh}"
 
@@ -71,19 +72,20 @@ head_code() {
   rm -f "$hdr"
   printf '%s%s\n' "$code" "${err:+/$err}"
 }
-r31="$(head_code "$base/pyannote/speaker-diarization-3.1/resolve/main/config.yaml")"
-rseg="$(head_code "$base/pyannote/segmentation-3.0/resolve/main/pytorch_model.bin")"
+# Both files are in the ONE repo of the pipeline under test (header item 1): one licence acceptance covers them.
+rcfg="$(head_code "$base/$pipeline/resolve/main/config.yaml")"
+rseg="$(head_code "$base/$pipeline/resolve/main/segmentation/pytorch_model.bin")"
 blocked=()
-[[ "$r31" == 200* ]] || blocked+=("https://huggingface.co/pyannote/speaker-diarization-3.1 (HTTP $r31)")
-[[ "$rseg" == 200* ]] || blocked+=("https://huggingface.co/pyannote/segmentation-3.0 (HTTP $rseg)")
+[[ "$rcfg" == 200* ]] || blocked+=("https://huggingface.co/$pipeline config.yaml (HTTP $rcfg)")
+[[ "$rseg" == 200* ]] || blocked+=("https://huggingface.co/$pipeline segmentation/pytorch_model.bin (HTTP $rseg)")
 if (( ${#blocked[@]} > 0 )); then
-  case "$r31$rseg" in
-    *401*|*403*) echo "V6 deferred: PyAnnote licence not accepted yet for ${blocked[*]} (to-do: visit each URL with the account that owns HF_TOKEN in $tokf, click 'Agree and access repository', then re-run: sudo $entry phase2 --force 05)"; exit 2 ;;
+  case "$rcfg$rseg" in
+    *401*|*403*) echo "V6 deferred: PyAnnote licence not accepted yet for ${blocked[*]} (to-do: visit https://huggingface.co/$pipeline with the account that owns HF_TOKEN in $tokf, accept its conditions, then re-run: sudo $entry phase2 --force 05)"; exit 2 ;;
     *) echo "V6 fail: huggingface.co unreachable or the token is invalid: ${blocked[*]} (proxy up? huggingface.co and .hf.co allowlisted?)"; exit 1 ;;
   esac
 fi
 
-# 2. Generated 10-second two-tone WAV (16 kHz mono; the 3.1 card wants mono 16 kHz).
+# 2. Generated 10-second two-tone WAV (16 kHz mono, what the pyannote cards want).
 python3 - "$work/test16k.wav" <<'PY' || { echo "V6 fail: could not generate the test WAV"; exit 1; }
 import math, struct, sys, wave
 sr, secs = 16000, 10
@@ -162,31 +164,31 @@ used="$pipeline"
 note=""
 online="$(diarise "$pipeline" 0)" && rc=0 || rc=$?
 if (( rc == 3 )); then
-  # 3. The installed pyannote.audio refused the 3.1 pipeline id: a FAIL (Sections 14.1 and 21 name 3.1; header item 3).
-  #    The research's fallback is probed as a DIAGNOSTIC for the Principal's decision, never as the pass path.
+  # 3. The installed pyannote.audio refused the pipeline id: a FAIL (Sections 14.1 and 21 name it; header item 3).
+  #    The previous pipeline is probed as a DIAGNOSTIC for the Principal's decision, never as the pass path.
   refusal="$(err_of "$online")"
   rfb="$(head_code "$base/$fallback/resolve/main/config.yaml")"
   if [[ "$rfb" != 200* ]]; then
-    diag="the research's fallback $fallback is not reachable either (HTTP $rfb at https://huggingface.co/$fallback: its user conditions are not accepted with the HF_TOKEN account, or the host is unreachable)"
+    diag="the previous pipeline $fallback is not reachable either (HTTP $rfb at https://huggingface.co/$fallback: its user conditions are not accepted with the HF_TOKEN account, or the host is unreachable)"
   elif fbout="$(diarise "$fallback" 0)"; then
-    diag="DIAGNOSTIC: the research's fallback $fallback DOES load and diarise under the same install ($(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(f"load {d[\"load_s\"]}s, run {d[\"run_s\"]}s, {d[\"speakers\"]} speaker(s)")' "$fbout" 2>/dev/null || echo ok)); switching to it needs a Section 23 row amending 14.1/21 first (research conflict 1), then PYANNOTE_PIPELINE in voice.env"
+    diag="DIAGNOSTIC: the previous pipeline $fallback DOES load and diarise under the same install ($(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(f"load {d[\"load_s\"]}s, run {d[\"run_s\"]}s, {d[\"speakers\"]} speaker(s)")' "$fbout" 2>/dev/null || echo ok)); switching back needs a Section 23 row amending 14.1/21 first, then PYANNOTE_PIPELINE in voice.env"
   else
-    diag="the research's fallback $fallback does not load either ($(err_of "$fbout"))"
+    diag="the previous pipeline $fallback does not load either ($(err_of "$fbout"))"
   fi
-  echo "V6 fail: $pipeline did not load under pyannote.audio $pa_version ($refusal); Section 14.1 names PyAnnote 3.1, so this is a fail, not a fallback. $diag. Remedy: pin pyannote.audio (phase2/05-voice.sh PYANNOTE_PIN) to a release that loads 3.1, or amend 14.1/21; then re-run: sudo $entry phase2 --force 05"
+  echo "V6 fail: $pipeline did not load under pyannote.audio $pa_version ($refusal); Section 14.1 names it (v0.4.0, C-06), so this is a fail, not a fallback. $diag. Remedy: pin pyannote.audio (phase2/05-voice.sh PYANNOTE_PIN) to a release that loads it, or amend 14.1/21; then re-run: sudo $entry phase2 --force 05"
   exit 1
 elif (( rc != 0 )); then
   echo "V6 fail: diarisation with $pipeline failed: $(err_of "$online")"
   exit 1
 fi
 offline="$(diarise "$used" 1)" || { echo "V6 fail: $used loaded online but not with HF_HUB_OFFLINE=1 from $hf_home: $(err_of "$offline")"; exit 1; }
-# `used` is always the 3.1 id here (header item 3); kept as a variable so the message names what was proven.
+# `used` is always the pipeline under test here (header item 3); kept as a variable so the message names what was proven.
 
-summary="$(python3 - "$online" "$offline" "$used" "$r31" "$rseg" "$pa_version" "$note" <<'PY'
+summary="$(python3 - "$online" "$offline" "$used" "$rcfg" "$rseg" "$pa_version" "$note" <<'PY'
 import json, sys
 on, off = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-used, r31, rseg, pav, note = sys.argv[3:8]
-print(f"pipeline used: {used} (pyannote.audio {pav}); 3.1 accepted (HEAD 3.1 config.yaml {r31}, segmentation-3.0 "
+used, rcfg, rseg, pav, note = sys.argv[3:8]
+print(f"pipeline used: {used} (pyannote.audio {pav}); accepted (HEAD config.yaml {rcfg}, segmentation/"
       f"pytorch_model.bin {rseg}); loaded in {on['load_s']}s, diarised 10 s of synthetic audio in {on['run_s']}s "
       f"({on['speakers']} speaker(s) found); offline reload {off['load_s']}s{note}")
 PY

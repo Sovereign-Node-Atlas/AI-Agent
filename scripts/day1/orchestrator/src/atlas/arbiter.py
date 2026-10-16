@@ -4,43 +4,49 @@ Every load and unload of a weight-bearing process passes through one Arbiter ins
 the orchestrator"). The unit tests (tests/test_arbiter.py, V14a) drive it with StubController and StubProbe; Phase 3
 drives it against real engines (V10, V14b, V21).
 
-Rule map (the numbers are Section 4.2's):
+Rule map (the numbers are Section 4.2's; v0.4.0 changes approved by the Principal on 2026-10-16 are marked):
   1  Ledger: `Arbiter.resident` holds each resident engine with its projected and, once known, measured footprint.
-  2  `request_load(engine, ctx, parallel)` projects weights + KV against the live budget and returns
+  2  `request_load(engine, ctx, parallel)` projects weights + KV + compute buffers against the live budget and returns
      granted / queued / refused.
-  3  At most MAX_RESIDENT = 2 resident engines; exactly one generation at a time (`acquire_generation`).
+  3  At most `max_resident` LLM seats resident (D-32, S-23: Settings.arbiter_max_resident, default 1, so every seat
+     runs alone with the whole budget); always-resident companions, class-external loads and Phase 4 containers never
+     count against it. Exactly one generation at a time (`acquire_generation`).
   4  A second generation request queues FIFO behind the running one (`try_generation` says "queued"; the blocking
      form waits its turn).
   5  Release confirmation: after a stop the GTT counter is polled until it drops within `release_tolerance_bytes`
      of the expected value; `ReleaseTimeout` is raised loudly after `release_timeout_s`.
   6  Never preempt mid-generation: an eviction whose victim is generating makes the request "queued".
-  7  Apex exclusivity: loading deepseek-v4-flash unloads everything else first, and nothing co-resides with it: a later
-     request for another engine evicts the Apex engine when it is idle (rule 5 path) or queues while it generates
-     (rule 6). Residency is exclusive; it is not permanent (Section 6.3: gpt-oss-120b carries most of the day).
+  7  Exclusivity (S-23: rule 7 extended from the Apex engine to every LLM seat at the default limit of 1): loading a
+     seat unloads every other resident seat first, and nothing co-resides with it; a later request for another seat
+     evicts it when it is idle (rule 5 path) or queues while it generates (rule 6). Residency is exclusive; it is not
+     permanent. At a limit of 2 (D-32 option (b)) only the Apex engine (deepseek-v4-flash) is exclusive.
   8  `plan_deep_think(tier)` pre-requests the full footprint and downgrades deep -> standard -> quick when it does
      not fit.
   9  Every decision is logged (structured line) and written to ledger.arbiter_decisions with the task id.
 
-Budget (Section 4.1): budget = pool - resident set - headroom, where pool = min(GTT total, MemTotal). Kernel 7.0.0-38
-reports the requested 192 GiB as the GTT total even though the node has less RAM; 7.0.0-39 and later cap it at MemTotal
-themselves (S47), and MemTotal is the real limit either way because Phase 1 step 4 puts kho=off on the kernel line
-(S49): Ubuntu's 7.0 kernel has kexec handover on by default, and it then keeps about 13 GiB of MemTotal (INFERRED) as
-CMA scratch that TTM/GTT pages can never use, so the pool would overstate what engines can get by that much; V3a fails
-while any of it is set aside. The resident set is what mem_info_gtt_used shows before any engine is loaded, measured
-by `measure_resident_set()` at startup and again whenever nothing is resident: GPU buffer objects, i.e. the three
-resident small models and whatever else sits on the iGPU. Ordinary CPU memory (Ubuntu, XFCE, Docker, Open WebUI,
-ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but does not appear on that
-counter (only memory a process hands the GPU through userptr or a dma-buf import does), so `headroom_bytes` reserves it
-(v0.3.5, S44: Settings.arbiter_headroom_bytes, default config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set by
-build_arbiter; the constructor's 0 is for the stub tests only).
-At 16 GiB every Apex KV-ladder rung fits; at the larger GPU resident set (about 7-8 GiB) the f16 and q8_0 rungs fit only
-because Phase 1 step 4 drops kdump's 4.25 GiB crash-kernel reservation from MemTotal (S48; config.py has the numbers),
-and V3a fails when that reservation survives.
+Budget (Section 4.1): budget = pool - GPU resident set - host resident set - headroom, where pool = min(GTT total,
+MemTotal). Kernel 7.0.0-38 reports the requested 192 GiB as the GTT total even though the node has less RAM; 7.0.0-39
+and later cap it at MemTotal themselves (S47), and MemTotal is the real limit either way because Phase 1 step 4 puts
+kho=off on the kernel line (S49): Ubuntu's 7.0 kernel has kexec handover on by default, and it then keeps about 13 GiB
+of MemTotal (INFERRED) as CMA scratch that TTM/GTT pages can never use, so the pool would overstate what engines can get
+by that much; V3a fails while any of it is set aside. The GPU resident set is what mem_info_gtt_used shows before any
+engine is loaded, measured by `measure_resident_set()` at startup and again whenever nothing is resident: GPU buffer
+objects, i.e. the router (v0.4.0: the only companion left on the iGPU) and whatever else sits there. The host resident
+set (D-14 option (e), approved 2026-10-16) is the always-resident companions with placement "cpu", the Qwen3 4B
+retrieval pair: their memory is host RAM the GTT counter never shows, so each is charged its measured VmRSS (the unit's
+MainPID, when the controller can name it), never below the bytes of its weights (they are file-backed pages the kernel
+may drop and re-read, so they are budgeted in full), else its projection (weights + KV + compute buffers at its
+engines.json profile); it is re-measured with the GPU set. Ordinary CPU memory (Ubuntu, XFCE, Docker, Open WebUI,
+ChromaDB, Kokoro/Whisper/PyAnnote, the orchestrator stack) shares the same unified RAM but appears on neither counter
+(only memory a process hands the GPU through userptr or a dma-buf import shows on the GTT one), so `headroom_bytes`
+reserves it (v0.3.5, S44: Settings.arbiter_headroom_bytes, default config.DEFAULT_ARBITER_HEADROOM_GIB = 16 GiB, set
+by build_arbiter; the constructor's 0 is for the stub tests only).
 Each measurement also reads /proc/meminfo when the probe can: MemTotal - MemAvailable - (GPUActive + GPUReclaim where
 the kernel reports them, else gtt_used) is the CPU-side use at that moment (`host_used_bytes()`, which `atlas-admin
-arbiter status` prints too), shown in status() as host_used_bytes and logged at WARNING when it exceeds the headroom
-(the reserve is then too small for this node: raise ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from,
-so a transient CPU job cannot shrink the budget between two identical requests.
+arbiter status` prints too), shown in status() as host_used_bytes and logged at WARNING when, less the host resident
+set the budget already charges, it exceeds the headroom (the reserve is then too small for this node: raise
+ATLAS_ARBITER_HEADROOM_GIB). It is observed, never budgeted from, so a transient CPU job cannot shrink the budget
+between two identical requests.
 
 Phase 4 engines (Section 15.2, CONVENTIONS.md §8 class `phase4`). build_arbiter() merges config/phase4-engines.json into
 the Arbiter's engine map so Phase 4 step 5 (POST /arbiter/register) records each container engine's measured footprint
@@ -55,8 +61,9 @@ an unknown key is a 404 there.
 External engines (Section 4.2 "Chatterbox when invoked"; config/engines.json `external` list, CONVENTIONS.md §8 class
 `external`). Chatterbox is loaded in-process by phase2/voice_render.py and the orchestrator's voice path, never as a
 llama-server unit, so the Arbiter budgets it (rule 2: weights only, the measured peak RSS once POST /arbiter/register
-has recorded it), counts it as one of the two resident engines (rule 3), evicts LRU victims for it (rule 5 per victim)
-and ledgers every decision (rules 1, 9) but calls NO controller for it: the caller owns the process and POSTs
+has recorded it), never counts it against the LLM-seat limit (rule 3, D-32: a TTS render must not evict the seat for
+a slot it does not take), evicts LRU victims for it only when the budget needs their memory (rule 5 per victim) and
+ledgers every decision (rules 1, 9) but calls NO controller for it: the caller owns the process and POSTs
 /arbiter/unload when it has exited. RELEASE (rule 5's substance, "by polling the memory counters, not by trusting the
 process exit", with the right counter for a CPU process; fix round 6): its release is not observable on the GTT
 counter (a CPU process on the unified memory of the APU is charged to the ledger, not to mem_info_gtt_used), so
@@ -66,10 +73,9 @@ charged, an ERROR row is written and ReleaseTimeout is raised WITHOUT halting th
 the caller retries the unload once it has really exited). An unload WITHOUT a pid is accepted on the caller's word,
 said so in the reason ("not measured") and logged at WARNING: the step-5 renders and voice_render.py pass the pid; the
 API route (POST /arbiter/unload, another writer) is asked to forward a `pid` field. An external resident is never chosen
-as an eviction victim: a load that would need its memory is QUEUED with that reason until the caller unloads it. RULE 7
-EXCEPTION, knowingly: an Apex request while an external engine is resident is QUEUED too ("unloads any co-resident
-engine first" cannot be performed by the Arbiter on a caller-owned process; the request waits for the caller's POST
-/arbiter/unload, tests/test_arbiter.py asserts the reason), and engines.json's `external` notes say the same.
+as an eviction victim: a load that would need its memory is QUEUED with that reason until the caller unloads it. An
+external process is not an LLM seat, so seat exclusivity (rule 7) never evicts it and never evicts a seat for it: only
+the budget does (v0.4.0; in v0.3.5 an Apex request queued behind any external resident).
 
 Failure paths (fix round). A controller start that raises — EngineControlError from systemctl, or the parent
 EngineError from the post-start /health check — releases the reservation and clears `_busy`; a catch-all does the same
@@ -79,18 +85,13 @@ still be active, and the next request_unload/request_load can retry once the cau
 is fixed.
 
 What the projection follows (fix round). `systemctl start llama-server@<key>` runs the flags of
-$ATLAS_ENGINES_ENV_DIR/<key>.env (ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_KV_TYPE, ATLAS_CORESIDENT), rendered by
-phase2/engine-env.py from engines.json plus overrides.json — the orchestrator (user atlas) cannot re-render that
-root-owned file. So when the env file exists the Arbiter projects against exactly those values (the "hard pre-flight,
-the actual OOM backstop" of Section 4.3 then guards the real load) and refuses a request whose explicit ctx/parallel/
-kv/coresident argument disagrees with it. The everyday pairing of Section 4.1 (gpt-oss + the vision engine at 2 slots)
-forms because the co-resident profile is the vision engine's STANDING profile (S52, EngineSpec.standing_coresident):
-engine-env.py renders it, ATLAS_CORESIDENT=1, unless overrides.json says coresident=false, the Principal's choice of
-the 8-slot profile (a root action, never this process); such a unit is projected at 8 slots and evicts gpt-oss
-instead of pairing, and the grant says how to restore the standing profile. Without an env file (unit tests, an
-engine not rendered yet) the projection comes from engines.json at the same standing profile, alone or beside another
-engine, so it never differs from what the rendered unit will run; an explicit coresident argument picks the
-co-resident (True) or full (False) profile instead.
+$ATLAS_ENGINES_ENV_DIR/<key>.env (ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_KV_TYPE), rendered by phase2/engine-env.py from
+engines.json plus overrides.json — the orchestrator (user atlas) cannot re-render that root-owned file. So when the env
+file exists the Arbiter projects against exactly those values (the "hard pre-flight, the actual OOM backstop" of
+Section 4.3 then guards the real load) and refuses a request whose explicit ctx/parallel/kv argument disagrees with it.
+Without an env file (unit tests, an engine not rendered yet) the projection comes from engines.json's ctx_size x
+parallel and kv_class. S-22 (v0.4.0) removed the standing co-resident profile of S52 with the pairing it served: an
+ATLAS_CORESIDENT line in an older env file is ignored.
 
 Locking (fix round). One state lock (`_cv`, a Condition) guards the ledger; the controller's stop/start and the
 release poll — minutes on a cold load — run OUTSIDE it. A load reserves its budget under the lock by inserting a
@@ -113,54 +114,79 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from atlas.config import PHASE4_MODE, EngineSpec, parse_env_file
+from atlas.config import DEFAULT_ARBITER_MAX_RESIDENT, PHASE4_MODE, EngineSpec, parse_env_file
 from atlas.engines import UNIT_KEY_RE, EngineController, EngineError
 from atlas.ledger import Ledger
 
 log = logging.getLogger("atlas.arbiter")
 
 GIB = 1024**3
-MAX_RESIDENT = 2  # Section 4.2 rule 3
+MAX_RESIDENT = DEFAULT_ARBITER_MAX_RESIDENT  # Section 4.2 rule 3, LLM seats (D-32: 1; Settings.arbiter_max_resident)
 # register_measured(allow_unknown=True) may create at most this many specs per process (16.3 item 6: configuration
 # changes are the Principal's; a measurement for a key the config does not list is tolerated, never unbounded).
 MAX_REQUEST_SPECS = 32
-APEX_KEY = "deepseek-v4-flash"  # CONVENTIONS.md §8 arbiter class `apex`
+APEX_KEY = "deepseek-v4-flash"  # CONVENTIONS.md §8 arbiter class `apex`: DeepSeek-V4-Flash-0731 UD-Q8_K_XL (S-42)
 
-# --- KV-cache size model (Section 4.3; bytes of K+V per token of the TOTAL pool, at f16) ------------------------------
+# --- KV-cache size model (Section 4.3; S-17, v0.4.0) -----------------------------------------------------------------
 #
-# K+V per token at f16 = 2 * n_attention_layers * n_kv_heads * head_dim * 2 bytes. The projection is an OOM backstop
-# (4.3 "Hard pre-flight"), replaced by the measured footprint once an engine has been loaded (rule 1), so estimates err
-# on the high side. Sources per engine:
-#   gpt-oss-120b(-abliterated): 36 layers (VERIFIED, gguf-models.md §1.2 "case 36: LLM_TYPE_120B"), head dim 64
-#       (VERIFIED, §2 "head dim 64 % 64 == 0"); 8 KV heads UNVERIFIED (openai/gpt-oss config.json, from memory).
-#       Both iswa sub-caches
-#       are charged the full pool, which over-states the SWA half (its cells are the window, not n_ctx).
-#   nemotron-3-super, qwen3.5-122b: hybrid models whose attention layers are a minority; the per-token figure is backed
-#       out of Section 4.3's bounds ("Nemotron < 10 GB, Qwen3.5 < 15 GB at 32k x 8 slots" at q8_0). UNVERIFIED.
-#   deepseek-v4-flash: ~10 GB of f16 cache at the 32768 cap (engines.json known_issue; Section 4.3 gives the Apex
-#       engine "about 8 to 10 GiB of margin" at 155 GB of weights, v0.3.5).
-#       Four sub-caches; the compressor states are f32 and are inside the figure. UNVERIFIED.
-#   qwen2.5-vl-72b, meditron-70b: dense GQA, 80 layers x 8 KV heads x 128 head dim (Qwen2.5-72B / Llama-2-70B configs,
-#       UNVERIFIED from memory) = 327,680 B/token at f16.
-#   router-qwen3.5-4b: resident, never budgeted (Section 4.1); a nominal figure for completeness.
+# Bytes of K+V per token of the TOTAL pool at f16, read from the GGUF headers and the cache code of the pinned
+# llama.cpp (b11474 = b9acf138; v040 engine_data.md, 2026-10-16, VERIFIED against src/llama-model.cpp create_memory,
+# llama-kv-cache.cpp, llama-memory-hybrid-idx.cpp, llama-kv-cache-dsv4.cpp). The projection is an OOM backstop (4.3
+# "Hard pre-flight"), replaced by the measured footprint once an engine has been loaded (rule 1), and Phase 3 step 4's
+# kv-estimates to-do sets it beside each engine's own load log.
+#   glm-5.3-flash: hybrid_idx; 11 DSA layers keep a K-only MLA cache (512) plus an indexer cache (384) per token:
+#       11 x 896 x 2 B = 19,712 B/token f16 (10,472 at q8_0); the NextN layer is outside the main context.
+#   deepseek-v4-flash: dsv4; 21 CSA layers (compressed K 512/4 + indexer K 128/4 per token) and 20 HCA layers (512/128):
+#       21 x 320 + 20 x 8 = 6,880 B/token f16 (3,655 at q8_0). v0.3.5 charged 327,680 (an estimate ~48x too high).
+#   gpt-oss-120b: iSWA, 18 full-attention layers x (K 512 + V 512) x 2 B = 36,864 B/token f16; the 18 sliding layers are
+#       a fixed window per slot (KV_STATE_BYTES_PER_SEQUENCE). v0.3.5 charged both halves the full pool (73,728).
+#   gpt-oss-120b-abliterated: the v0.3.5 figure, unchanged with the uncensored entry (this revision leaves it alone).
+#   router-qwen3.5-4b: resident, never budgeted (Section 4.1): 8 full-attention layers, 32,768 B/token f16.
+#   embed-qwen3-4b, rerank-qwen3-4b: causal qwen3, 36 layers x 8 KV heads x 128 x K and V x 2 B = 147,456 B/token f16;
+#       unlike the non-causal bge pair they allocate a real cache, charged in the host resident set (D-14 (e)).
+# A phased engine brings its own figure in engines.json (kv_bytes_per_token_f16), never a key here before it exists.
 KV_BYTES_PER_TOKEN_F16: dict[str, int] = {
-    "gpt-oss-120b": 73_728,
+    "gpt-oss-120b": 36_864,
     "gpt-oss-120b-abliterated": 73_728,
-    "nemotron-3-super": 77_102,  # UNVERIFIED: 10 GiB / 262144 tokens / 0.53125 (q8_0 factor), Section 4.3 bound
-    "qwen3.5-122b": 115_653,  # UNVERIFIED: 15 GiB / 262144 tokens / 0.53125, Section 4.3 bound
-    "deepseek-v4-flash": 327_680,  # UNVERIFIED: ~10 GiB at 32768 tokens f16 (engines.json known_issue)
-    "qwen2.5-vl-72b": 327_680,
-    "meditron-70b": 327_680,
-    "router-qwen3.5-4b": 24_576,
-    "embed-bge-m3": 0,
-    "rerank-bge-v2-m3": 0,
+    "glm-5.3-flash": 19_712,
+    "deepseek-v4-flash": 6_880,
+    "router-qwen3.5-4b": 32_768,
+    "embed-qwen3-4b": 147_456,
+    "rerank-qwen3-4b": 147_456,
+}
+# Context memory that does not grow with the context, charged once per slot (llama.cpp sizes it by n_seq_max =
+# --parallel), at f16 for the K parts and f32 for the recurrent and compressor states (engine_data.md, VERIFIED code
+# paths, sizes INFERRED by arithmetic): GLM's 34 KDA recurrent layers (152,633,344 B per sequence); DeepSeek's raw
+# sliding-window K (43 layers x 512 x 2 B x 768 cells at -ub 512: 33,816,576 B) plus its compressor states (12,206,080
+# B); gpt-oss's 18 sliding-window layers (18 x 1024 x 2 B x 2,304 cells at -ub 2048: 84,934,656 B). The window parts
+# grow with -ub (cells = GGML_PAD(window + n_ubatch, 256)); the figures are the Day 1 defaults, an estimate that the
+# Phase 3 memory record checks against the load log. engines.json kv_state_bytes_per_sequence overrides a key.
+KV_STATE_BYTES_PER_SEQUENCE: dict[str, int] = {
+    "glm-5.3-flash": 152_633_344,
+    "deepseek-v4-flash": 33_816_576 + 12_206_080,
+    "gpt-oss-120b": 84_934_656,
+    "router-qwen3.5-4b": 52_690_944,
 }
 # ggml block layouts (VERIFIED, ggml-common.h): q8_0 = 34 bytes per 32 values (8.5 bit), q4_0 = 18 bytes per 32
-# values (4.5 bit). f16/f32 stay here for projections passed explicitly (the DeepSeek KV ladder's f16 result reaches
-# the Arbiter through the unit's env file); config.KV_CLASSES does not admit them in engines.json.
+# values (4.5 bit). f16 is an engines.json class since D-29 (v0.4.0); `none` renders no --cache-type flag, so an engine
+# with a cache then runs llama.cpp's default f16 (kv_estimate_bytes charges it so).
 KV_CLASS_FACTOR: dict[str, float] = {
     "f32": 2.0, "f16": 1.0, "bf16": 1.0, "q8_0": 8.5 / 16, "q4_0": 4.5 / 16, "none": 0.0,
 }
+# S-17: the compute buffers a llama-server allocates beside its weights and cache (Vulkan0 and host compute buffers,
+# the mmproj's image encoder). No log of them exists for any Day 1 engine on gfx1151 (research: "the 9 GiB allowance is
+# inferred from two whole-footprint measurements, not from logs"), so these are planning figures, INFERRED: 2 GiB for an
+# LLM seat, 0.5 GiB for a retrieval companion at -ub 2048. engines.json compute_buffer_gib overrides a key; Phase 3
+# records the logged figures (S52 memory record, to-do kv-estimates) and the measured footprint replaces the whole
+# projection once the engine has been loaded (rule 1).
+DEFAULT_COMPUTE_BUFFER_GIB = 2.0
+DEFAULT_COMPANION_COMPUTE_BUFFER_GIB = 0.5
+# Section 9.1 / S-43 (approved 2026-10-16): the Deep Think pair is GLM-5.3-Flash (generator) and DeepSeek-V4-Flash-0731
+# (adversary; the Apex engine, also the deep tier's synthesis). The deep tier's third opinion on documents runs on
+# gpt-oss-120b on Day 1, the stand-in for Qwen3.8-Flash-Next, whose pull is phased. atlas.deep_think names the same
+# keys.
+DEEP_THINK_GENERATOR = "glm-5.3-flash"
+DEEP_THINK_THIRD_OPINION = "gpt-oss-120b"
 
 
 class ArbiterError(RuntimeError):
@@ -307,11 +333,11 @@ class Footprint:
     parallel: int
     kv_class: str
     measured: bool = False
-    coresident: bool = False  # the profile this footprint was projected for (engines.json coresident, or the unit's)
+    compute_bytes: int = 0  # S-17: the compute-buffer term (0 once measured: the measurement includes it)
 
     @property
     def total_bytes(self) -> int:
-        return self.weights_bytes + self.kv_bytes
+        return self.weights_bytes + self.kv_bytes + self.compute_bytes
 
     @property
     def total_gib(self) -> float:
@@ -325,12 +351,10 @@ class UnitProfile:
     ctx: int
     parallel: int
     kv_type: str
-    coresident: bool
     path: Path
 
     def describe(self) -> str:
-        return (f"{self.path.name}: ctx {self.ctx} x {self.parallel} slots, kv {self.kv_type}, "
-                f"ATLAS_CORESIDENT={int(self.coresident)}")
+        return f"{self.path.name}: ctx {self.ctx} x {self.parallel} slots, kv {self.kv_type}"
 
 
 def read_unit_profile(path: Path) -> UnitProfile | None:
@@ -348,8 +372,9 @@ def read_unit_profile(path: Path) -> UnitProfile | None:
     kv_type = env["ATLAS_KV_TYPE"]
     if kv_type not in KV_CLASS_FACTOR:
         raise ArbiterError(f"{path}: ATLAS_KV_TYPE {kv_type!r} has no size factor (known: {sorted(KV_CLASS_FACTOR)})")
-    return UnitProfile(ctx=ctx, parallel=parallel, kv_type=kv_type, coresident=env.get("ATLAS_CORESIDENT", "0") == "1",
-                       path=path)
+    # S-22: an ATLAS_CORESIDENT line (an env file rendered before v0.4.0) is ignored; the file's ctx and parallel are
+    # what the unit runs either way.
+    return UnitProfile(ctx=ctx, parallel=parallel, kv_type=kv_type, path=path)
 
 
 @dataclass
@@ -414,7 +439,6 @@ class _LoadPlan:
     footprint: Footprint
     victims: tuple[str, ...]
     task_id: str | None
-    coresident: bool
     profile: UnitProfile | None
     resident_small: bool = False
     external: bool = False  # Section 4.2 class external: budgeted and ledgered, no controller start/stop
@@ -427,7 +451,8 @@ def kv_estimate_bytes(spec: EngineSpec, ctx: int, parallel: int, kv_class: str |
     """K+V bytes for a TOTAL pool of `ctx` tokens (research conflict 9: n_ctx is split across `parallel` slots).
 
     `parallel` does not multiply the size (the pool is already the total); it is validated so a caller who passes a
-    per-slot figure by mistake is told so instead of under-estimating.
+    per-slot figure by mistake is told so instead of under-estimating. kv_class `none` on an engine with a cache (a
+    causal embedder or reranker) is charged at f16, llama.cpp's default when no --cache-type flag is rendered.
     """
     if parallel < 1:
         raise ArbiterError(f"{spec.key}: parallel must be >= 1 (never auto; gguf-models.md §1.3)")
@@ -443,7 +468,27 @@ def kv_estimate_bytes(spec: EngineSpec, ctx: int, parallel: int, kv_class: str |
     if per_token is None:
         raise ArbiterError(f"{spec.key}: no KV size model (add kv_bytes_per_token_f16 to engines.json or register a "
                            "measured footprint)")
-    return int(per_token * ctx * KV_CLASS_FACTOR[kv_class])
+    factor = KV_CLASS_FACTOR["f16"] if kv_class == "none" else KV_CLASS_FACTOR[kv_class]
+    return int(per_token * ctx * factor)
+
+
+def kv_state_bytes(spec: EngineSpec, parallel: int) -> int:
+    """The per-sequence context memory that does not grow with ctx (recurrent, sliding-window and compressor state),
+    once per slot (S-17; KV_STATE_BYTES_PER_SEQUENCE, or engines.json kv_state_bytes_per_sequence)."""
+    per_seq = spec.kv_state_bytes_per_sequence
+    if per_seq is None:
+        per_seq = KV_STATE_BYTES_PER_SEQUENCE.get(spec.key, 0)
+    return int(per_seq) * max(1, parallel)
+
+
+def compute_buffer_bytes(spec: EngineSpec) -> int:
+    """The compute-buffer term of a projection (S-17): engines.json compute_buffer_gib, else the planning default for
+    an LLM seat or a retrieval companion (DEFAULT_COMPUTE_BUFFER_GIB, DEFAULT_COMPANION_COMPUTE_BUFFER_GIB)."""
+    if spec.compute_buffer_gib is not None:
+        return int(spec.compute_buffer_gib * GIB)
+    if spec.mode in ("chat", "vision"):
+        return int(DEFAULT_COMPUTE_BUFFER_GIB * GIB)
+    return int(DEFAULT_COMPANION_COMPUTE_BUFFER_GIB * GIB)
 
 
 class Arbiter:
@@ -452,13 +497,20 @@ class Arbiter:
                  release_tolerance_bytes: int = GIB, poll_interval_s: float = 1.0,
                  resident_set_bytes: int | None = None, headroom_bytes: int = 0,
                  deep_think_engines: dict[str, Sequence[str]] | None = None,
-                 engines_env_dir: Path | None = None,
+                 engines_env_dir: Path | None = None, max_resident: int = MAX_RESIDENT,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 rss_of: Callable[[int], int | None] = process_rss_bytes) -> None:
+                 rss_of: Callable[[int], int | None] = process_rss_bytes,
+                 pid_of: Callable[[str], int | None] | None = None) -> None:
+        if max_resident < 1:
+            raise ArbiterError(f"max_resident {max_resident} must be >= 1 LLM seat (Section 4.2 rule 3, D-32)")
         self.engines = engines
         self.controller = controller
         self.probe = probe
+        self.max_resident = max_resident  # rule 3: LLM seats resident at once (D-32; build_arbiter reads the setting)
         self._rss_of = rss_of  # /proc/<pid> VmRSS: the release counter of a class-external process (rule 5)
+        # The MainPID of a companion's unit (SystemdEngineController.main_pid): its VmRSS is the measured host resident
+        # set of a CPU-placed companion (D-14 (e)); None (the stub tests) charges the projection.
+        self._pid_of = pid_of
         self.ledger = ledger
         self.release_timeout_s = release_timeout_s  # research §6.3: time-box 60 s
         self.release_tolerance_bytes = release_tolerance_bytes  # research §6.3: within ~1 GiB of the baseline
@@ -472,10 +524,12 @@ class Arbiter:
         self._clock = clock
         self._sleep = sleep
         self._resident_set_bytes = resident_set_bytes
+        self._host_resident_bytes = 0  # D-14 (e): the CPU-placed companions, charged beside the GPU resident set
+        self._host_resident: dict[str, dict[str, Any]] = {}  # per companion: charged bytes and where they came from
         self.resident: dict[str, Resident] = {}  # rule 1, insertion order = load order
         self.measured: dict[str, int] = {}  # measured total footprints by engine key (Phase 3 / Phase 4 step 5)
         # (ctx, parallel, kv) each figure in `measured` was taken at, when the engine was resident at registration
-        # (S52 fix round): a measurement is charged only to that profile; without an entry, the standing profile.
+        # (S52 fix round): a measurement is charged only to that profile; without an entry, engines.json's profile.
         self.measured_profile: dict[str, tuple[int, int, str]] = {}
         self._request_specs: set[str] = set()  # keys register_measured(allow_unknown=True) created (MAX_REQUEST_SPECS)
         self._cv = threading.Condition(threading.RLock())  # the state lock; never held across controller I/O
@@ -486,10 +540,11 @@ class Arbiter:
         self._halted: str | None = None  # set by a ReleaseTimeout; every later load is refused with this reason
         self._warned_no_env: set[str] = set()
         self.deep_think_engines: dict[str, tuple[str, ...]] = {
-            # 9.1: Standard plus a second expansion and scoring round, the Apex engine delivering the final synthesis,
-            # Qwen3.5 as third opinion on documents — run one at a time, requested up front (rule 8).
-            "deep": ("gpt-oss-120b", "nemotron-3-super", "qwen3.5-122b", APEX_KEY),
-            "standard": ("gpt-oss-120b", "nemotron-3-super"),  # 9.1: Ren generates, Arthur scores, swapped in turn
+            # 9.1 (S-43): Standard plus a second expansion and scoring round, the third opinion on documents and the
+            # Apex engine (the adversary's own engine) delivering the final synthesis — run one at a time, requested up
+            # front (rule 8).
+            "deep": (DEEP_THINK_GENERATOR, APEX_KEY, DEEP_THINK_THIRD_OPINION),
+            "standard": (DEEP_THINK_GENERATOR, APEX_KEY),  # 9.1: Ren generates on GLM, Arthur scores on DeepSeek
             "quick": (),  # 9.1: the currently loaded engine, no swap
         }
         if deep_think_engines:
@@ -498,18 +553,56 @@ class Arbiter:
     # --- budget (Section 4.1) --------------------------------------------------------------------------------------
 
     def measure_resident_set(self) -> int:
-        """Record what the GTT counter shows before any engine loads: the always-resident set (Section 4.1 table)."""
+        """Record what the GTT counter shows before any engine loads: the always-resident GPU set (Section 4.1 table),
+        and beside it the host resident set of the CPU-placed companions (D-14 (e); module docstring "Budget")."""
         with self._cv:
             if self.resident:
                 raise ArbiterError("measure_resident_set() must run before any engine is resident")
             self._resident_set_bytes = self.probe.gtt_used_bytes()
+            self._measure_host_resident()
             self._observe_host()
             host = "n/a" if self._host_used_bytes is None else f"{self._host_used_bytes / GIB:.2f}"
-            log.info("arbiter resident_set_gib=%.2f gtt_total_gib=%.2f pool_gib=%.2f headroom_gib=%.2f "
-                     "budget_gib=%.2f host_used_gib=%s", self._resident_set_bytes / GIB,
+            log.info("arbiter resident_set_gib=%.2f host_resident_set_gib=%.2f gtt_total_gib=%.2f pool_gib=%.2f "
+                     "headroom_gib=%.2f budget_gib=%.2f host_used_gib=%s max_resident_seats=%d",
+                     self._resident_set_bytes / GIB, self._host_resident_bytes / GIB,
                      self.probe.gtt_total_bytes() / GIB, self.pool_bytes / GIB, self.headroom_bytes / GIB,
-                     self.budget_bytes / GIB, host)
+                     self.budget_bytes / GIB, host, self.max_resident)
             return self._resident_set_bytes
+
+    def companion_projection(self, key: str) -> Footprint:
+        """A CPU-placed companion at its engines.json profile: weights (exact bytes, D-31) + KV + per-slot state +
+        compute buffers (D-14 (e), S-17): what the host resident set charges while the unit cannot be measured."""
+        spec = self.spec(key)
+        kv = kv_estimate_bytes(spec, spec.ctx_size, spec.parallel) + kv_state_bytes(spec, spec.parallel)
+        return Footprint(spec.footprint_bytes, kv, spec.ctx_size, spec.parallel, spec.kv_class,
+                         compute_bytes=compute_buffer_bytes(spec))
+
+    def _measure_host_resident(self) -> None:
+        """Under the lock: charge every always-resident companion with placement "cpu" its measured VmRSS (the unit's
+        MainPID through pid_of), never below its weights' bytes, else its projection."""
+        total, detail = 0, {}
+        for spec in self.engines.values():
+            if not (spec.is_resident and spec.placement == "cpu"):
+                continue
+            projection = self.companion_projection(spec.key).total_bytes
+            pid: int | None = None
+            if self._pid_of is not None:
+                try:
+                    pid = self._pid_of(spec.key)
+                except Exception as exc:  # a status read must never stop a measurement; the projection stands in
+                    log.warning("arbiter: MainPID of %s unreadable (%s); charging its projection", spec.key, exc)
+            rss = self._rss_of(pid) if pid else None
+            if rss is not None:
+                # The weights are file-backed (mmap on the CPU backend): the kernel may drop and re-read them, so the
+                # RSS can show less than the file; they are budgeted in full (answers.md 2.1, measure 11).
+                charged = max(rss, spec.footprint_bytes)
+                source = (f"measured VmRSS {rss / GIB:.2f} GiB of pid {pid}, never below its weights "
+                          f"{spec.footprint_bytes / GIB:.2f} GiB")
+            else:
+                charged, source = projection, "projected (weights + KV + compute; unit not running or pid unknown)"
+            total += charged
+            detail[spec.key] = {"charged_bytes": charged, "projected_bytes": projection, "source": source}
+        self._host_resident_bytes, self._host_resident = total, detail
 
     def _observe_host(self) -> None:
         """Records MemTotal (it caps the pool) and the CPU-side use beside the GPU's pages: TTM pages backing GTT
@@ -523,12 +616,15 @@ class Arbiter:
         # GPUActive + GPUReclaim when the kernel reports them; else the GTT counter, which measure_resident_set() has
         # just read into the resident set (nothing is resident then).
         self._host_used_bytes = host_used_bytes(mem_total, mem_available, gpu_pages, self._resident_set_bytes or 0)
-        over = self._host_used_bytes > self.headroom_bytes
+        # The CPU-placed companions are inside that figure but already charged as the host resident set (D-14 (e)).
+        unreserved = self._host_used_bytes - self._host_resident_bytes
+        over = unreserved > self.headroom_bytes
         if over and not self._host_over:
-            log.warning("arbiter: CPU-side memory in use is %.2f GiB, above the %.2f GiB headroom the budget reserves "
-                        "for it (Section 4.1); engines may be granted memory the host needs. Raise "
-                        "ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env and restart atlas-orchestrator",
-                        self._host_used_bytes / GIB, self.headroom_bytes / GIB)
+            log.warning("arbiter: CPU-side memory in use is %.2f GiB (%.2f GiB beside the %.2f GiB host resident set), "
+                        "above the %.2f GiB headroom the budget reserves for it (Section 4.1); engines may be granted "
+                        "memory the host needs. Raise ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env and restart "
+                        "atlas-orchestrator", self._host_used_bytes / GIB, unreserved / GIB,
+                        self._host_resident_bytes / GIB, self.headroom_bytes / GIB)
         self._host_over = over
 
     @property
@@ -547,8 +643,13 @@ class Arbiter:
         return total if self._mem_total_bytes is None else min(total, self._mem_total_bytes)
 
     @property
+    def host_resident_set_bytes(self) -> int:
+        """The CPU-placed companions' charge (D-14 (e)), set by measure_resident_set(); 0 when there are none."""
+        return self._host_resident_bytes
+
+    @property
     def budget_bytes(self) -> int:
-        return max(0, self.pool_bytes - self.resident_set_bytes - self.headroom_bytes)
+        return max(0, self.pool_bytes - self.resident_set_bytes - self._host_resident_bytes - self.headroom_bytes)
 
     @property
     def charged_bytes(self) -> int:
@@ -573,9 +674,10 @@ class Arbiter:
         except KeyError as exc:
             raise UnknownEngine(f"unknown engine {key!r} (CONVENTIONS.md §8 keys)") from exc
 
-    def _footprint(self, spec: EngineSpec, ctx: int, parallel: int, kv_class: str, *,
-                   coresident: bool = False) -> Footprint:
+    def _footprint(self, spec: EngineSpec, ctx: int, parallel: int, kv_class: str) -> Footprint:
         if spec.is_resident:
+            # Never budgeted directly (Section 4.1): a GPU companion is in the measured GPU resident set, a CPU one in
+            # the host resident set (D-14 (e)).
             return Footprint(0, 0, ctx, parallel, kv_class)
         if spec.is_phase4 or spec.is_external:
             # Containers (Section 15.2) and in-process external loads (Section 4.2 "Chatterbox when invoked"): weights
@@ -583,26 +685,21 @@ class Arbiter:
             if spec.key in self.measured:
                 return Footprint(self.measured[spec.key], 0, 0, 1, "none", measured=True)
             return Footprint(spec.footprint_bytes, 0, 0, 1, "none")
-        # Phase 3 step 2 measures the rendered unit: the standing profile (S52) unless an override changed it (the
-        # Principal's coresident=false, 8 x 32k). A measurement applies only to the profile it was measured at
-        # (measured_profile); one registered while the engine was not resident is taken as the standing profile.
-        measured_at = self.measured_profile.get(spec.key, (*spec.profile(), spec.kv_class))
+        # Phase 3 step 2 measures the rendered unit. A measurement applies only to the profile it was measured at
+        # (measured_profile); one registered while the engine was not resident is taken as engines.json's profile.
+        measured_at = self.measured_profile.get(spec.key, (spec.ctx_size, spec.parallel, spec.kv_class))
         if spec.key in self.measured and (ctx, parallel, kv_class) == measured_at:
-            return Footprint(self.measured[spec.key], 0, ctx, parallel, kv_class, measured=True,
-                             coresident=coresident)
-        return Footprint(spec.footprint_bytes, kv_estimate_bytes(spec, ctx, parallel, kv_class), ctx, parallel,
-                         kv_class, coresident=coresident)
+            return Footprint(self.measured[spec.key], 0, ctx, parallel, kv_class, measured=True)
+        kv = kv_estimate_bytes(spec, ctx, parallel, kv_class) + kv_state_bytes(spec, parallel)
+        return Footprint(spec.footprint_bytes, kv, ctx, parallel, kv_class, compute_bytes=compute_buffer_bytes(spec))
 
     def projected_footprint(self, key: str, ctx: int | None = None, parallel: int | None = None,
-                            kv_class: str | None = None, *, coresident: bool | None = None) -> Footprint:
-        """The engines.json projection: the standing profile (coresident None: the co-resident one where the engine
-        defines it, S52), the co-resident one (True) or the full one (False). See unit_profile() for what the unit
-        runs."""
+                            kv_class: str | None = None) -> Footprint:
+        """The engines.json projection at ctx_size x parallel and kv_class unless the caller names other values (the
+        Phase 3 KV ladder, the load test's memory record). See unit_profile() for what the unit runs."""
         spec = self.spec(key)
-        co = spec.standing_coresident if coresident is None else coresident
-        prof_ctx, prof_parallel = spec.profile(co)
-        return self._footprint(spec, prof_ctx if ctx is None else ctx, prof_parallel if parallel is None else parallel,
-                               kv_class or spec.kv_class, coresident=co)
+        return self._footprint(spec, spec.ctx_size if ctx is None else ctx,
+                               spec.parallel if parallel is None else parallel, kv_class or spec.kv_class)
 
     def unit_profile(self, key: str) -> UnitProfile | None:
         """<engines_env_dir>/<key>.env as phase2/engine-env.py rendered it, or None (no dir, or not rendered yet)."""
@@ -621,13 +718,12 @@ class Arbiter:
         profile = self.unit_profile(key)
         if profile is None:
             return None
-        return (self._footprint(self.spec(key), profile.ctx, profile.parallel, profile.kv_type,
-                                coresident=profile.coresident), profile)
+        return self._footprint(self.spec(key), profile.ctx, profile.parallel, profile.kv_type), profile
 
     def register_measured(self, key: str, total_bytes: int, *, task_id: str | None = None,
                           allow_unknown: bool = False) -> None:
         """Phase 3 step 2 / Phase 4 step 5: replace the estimate with the measured footprint (rule 1), at the profile
-        (ctx, parallel, kv) the engine is resident at when it is registered, or at its standing profile when it is not
+        (ctx, parallel, kv) the engine is resident at when it is registered, or at engines.json's profile when it is not
         resident (measured_profile, S52 fix round). Held in memory only: nothing replays it after a restart.
 
         `key` must be in engines.json or phase4-engines.json (CONVENTIONS.md §8: one list of names); anything else is
@@ -666,8 +762,8 @@ class Arbiter:
             res = self.resident.get(key)
             if res is not None:
                 res.measured_bytes = int(total_bytes)
-                # The profile the figure belongs to (S52 fix round): an 8-slot measurement is never charged to the
-                # 2-slot standing unit after the override is cleared, and vice versa.
+                # The profile the figure belongs to (S52 fix round): a measurement at one ctx x parallel x kv is never
+                # charged to a unit re-rendered at another (an overrides.json change, the KV ladder's rungs).
                 self.measured_profile[key] = (res.footprint.ctx, res.footprint.parallel, res.footprint.kv_class)
             else:
                 self.measured_profile.pop(key, None)
@@ -698,7 +794,7 @@ class Arbiter:
     # --- loads (rules 2, 3, 5, 6, 7) -------------------------------------------------------------------------------
 
     def request_load(self, key: str, ctx: int | None = None, parallel: int | None = None, *,
-                     task_id: str | None = None, wait_s: float | None = None, coresident: bool | None = None,
+                     task_id: str | None = None, wait_s: float | None = None,
                      kv_class: str | None = None) -> LoadDecision:
         """Grant, queue or refuse a load. Granted means the engine is resident and serving when this returns.
 
@@ -708,7 +804,7 @@ class Arbiter:
         deadline = None if wait_s is None else self._clock() + wait_s
         while True:
             with self._cv:
-                outcome = self._plan_load(key, ctx, parallel, task_id, coresident, kv_class)
+                outcome = self._plan_load(key, ctx, parallel, task_id, kv_class)
                 if isinstance(outcome, LoadDecision):
                     if outcome.decision is not Decision.QUEUED or deadline is None:
                         return outcome
@@ -722,7 +818,7 @@ class Arbiter:
             return self._execute_load(plan)
 
     def _plan_load(self, key: str, ctx: int | None, parallel: int | None, task_id: str | None,
-                   coresident: bool | None, kv_class: str | None) -> LoadDecision | _LoadPlan:
+                   kv_class: str | None) -> LoadDecision | _LoadPlan:
         """Under the lock: decide, and when the answer is a load, reserve it (placeholder + victims + _busy)."""
         spec = self.spec(key)
         if spec.is_phase4:
@@ -739,7 +835,7 @@ class Arbiter:
                 return self._decide(Decision.QUEUED, key, task_id, 0, f"arbiter busy: {self._busy}")
             self._busy = f"starting resident {key}"
             return _LoadPlan(key, spec, Footprint(0, 0, spec.ctx_size, spec.parallel, spec.kv_class), (), task_id,
-                             False, None, resident_small=True)
+                             None, resident_small=True)
         if self._halted:
             return self._decide(Decision.REFUSED, key, task_id, 0, f"arbiter halted: {self._halted}")
         res = self.resident.get(key)
@@ -752,46 +848,41 @@ class Arbiter:
                                     f"unload of {key} in progress; retry when it has released")
             fp0 = res.footprint
             mismatch = [f"{name} {want!r} != resident {have!r}" for name, want, have in (
-                ("coresident", coresident, fp0.coresident), ("ctx", ctx, fp0.ctx), ("parallel", parallel, fp0.parallel),
-                ("kv_class", kv_class, fp0.kv_class),
+                ("ctx", ctx, fp0.ctx), ("parallel", parallel, fp0.parallel), ("kv_class", kv_class, fp0.kv_class),
             ) if want is not None and want != have]
             if mismatch:
                 # A swap is free only at the profile that is running; a different one needs an unload first.
                 return self._decide(Decision.REFUSED, key, task_id, fp0.total_bytes,
-                                    f"resident at ctx {fp0.ctx} x {fp0.parallel} slots, kv {fp0.kv_class}, "
-                                    f"coresident {fp0.coresident}; requested {', '.join(mismatch)}: request_unload() "
-                                    "first")
+                                    f"resident at ctx {fp0.ctx} x {fp0.parallel} slots, kv {fp0.kv_class}; "
+                                    f"requested {', '.join(mismatch)}: request_unload() first")
             res.last_used = self._clock()
             return self._decide(Decision.GRANTED, key, task_id, res.footprint.total_bytes,
                                 "already resident (swap is free)")
         if self._busy:
             return self._decide(Decision.QUEUED, key, task_id, 0, f"arbiter busy: {self._busy}")
         budget = self.budget_bytes
-        # 1. What will actually load: the unit's env file when it exists, else the engines.json standing profile.
+        # 1. What will actually load: the unit's env file when it exists, else the engines.json profile.
         unit = self.unit_footprint(key)
         profile: UnitProfile | None = None
         if unit is not None:
             fp, profile = unit
             mismatch = [f"{name} {want!r} != unit {have!r}" for name, want, have in (
-                ("coresident", coresident, profile.coresident), ("ctx", ctx, profile.ctx),
-                ("parallel", parallel, profile.parallel), ("kv_class", kv_class, profile.kv_type),
+                ("ctx", ctx, profile.ctx), ("parallel", parallel, profile.parallel),
+                ("kv_class", kv_class, profile.kv_type),
             ) if want is not None and want != have]
             if mismatch:
                 return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
                                     f"requested {', '.join(mismatch)}: the unit runs {profile.describe()}; change "
                                     "it with phase2/engine-env.py --set-override (root), the Arbiter cannot")
-            co = profile.coresident
         else:
-            # The standing profile (S52) unless the caller names one: the same profile alone or beside another engine,
-            # as engine-env.py will render it, so a projection never changes with what happens to be resident.
-            fp = self.projected_footprint(key, ctx, parallel, kv_class, coresident=coresident)
-            co = fp.coresident
+            # engines.json's profile unless the caller names one, as engine-env.py will render it.
+            fp = self.projected_footprint(key, ctx, parallel, kv_class)
         if fp.total_bytes > budget:
             return self._decide(Decision.REFUSED, key, task_id, fp.total_bytes,
                                 f"projected {fp.total_gib:.1f} GiB exceeds the engine budget {budget / GIB:.1f} GiB "
                                 "(Section 4.2 rule 2)" + (f"; unit runs {profile.describe()}" if profile else ""))
-        # 2. Evictions, planned against that footprint (rule 3, LRU; rule 7 puts a resident Apex engine first; rule 6
-        #    says queued when a victim generates).
+        # 2. Evictions, planned against that footprint (rule 3, the LLM-seat limit; rule 7, exclusive seats leave first;
+        #    then LRU for memory; rule 6 says queued when a victim generates).
         victims = self._plan_evictions(spec, fp)
         if victims is None:
             return self._decide(Decision.QUEUED, key, task_id, fp.total_bytes,
@@ -807,7 +898,7 @@ class Arbiter:
         for victim in victims:
             self.resident[victim].unloading = True
         self._busy = f"loading {key}" + (f" (evicting {', '.join(victims)})" if victims else "")
-        return _LoadPlan(key, spec, fp, tuple(victims), task_id, co, profile, external=spec.is_external)
+        return _LoadPlan(key, spec, fp, tuple(victims), task_id, profile, external=spec.is_external)
 
     def _execute_load(self, plan: _LoadPlan) -> LoadDecision:
         """Outside the lock: stop the victims (rule 5 per victim), start the engine, then finalise under the lock."""
@@ -825,8 +916,10 @@ class Arbiter:
         try:
             for victim in plan.victims:
                 why = f"evicted for {key}"
-                if self.engines[victim].is_apex:
-                    why += " (Section 4.2 rule 7: the Apex engine is exclusive while resident, so it leaves when idle)"
+                if plan.spec.is_llm_seat and self.engines[victim].is_llm_seat and (
+                        self._exclusive(plan.spec) or self._exclusive(self.engines[victim])):
+                    why += (" (Section 4.2 rule 7 with rule 3, D-32: an LLM seat runs alone, so the idle one leaves "
+                            "for the next)")
                 stage = f"eviction of {victim}"
                 self._stop_and_confirm(victim, task_id, reason=why)
             used_before = self.probe.gtt_used_bytes()
@@ -892,46 +985,51 @@ class Arbiter:
                 how = (
                     f"unit env {plan.profile.describe()}"
                     if plan.profile
-                    else f"{'coresident ' if plan.coresident else ''}ctx {plan.footprint.ctx} x "
-                    f"{plan.footprint.parallel} slots, kv {plan.footprint.kv_class}"
-                )
-            hint = ""
-            if plan.profile and not plan.profile.coresident and plan.victims and plan.spec.standing_coresident:
-                # S52: the co-resident profile is this engine's standing one, so a unit at its full profile carries
-                # an explicit overrides.json coresident=false (the Principal's choice) or predates that rule.
-                hint = (
-                    "; its unit runs the full profile (overrides.json coresident=false, or an env file rendered "
-                    "before S52), which evicts instead of pairing (Section 4.1): the standing co-resident profile "
-                    f"comes back with phase2/engine-env.py --clear-override {key} coresident (root)"
+                    else f"ctx {plan.footprint.ctx} x {plan.footprint.parallel} slots, kv {plan.footprint.kv_class}"
                 )
             return self._decide(
                 Decision.GRANTED,
                 key,
                 task_id,
                 plan.footprint.total_bytes,
-                f"loaded ({how}){hint}",
+                f"loaded ({how})",
                 evicted=plan.victims,
             )
 
+    def _exclusive(self, spec: EngineSpec) -> bool:
+        """Rule 7 (S-23): an LLM seat co-resides with no other seat. Every seat at the default limit of 1 (D-32); at a
+        limit of 2 (option (b)) the Apex engine alone."""
+        return spec.is_llm_seat and (self.max_resident <= 1 or spec.is_apex)
+
     def _plan_evictions(self, spec: EngineSpec, fp: Footprint) -> list[str] | str | None:
         """Which residents must go so `spec` fits; None when a needed victim is generating (rule 6); a str (the
-        queued reason) when a needed victim is an external resident the Arbiter cannot stop (module docstring)."""
-        if spec.is_apex:
-            victims = list(self.resident)  # rule 7: everything else leaves first
-        else:
-            # Rule 7, second half: nothing co-resides with the Apex engine, so a resident one is the first victim of
-            # any other load (idle -> evicted here through rule 5; generating -> None below, rule 6).
-            victims = [k for k, r in self.resident.items() if r.spec.is_apex]
-            free = self.free_bytes + sum(self.resident[k].charged_bytes for k in victims)
-            count = len(self.resident) - len(victims)
-            # LRU next (Section 6.3 groups work by engine; the least recently used is the cheapest to lose).
-            for k, _r in sorted(self.resident.items(), key=lambda kv: kv[1].last_used):
-                if k in victims:
-                    continue
-                if count < MAX_RESIDENT and free >= fp.total_bytes:
-                    break
-                victims.append(k)
-                free += self.resident[k].charged_bytes
+        queued reason) when a needed victim is an external resident the Arbiter cannot stop (module docstring).
+
+        D-32 / S-23: only LLM seats count against `max_resident` and only a seat triggers seat exclusivity; a
+        class-external load evicts a seat only when the budget needs that seat's memory (LRU)."""
+        seats = [k for k, r in self.resident.items() if r.spec.is_llm_seat]
+        victims: list[str] = []
+        if spec.is_llm_seat:
+            # Rule 7: an exclusive seat (every seat at a limit of 1) unloads every other seat first; at a limit of 2 a
+            # resident exclusive seat (the Apex engine) is still the first victim of any other seat's load (idle ->
+            # evicted here through rule 5; generating -> None below, rule 6).
+            victims = list(seats) if self._exclusive(spec) else [k for k in seats if self._exclusive(
+                self.resident[k].spec)]
+        free = self.free_bytes + sum(self.resident[k].charged_bytes for k in victims)
+        count = len([k for k in seats if k not in victims])
+        # LRU next (Section 6.3 groups work by engine; the least recently used is the cheapest to lose), for the seat
+        # limit (rule 3) and for memory (rule 2).
+        for k, r in sorted(self.resident.items(), key=lambda kv: kv[1].last_used):
+            if k in victims:
+                continue
+            over_limit = spec.is_llm_seat and count >= self.max_resident
+            if not over_limit and free >= fp.total_bytes:
+                break
+            if over_limit and free >= fp.total_bytes and not r.spec.is_llm_seat:
+                continue  # unloading a non-seat frees memory that is not short, never a seat slot
+            victims.append(k)
+            free += r.charged_bytes
+            if r.spec.is_llm_seat:
                 count -= 1
         if any(self._is_generating(v) for v in victims):
             return None
@@ -1190,6 +1288,9 @@ class Arbiter:
                 "gtt_total_bytes": self.probe.gtt_total_bytes(),
                 "gtt_used_bytes": self.probe.gtt_used_bytes(),
                 "resident_set_bytes": self._resident_set_bytes,
+                "host_resident_set_bytes": self._host_resident_bytes,
+                "host_resident": {k: dict(v) for k, v in self._host_resident.items()},
+                "max_resident": self.max_resident,
                 "mem_total_bytes": self._mem_total_bytes,
                 "pool_bytes": self.pool_bytes,
                 "headroom_bytes": self.headroom_bytes,
@@ -1207,7 +1308,7 @@ class Arbiter:
                 "measured": [
                     {"engine": k, "class": self.engines[k].arbiter_class if k in self.engines else None,
                      "measured_bytes": n,
-                     # [ctx, parallel, kv] it applies to; None: registered while not resident (standing profile)
+                     # [ctx, parallel, kv] it applies to; None: registered while not resident (engines.json profile)
                      "profile": list(self.measured_profile[k]) if k in self.measured_profile else None}
                     for k, n in self.measured.items()
                 ],
@@ -1269,13 +1370,21 @@ def build_arbiter(engines: dict[str, EngineSpec], *, ledger: Ledger | None = Non
         if settings.arbiter_headroom_error:
             raise ConfigError(settings.arbiter_headroom_error)
         kw["headroom_bytes"] = settings.arbiter_headroom_bytes
-    return Arbiter({**engines, **phase4_engines}, SystemdEngineController(engines=engines), SysfsMemoryProbe(),
-                   ledger=ledger, engines_env_dir=engines_env_dir, **kw)
+    if "max_resident" not in kw:  # D-32: the LLM-seat residency limit; a bad override stops the Arbiter only
+        if settings.arbiter_max_resident_error:
+            raise ConfigError(settings.arbiter_max_resident_error)
+        kw["max_resident"] = settings.arbiter_max_resident
+    controller = SystemdEngineController(engines=engines)
+    kw.setdefault("pid_of", controller.main_pid)  # D-14 (e): the CPU companions' units, measured by VmRSS
+    return Arbiter({**engines, **phase4_engines}, controller, SysfsMemoryProbe(), ledger=ledger,
+                   engines_env_dir=engines_env_dir, **kw)
 
 
 __all__ = [
-    "APEX_KEY", "DEEP_THINK_TIERS", "GIB", "KV_BYTES_PER_TOKEN_F16", "KV_CLASS_FACTOR", "MAX_RESIDENT", "Arbiter",
-    "ArbiterError", "Decision", "DeepThinkPlan", "Footprint", "LoadDecision", "MemoryProbe", "ReleaseTimeout",
-    "Resident", "StubProbe", "SysfsMemoryProbe", "UnitProfile", "UnknownEngine", "build_arbiter",
-    "kv_estimate_bytes", "process_rss_bytes", "read_unit_profile",
+    "APEX_KEY", "DEEP_THINK_GENERATOR", "DEEP_THINK_THIRD_OPINION", "DEEP_THINK_TIERS",
+    "DEFAULT_COMPANION_COMPUTE_BUFFER_GIB", "DEFAULT_COMPUTE_BUFFER_GIB", "GIB", "KV_BYTES_PER_TOKEN_F16",
+    "KV_CLASS_FACTOR", "KV_STATE_BYTES_PER_SEQUENCE", "MAX_RESIDENT", "Arbiter", "ArbiterError", "Decision",
+    "DeepThinkPlan", "Footprint", "LoadDecision", "MemoryProbe", "ReleaseTimeout", "Resident", "StubProbe",
+    "SysfsMemoryProbe", "UnitProfile", "UnknownEngine", "build_arbiter", "compute_buffer_bytes", "kv_estimate_bytes",
+    "kv_state_bytes", "process_rss_bytes", "read_unit_profile",
 ]

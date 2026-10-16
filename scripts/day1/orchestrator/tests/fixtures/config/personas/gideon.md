@@ -5,9 +5,10 @@ hemisphere: corporate
 division: Corporate
 remit: Legal & Compliance
 reports_to: ren
-default_engine: gpt-oss-120b
+default_engine: glm-5.3-flash
 engine_settings: high reasoning, retrieval-grounded
-override_engines: [qwen3.5-122b, deepseek-v4-flash]
+override_engines: [deepseek-v4-flash]
+fallback_engine: deepseek-v4-flash
 speaks_externally_tier: sensitive
 kokoro_voice: null
 kokoro_alternate: bm_george

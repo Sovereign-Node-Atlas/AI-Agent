@@ -2,11 +2,17 @@
 
 Depths (9.1 table):
     quick     generator and adversary on the SAME loaded engine with different role prompts; 0 swaps; 1-2 min
-    standard  Ren generates three trajectories, Arthur scores on his own engine, Ren refines the winner; 2 swaps
-    deep      standard plus a second expansion and scoring round, the Apex engine (DeepSeek V4 Flash) delivering the
-              final synthesis, Qwen3.5 as third opinion on documents; 3-4 swaps
+    standard  Ren generates three trajectories on GLM-5.3-Flash, Arthur scores on DeepSeek-V4-Flash-0731, Ren refines
+              the winner; 2 swaps
+    deep      standard plus a second expansion and scoring round, a third opinion on documents (gpt-oss-120b on
+              Day 1, standing in for the phased Qwen3.8-Flash-Next) and the Apex engine (DeepSeek-V4-Flash-0731, the
+              adversary's own) delivering the final synthesis; 3-4 swaps
 
-Corrections adopted (9.1): Nemotron (Arthur) runs at LOW temperature, not zero (reasoning models loop at exactly
+v0.4.0 (S-43, approved 2026-10-16): the pair is GLM-5.3-Flash (generator) and DeepSeek-V4-Flash-0731 (adversary), two
+families; v0.3.5 ran gpt-oss-120b against Nemotron 3 Super. Every engine runs alone (D-32), so each change of engine is
+a swap (50-85 s plus re-prefill, D-23) and the phases stay batched.
+
+Corrections adopted (9.1): the adversary (Arthur) runs at LOW temperature, not zero (reasoning models loop at exactly
 zero); scores out of 100 are rubric judgements with NAMED criteria, not mathematics; where a real figure exists Silas
 computes it in the sandbox and Arthur scores against the number; phases are BATCHED (all generations, then all
 scores), never round-by-round ping-pong between engines.
@@ -17,7 +23,7 @@ holds the generation lock), so this module never touches an engine itself and th
 
 What is a skeleton here, marked TODO: the prompt wording (untested against the real engines), the rubric weights
 (equal), the JSON-score repair (one retry), the Silas figure hook (a callback slot, no automatic detection of
-"a real figure exists"), Qwen3.5's third opinion (called only when `documents` are passed). None of it lies: every
+"a real figure exists"), the third opinion (called only when `documents` are passed). None of it lies: every
 step runs, returns real text, and records what it did in `DeepThinkResult.log`.
 """
 
@@ -31,7 +37,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from atlas.arbiter import APEX_KEY, DEEP_THINK_TIERS, Arbiter, DeepThinkPlan
+from atlas.arbiter import (
+    APEX_KEY,
+    DEEP_THINK_GENERATOR,
+    DEEP_THINK_THIRD_OPINION,
+    DEEP_THINK_TIERS,
+    Arbiter,
+    DeepThinkPlan,
+)
 
 log = logging.getLogger("atlas.deep_think")
 
@@ -48,10 +61,10 @@ __all__ = [
     "score_trajectories",
 ]
 
-# Engines per role (Section 6.2 final engine map; CONVENTIONS.md §8 keys). Persona keys follow the same map.
-GENERATOR_ENGINE = "gpt-oss-120b"  # Ren
-ADVERSARY_ENGINE = "nemotron-3-super"  # Arthur
-THIRD_OPINION_ENGINE = "qwen3.5-122b"  # Arthur, override: long documents
+# Engines per role (Section 6.2 engine map, v0.4.0; CONVENTIONS.md §8 keys; the Arbiter's tier lists name the same).
+GENERATOR_ENGINE = DEEP_THINK_GENERATOR  # glm-5.3-flash: Ren
+ADVERSARY_ENGINE = APEX_KEY  # deepseek-v4-flash: Arthur's own engine (P-02, P-11)
+THIRD_OPINION_ENGINE = DEEP_THINK_THIRD_OPINION  # gpt-oss-120b on Day 1; Qwen3.8-Flash-Next once pulled (phased)
 SYNTHESIS_ENGINE = APEX_KEY  # deepseek-v4-flash, deep only
 GENERATOR_PERSONA = "ren"
 ADVERSARY_PERSONA = "arthur"
@@ -392,7 +405,7 @@ def run_deep(
     documents: str = "",
     max_tokens: int = 3072,
 ) -> DeepThinkResult:
-    """Standard, then a second expansion and scoring round, Qwen3.5 as third opinion on documents, the Apex engine
+    """Standard, then a second expansion and scoring round, the third opinion on documents, the Apex engine
     delivering the final synthesis (3-4 swaps)."""
     first = run_standard(problem, call, context=context, computed=computed, max_tokens=max_tokens)
     result = DeepThinkResult(

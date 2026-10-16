@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # phase3-models.sh — Phase 3 driver: core LLM pull and load tests (ATLAS_FRAMEWORK_REVIEW.md Section 17 Phase 3,
-# Section 21 V4, V10, V14b, V21, V22; R19). Long, detached under systemd, resumable at the file level.
+# Section 21 V4, V10, V14b, V21, V22, V25; R19). Long, detached under systemd, resumable at the file level.
+# v0.4.0 (approved 2026-10-16, register D-26 (c)): the Day 1 LLM seats are gpt-oss-120b, its abliterated twin (left
+# exactly as v0.3.5 has it), glm-5.3-flash and deepseek-v4-flash (S-34, D-42 (b)); one LLM seat is resident at a time
+# (D-32 (a)); the resident router and the Qwen3 embedder/reranker pair are Phase 2's.
 #
 #   sudo ./atlas-day1.sh phase3 [--dry-run] [--force STEP] [--status] [--foreground]   (the entry point re-execs this)
 #   phase3-models.sh --run          the in-unit entry started by detached_phase (atlas-day1-phase3)
@@ -15,41 +18,55 @@
 #   when foreground=1; parse_common_args takes --run anywhere in argv).
 #
 # Steps (CONVENTIONS.md §1, §6; each wrapped in run_step, so a re-run skips what is complete):
-#   01  pull: every engine whose arbiter_class is core/apex/vision/crosscheck (the seven GGUF engines of Section 5.1),
-#       hashes and sizes read from the Hugging Face tree API at pull time (research conflict a), a research-pinned
-#       sha256 that disagrees with the tree is FATAL before any byte moves (rule §7.9), the repo's commit sha resolved
-#       before and after each pull (a repo that moved mid-pull is fatal), resumable per file, Meditron raw splits
-#       cat-joined (conflict d), enumerated shard names for the abliterated twin and Nemotron (conflicts e, f); then the
-#       aggregate manifest (Section 9.5) written INTO THE BACKUP SET at $ATLAS_SRV/data/manifests/models-MANIFEST.json
+#   01  pull: every engine whose arbiter_class is core/apex (P3_CLASSES: the four Day 1 LLM seats above; vision and
+#       crosscheck have no Day 1 entry, S-34), hashes and sizes read from the Hugging Face tree API at pull time
+#       (research conflict a; engine_tree_lfs, which also lists the repo root when a subdir entry names a root-level
+#       file such as GLM's mmproj), a research-pinned sha256 that disagrees with the tree is FATAL before any byte
+#       moves (rule §7.9), the repo's commit sha resolved before and after each pull (a repo that moved mid-pull is
+#       fatal), resumable per file, enumerated shard names for the abliterated twin (conflict e); no Day 1 entry is
+#       cat-joined (Meditron, the only join_into, is retired, S-11), so the free-space check is the download plus 5 %
+#       headroom. The size announced is the engines.json footprint_gb sum (D-42 (b)). Then the aggregate manifest (Section 9.5) written INTO THE BACKUP SET at $ATLAS_SRV/data/manifests/models-MANIFEST.json
 #       with a convenience copy at $ATLAS_SRV/models/MANIFEST.json (see _p3_write_manifest).
 #   02  load tests, one engine at a time, by phase3/loadtest.py: load through the orchestrator's Arbiter API ONLY
 #       (POST /arbiter/load|unload|register; Section 4.2 is a hard requirement and Section 17 step 2 says "load through
 #       the Engine Arbiter": an orchestrator that is not serving is the missing Phase 2 step 2 prerequisite and stops
 #       the phase, there is no systemctl fallback), /health, V4 proof from the unit's journal (conflict h),
-#       decode/prefill tok/s at 512 and 8k prompt tokens with the Section 5.1 band as part of the V10 verdict, swap time
+#       decode/prefill tok/s at 512 and 8k prompt tokens (V10 under D-33 (c): recorded beside the research projection,
+#       a fail only below a per-seat decode_floor_tok_s the Principal sets; null floors raise the to-do decode-floors;
+#       the abliterated entry keeps its v0.3.5 band and rule), swap time
 #       (unload previous + load this), the measured footprint registered with the Arbiter (Section 4.2 rule 1), unload,
 #       GTT release polled after EVERY unload and after every unit that died on its own (rule 5: never the process exit;
 #       measurement window 2 GiB / 120 s; the Arbiter's own rule-5 check is the authority; a leak stops the phase).
-#       A decode rate under the Section 5.1 band is a V10 fail (Section 21 V10, no tolerance). The 8k prefill is
-#       followed by an alive check; a server that died is a V10 FAIL, Nemotron's with llama.cpp issue #20732 in the
-#       message (Section 23 S6; engines.json known_issue: "fail when it does not" answer /health).
-#       DeepSeek V4 Flash ladders f16 -> q8_0 -> q4_0 (Section 4.3 / Section 23 S2) with a coherence prompt at EACH
-#       rung, every rung tried, and keeps the lowest coherent rung (conflict b); an f16-only result records V4 deferred
-#       and V22 pass with the note; any DeepSeek failure records V22 deferred and continues (R19).
-#       Every path to a generation other than the tests is closed for steps 02 and 03 (Section 4.2 rule 3: one
+#       The 8k prefill is followed by an alive check; a server that died is a V10 FAIL (an engines.json known_issue
+#       naming llama.cpp #20732 rides in the message, Section 23 S6).
+#       DeepSeek V4 Flash (the Apex) runs the kv_ladder f16 -> q8_0 (S-42, D-29 (a)) with a coherence prompt: f16 is
+#       loaded first and stands when it loads and is coherent (nothing written to overrides.json); q8_0 only when f16
+#       fails; q4_0 is never a rung; no coherent rung records V4 and V22 deferred (R19). Every newer-architecture
+#       engine (min_llama_cpp_tag newer than v0.4.1's b10964: glm-5.3-flash) has its own V22 row, and its failure is
+#       deferred without blocking the gate (R19 generalised, S-26).
+#       Every path to a generation other than the tests is closed for steps 02, 02b, 02c and 03 (Section 4.2 rule 3: one
 #       generation at a time, background work too): atlas-sentinel.timer, atlas-prune.timer, atlas-celery-gpu.service
 #       and the atlas-openwebui container (the only user-facing client of the orchestrator's /v1 relay) are stopped,
 #       recorded in $ATLAS_STATE/phase3/quiesced BEFORE each stop, and restarted when the step ends, on every exit
 #       path, and, when a SIGKILL/OOM/power cut skipped that, loudly at the start of the next invocation (--status
 #       included). loadtest.py also waits for the orchestrator's generation slot before each direct request.
-#   03  two-residency: gpt-oss-120b + qwen2.5-vl-72b (vision at parallel_coresident / ctx_size_coresident, its standing
-#       profile since S52, asserted on the rendered env; no temporary override, and the vision engine keeps that
-#       profile afterwards), ~142 GB of weights plus their caches (~22 GiB, Section 4.1) on the GTT counter, capped at
-#       the Arbiter's live budget, two generation requests through the orchestrator (/internal/v1/chat/completions),
-#       the second proven to start after the first finished (V21); then, with the pair resident, the Arbiter's refusal
-#       of an over-budget load and its Deep Think downgrade against the real engine set (V14b, Section 21 V14). A
-#       rule-5 leak in its cleanup fails V21 AND stops the phase (as in step 02), so background generation is never
-#       resumed over held memory.
+#   02b parity (S-02, V25): `loadtest.py parity` compares the pin b11474 with the old pin v0.4.1 (its llama-perplexity
+#       built beside it by phase2/01-llama.sh, for this test only) on every chat engine both builds load
+#       (gpt-oss-120b, deepseek-v4-flash, the router): base logits of a fixed corpus (config/domains) from the old
+#       build, scored by the new one with --kl-divergence, and the deterministic task set phase3/parity-tasks.txt on
+#       both, flash attention on (the verdict) and off (recorded). glm-5.3-flash cannot load at v0.4.1, the embedder
+#       and reranker have no logits and the abliterated entry is left as it is: each is listed as not covered.
+#   02c quality (S-03): `loadtest.py quality` records each LLM seat's corpus perplexity and task score on the pin at
+#       its own KV type and raises the to-do kld-run (the reference-based KLD of T-03 needs files Day 1 does not pull).
+#       Both steps unload every LLM seat through the Arbiter first and poll the GTT counter back after every run.
+#   03  single residency (S-24, D-32 (a); replaces v0.3.5's two-residency test): gpt-oss-120b is loaded through the
+#       Arbiter, then glm-5.3-flash, and the Arbiter must evict the first (its unit stopped, the ledger holds the
+#       second alone, the GTT delta is the second's alone, capped at the live budget); two generation requests
+#       through the orchestrator (/internal/v1/chat/completions), the second proven to start after the first
+#       finished (V21; slot save and restore is phased, S-35). Then, with nothing resident, the Arbiter's refusal of an
+#       over-budget load and its Deep Think downgrade against the real engine set (V14b, Section 21 V14). A rule-5
+#       leak in its cleanup fails V21 AND stops the phase (as in step 02), so background generation is never resumed
+#       over held memory.
 #   04  gate: first the S52 Phase 3 items (`loadtest.py memory`): every load of step 02 recorded its context memory
 #       from its own log beside the Arbiter's projection for the same profile, its host RAM (VmRSS/RssAnon of the
 #       unit's MainPID, read-only) after the load and after the tests, the prompt-cache and checkpoint log lines and
@@ -57,41 +74,46 @@
 #       Those figures are raised as the Principal's to-dos kv-estimates and cache-ram (todo_add). Measurements, never
 #       a gate: a line not found is UNKNOWN and nothing here fails the phase; no engine setting is changed. Then the
 #       Section 17 table (engine, load ok, KV type, decode 512/8k, prefill, swap s, footprint, released, control mode,
-#       notes; every engines.json baseline_deviation printed under it) and `gate phase3 V4 V10 V14b V21 -- V22`.
+#       notes; every engines.json baseline_deviation printed under it; the residency, parity and quality summaries)
+#       and `gate phase3 V4 V10 V14b V21 V25 -- V22`.
 #
 # Contracts relied on from other writers (CONVENTIONS.md §1; each is checked and fails loudly when absent):
 #   * config/engines.json — schema per its _meta block (key, hf_repo, subdir, files[{name,sha256,bytes,verify}],
-#     enumerate_pattern, join_into, mmproj, quant, footprint_gb, ctx_size, parallel, parallel_coresident,
-#     ctx_size_coresident, kv_class, kv_ladder, ctx_size_f16_cap, n_keep, extra_args, expected_decode_tok_s,
-#     kv_proof_lines, arbiter_class, known_issue, baseline_deviation; kv_ladder_rule and baseline_deviation_rule).
-#   * phase2/04-memory.sh — its header offers `ej`, `hf_tree_lfs REPO [SUBDIR]`, `hf_download_public` and
-#     `pull_engine_files KEY` to this driver (the reference implementation of the manifest-at-pull-time rule). It is a
+#     enumerate_pattern, join_into, mmproj, quant, footprint_gb, ctx_size, parallel, kv_class, kv_ladder, n_keep,
+#     extra_args, projected_decode_tok_s, decode_floor_tok_s, expected_decode_tok_s (the abliterated entry only),
+#     min_llama_cpp_tag, placement, kv_proof_lines, arbiter_class, known_issue, baseline_deviation; kv_ladder_rule,
+#     decode_rule and baseline_deviation_rule).
+#   * phase2/04-memory.sh — its header offers `ej`, `hf_tree_lfs REPO [SUBDIR]`, `engine_tree_lfs KEY`,
+#     `hf_download_public` and `pull_engine_files KEY` to this driver (the reference implementation of the manifest-at-pull-time rule). It is a
 #     Phase 2 STEP file (CONVENTIONS.md §4: it defines step_04 and Phase 2 globals too), so it is NOT sourced into this
 #     shell: the named functions (and the two constants they read, HF_BASE and ATLAS_CACHE_DIR) are extracted from a
 #     subshell that sourced it (declare -f / declare -p, see below), so no step_04, no ATLAS_RESIDENT_KEYS and no pin
 #     leaks into the driver and a reorder or a new top-level line in that file cannot change Phase 3 behaviour. The
 #     proper home of these helpers is lib/ (lib/common.sh or a lib/hf.sh both drivers source): cross-writer request.
-#     hf_tree_lfs is anonymous first and loads the token only on a 401/403 (gated repo), so for the seven public
+#     hf_tree_lfs is anonymous first and loads the token only on a 401/403 (gated repo), so for the four public
 #     repos the secret is never read; its gated-repo path dies with the licence URL (16.3 item 8).
 #     Contract gap, stated for its writer: pull_engine_files pins revision `main`
 #     (hf_download's rev argument is not threaded through) and downgrades a research-snippet sha256 mismatch to a
 #     warning; this driver therefore checks the snippet hashes against the tree itself BEFORE the pull (fatal), records
 #     the repo commit sha before and after every pull in the aggregate manifest (revision_sha, revision_sha_after) and,
 #     when a repo moved during a pull, re-lists the tree and dies only if a WANTED file's oid or size differs from what
-#     was pulled (every byte was sha256-verified against the plan; an unrelated commit is a warning, not a 15-hour redo).
+#     was pulled (every byte was sha256-verified against the plan; an unrelated commit is a warning, not a 10-hour redo).
 #   * SECRETS ON ARGV (CONVENTIONS.md §2 "never echoed"; cross-writer gaps, stated here): lib/common.sh hf_download puts
 #     `-H "Authorization: Bearer $HF_TOKEN"` on curl's argv (/proc/<pid>/cmdline is world-readable for the hours a
 #     multi-GB file takes) and lib/common.sh notify does the same with NTFY_TOKEN for up to 10 s per push. The pull path
 #     of step 01 never reaches the first one: pull_engine_files calls hf_download_public (04-memory.sh), which runs
 #     hf_download with HF_TOKEN="" and ATLAS_ETC pointed at an empty directory, so no token exists in that call (none of
-#     the seven repos is gated). Step 01 checks that this is still so (declare -f pull_engine_files names
+#     the four repos is gated). Step 01 checks that this is still so (declare -f pull_engine_files names
 #     hf_download_public) and dies otherwise rather than leak the token for hours. This driver's own _p3_repo_sha is
 #     TOKENLESS (least exposure: the repos are public; a 401/403 dies with the licence URL, 16.3 item 8). This driver
 #     never calls lib/common.sh notify: every push goes through _p3_notify below, which passes the bearer header on
 #     curl's stdin (-H @-); the common.sh gap stays for the other phases until it passes the header through stdin.
 #   * phase2/engine-env.py — renders $ATLAS_ETC/engines/<key>.env (ATLAS_KV_TYPE, ATLAS_CTX_SIZE, ATLAS_PARALLEL,
 #     ATLAS_MODEL_PRESENT, ATLAS_KV_PROOF_LINES, LLAMA_ARG_PORT, ...) and owns $ATLAS_ETC/engines/overrides.json
-#     (--set-override KEY kv_type|ctx_size|parallel|coresident VALUE, --clear-override KEY FIELD, --key KEY).
+#     (--set-override KEY kv_type|ctx_size|parallel|n_keep VALUE, --clear-override KEY FIELD, --key KEY; v0.4.0 has
+#     no co-resident profile, S-22).
+#   * phase2/01-llama.sh — /usr/local/bin/llama-perplexity (the pin b11474, S-01) and
+#     $ATLAS_OPT/llama-parity/dist/bin/llama-perplexity (the old pin v0.4.1, S-02, for step 02b only).
 #   * systemd/llama-server@.service (phase2/01-llama.sh): `systemctl start` returns only when /health is 200; the
 #     journal of llama-server@<key> carries the "llama_kv_cache: size = ... K (q8_0): ... V (q8_0): ..." proof line.
 #   * the orchestrator (phase2/02-orchestrator.sh; $ATLAS_ETC/orchestrator.env ORCH_URL, optional
@@ -104,10 +126,11 @@
 # Contract this file defines for others: $ATLAS_STATE/phase3/results/<key>.json (one per engine, schema in loadtest.py;
 # the driver skips an engine on a re-run only when ok AND released are true; its resident_after tells the driver which
 # engine the next swap releases; its "memory" list holds the S52 record of each load, one per rung on the DeepSeek
-# ladder), the to-dos kv-estimates and cache-ram (step 04, re-raised with the latest figures on every run of it; only
-# the Principal closes them), $ATLAS_STATE/phase3/results/pending-overrides.json (loadtest.py's journal of
+# ladder), residency.json (step 03), parity.json (step 02b) and quality.json (step 02c) beside them, the to-dos
+# kv-estimates and cache-ram (step 04), decode-floors (step 02, D-33 (c)) and kld-run (step 02c, S-03), each re-raised
+# with the latest figures on every run of its step (only the Principal closes them), $ATLAS_STATE/phase3/results/pending-overrides.json (loadtest.py's journal of
 # temporary overrides, restored on the next invocation), $ATLAS_STATE/phase3/quiesced (one "unit NAME" or
-# "container NAME" line per background generator stopped for steps 02/03, removed when they are restarted),
+# "container NAME" line per background generator stopped for steps 02 to 03, removed when they are restarted),
 # $ATLAS_STATE/phase3/revisions/<key> and <key>.after (the HF commit sha before and after the pull) and the aggregate
 # manifest $ATLAS_SRV/data/manifests/models-MANIFEST.json (key, repo, revision_sha, revision_sha_after, source_endpoint,
 # quant, files[{name,bytes,sha256}], pulled_at).
@@ -128,9 +151,11 @@ P3_MEMORY_STEP="$ATLAS_DAY1_DIR/phase2/04-memory.sh"
 P3_ENGINES_JSON="$ATLAS_DAY1_DIR/config/engines.json"
 P3_MODELS_DIR="$ATLAS_SRV/models"
 P3_MANIFEST_DIR="$ATLAS_SRV/data/manifests"          # Appendix C: $ATLAS_SRV/data is in restic's include set
-P3_CLASSES="core apex vision crosscheck"      # CONVENTIONS.md §8: the seven GGUF engines; resident models are Phase 2's
-P3_TEXT_KEY="gpt-oss-120b"                     # Section 17 step 3 / Section 4.1: the everyday pairing
-P3_VISION_KEY="qwen2.5-vl-72b"
+P3_CLASSES="core apex"                        # v0.4.0 (S-34): the four Day 1 LLM seats; resident models are Phase 2's
+P3_FIRST_KEY="gpt-oss-120b"                    # step 03 (S-24): the seat loaded first, then evicted by the second
+P3_SECOND_KEY="glm-5.3-flash"                  # the everyday seat and the Deep Think generator (atlas/arbiter.py)
+P3_PERPLEXITY="/usr/local/bin/llama-perplexity"                    # the pin b11474 (phase2/01-llama.sh, S-01)
+P3_PARITY_PERPLEXITY="$ATLAS_OPT/llama-parity/dist/bin/llama-perplexity"  # the old pin v0.4.1, V25 only (S-02)
 P3_OPENWEBUI_CONTAINER="atlas-openwebui"       # docker/core/compose.yml container_name (phase2/03-openwebui.sh)
 
 # --- Background generation: stop list, restart, recovery --------------------------------------------------------------
@@ -138,7 +163,7 @@ P3_OPENWEBUI_CONTAINER="atlas-openwebui"       # docker/core/compose.yml contain
 # enqueue Celery gpu-queue tasks (CONVENTIONS.md §8), atlas-celery-gpu runs them, and the Open WebUI container is the
 # one user-facing client of the orchestrator's /v1 relay: any of them landing mid-measurement would generate beside the
 # timing request (corrupting tok/s) or make the Arbiter load or evict the engine under test. Each is stopped for steps
-# 02/03 and recorded in $P3_QUIESCED_FILE BEFORE the stop, so a SIGKILL, an OOM kill of the unit or a power cut (the
+# 02 to 03 and recorded in $P3_QUIESCED_FILE BEFORE the stop, so a SIGKILL, an OOM kill of the unit or a power cut (the
 # traps below never fire then) cannot leave the Sentinel (Section 9.3) or the 72-hour prune silently off: the next
 # invocation of this driver, --status included, restarts them loudly first (CONVENTIONS.md §7.4).
 P3_QUIESCED=()
@@ -206,7 +231,7 @@ if [[ "$ATLAS_DRY_RUN" != "1" ]]; then
     || die "Phase 2 has not passed its gate ($ATLAS_DONE_DIR/phase2.gate missing). Run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2"
 fi
 
-# Without --run (the in-unit entry) this driver detaches itself so a dropped SSH session cannot kill a 15-hour pull
+# Without --run (the in-unit entry) this driver detaches itself so a dropped SSH session cannot kill a 10-hour pull
 # (Section 17: "detached under systemd"). --dry-run always runs here, in the foreground, and touches nothing.
 if [[ "${ATLAS_IN_UNIT:-0}" != "1" && "$ATLAS_DRY_RUN" != "1" ]]; then
   if (( P3_FORCED )); then
@@ -224,7 +249,7 @@ done
 # Function-extraction guard (header): phase2/04-memory.sh is a Phase 2 STEP file; only the helpers this driver needs
 # (and the two constants they read) are taken from a subshell that sourced it, so step_04 and the Phase 2 globals never
 # enter this shell. The checks below fail loudly when the contract moved.
-P3_MEMORY_FNS=(ej engine_port _hf_endpoint_check _hf_tree_get hf_tree_lfs hf_download_public pull_engine_files)
+P3_MEMORY_FNS=(ej engine_port _hf_endpoint_check _hf_tree_get hf_tree_lfs engine_tree_lfs hf_download_public pull_engine_files)
 P3_MEMORY_VARS=(HF_BASE ATLAS_CACHE_DIR)
 P3_MEMORY_DEFS="$(
   # shellcheck source=phase2/04-memory.sh
@@ -235,7 +260,7 @@ P3_MEMORY_DEFS="$(
 eval "$P3_MEMORY_DEFS"
 unset P3_MEMORY_DEFS
 for fn in "${P3_MEMORY_FNS[@]}"; do
-  declare -F "$fn" >/dev/null || die "phase2/04-memory.sh does not define $fn (its header promises ej/hf_tree_lfs/hf_download_public/pull_engine_files to the Phase 3 driver; $fn is one of them or a helper they call)"
+  declare -F "$fn" >/dev/null || die "phase2/04-memory.sh does not define $fn (its header promises ej/hf_tree_lfs/engine_tree_lfs/hf_download_public/pull_engine_files to the Phase 3 driver; $fn is one of them or a helper they call)"
 done
 for v in "${P3_MEMORY_VARS[@]}"; do
   [[ -n "${!v:-}" ]] || die "phase2/04-memory.sh no longer sets $v, which hf_tree_lfs/hf_download_public read"
@@ -243,7 +268,7 @@ done
 # shellcheck disable=SC2031  # HF_BASE reaches this shell through the eval of `declare -p` above, not from the subshell
 [[ "${HF_BASE%/}" == "https://huggingface.co" ]] || die "phase2/04-memory.sh HF_BASE is '$HF_BASE'; model pulls come from https://huggingface.co only (Section 12.5, 16.3 item 8)"
 
-# Background generation stopped around steps 02/03 (Section 4.2 rule 3; see _p3_quiesce_background); restarted on every
+# Background generation stopped around steps 02 to 03 (Section 4.2 rule 3; see _p3_quiesce_background); restarted on every
 # exit path, including die and a signal, so a failed step never leaves the Sentinel or the prune timer off.
 _p3_install_signal_traps() {
   trap '_p3_resume_background' EXIT
@@ -252,7 +277,7 @@ _p3_install_signal_traps() {
 }
 _p3_install_signal_traps
 
-# The seven engine keys in engines.json order (CONVENTIONS.md §8 order is the port order and the test order).
+# The Day 1 LLM seat keys in engines.json order (CONVENTIONS.md §8 order is the port order and the test order).
 P3_KEYS=()
 mapfile -t P3_KEYS < <(python3 - "$P3_ENGINES_JSON" "$P3_CLASSES" <<'PY'
 import json, sys
@@ -273,8 +298,8 @@ _p3_orch_setting() {
 }
 
 # _p3_loadtest SUBCMD ARGS... — run phase3/loadtest.py with every path it needs; its stdout carries only
-# "RECORD<TAB>ID<TAB>RESULT<TAB>MSG" lines (recorded here with record_v) and, from `memory` only (S52),
-# "TODO<TAB>ID<TAB>TITLE<TAB>DETAIL" lines (raised here with todo_add); its stderr is the log. A non-zero exit is an
+# "RECORD<TAB>ID<TAB>RESULT<TAB>MSG" lines (recorded here with record_v) and, from `memory`, `summarize` and
+# `quality` (S52, D-33 (c), S-03), "TODO<TAB>ID<TAB>TITLE<TAB>DETAIL" lines (raised here with todo_add); its stderr is the log. A non-zero exit is an
 # infrastructure error (not a failed measurement, which loadtest.py records) and stops the phase. --atlas-python is
 # the orchestrator's venv: loadtest.py runs the Arbiter's own projection there for the S52 memory record (that venv
 # and the package are root:atlas with no group or other write, phase2/02-orchestrator.sh).
@@ -308,7 +333,8 @@ _p3_loadtest() {
     --engines "$P3_ENGINES_JSON" --env-dir "$ATLAS_ETC/engines" --results-dir "$P3_RESULTS" \
     --orch-url "$orch_url" --engine-env "$P3_ENGINE_ENV_PY" --models-dir "$P3_MODELS_DIR" \
     --slots-dir "$ATLAS_SRV/data/slots" --port-base "${LLAMA_PORT_BASE:-8100}" \
-    --overrides "$ATLAS_ETC/engines/overrides.json" --atlas-python "$ATLAS_OPT/venv/bin/python" "${extra[@]}" \
+    --overrides "$ATLAS_ETC/engines/overrides.json" --atlas-python "$ATLAS_OPT/venv/bin/python" \
+    --perplexity "$P3_PERPLEXITY" --parity-perplexity "$P3_PARITY_PERPLEXITY" "${extra[@]}" \
     "$sub" "$@" >"$out" 2> >(tee -a "$logf" >&2) &
   pid=$!
   # shellcheck disable=SC2064  # $pid is meant to expand now: the trap must name this child
@@ -412,7 +438,7 @@ _p3_render_envs() {
 }
 
 # _p3_repo_sha REPO — the commit sha huggingface.co serves for the repo's default branch (GET /api/models/<repo>,
-# field "sha"), through the allowlist proxy, TOKENLESS: none of the seven repos is gated and the pull path is tokenless
+# field "sha"), through the allowlist proxy, TOKENLESS: none of the four repos is gated and the pull path is tokenless
 # too (hf_download_public), so the secret is never loaded into this process for metadata (least exposure, CONVENTIONS.md
 # §2). A 401/403 means a gated repo: dies with the licence URL (16.3 item 8: accepting a licence is a Principal action).
 # Prints the sha; dies when it cannot be resolved (rule §7.9: the manifest records what was actually pulled).
@@ -425,7 +451,7 @@ _p3_repo_sha() {
   code="$(curl -sS -L --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 120 -w '%{http_code}' -o "$body" "$url" || true)"
   case "$code" in
     200) ;;
-    401|403) rm -f "$body"; die "_p3_repo_sha: HTTP $code for $url: $repo is gated. Accept its licence on https://huggingface.co/$repo with the account that owns HF_TOKEN (16.3 item 8); the Phase 3 pull is tokenless because none of the seven repos was gated at research time" ;;
+    401|403) rm -f "$body"; die "_p3_repo_sha: HTTP $code for $url: $repo is gated. Accept its licence on https://huggingface.co/$repo with the account that owns HF_TOKEN (16.3 item 8); the Phase 3 pull is tokenless because none of the four repos was gated at research time" ;;
     *) rm -f "$body"; die "_p3_repo_sha: HTTP ${code:-none} for $url (proxy down? huggingface.co not allowlisted?)" ;;
   esac
   local sha
@@ -443,7 +469,9 @@ _p3_remaining_bytes() {
   repo="$(ej "$key" hf_repo)"; subdir="$(ej "$key" subdir)"
   [[ -n "$repo" ]] || die "engines.json: $key has no hf_repo"
   treef="$(mktemp)"
-  hf_tree_lfs "$repo" "$subdir" >"$treef"
+  # engine_tree_lfs (04-memory.sh): the subdir listing plus the root listing when files[] names a root-level file
+  # (glm-5.3-flash keeps its mmproj at the repo root beside the UD-IQ4_XS folder); the same listing the pull uses.
+  engine_tree_lfs "$key" >"$treef"
   [[ -s "$treef" ]] || { rm -f "$treef"; die "$repo${subdir:+/$subdir} lists no files on the Hugging Face tree API"; }
   python3 - "$P3_ENGINES_JSON" "$key" "$P3_MODELS_DIR/$key" "$treef" <<'PY' || rc=$?
 import fnmatch, json, os, sys
@@ -513,9 +541,10 @@ _p3_write_manifest() {
   local rc=0
   ensure_dir "$P3_MANIFEST_DIR" atlas:atlas 755
   python3 - "$P3_ENGINES_JSON" "$P3_MODELS_DIR" "$P3_REVISIONS" "$P3_MANIFEST_DIR/models-MANIFEST.json" \
-    "${HF_ENDPOINT:-https://huggingface.co}" <<'PY' || rc=$?
+    "${HF_ENDPOINT:-https://huggingface.co}" "$P3_CLASSES" <<'PY' || rc=$?
 import datetime, json, os, sys
 engines_path, models_dir, rev_dir, out_path, endpoint = sys.argv[1:6]
+classes = set(sys.argv[6].split())  # P3_CLASSES: the seats this phase pulls must each have a manifest
 engines = json.load(open(engines_path, encoding="utf-8"))["engines"]
 out = {"generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
        "models_dir": models_dir,
@@ -526,7 +555,7 @@ missing = []
 for e in engines:
     p = os.path.join(models_dir, e["key"], "MANIFEST.json")
     if not os.path.isfile(p):
-        if e.get("arbiter_class") in {"core", "apex", "vision", "crosscheck"}:
+        if e.get("arbiter_class") in classes:
             missing.append(e["key"])
         continue
     m = json.load(open(p, encoding="utf-8"))
@@ -560,12 +589,11 @@ PY
 # compare the oid (sha256) and size of every file the per-engine MANIFEST.json records (what was actually pulled and
 # verified) with what the tree serves now. Prints nothing; returns 0 when every wanted file is unchanged, dies with the
 # differing file when one is not (the files may then mix two revisions). An unrelated commit (a README edit, another
-# quant folder) is therefore not a reason to redo a 15-hour pull.
+# quant folder) is therefore not a reason to redo a 10-hour pull.
 _p3_tree_matches_manifest() {
-  local key="$1" repo subdir treef rc=0
-  repo="$(ej "$key" hf_repo)"; subdir="$(ej "$key" subdir)"
+  local key="$1" treef rc=0
   treef="$(mktemp)"
-  hf_tree_lfs "$repo" "$subdir" >"$treef"
+  engine_tree_lfs "$key" >"$treef"
   python3 - "$P3_MODELS_DIR/$key/MANIFEST.json" "$treef" "$key" <<'PY' || rc=$?
 import json, sys
 manifest, treef, key = sys.argv[1:4]
@@ -608,9 +636,17 @@ step_01() {
     die "phase2/04-memory.sh pull_engine_files no longer downloads through hf_download_public: with $ATLAS_ETC/secrets/hf-token.env present, lib/common.sh hf_download would expose HF_TOKEN on curl's command line (/proc/<pid>/cmdline) for the whole pull; fix that first (header: SECRETS ON ARGV)"
   fi
   if [[ ! -s "$ATLAS_ETC/secrets/hf-token.env" ]]; then
-    warn "no Hugging Face token in $ATLAS_ETC/secrets/hf-token.env; none of the seven repos is known to be gated (gguf-models.md, UNVERIFIED), a 401/403 will stop the pull with the licence URL"
+    warn "no Hugging Face token in $ATLAS_ETC/secrets/hf-token.env; none of the four repos is known to be gated (v0.4.0 engine data), a 401/403 will stop the pull with the licence URL"
   fi
-  _p3_notify "Phase 3 step 1: pulling ${#P3_KEYS[@]} engines into $P3_MODELS_DIR (~690 GB)"
+  # D-42 (b): the announced size is the engines.json footprint_gb sum of the seats pulled here, never a fixed figure.
+  local footprint
+  footprint="$(python3 - "$P3_ENGINES_JSON" "$P3_CLASSES" <<'PY'
+import json, sys
+classes = set(sys.argv[2].split())
+print(f"{sum(float(e.get('footprint_gb') or 0) for e in json.load(open(sys.argv[1], encoding='utf-8'))['engines'] if e.get('arbiter_class') in classes):.0f}")
+PY
+)" || die "could not sum footprint_gb in $P3_ENGINES_JSON"
+  _p3_notify "Phase 3 step 1: pulling ${#P3_KEYS[@]} engines into $P3_MODELS_DIR (~$footprint GB, engines.json footprint_gb)"
 
   # Plan first: remaining bytes per engine from the tree API (also proves huggingface.co is reachable through the proxy),
   # pinned hashes checked against the tree, and the repo commit sha the plan is made against.
@@ -632,10 +668,11 @@ step_01() {
   done
   local free
   free="$(df -B1 --output=avail "$P3_MODELS_DIR" | tail -n1 | tr -d ' ')"
-  # Meditron is joined from a copy of its parts (+~74 GB transiently); keep 5 % headroom on top.
-  local need=$(( total + total / 20 + 80000000000 ))
+  # No Day 1 entry is cat-joined (layout_rule: Meditron, the only join_into, is retired, S-11), so nothing is copied
+  # transiently; keep 5 % headroom on top of the download.
+  local need=$(( total + total / 20 ))
   if (( total > 0 && free < need )); then
-    die "only $(_p3_human_gb "$free") free on $P3_MODELS_DIR, need about $(_p3_human_gb "$need") ($(_p3_human_gb "$total") to download plus join and headroom)"
+    die "only $(_p3_human_gb "$free") free on $P3_MODELS_DIR, need about $(_p3_human_gb "$need") ($(_p3_human_gb "$total") to download plus 5 % headroom)"
   fi
   log "plan: $(_p3_human_gb "$total") to download in total, expected $(_p3_eta "$total") (DOWNLOAD_MBPS=${DOWNLOAD_MBPS:-100}); $(_p3_human_gb "$free") free"
 
@@ -669,7 +706,7 @@ step_01() {
   done
 
   _p3_write_manifest
-  # The seven env files were rendered in Phase 2 with ATLAS_MODEL_PRESENT=0; re-render now that the files exist.
+  # The LLM seats' env files were rendered in Phase 2 with ATLAS_MODEL_PRESENT=0; re-render now that the files exist.
   _p3_render_envs
   local absent=()
   for key in "${P3_KEYS[@]}"; do
@@ -723,20 +760,47 @@ step_02() {
   done
   # The last engine is still resident on purpose (its unload + release is the measurement): finish it now.
   _p3_loadtest finish ${prev:+--previous "$prev"}
-  # V10 per engine, the V10 summary the gate reads, and V22 (DeepSeek, R19) from the result files.
+  # V10 per engine, the V10 summary the gate reads, V22 per newer-architecture engine and the Apex (R19 generalised,
+  # S-26) and its summary, and the to-do decode-floors while any seat has no floor (D-33 (c)), from the result files.
   _p3_loadtest summarize
   _p3_resume_background
   _p3_notify "Phase 3 step 2 done: load tests recorded (see verify.jsonl V4/V10/V22)"
   log "step 02 done"
 }
 
-# --- Step 03: two-residency ------------------------------------------------------------------------------------------
+# --- Step 02b: output parity of the re-pin (S-02, V25) ----------------------------------------------------------------
+step_02b() {
+  [[ -x "$P3_PERPLEXITY" ]] || warn "$P3_PERPLEXITY is missing: V25 fails (phase2/01-llama.sh builds it; sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 01)"
+  [[ -x "$P3_PARITY_PERPLEXITY" ]] || warn "$P3_PARITY_PERPLEXITY is missing: V25 fails (phase2/01-llama.sh builds the old pin beside the new one)"
+  _p3_control_mode
+  log "do not use the assistant while the parity test runs (llama-perplexity holds each model outside the Arbiter's ledger)"
+  _p3_quiesce_background
+  _p3_notify "Phase 3 step 2b: output parity b11474 vs v0.4.1 (V25). Do not use the assistant until it finishes."
+  # Every LLM seat is unloaded through the Arbiter first; each run is followed by the rule-5 release poll; a leak
+  # stops the phase after parity.json and the V25 rows are written (loadtest.py cmd_parity).
+  _p3_loadtest parity
+  _p3_resume_background
+  log "step 02b done"
+}
+
+# --- Step 02c: KLD record (S-03) -------------------------------------------------------------------------------------
+step_02c() {
+  _p3_control_mode
+  _p3_quiesce_background
+  _p3_notify "Phase 3 step 2c: quality record (S-03). Do not use the assistant until it finishes."
+  # A record with the to-do kld-run, never a verdict (nothing here is gated); a rule-5 leak still stops the phase.
+  _p3_loadtest quality
+  _p3_resume_background
+  log "step 02c done"
+}
+
+# --- Step 03: single residency (S-24) --------------------------------------------------------------------------------
 step_03() {
   _p3_control_mode
-  log "do not use the assistant while the two-residency test runs (it owns the engine budget and the generation lock)"
+  log "do not use the assistant while the single-residency test runs (it owns the engine budget and the generation lock)"
   _p3_quiesce_background
-  _p3_notify "Phase 3 step 3: two-residency test ($P3_TEXT_KEY + $P3_VISION_KEY). Do not use the assistant until it finishes."
-  _p3_loadtest coresident --text "$P3_TEXT_KEY" --vision "$P3_VISION_KEY"
+  _p3_notify "Phase 3 step 3: single-residency test ($P3_FIRST_KEY, then $P3_SECOND_KEY). Do not use the assistant until it finishes."
+  _p3_loadtest residency --first "$P3_FIRST_KEY" --second "$P3_SECOND_KEY"
   _p3_resume_background
   log "step 03 done"
 }
@@ -749,10 +813,11 @@ step_04() {
   _p3_loadtest memory
   log "Phase 3 load tests (Section 17 step 4 table; loadtest.py prints it to stderr, tee'd into $(_atlas_log_file)):"
   _p3_loadtest table
-  # CONVENTIONS.md §6: V4 per engine, V10, V14b, V21 required; V22 recorded only (a DeepSeek failure defers it, R19).
-  # The gate table is printed to stdout (the journal) and into the phase log as well.
+  # CONVENTIONS.md §6: V4 per engine, V10, V14b, V21 and V25 (S-02) required; V22 recorded only (a newer-architecture
+  # or Apex failure defers it, R19 generalised, S-26). The gate table is printed to stdout (the journal) and into the
+  # phase log as well.
   local rc=0
-  gate phase3 V4 V10 V14b V21 -- V22 > >(tee -a "$(_atlas_log_file)") || rc=$?
+  gate phase3 V4 V10 V14b V21 V25 -- V22 > >(tee -a "$(_atlas_log_file)") || rc=$?
   if (( rc == 0 )); then
     _p3_notify "Phase 3 gate: PASS. Next: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase4"
     return 0
@@ -766,6 +831,8 @@ log "Phase 3 (core LLM pull and load tests) starting; engines: ${P3_KEYS[*]}; lo
 [[ "$ATLAS_DRY_RUN" == "1" ]] || _p3_notify "Phase 3 starting (detached; follow with: journalctl -u atlas-day1-phase3 -f)"
 run_step phase3 01 step_01
 run_step phase3 02 step_02
+run_step phase3 02b step_02b
+run_step phase3 02c step_02c
 run_step phase3 03 step_03
 run_step phase3 04 step_04
 if [[ "$ATLAS_DRY_RUN" != "1" ]]; then

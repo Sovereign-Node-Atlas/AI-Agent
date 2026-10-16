@@ -243,107 +243,166 @@ def _ctx(tmp_path: Path, engines: list[dict[str, Any]]) -> Any:
     return ctx
 
 
+# The v0.4.0 Day 1 shape (S-34): one plain core seat, the newer-architecture seat (glm5-next, first build b11279 >
+# v0.4.1's b10964: its own deferrable V22 row, R19 generalised), the Apex with the S-42 ladder f16 -> q8_0, the
+# resident router. No floors are set (D-33 (c): record only), no co-resident profile and no f16 context cap exist.
 ENGINES = [
-    {"key": "gpt-oss-120b", "arbiter_class": "core", "expected_decode_tok_s": [30, 55], "ctx_size": 262144},
-    {"key": "deepseek-v4-flash", "arbiter_class": "apex", "kv_ladder": ["f16", "q8_0", "q4_0"], "kv_class": "q4_0",
-     "ctx_size_f16_cap": 16384, "ctx_size": 32768},
-    {"key": "qwen2.5-vl-72b", "arbiter_class": "vision", "expected_decode_tok_s": [2, 4], "ctx_size": 262144},
+    {"key": "gpt-oss-120b", "arbiter_class": "core", "projected_decode_tok_s": [35, 50], "decode_floor_tok_s": None,
+     "ctx_size": 262144, "min_llama_cpp_tag": "b6096"},
+    {"key": "glm-5.3-flash", "arbiter_class": "core", "mode": "vision", "arch": "glm5-next",
+     "min_llama_cpp_tag": "b11279", "projected_decode_tok_s": [10, 20], "decode_floor_tok_s": None,
+     "ctx_size": 262144, "kv_class": "f16"},
+    {"key": "deepseek-v4-flash", "arbiter_class": "apex", "kv_ladder": ["f16", "q8_0"], "kv_class": "f16",
+     "ctx_size": 131072, "min_llama_cpp_tag": "b9840", "quant": "UD-Q8_K_XL"},
     {"key": "router-qwen3.5-4b", "arbiter_class": "resident"},
 ]
 
 
-def _records(capsys: pytest.CaptureFixture[str]) -> list[tuple[str, str, str]]:
-    out = []
+def _lines(capsys: pytest.CaptureFixture[str]) -> tuple[list[tuple[str, str, str]], dict[str, tuple[str, str]]]:
+    """(RECORD lines, TODO lines by id) of one capture: summarize and quality emit both (D-33 (c), S-03)."""
+    recs: list[tuple[str, str, str]] = []
+    todos: dict[str, tuple[str, str]] = {}
     for line in capsys.readouterr().out.splitlines():
         tag, vid, result, msg = line.split("\t", 3)
-        assert tag == "RECORD"
-        out.append((vid, result, msg))
-    return out
+        assert tag in ("RECORD", "TODO")
+        if tag == "RECORD":
+            recs.append((vid, result, msg))
+        else:
+            todos[vid] = (result, msg)
+    return recs, todos
+
+
+def _records(capsys: pytest.CaptureFixture[str]) -> list[tuple[str, str, str]]:
+    return _lines(capsys)[0]
 
 
 def test_summarize_missing_apex_is_deferred_and_not_counted(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     ctx = _ctx(tmp_path, ENGINES)
     _good().save(ctx)
-    lt.EngineResult(key="qwen2.5-vl-72b", load_ok=True, generated=True, released=True, decode_tps_512=3.0).save(ctx)
+    glm = _good("glm-5.3-flash")
+    glm.v22_result, glm.v22_msg = "pass", "glm-5.3-flash (glm5-next, first build b11279): loads"
+    glm.save(ctx)
     lt.cmd_summarize(ctx, None)
-    recs = _records(capsys)
-    assert ("V22", "deferred", "deepseek-v4-flash: no ladder result recorded (R19)") in recs
-    assert any(v == "V10" and r == "deferred" and "Apex" in m for v, r, m in recs)
+    recs, todos = _lines(capsys)
+    assert ("V22", "deferred", "deepseek-v4-flash: no result recorded (R19)") in recs
+    assert any(v == "V10" and r == "deferred" and "Apex" in m and m.startswith("deepseek") for v, r, m in recs)
+    # The newer-architecture seat: its V10 line is a record pointing at V22, never counted in the V10 summary.
+    assert any(v == "V10" and r == "pass" and m.startswith("glm-5.3-flash") and m.endswith("[see V22]")
+               for v, r, m in recs)
+    assert ("V22", "pass", "glm-5.3-flash (glm5-next, first build b11279): loads") in recs
     summary = [m for v, r, m in recs if v == "V10" and m.startswith("summary")]
     assert summary == [
-        "summary: all 2 engines load, generate, swap and release memory at their fixed quantisations, within the "
-        "expected bands; warns: none; apex: deepseek-v4-flash=deferred"]
+        "summary: all 1 engines load, generate, swap and release memory at their fixed quantisations; decode recorded "
+        "beside the projections (D-33 (c)); warns: none; V22 engines: glm-5.3-flash=pass, deepseek-v4-flash=deferred"]
+    v22 = [(r, m) for v, r, m in recs if v == "V22" and m.startswith("summary")]
+    assert v22 and v22[-1][0] == "deferred" and "glm-5.3-flash=pass, deepseek-v4-flash=deferred" in v22[-1][1]
+    assert recs[-1][0] == "V22"  # the summary is the last V22 the gate reads
+    # No floor is set on any seat: the to-do decode-floors carries every seat's measured rate beside its projection.
+    title, detail = todos["decode-floors"]
+    assert "D-33 (c)" in title and "gpt-oss-120b: 40.0/35.0 tok/s at 512/8k, projected 35-50 tok/s" in detail
+    assert "deepseek-v4-flash: not measured, projected none tok/s" in detail
 
 
 def test_summarize_counts_missing_and_off_band(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    ctx = _ctx(tmp_path, ENGINES)
+    # D-33 (c): a seat FAILS only below a floor the Principal set; the abliterated entry keeps its v0.3.5 band and rule
+    # (left exactly as v0.3.5 has it) and is counted when it has no result; the V22 engines are never counted.
+    engines = [{**ENGINES[0], "decode_floor_tok_s": 30},
+               {"key": "gpt-oss-120b-abliterated", "arbiter_class": "core", "expected_decode_tok_s": [30, 55]},
+               *ENGINES[1:]]
+    ctx = _ctx(tmp_path, engines)
     res = _good()
     res.decode_tps_512 = 20.0
     lt.check_band(res, ctx.spec("gpt-oss-120b"))
     res.save(ctx)
     lt.cmd_summarize(ctx, None)
-    recs = _records(capsys)
+    recs, todos = _lines(capsys)
     summary = [m for v, r, m in recs if v == "V10" and m.startswith("summary")]
-    assert len(summary) == 1 and summary[0].startswith("summary: 2 of 2 engines failed (gpt-oss-120b, qwen2.5-vl-72b)")
-    assert "off-band: gpt-oss-120b" in summary[0]
+    assert len(summary) == 1 and summary[0].startswith(
+        "summary: 2 of 2 engines failed (gpt-oss-120b, gpt-oss-120b-abliterated)")
+    assert "below their floor: gpt-oss-120b" in summary[0]
     assert [r for v, r, _ in recs if v == "V10"].count("fail") == 3
+    assert any("FLOOR FAIL: decode 20.0 tok/s below the seat's floor 30 tok/s vs 35-50 tok/s projected" in m
+               for v, r, m in recs if v == "V10" and r == "fail")
+    # The to-do names only the seats without a verdict: floor set (gpt-oss) and v0.3.5 band (abliterated) are out.
+    detail = todos["decode-floors"][1]
+    assert "glm-5.3-flash: not measured" in detail and "deepseek-v4-flash: not measured" in detail
+    assert "gpt-oss-120b" not in detail
 
 
-# --- the ladder decision (engines.json kv_ladder_rule: descent f16 -> q8_0 -> q4_0, lowest coherent rung reached) ----
+def test_summarize_raises_no_floor_todo_once_every_seat_has_a_floor(tmp_path: Path,
+                                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    engines = [{**e, "decode_floor_tok_s": 5} if e["arbiter_class"] in ("core", "apex") else e for e in ENGINES]
+    ctx = _ctx(tmp_path, engines)
+    _good().save(ctx)
+    lt.cmd_summarize(ctx, None)
+    recs, todos = _lines(capsys)
+    assert "decode-floors" not in todos
+    assert any(v == "V10" and r == "pass" and "(projected 35-50, floor 5)" in m
+               for v, r, m in recs if m.startswith("gpt-oss-120b"))
 
-LADDER = ["f16", "q8_0", "q4_0"]
+
+# --- the ladder decision (engines.json kv_ladder_rule under S-42 / D-29 (a): the highest-precision coherent rung) ---
+
+LADDER = ["f16", "q8_0"]
 
 
 def _rung(kv: str, load_ok: bool, coherent: bool, proof: bool = True, **extra: Any) -> dict[str, Any]:
     return {"kv": kv, "load_ok": load_ok, "coherent": coherent, "kv_proof_ok": proof and load_ok, **extra}
 
 
-def test_ladder_q4_win_keeps_baseline() -> None:
-    rungs = [_rung("f16", True, True), _rung("q8_0", True, True), _rung("q4_0", True, True)]
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 28.0, 500.0)
-    assert v.winner == "q4_0" and v.v4_result == "pass" and v.clear_ov == ["kv_type", "ctx_size"] and not v.set_ov
-    assert v.v22_result == "pass" and "not tried" not in v.summary and not v.deviation
-    assert "Section 4.3 target reached" in v.v4_msg
+def test_ladder_f16_win_stands_and_clears_overrides() -> None:
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True)], "f16", "", True, "", 7.5, 300.0,
+                         "UD-Q8_K_XL")
+    assert v.winner == "f16" and v.v4_result == "pass" and v.clear_ov == ["kv_type", "ctx_size"] and not v.set_ov
+    assert v.v22_result == "pass" and v.summary == "f16=coherent, q8_0=not tried" and not v.deviation
+    assert "f16 applied and coherent, the highest-precision rung (S-42" in v.v4_msg
+    assert v.v22_msg.startswith("deepseek-v4-flash UD-Q8_K_XL loads and generates coherently with f16 KV")
 
 
 def test_ladder_q8_win_names_the_incoherent_baseline() -> None:
-    rungs = [_rung("f16", True, True), _rung("q8_0", True, True), _rung("q4_0", True, False)]
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 28.0, 500.0)
-    assert v.winner == "q8_0" and v.v4_result == "pass"
-    assert "q8_0 applied (Section 4.3 setting q4_0 incoherent: q4_0=incoherent" in v.v4_msg
-    assert v.set_ov == [("kv_type", "q8_0")] and v.clear_ov == ["ctx_size"] and v.deviation
+    rungs = [_rung("f16", True, False), _rung("q8_0", True, True)]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "f16", "", True, "", 7.0, 280.0)
+    assert v.winner == "q8_0" and v.v4_result == "pass" and v.v22_result == "pass"
+    assert "q8_0 applied because the f16 rung did not stand (f16=incoherent;" in v.v4_msg
+    assert v.set_ov == [("kv_type", "q8_0")] and v.clear_ov == ["ctx_size"] and not v.deviation  # S-42: no deviation
 
 
-def test_ladder_f16_win_defers_v4_and_passes_v22_with_cap() -> None:
-    rungs = [_rung("f16", True, True), _rung("q8_0", False, False)]
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 20.0, 400.0)
-    assert v.winner == "f16" and v.v4_result == "deferred" and "unquantised KV" in v.v4_msg
-    assert v.v22_result == "pass" and "unquantised KV" in v.v22_msg
-    assert ("ctx_size", "16384") in v.set_ov and ("kv_type", "f16") in v.set_ov
-    assert "q8_0=load failed" in v.summary and "q4_0=not tried" in v.summary
+def test_ladder_f16_load_failure_falls_to_q8() -> None:
+    rungs = [_rung("f16", False, False), _rung("q8_0", True, True)]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "f16", "", True, "", 7.0, 280.0)
+    assert v.winner == "q8_0" and "f16=load failed" in v.v4_msg and v.summary == "f16=load failed, q8_0=coherent"
+    # A coherent rung whose KV type is unproven never stands: q8_0 wins over an unproven f16.
+    rungs = [_rung("f16", True, True, proof=False), _rung("q8_0", True, True)]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "f16", "", True, "", 7.0, 280.0)
+    assert v.winner == "q8_0" and "f16=coherent but KV unproven" in v.v4_msg
 
 
-def test_ladder_no_winner_defers_both_and_lowest_coherent_wins() -> None:
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, False)], "q4_0", 16384, "", True, "", None,
-                         None)
+def test_ladder_no_winner_defers_both_and_the_first_winner_stands() -> None:
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, False), _rung("q8_0", False, False)], "f16",
+                         "", True, "", None, None)
     assert v.winner == "" and v.v4_result == "deferred" and v.v22_result == "deferred"
-    assert v.clear_ov == ["kv_type", "ctx_size"]
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True), _rung("q8_0", True, True)],
-                         "q4_0", 16384, "", True, "", 1.0, 1.0)
-    assert v.winner == "q8_0"  # the LAST coherent rung (lowest reached), never f16 while a quantised rung is coherent
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True), _rung("q8_0", True, True),
-                                                       _rung("q4_0", True, True)], "q4_0", 16384, "", False,
+    assert v.clear_ov == ["kv_type", "ctx_size"] and "no coherent rung (f16=incoherent, q8_0=load failed)" in v.v4_msg
+    # Rungs are in list order and the FIRST coherent, proven one stands (ladder_engine stops there): never q8_0
+    # while f16 is coherent, the opposite of v0.3.5's descent to the lowest coherent rung.
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True), _rung("q8_0", True, True)], "f16",
+                         "", True, "", 1.0, 1.0)
+    assert v.winner == "f16"
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True)], "f16", "", False,
                          "GTT still 200 GB", 1.0, 1.0)
-    assert v.winner == "q4_0" and v.v22_result == "deferred" and "GTT still 200 GB" in v.v22_msg
+    assert v.winner == "f16" and v.v22_result == "deferred" and "GTT still 200 GB" in v.v22_msg
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", False, False)], "f16", "model file x not found",
+                         True, "", None, None)
+    assert "model file x not found" in v.v4_msg and v.summary == "f16=load failed, q8_0=not tried"
 
 
 def test_ladder_measurement_failure_keeps_the_rung_and_defers_v22() -> None:
     # A coherent, proven rung whose measurement failed is still the winner (not incoherence); V22 is deferred (R19).
-    rungs = [_rung("f16", True, True), _rung("q8_0", True, True, measure_error="8k prefill crashed the server")]
-    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "q4_0", 16384, "", True, "", 25.0, 450.0)
+    rungs = [_rung("f16", True, False), _rung("q8_0", True, True, measure_error="8k prefill crashed the server")]
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, rungs, "f16", "", True, "", 6.0, 250.0)
     assert v.winner == "q8_0" and v.v4_result == "pass" and v.v22_result == "deferred"
     assert "measurement failed at q8_0: 8k prefill crashed" in v.v22_msg
     assert "q8_0=coherent (measurement failed)" in v.summary
+    assert "q4_0" not in "".join([v.summary, v.v4_msg, v.v22_msg])  # D-29 (a): q4_0 is never a rung
 
 
 class FakeControl:
@@ -396,88 +455,95 @@ def _ladder_harness(ctx: Any, ctl: FakeControl, monkeypatch: pytest.MonkeyPatch,
     return rendered, current
 
 
-def test_ladder_engine_descends_and_keeps_the_rung_above_a_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                                     capsys: pytest.CaptureFixture[str]) -> None:
+def _measure_ok(_ctx: Any, res: Any, *_a: Any) -> None:
+    res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 7.5, 300.0
+
+
+def test_ladder_engine_f16_stands_when_it_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture[str]) -> None:
+    # S-42 (2): f16 is loaded first at the entry's own profile; when it loads, proves its lines and is coherent it
+    # stands, q8_0 is never loaded and nothing is written to overrides.json.
     ctx = _ctx(tmp_path, ENGINES)
-    ctl = FakeControl(fail_loads={"q4_0"})
-
-    def fake_measure(_ctx: Any, res: Any, *_a: Any) -> None:
-        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
-
-    rendered, _ = _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    ctl = FakeControl(fail_loads=set())
+    rendered, _ = _ladder_harness(ctx, ctl, monkeypatch, _measure_ok)
     res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
     lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
-    assert ctl.loads == ["f16", "q8_0", "q4_0"]  # f16 and q8_0 coherent -> descended; q4_0 failed -> q8_0 stands
-    assert res.kv_applied == "q8_0" and res.ok and res.v22_result == "pass"
-    assert [r["kv"] for r in res.ladder] == ["f16", "q8_0", "q4_0"] and res.ladder[2]["note"].startswith("load failed")
-    assert rendered[0] == ([("kv_type", "f16"), ("ctx_size", "16384")], ["coresident"])
-    assert rendered[1] == ([("kv_type", "q8_0")], ["coresident", "ctx_size"])
-    assert rendered[-1] == ([("kv_type", "q8_0")], ["ctx_size"])
-    assert res.footprint_bytes == 150 * lt.GB and ctl.registered == [150 * lt.GB, 150 * lt.GB]
+    assert ctl.loads == ["f16"]
+    assert res.kv_applied == "f16" and res.ok and res.v22_result == "pass" and [r["kv"] for r in res.ladder] == ["f16"]
+    assert rendered[0] == ([("kv_type", "f16")], ["ctx_size"])  # no f16 context cap any more (kv_ladder_rule)
+    assert rendered[-1] == ([], ["kv_type", "ctx_size"])  # the standing profile: overrides cleared
+    assert res.footprint_bytes == 150 * lt.GB and ctl.registered == [150 * lt.GB]
     recs = _records(capsys)
-    assert recs[-1][0] == "V4" and recs[-1][1] == "pass"
-    assert "Section 4.3 setting q4_0 load failed: q4_0=load failed" in recs[-1][2]
+    assert recs[-1][0] == "V4" and recs[-1][1] == "pass" and "f16 applied and coherent" in recs[-1][2]
+    assert "q8_0=not tried" in recs[-1][2]
     saved = json.loads(ctx.result_path("deepseek-v4-flash").read_text())
-    assert saved["control_mode"] == "orchestrator" and saved["baseline_deviation"].startswith("KV q8_0")
+    assert saved["control_mode"] == "orchestrator" and saved["baseline_deviation"] == ""
+    assert saved["resident_after"] is False
     assert not lt.pending_path(ctx).exists()  # the journal of the temporary rung overrides is closed
 
 
-def test_ladder_engine_tries_every_rung_so_q4_wins_below_a_failed_q8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                                     capsys: pytest.CaptureFixture[str]) -> None:
-    # Section 4.3: "a coherence prompt at each rung ... keeps the lowest coherent setting": a q8_0 that fails to load
-    # (its KV at 32768 is about the f16 rung's bytes at the 16384 cap) must not hide a q4_0 that fits.
+def test_ladder_engine_q8_only_after_f16_fails_to_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
     ctx = _ctx(tmp_path, ENGINES)
-    ctl = FakeControl(fail_loads={"q8_0"})
-
-    def fake_measure(_ctx: Any, res: Any, *_a: Any) -> None:
-        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
-
-    _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    ctl = FakeControl(fail_loads={"f16"})
+    rendered, _ = _ladder_harness(ctx, ctl, monkeypatch, _measure_ok)
     res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
     lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
-    assert ctl.loads == ["f16", "q8_0", "q4_0"]
-    assert res.kv_applied == "q4_0" and res.ok and res.v22_result == "pass" and not res.baseline_deviation
-    assert res.ladder[1]["note"].startswith("load failed") and res.ladder[2]["coherent"]
+    assert ctl.loads == ["f16", "q8_0"]
+    assert res.kv_applied == "q8_0" and res.ok and res.v22_result == "pass" and not res.baseline_deviation
+    assert res.ladder[0]["note"].startswith("load failed") and res.ladder[1]["coherent"]
+    assert rendered[1] == ([("kv_type", "q8_0")], ["ctx_size"])
+    assert rendered[-1] == ([("kv_type", "q8_0")], ["ctx_size"])  # the rung that stands, written to overrides.json
     recs = _records(capsys)
-    assert recs[-1][1] == "pass" and "Section 4.3 target reached" in recs[-1][2]
-    assert "rungs above the winner failed (q8_0=load failed)" in recs[-1][2]
+    assert recs[-1][1] == "pass" and "q8_0 applied because the f16 rung did not stand (f16=load failed" in recs[-1][2]
+    assert "q8_0 written to overrides.json" in recs[-1][2]
 
 
-def test_ladder_engine_measurement_failure_does_not_stop_the_descent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                                                     capsys: pytest.CaptureFixture[str]) -> None:
+def test_ladder_engine_incoherent_f16_falls_to_q8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
     ctx = _ctx(tmp_path, ENGINES)
     ctl = FakeControl(fail_loads=set())
-
-    def fake_measure(_ctx: Any, res: Any, _key: str, *_a: Any) -> None:
-        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
-        if res.ladder[-1]["kv"] == "q8_0":
-            res.crashed_at_8k, res.load_error = True, "8k prefill crashed the server (died during the prefill)"
-
-    _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    _, current = _ladder_harness(ctx, ctl, monkeypatch, _measure_ok)
+    monkeypatch.setattr(lt, "coherence_check", lambda _port, _model: (current["kv"] != "f16", "rung-dependent"))
     res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
     lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
-    assert ctl.loads == ["f16", "q8_0", "q4_0"]  # q8_0's measurement failed; q4_0 was still tried and wins
-    assert res.kv_applied == "q4_0" and res.v22_result == "pass" and res.ok
-    assert ctl.registered == [150 * lt.GB, 150 * lt.GB]  # f16 and q4_0 registered, the dead q8_0 server never (rule 1)
+    assert ctl.loads == ["f16", "q8_0"] and res.kv_applied == "q8_0" and res.ok
+    assert ctl.registered == [150 * lt.GB]  # only the rung that stands is measured and registered (rule 1)
+    assert res.ladder[0]["coherent"] is False and res.ladder[0]["released"] is True
     assert _records(capsys)[-1][1] == "pass"
+
+
+def test_ladder_engine_no_coherent_rung_defers_v4_and_v22(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _ctx(tmp_path, ENGINES)
+    ctl = FakeControl(fail_loads={"q8_0"})
+    rendered, _ = _ladder_harness(ctx, ctl, monkeypatch, _measure_ok)
+    monkeypatch.setattr(lt, "coherence_check", lambda _port, _model: (False, "gibberish"))
+    res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
+    lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
+    assert ctl.loads == ["f16", "q8_0"] and res.kv_applied == "" and not res.ok
+    assert res.v22_result == "deferred" and rendered[-1] == ([], ["kv_type", "ctx_size"])
+    assert ctl.registered == []
+    recs = _records(capsys)
+    assert recs[-1][:2] == ("V4", "deferred") and "f16=incoherent, q8_0=load failed" in recs[-1][2]
 
 
 def test_ladder_engine_winner_with_failed_measurement_defers_v22(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                                  capsys: pytest.CaptureFixture[str]) -> None:
     ctx = _ctx(tmp_path, ENGINES)
-    ctl = FakeControl(fail_loads={"q4_0"})
+    ctl = FakeControl(fail_loads=set())
 
     def fake_measure(_ctx: Any, res: Any, _key: str, *_a: Any) -> None:
-        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
-        if res.ladder[-1]["kv"] == "q8_0":
-            res.crashed_at_8k, res.load_error = True, "8k prefill crashed the server (died during the prefill)"
+        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 7.5, 300.0
+        res.crashed_at_8k, res.load_error = True, "8k prefill crashed the server (died during the prefill)"
 
     _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
     res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
     lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
-    assert ctl.loads == ["f16", "q8_0", "q4_0"]
-    assert res.kv_applied == "q8_0" and res.v22_result == "deferred" and not res.ok
-    assert "measurement failed at q8_0" in res.v22_msg and ctl.registered == [150 * lt.GB]  # only f16 was registered
+    # A measurement failure is not incoherence: f16 still stands, q8_0 is not tried, V22 is deferred (R19).
+    assert ctl.loads == ["f16"]
+    assert res.kv_applied == "f16" and res.v22_result == "deferred" and not res.ok
+    assert "measurement failed at f16" in res.v22_msg and ctl.registered == []  # a dead server is never registered
     assert _records(capsys)[-1][1] == "pass"
 
 
@@ -710,8 +776,9 @@ def test_control_load_queued_retries_the_arbiter_not_the_ledger(monkeypatch: pyt
 
 def test_test_engine_renders_the_unit_as_production_runs_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                             capsys: pytest.CaptureFixture[str]) -> None:
-    """S52: step 2 measures the vision engine at the profile production runs (its standing co-resident one, or the
-    Principal's overrides.json coresident=false): it neither sets nor clears `coresident` any more."""
+    """Step 2 measures each seat at the profile production runs (engines.json or the Principal's overrides.json; v0.4.0
+    has no co-resident profile, S-22): it neither sets nor clears anything. A newer-architecture seat that does not
+    load records V4 deferred and its own V22 deferred (R19 generalised, S-26), never a blocking fail."""
     ctx = _ctx(tmp_path, ENGINES)
     ctx.results_dir.mkdir(parents=True)
     (ctx.results_dir / "baseline.json").write_text(json.dumps({"gtt_used_bytes": 10 * lt.GB}))
@@ -724,76 +791,155 @@ def test_test_engine_renders_the_unit_as_production_runs_it(tmp_path: Path, monk
     monkeypatch.setattr(lt, "Control", lambda *_a, **_k: FakeControl(set()))
     monkeypatch.setattr(ctx, "render", fake_render)
     monkeypatch.setattr(lt, "swap_out", lambda *_a: (0.0, "released"))
-    lt.test_engine(ctx, "qwen2.5-vl-72b", None)
-    assert rendered == [("qwen2.5-vl-72b", [], [])]
-    assert _records(capsys)[0][:2] == ("V4", "fail")
+    lt.test_engine(ctx, "glm-5.3-flash", None)
+    assert rendered == [("glm-5.3-flash", [], [])]
+    recs = _records(capsys)
+    assert recs[0][:2] == ("V4", "deferred") and "newer architecture (glm5-next, first build b11279)" in recs[0][2]
+    saved = json.loads(ctx.result_path("glm-5.3-flash").read_text())
+    assert saved["v22_result"] == "deferred" and "pin 10964 cannot load it" in saved["v22_msg"]
+    # The same failure on a seat both pins load is a plain V4 fail.
+    rendered.clear()
+    lt.test_engine(ctx, "gpt-oss-120b", None)
+    assert rendered == [("gpt-oss-120b", [], [])] and _records(capsys)[0][:2] == ("V4", "fail")
+    assert json.loads(ctx.result_path("gpt-oss-120b").read_text())["v22_result"] == ""
 
 
-VISION_CO = {"key": "qwen2.5-vl-72b", "arbiter_class": "vision", "ctx_size": 262144, "parallel": 8,
-             "ctx_size_coresident": 65536, "parallel_coresident": 2, "footprint_gb": 79}
+# --- step 03: the single-residency proof (S-24, D-32 (a)) ---------------------------------------------------------
+
+RES_ENGINES = [
+    {**ENGINES[0], "footprint_gb": 65.37, "files": [{"name": "gpt-oss-120b-F16.gguf", "bytes": 65 * lt.GB}]},
+    {**ENGINES[1], "footprint_gb": 140.0, "files": [{"name": "a.gguf", "bytes": 100 * lt.GB},
+                                                    {"name": "b.gguf", "bytes": 40 * lt.GB}]},
+    ENGINES[2], ENGINES[3],
+]
 
 
-class _CoControl:
+class _ResControl:
+    """The Arbiter at limit 1 (D-32 (a)): granting the second seat evicts the first, unless evict=False."""
+
     mode = "orchestrator"
 
+    def __init__(self, evict: bool = True) -> None:
+        self.evict = evict
+        self.ledger: list[str] = []
+        self.loads: list[str] = []
+        self.unloads: list[str] = []
+        self.last_decision: dict[str, Any] = {}
+
     def resident_keys(self) -> list[str]:
-        return []
+        return list(self.ledger)
 
     def status(self) -> dict[str, Any]:
-        return {"budget_bytes": 164 * lt.GB}
+        return {"budget_bytes": 164 * lt.GB, "max_resident": 1, "generation_queue": []}
+
+    def load(self, key: str, _ctx: int, _par: int, _port: int) -> float:
+        evicted = [k for k in self.ledger if self.evict]
+        self.ledger = [key] if self.evict else [*self.ledger, key]
+        self.loads.append(key)
+        self.last_decision = {"decision": "granted", "reason": f"fits after evicting {evicted or 'nothing'}"}
+        return 30.0
+
+    def unload(self, key: str) -> str:
+        self.ledger.remove(key)
+        self.unloads.append(key)
+        return f"{key} released"
 
 
-def _coresident_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vision_env: dict[str, str],
-                        ) -> tuple[Any, list[tuple[str, list[Any], list[Any]]]]:
-    engines = [{**ENGINES[0], "footprint_gb": 63}, VISION_CO]
-    ctx = _ctx(tmp_path, engines)
+def _residency_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ctl: _ResControl, present: bool = True,
+                       ) -> tuple[Any, list[tuple[str, list[Any], list[Any]]]]:
+    ctx = _ctx(tmp_path, RES_ENGINES)
     ctx.results_dir.mkdir(parents=True, exist_ok=True)
     (ctx.results_dir / "baseline.json").write_text(json.dumps({"gtt_used_bytes": 10 * lt.GB}))
     rendered: list[tuple[str, list[Any], list[Any]]] = []
 
     def fake_render(key: str, set_ov: Any = (), clear_ov: Any = ()) -> dict[str, str]:
         rendered.append((key, list(set_ov), list(clear_ov)))
-        base = {"ATLAS_MODEL_PRESENT": "0", "ATLAS_MODEL_FILE": f"{key}.gguf", "LLAMA_ARG_PORT": "8101"}
-        return {**base, **vision_env} if key == "qwen2.5-vl-72b" else base
+        return {"ATLAS_MODEL_PRESENT": "1" if present else "0", "ATLAS_MODEL_FILE": f"{key}.gguf",
+                "LLAMA_ARG_PORT": "8101", "ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8"}
 
-    monkeypatch.setattr(lt, "Control", lambda *_a, **_k: _CoControl())
+    weights = {"gpt-oss-120b": 65 * lt.GB, "glm-5.3-flash": 140 * lt.GB}
+
+    def chat(_url: str, _model: str, messages: list[dict[str, str]], _max: int, **_k: Any) -> dict[str, Any]:
+        if "lighthouses" in messages[0]["content"]:  # the first concurrent request
+            return {"error": "", "t_send": 0.0, "t_recv": 10.0, "timings": {"prompt_ms": 1000, "predicted_ms": 8000}}
+        if _k.get("path"):  # the second, through the orchestrator: started after the first finished
+            return {"error": "", "t_send": 0.5, "t_recv": 18.0, "timings": {"prompt_ms": 500, "predicted_ms": 7500}}
+        return {"error": "", "t_send": 0.0, "t_recv": 8.0, "timings": {}}  # the solo timing, direct to the port
+
+    real_sleep = lt.time.sleep
+    monkeypatch.setattr(lt.time, "sleep", lambda _s: real_sleep(0.001))
+    monkeypatch.setattr(lt, "Control", lambda *_a, **_k: ctl)
     monkeypatch.setattr(ctx, "render", fake_render)
-    monkeypatch.setattr(lt, "unit_active", lambda _k: False)
+    monkeypatch.setattr(lt, "unit_active", lambda k: k in ctl.ledger)
     monkeypatch.setattr(lt, "clear_residents", lambda _c, _r, base, _w: (True, 0.0, "nothing resident", base))
+    monkeypatch.setattr(lt, "gtt_used_bytes", lambda: 10 * lt.GB + 5 * lt.GB + sum(weights[k] for k in ctl.ledger))
+    monkeypatch.setattr(lt, "unload_and_release", lambda c, k, _b: (bool(c.unload(k)), 1.0, "GTT back"))
+    monkeypatch.setattr(lt, "require_generation_idle", lambda *_a: None)
+    monkeypatch.setattr(lt, "chat", chat)
+    monkeypatch.setattr(lt, "arbiter_refusal_proof", lambda *_a: (True, "refused: over budget; downgraded"))
     return ctx, rendered
 
 
-def test_coresident_step_renders_the_standing_profile_without_a_temporary_override(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """S52: step 3 renders both units exactly as production runs them (no set, no clear, nothing journalled, nothing
-    restored at the end), and still asserts ATLAS_CORESIDENT=1 at engines.json's 2-slot values before any load."""
+def test_residency_proves_the_arbiter_evicts_the_first_seat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            capsys: pytest.CaptureFixture[str]) -> None:
     import argparse
 
-    good = {"ATLAS_CORESIDENT": "1", "ATLAS_PARALLEL": "2", "ATLAS_CTX_SIZE": "65536"}
-    ctx, rendered = _coresident_harness(tmp_path, monkeypatch, good)
-    args = argparse.Namespace(text="gpt-oss-120b", vision="qwen2.5-vl-72b")
-    assert lt.cmd_coresident(ctx, args) == 0  # the model files are absent here: V21 recorded as a fail, no load
-    assert rendered == [("gpt-oss-120b", [], []), ("qwen2.5-vl-72b", [], [])]
-    assert not lt.pending_path(ctx).exists() and not ctx.overrides.exists()
-    assert [r[:2] for r in _records(capsys)] == [("V21", "fail"), ("V14b", "fail")]
-    # The Principal's coresident=false: the pair cannot form at the full profile and Phase 3 does not override it.
-    ctx.overrides.write_text(json.dumps({"qwen2.5-vl-72b": {"coresident": False}}))
-    ctx, rendered = _coresident_harness(tmp_path, monkeypatch, {**good, "ATLAS_CORESIDENT": "0",
-                                                                "ATLAS_PARALLEL": "8", "ATLAS_CTX_SIZE": "262144"})
-    principal = r"coresident=false for qwen2\.5-vl-72b.*--clear-override qwen2\.5-vl-72b coresident"
-    with pytest.raises(lt.Infra, match=principal):
-        lt.cmd_coresident(ctx, args)
-    assert json.loads(ctx.overrides.read_text()) == {"qwen2.5-vl-72b": {"coresident": False}}  # untouched
-    # No override, yet not rendered co-resident (an engine-env.py without the S52 default): still refused.
-    ctx.overrides.unlink()
-    ctx, _ = _coresident_harness(tmp_path, monkeypatch, {**good, "ATLAS_CORESIDENT": "0"})
-    with pytest.raises(lt.Infra, match=re.escape("did not render qwen2.5-vl-72b with ATLAS_CORESIDENT=1")):
-        lt.cmd_coresident(ctx, args)
-    # Co-resident flag but not engines.json's 2-slot values: refused before any load (the existing check).
-    ctx, _ = _coresident_harness(tmp_path, monkeypatch, {**good, "ATLAS_PARALLEL": "8"})
-    with pytest.raises(lt.Infra, match="parallel_coresident 2"):
-        lt.cmd_coresident(ctx, args)
-    assert _records(capsys) == []
+    ctl = _ResControl()
+    ctx, rendered = _residency_harness(tmp_path, monkeypatch, ctl)
+    assert lt.cmd_residency(ctx, argparse.Namespace(first="gpt-oss-120b", second="glm-5.3-flash")) == 0
+    assert ctl.loads == ["gpt-oss-120b", "glm-5.3-flash"] and ctl.unloads == ["glm-5.3-flash"]
+    # Both units rendered as production runs them: no override set or cleared (S-22: no co-resident profile).
+    assert rendered == [("gpt-oss-120b", [], []), ("glm-5.3-flash", [], [])] and not ctx.overrides.exists()
+    recs = _records(capsys)
+    assert [r[:2] for r in recs] == [("V21", "pass"), ("V14b", "pass")]
+    v21 = recs[0][2]
+    assert "loading glm-5.3-flash evicted gpt-oss-120b (ledger ['glm-5.3-flash']" in v21 and "limit 1" in v21
+    assert "GTT delta 145.0 GB for glm-5.3-flash alone (weights 140.0 GB" in v21
+    assert "queued behind the first" in v21 and "slot save and restore across the swap: phased" in v21
+    saved = json.loads((ctx.results_dir / "residency.json").read_text())
+    assert saved["single"] is True and saved["memory_ok"] is True and saved["ledger_after_second"] == ["glm-5.3-flash"]
+    assert saved["v14b"][0] == "pass"
+
+
+def test_residency_fails_when_both_seats_stay_resident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    ctl = _ResControl(evict=False)
+    ctx, _ = _residency_harness(tmp_path, monkeypatch, ctl)
+    assert lt.cmd_residency(ctx, argparse.Namespace(first="gpt-oss-120b", second="glm-5.3-flash")) == 0
+    recs = _records(capsys)
+    assert recs[0][:2] == ("V21", "fail")
+    assert "NOT single residency after loading glm-5.3-flash" in recs[0][2] and "still active" in recs[0][2]
+    assert "memory out of tolerance" in recs[0][2]  # 210 GB delta: above the budget cap
+    assert sorted(ctl.unloads) == ["glm-5.3-flash", "gpt-oss-120b"]  # cleanup unloads both through the Arbiter
+
+
+def test_residency_without_model_files_records_v21_fail_and_still_proves_v14b(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    ctl = _ResControl()
+    ctx, _ = _residency_harness(tmp_path, monkeypatch, ctl, present=False)
+    assert lt.cmd_residency(ctx, argparse.Namespace(first="gpt-oss-120b", second="glm-5.3-flash")) == 0
+    recs = _records(capsys)
+    assert recs == [("V21", "fail", "gpt-oss-120b: model file not present (gpt-oss-120b.gguf)"),
+                    ("V14b", "pass", "refused: over budget; downgraded")]
+    assert ctl.loads == []
+
+
+def test_residency_leak_in_cleanup_fails_v21_and_stops_the_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    ctl = _ResControl()
+    ctx, _ = _residency_harness(tmp_path, monkeypatch, ctl)
+    monkeypatch.setattr(lt, "unload_and_release", lambda c, k, _b: (c.unload(k) and False, 120.0, "GTT 40 GB above"))
+    with pytest.raises(lt.Infra, match="single-residency cleanup"):
+        lt.cmd_residency(ctx, argparse.Namespace(first="gpt-oss-120b", second="glm-5.3-flash"))
+    recs = _records(capsys)
+    assert recs[0][:2] == ("V21", "fail") and "release: glm-5.3-flash did not release" in recs[0][2]
+    assert recs[1] == ("V14b", "fail", "not attempted: memory still held after the residency test")
 
 
 def test_test_engine_releases_the_previous_engine_before_the_model_check(tmp_path: Path,
@@ -807,8 +953,8 @@ def test_test_engine_releases_the_previous_engine_before_the_model_check(tmp_pat
     monkeypatch.setattr(ctx, "render", lambda *_a, **_k: {"ATLAS_MODEL_PRESENT": "0", "ATLAS_MODEL_FILE": "x.gguf",
                                                            "ATLAS_KV_TYPE": "q4_0"})
     monkeypatch.setattr(lt, "swap_out", lambda _c, _l, prev, _b: (swapped.append(prev), (0.0, "released"))[1])
-    lt.test_engine(ctx, "gpt-oss-120b", "qwen2.5-vl-72b")
-    assert swapped == ["qwen2.5-vl-72b"]  # the previous engine was released although this one never loaded
+    lt.test_engine(ctx, "gpt-oss-120b", "glm-5.3-flash")
+    assert swapped == ["glm-5.3-flash"]  # the previous engine was released although this one never loaded
     saved = json.loads(ctx.result_path("gpt-oss-120b").read_text())
     assert saved["resident_after"] is False and not saved["load_ok"]
     assert _records(capsys) == [("V4", "fail", "gpt-oss-120b: not loaded (ATLAS_MODEL_PRESENT=0 in gpt-oss-120b.env: "
@@ -1016,7 +1162,7 @@ def test_memory_record_context_shift_states_growth_and_unknowns() -> None:
     proj = {"kv_bytes": int(5.0625 * lt.GIB), "per_token_f16": 73728, "kv_factor": 0.28125}
     rec = lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM), proj, "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5))
     assert rec["ctx_shift"] == "disabled" and rec["ctx_shift_why"] == "not supported by this context"
-    assert rec["profile"] == {"ctx": 262144, "parallel": 8, "kv": "q4_0", "coresident": False}
+    assert rec["profile"] == {"ctx": 262144, "parallel": 8, "kv": "q4_0"}  # S-22: no co-resident profile
     assert rec["anon_growth_bytes"] == int(1.5 * lt.GIB) - lt.GIB
     assert any("prompt-cache size" in u for u in rec["unknown"]) and not any("projection" in u for u in rec["unknown"])
     kept = lt.memory_record(env, lt.parse_memory_lines(NEMOTRON_MEM), None, "no python", {"why": "x"}, {"why": "y"})
@@ -1069,15 +1215,26 @@ def _real_ctx(tmp_path: Path, python: str = sys.executable) -> Any:
 
 
 def test_arbiter_projection_runs_the_arbiters_own_code(tmp_path: Path) -> None:
+    from atlas.arbiter import Arbiter
+    from atlas.config import load_engines
+
     ctx = _real_ctx(tmp_path)
-    d, why = lt.arbiter_projection(ctx, "qwen2.5-vl-72b", 65536, 2, "q8_0")  # the S52 standing vision profile
-    assert why == "" and d is not None and not d["measured"]
-    assert d["kv_bytes"] == int(327_680 * 65536 * 8.5 / 16) and d["total_bytes"] == int(89.625 * lt.GIB)
-    d, _ = lt.arbiter_projection(ctx, "gpt-oss-120b", 262144, 8, "q4_0")
-    assert d is not None and d["kv_bytes"] == int(73_728 * 262144 * 4.5 / 16) and d["kv_factor"] == 0.28125
-    d, _ = lt.arbiter_projection(ctx, "deepseek-v4-flash", 16384, 1, "f16")  # a ladder rung: its own profile
-    assert d is not None and d["total_bytes"] == 160 * lt.GIB
-    d, why = lt.arbiter_projection(_real_ctx(tmp_path, ""), "gpt-oss-120b", 262144, 8, "q4_0")
+    # The subprocess projection is the Arbiter's own (v0.4.0: exact file bytes, D-31; the S-17 KV table with per-slot
+    # state; the compute-buffer term), for the Day 1 seats at the profiles Phase 3 renders.
+    arb = Arbiter(load_engines(REAL_ENGINES.parent), None, None)  # type: ignore[arg-type]
+    for key, n_ctx, par, kv in (("glm-5.3-flash", 262144, 8, "f16"), ("gpt-oss-120b", 262144, 8, "q8_0"),
+                                ("deepseek-v4-flash", 131072, 1, "f16"), ("deepseek-v4-flash", 131072, 1, "q8_0")):
+        d, why = lt.arbiter_projection(ctx, key, n_ctx, par, kv)
+        fp = arb.projected_footprint(key, n_ctx, par, kv)
+        assert why == "" and d is not None and not d["measured"], (key, why)
+        assert (d["weights_bytes"], d["kv_bytes"], d["total_bytes"]) == (fp.weights_bytes, fp.kv_bytes, fp.total_bytes)
+    d, _ = lt.arbiter_projection(ctx, "glm-5.3-flash", 262144, 8, "f16")
+    assert d is not None and d["per_token_f16"] == 19_712 and d["kv_bytes"] == 19_712 * 262144 + 8 * 152_633_344
+    d, _ = lt.arbiter_projection(ctx, "gpt-oss-120b", 262144, 8, "q8_0")
+    assert d is not None and d["per_token_f16"] == 36_864 and d["kv_factor"] == 0.53125
+    d, _ = lt.arbiter_projection(ctx, "deepseek-v4-flash", 131072, 1, "f16")  # a ladder rung: its own profile
+    assert d is not None and d["per_token_f16"] == 6_880 and d["kv_factor"] == 1.0
+    d, why = lt.arbiter_projection(_real_ctx(tmp_path, ""), "gpt-oss-120b", 262144, 8, "q8_0")
     assert d is None and "no orchestrator python" in why
     argv: list[list[str]] = []
 
@@ -1087,13 +1244,13 @@ def test_arbiter_projection_runs_the_arbiters_own_code(tmp_path: Path) -> None:
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(lt, "run", fake_run)
-        assert lt.arbiter_projection(ctx, "meditron-70b", 4096, 1, "q8_0") == ({"kv_bytes": 1}, "")
+        assert lt.arbiter_projection(ctx, "glm-5.3-flash", 4096, 1, "q8_0") == ({"kv_bytes": 1}, "")
     # Isolated (no PYTHONPATH, no cwd on sys.path) and no .pyc written as root; the config dir, then the profile.
-    assert argv[0][1:4] == ["-I", "-B", "-c"] and argv[0][5:] == [str(REAL_ENGINES.parent), "meditron-70b", "4096",
+    assert argv[0][1:4] == ["-I", "-B", "-c"] and argv[0][5:] == [str(REAL_ENGINES.parent), "glm-5.3-flash", "4096",
                                                                   "1", "q8_0"]
     bad = _ctx(tmp_path, ENGINES)  # four engines: atlas.config refuses it, so the projection is UNKNOWN, not a crash
     bad.atlas_python = sys.executable
-    d, why = lt.arbiter_projection(bad, "gpt-oss-120b", 262144, 8, "q4_0")
+    d, why = lt.arbiter_projection(bad, "gpt-oss-120b", 262144, 8, "q8_0")
     assert d is None and why.startswith("projection failed (exit 1)") and "ConfigError" in why
 
 
@@ -1133,13 +1290,16 @@ def test_test_engine_records_memory_beside_the_projection(tmp_path: Path, monkey
     saved = json.loads(ctx.result_path("gpt-oss-120b").read_text())
     assert saved["ok"] and saved["resident_after"] and len(saved["memory"]) == 1
     rec = saved["memory"][0]
-    assert rec["measured"]["context_mib"] == 2774.25 and rec["projected"]["kv_bytes"] == int(5.0625 * lt.GIB)
+    # The Arbiter's projection for gpt-oss-120b at 262144 x 8 q4_0 (S-17, v0.4.0): the 18 full-attention layers' cache
+    # (36,864 B/token at f16) plus the sliding-window cells of each of the 8 slots.
+    assert rec["measured"]["context_mib"] == 2774.25
+    assert rec["projected"]["kv_bytes"] == int(36_864 * 262144 * 4.5 / 16) + 8 * 84_934_656
     assert rec["ctx_shift"] == "disabled" and rec["anon_growth_bytes"] == int(1.4 * lt.GIB) - lt.GIB
     assert calls["journal"] == [("gpt-oss-120b", "inv-1")]
     assert calls["host"] == ["gpt-oss-120b", "<the tests>", "gpt-oss-120b"]  # RSS read before and after the requests
     err = capsys.readouterr().err
     lines = [ln for ln in err.splitlines() if "memory (S52)" in ln]
-    assert len(lines) == 1 and "context 2.71 GiB measured (2 K/V line(s), SWA 0.18) vs 5.06 GiB projected" in lines[0]
+    assert len(lines) == 1 and "context 2.71 GiB measured (2 K/V line(s), SWA 0.18) vs 3.16 GiB projected" in lines[0]
     assert "context shift disabled (not supported by this context)" in lines[0] and "(anon +410 MiB)" in lines[0]
 
 
@@ -1166,17 +1326,14 @@ def test_test_engine_never_fails_on_the_memory_record(tmp_path: Path, monkeypatc
 
 def test_ladder_records_every_rung_that_loaded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx(tmp_path, ENGINES)
-    ctl = FakeControl(fail_loads={"q4_0"})
-
-    def fake_measure(_ctx: Any, res: Any, *_a: Any) -> None:
-        res.generated, res.decode_tps_512, res.prefill_tps_512 = True, 27.0, 600.0
-
-    _ladder_harness(ctx, ctl, monkeypatch, fake_measure)
+    ctl = FakeControl(fail_loads=set())
+    _, current = _ladder_harness(ctx, ctl, monkeypatch, _measure_ok)
+    monkeypatch.setattr(lt, "coherence_check", lambda _port, _model: (current["kv"] != "f16", "rung-dependent"))
     monkeypatch.setattr(lt, "journal_lines", lambda *_a: DEEPSEEK_MEM)
     monkeypatch.setattr(lt, "host_memory", lambda _k: _host(5, 160.0, 2.0))
     res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
     lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
-    assert [r["label"] for r in res.memory] == ["f16", "q8_0"]  # the q4_0 rung never loaded: nothing to measure
+    assert [r["label"] for r in res.memory] == ["f16", "q8_0"]  # the incoherent f16 rung loaded: it is recorded too
     assert all(r["measured"]["kv_lines"] == 5 and r["ctx_shift"] == "disabled" for r in res.memory)
     saved = json.loads(ctx.result_path("deepseek-v4-flash").read_text())
     assert [r["label"] for r in saved["memory"]] == ["f16", "q8_0"] and saved["kv_applied"] == "q8_0"
@@ -1290,7 +1447,9 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
                                        {"kv_bytes": int(5.0625 * lt.GIB), "per_token_f16": 73728, "kv_factor": 0.28125},
                                        "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5)))
     gpt.save(ctx)
-    vis = lt.EngineResult(key="qwen2.5-vl-72b", ok=True)
+    # v0.4.0 Day 1 list (S-34, real engines.json): the vision record belongs to glm-5.3-flash, the engine with the
+    # mmproj (D-20); the journal is the generic vision fixture (VISION_MEM) at its own synthetic profile.
+    vis = lt.EngineResult(key="glm-5.3-flash", ok=True)
     vis_env = {**env, "ATLAS_CTX_SIZE": "65536", "ATLAS_PARALLEL": "2", "ATLAS_KV_TYPE": "q8_0"}
     vis.memory.append(lt.memory_record(vis_env, lt.parse_memory_lines(VISION_MEM), None, "no python", {}, {}))
     vis.save(ctx)
@@ -1301,7 +1460,8 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
                                               "ATLAS_KV_TYPE": kv}, lt.parse_memory_lines(DEEPSEEK_MEM), None, "",
                                              {}, {}, kv)})
     ds.save(ctx)
-    lt.EngineResult(key="meditron-70b", memory=[{"label": "", "error": "OSError: boom", "unknown": []}]).save(ctx)
+    # gpt-oss-120b-abliterated has no result file: the "not tested" entry. The "record not taken" entry is checked
+    # below by replacing gpt-oss-120b's record (the Day 1 list has no fifth Phase 3 engine to carry it).
     monkeypatch.setattr(lt, "unit_active", lambda k: k == "router-qwen3.5-4b")
     monkeypatch.setattr(lt, "unit_invocation_id", lambda _k: "inv-router")
     monkeypatch.setattr(lt, "run", lambda cmd, timeout=60.0: lt.subprocess.CompletedProcess(
@@ -1318,12 +1478,13 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
     assert ("gpt-oss-120b 262144 x 8 q4_0: context 2.71 GiB measured (K/V 2.71 GiB in 2 line(s), of which "
             "sliding-window 0.18) vs 5.06 GiB projected (73728 B/token at f16 x 0.28125); implied 39,456 B/token at "
             "f16 at this profile; compute buffers 1.21 GiB; GTT footprint 70.0 GB registered (rule 1)") in kv
-    assert "qwen2.5-vl-72b 65536 x 2 q8_0: context 10.62 GiB measured" in kv and "projection UNKNOWN" in kv
+    assert "glm-5.3-flash 65536 x 2 q8_0: context 10.62 GiB measured" in kv and "projection UNKNOWN" in kv
     assert "(+ mmproj 0.29)" in kv
     assert "deepseek-v4-flash (ladder rung f16)" in kv and "deepseek-v4-flash (ladder rung q8_0, the rung that " \
         "stands)" in kv and "GTT footprint 160.0 GB" in kv
-    assert "meditron-70b: UNKNOWN (record not taken: OSError: boom)" in kv
-    assert "nemotron-3-super (not tested): UNKNOWN" in kv
+    assert "gpt-oss-120b-abliterated (not tested): UNKNOWN" in kv
+    for retired in ("qwen2.5-vl-72b", "meditron-70b", "nemotron-3-super", "qwen3.5-122b"):
+        assert retired not in kv  # S-11: only engines.json's Phase 3 engines are listed
     assert "router-qwen3.5-4b (resident, not loaded by Phase 3" in kv and "(resident: never charged, Section 4.1)" in kv
     assert "Updating the figures is the Principal's call" in kv
     cache_title, cache = todos["cache-ram"]
@@ -1331,13 +1492,19 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
     assert ("gpt-oss-120b: RSS 3.00 GiB after the load, 3.50 after the tests (RssAnon 1.00 -> 1.50, +512 MiB); "
             "prompt cache: 2 eviction(s) logged, largest entry 512.25 MiB; checkpoints: 1 erased") in cache
     assert "suggested --cache-ram 2816 --ctx-checkpoints 5" in cache
-    assert "qwen2.5-vl-72b: RSS UNKNOWN" in cache and "checkpoints: none made (its cache rolls back); suggested " \
+    assert "glm-5.3-flash: RSS UNKNOWN" in cache and "checkpoints: none made (its cache rolls back); suggested " \
         "--cache-ram 8192 (up to 8192 MiB)" in cache
     assert "deepseek-v4-flash (ladder rung q8_0, the rung that stands)" in cache and "rung f16)" not in cache
     assert ("router-qwen3.5-4b (resident, not loaded by Phase 3: current journal and RSS, read-only): RSS 5.00 GiB "
             "now (RssAnon 0.90)") in cache and "Phase 3 changed no engine setting" in cache
     assert "The two largest engines plus the resident chat engine(s) could hold up to" in cache
     assert "router-qwen3.5-4b: memory (S52) resident:" in cap.err and "context shift disabled" in cap.err
+    # A record that could not be taken is UNKNOWN with the reason, and the to-dos still go out.
+    lt.EngineResult(key="gpt-oss-120b", memory=[{"label": "", "error": "OSError: boom", "unknown": []}]).save(ctx)
+    assert lt.cmd_memory(ctx, None) == 0
+    todos = _todos(capsys.readouterr().out)
+    assert set(todos) == {"kv-estimates", "cache-ram"}
+    assert "gpt-oss-120b: UNKNOWN (record not taken: OSError: boom)" in todos["kv-estimates"][1]
 
 
 def test_cmd_memory_never_fails_and_still_raises_both_todos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1384,6 +1551,37 @@ def test_driver_raises_the_todos_and_passes_the_venv() -> None:
     assert step4.index("_p3_loadtest memory") < step4.index("_p3_loadtest table") < step4.index("gate phase3")
 
 
+def test_driver_wires_the_v040_steps_and_the_day1_list() -> None:
+    """phase3-models.sh for v0.4.0: the Day 1 classes (S-34), the parity and quality steps between the load tests and
+    the single-residency test (S-02, S-03), V25 in the gate, both llama-perplexity builds passed to loadtest.py, the
+    free space without the Meditron join, the size announced from engines.json (D-42 (b)), and every engine key the
+    driver names present in engines.json."""
+    driver = (LOADTEST.parents[1] / "phase3-models.sh").read_text(encoding="utf-8")
+    assert re.search(r'^P3_CLASSES="core apex"', driver, re.M)
+    assert ("run_step phase3 02 step_02\nrun_step phase3 02b step_02b\nrun_step phase3 02c step_02c\n"
+            "run_step phase3 03 step_03\nrun_step phase3 04 step_04") in driver
+    assert '_p3_loadtest residency --first "$P3_FIRST_KEY" --second "$P3_SECOND_KEY"' in driver
+    assert "_p3_loadtest coresident" not in driver and "P3_VISION_KEY" not in driver
+    assert "gate phase3 V4 V10 V14b V21 V25 -- V22" in driver
+    assert '--perplexity "$P3_PERPLEXITY" --parity-perplexity "$P3_PARITY_PERPLEXITY"' in driver
+    assert 'P3_PARITY_PERPLEXITY="$ATLAS_OPT/llama-parity/dist/bin/llama-perplexity"' in driver
+    assert "local need=$(( total + total / 20 ))" in driver and "80000000000" not in driver and "690 GB" not in driver
+    assert re.search(r"^P3_MEMORY_FNS=\(.* engine_tree_lfs .*\)$", driver, re.M)
+    for fn in ("_p3_remaining_bytes", "_p3_tree_matches_manifest"):
+        body = driver[driver.index(f"{fn}() {{"):]
+        body = body[:body.index("\n}\n")]
+        assert 'engine_tree_lfs "$key"' in body and "hf_tree_lfs " not in body, fn
+    for step in ("step_02b", "step_02c"):
+        body = driver[driver.index(f"{step}() {{"):]
+        body = body[:body.index("\n}\n")]
+        assert "_p3_quiesce_background" in body and "_p3_resume_background" in body, step
+    keys = {e["key"]: e for e in json.loads(REAL_ENGINES.read_text())["engines"]}
+    for var in ("P3_FIRST_KEY", "P3_SECOND_KEY"):
+        m = re.search(rf'^{var}="([^"]+)"', driver, re.M)
+        assert m and m.group(1) in keys and keys[m.group(1)]["arbiter_class"] in lt.P3_CLASSES, var
+    assert re.search(r'^P3_SECOND_KEY="' + re.escape(lt.DEEP_THINK_GENERATOR) + '"', driver, re.M)
+
+
 def test_resident_memory_record_is_read_only_and_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _real_ctx(tmp_path)
     monkeypatch.setattr(ctx, "env", lambda _k: {"ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "4", "ARGS": CHAT_ARGS})
@@ -1409,3 +1607,345 @@ def test_resident_memory_record_is_read_only_and_never_raises(tmp_path: Path, mo
     monkeypatch.setattr(ctx, "env", stopped)
     with pytest.raises(lt.Terminated):
         lt.resident_memory_record(ctx, "router-qwen3.5-4b")
+
+
+# --- v0.4.0: newer architectures (S-26), the glm5-next memory lines, the probe seat ----------------------------------
+
+
+def test_newer_architecture_helpers() -> None:
+    assert lt.build_number("b11279") == 11279 and lt.build_number("v0.4.1") is None and lt.build_number(None) is None
+    gpt, glm, ds = ENGINES[0], ENGINES[1], ENGINES[2]
+    assert lt.is_newer_arch(glm) and not lt.is_newer_arch(gpt) and not lt.is_newer_arch(ds)
+    assert not lt.is_newer_arch({"min_llama_cpp_tag": f"b{lt.PARITY_PIN_BUILD}"})  # v0.4.1 itself loads it
+    assert not lt.is_newer_arch({})  # no tag recorded (the unchanged abliterated entry): not newer
+    assert lt.is_v22_engine(glm) and lt.is_v22_engine(ds) and not lt.is_v22_engine(gpt)
+    assert lt.v4_verdict(gpt, True, "ok") == ("pass", "ok") and lt.v4_verdict(gpt, False, "bad") == ("fail", "bad")
+    result, msg = lt.v4_verdict(glm, False, "bad")
+    assert result == "deferred" and msg.startswith("bad [newer architecture (glm5-next, first build b11279)")
+    assert "R19 generalised, S-26" in msg
+
+
+def test_set_v22_for_a_newer_architecture_seat() -> None:
+    res = _good("glm-5.3-flash")
+    res.ok, res.kv_proof_ok, res.kv_applied = True, True, "f16"
+    lt.set_v22(res, ENGINES[1])
+    assert res.v22_result == "pass" and "proves f16 KV" in res.v22_msg and "pin 10964 cannot load it" in res.v22_msg
+    res = _good("glm-5.3-flash")
+    res.ok, res.kv_proof_ok, res.kv_proof_msg = True, False, "glm-5.3-flash: f16 requested, NOT proven"
+    lt.set_v22(res, ENGINES[1])
+    assert res.v22_result == "deferred" and "V4 not proven: glm-5.3-flash: f16 requested" in res.v22_msg
+    plain, apex = _good(), _good("deepseek-v4-flash")
+    lt.set_v22(plain, ENGINES[0])
+    lt.set_v22(apex, {**ENGINES[2], "min_llama_cpp_tag": "b11300"})  # the Apex's V22 comes from its ladder only
+    assert plain.v22_result == "" and apex.v22_result == ""
+
+
+def test_check_band_d33c_floor_is_the_only_verdict() -> None:
+    spec = {"projected_decode_tok_s": [35, 50], "decode_floor_tok_s": None, "arbiter_class": "core"}
+    res = _good()
+    res.decode_tps_512 = 5.0  # far below the projection, but no floor: a record, never a fail (D-33 (c))
+    lt.check_band(res, spec)
+    assert not res.band_fail and "no floor set" in res.band_note and "vs 35-50 tok/s projected" in res.band_note
+    assert lt.v10_line(res, spec)[0] == "pass" and "(projected 35-50, no floor)" in lt.v10_line(res, spec)[1]
+    floored = {**spec, "decode_floor_tok_s": 20}
+    res = _good()
+    res.decode_tps_512 = 19.9
+    lt.check_band(res, floored)
+    assert res.band_fail.startswith("decode 19.9 tok/s below the seat's floor 20 tok/s")
+    assert lt.v10_line(res, floored)[0] == "fail"
+    res = _good()
+    res.decode_tps_512 = 20.0
+    lt.check_band(res, floored)
+    assert not res.band_fail and "at or above the floor 20" in res.band_note
+    res = _good()
+    res.decode_tps_512 = 3.0
+    lt.check_band(res, {"decode_floor_tok_s": None})
+    assert not res.band_fail and "(no projection recorded)" in res.band_note
+
+
+FMT_IDX = "%s: creating indexer KV cache, size = %u cells"  # src/llama-memory-hybrid-idx.cpp:68 (b11474)
+GLM_MEM = [
+    _cl("I", "llama_context: flash_attn            = enabled"),
+    _kv(262144, 47, 8, 1, "f16", 4700.0, 0.0),  # the MLA attention cache, announced by nothing: "full"
+    _cl("I", FMT_IDX % ("llama_memory_hybrid_idx", 262144)),
+    _kv(262144, 47, 8, 1, "f16", 470.0, 0.0),  # the DSA indexer cache
+    _srv("load_model", "I", FMT_SLOTS % (8, 32768, "true")),
+]
+
+
+def test_glm5_next_memory_lines_tag_the_indexer_and_prove_v4() -> None:
+    m = lt.parse_memory_lines(GLM_MEM)
+    assert [p["part"] for p in m["kv_parts"]] == ["full", "indexer"] and m["kv_lines"] == 2
+    assert m["kv_mib"] == 5170.0 and m["n_slots"] == 8
+    real = {e["key"]: e for e in json.loads(REAL_ENGINES.read_text())["engines"]}
+    ok, msg, applied = lt.evaluate_kv_lines("glm-5.3-flash", "f16", int(real["glm-5.3-flash"]["kv_proof_lines"]),
+                                            GLM_MEM)
+    assert ok and applied == "f16" and "2 llama_kv_cache line(s)" in msg
+
+
+def test_pick_probe_key_prefers_the_deep_think_generator_and_never_the_abliterated(tmp_path: Path) -> None:
+    ctx = _real_ctx(tmp_path)
+    assert lt.pick_probe_key(ctx, ()) == "glm-5.3-flash" == lt.DEEP_THINK_GENERATOR
+    assert lt.pick_probe_key(ctx, ("glm-5.3-flash",)) == "gpt-oss-120b"
+    with pytest.raises(lt.Infra):
+        lt.pick_probe_key(ctx, ("glm-5.3-flash", "gpt-oss-120b"))  # the abliterated twin and the Apex never probe
+
+
+def test_main_offers_residency_parity_quality_and_no_coresident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                 ) -> None:
+    ep = tmp_path / "engines.json"
+    ep.write_text(json.dumps({"engines": ENGINES}), encoding="utf-8")
+    base = ["--engines", str(ep), "--env-dir", str(tmp_path), "--results-dir", str(tmp_path / "r"), "--orch-url",
+            "http://127.0.0.1:8800", "--engine-env", "x", "--models-dir", "x", "--slots-dir", "x", "--port-base",
+            "8100", "--overrides", str(tmp_path / "o.json")]
+    seen: list[Any] = []
+    monkeypatch.setattr(lt.signal, "signal", lambda *_a: None)
+    for name in ("cmd_residency", "cmd_parity", "cmd_quality"):
+        monkeypatch.setattr(lt, name, lambda _ctx, args: seen.append(args) or 0)
+    # main() reads the subcommand functions from the module globals at call time, so the stand-ins receive the args.
+    assert lt.main([*base, "residency", "--first", "gpt-oss-120b", "--second", "glm-5.3-flash"]) == 0
+    assert lt.main([*base, "--perplexity", "/new", "--parity-perplexity", "/old", "parity"]) == 0
+    assert lt.main([*base, "quality"]) == 0
+    assert (seen[0].first, seen[0].second) == ("gpt-oss-120b", "glm-5.3-flash")
+    assert (seen[1].perplexity, seen[1].parity_perplexity) == ("/new", "/old")
+    assert seen[2].parity_perplexity.endswith("llama-parity/dist/bin/llama-perplexity")
+    with pytest.raises(SystemExit):
+        lt.main([*base, "coresident", "--text", "gpt-oss-120b", "--vision", "glm-5.3-flash"])
+
+
+# --- S-02 output parity (V25) and the S-03 KLD record ----------------------------------------------------------------
+
+
+def _hs_lines(answers: list[bool]) -> str:
+    out, n = [], 0
+    for i, a in enumerate(answers, start=1):
+        n += a
+        out.append(f"{i}\t{100.0 * n / i:3.8f}%\t[{0.0:.4f}%, {100.0:.4f}%]")  # tools/perplexity/perplexity.cpp:988
+    return "\n".join(out)
+
+
+def _kld_text(kld: float, top: float) -> str:
+    return "\n".join([
+        "====== Perplexity statistics ======",
+        f"Mean PPL(Q)                   : {7.120001:10.6f} ± {0.051:10.6f}",
+        f"Mean PPL(base)                : {7.110002:10.6f} ± {0.050:10.6f}",
+        "====== KL divergence statistics ======",
+        f"Mean    KLD: {kld:10.6f} ± {0.000012:10.6f}",
+        "====== Token probability statistics ======",
+        f"Same top p: {top:6.3f} ± {0.123:5.3f} %",
+    ])
+
+
+def test_parse_ppl_kld_and_hellaswag() -> None:
+    assert lt.parse_ppl("[1]7.1,[2]7.0\nFinal estimate: PPL = 7.1100 +/- 0.05000\n") == 7.11
+    assert lt.parse_ppl("llama_model_load: error") is None
+    k = lt.parse_kld(_kld_text(0.000412, 99.512))
+    assert k == {"mean_kld": 0.000412, "mean_kld_unc": 1.2e-05, "same_top_pct": 99.512, "same_top_unc": 0.123,
+                 "ppl_q": 7.120001, "ppl_base": 7.110002}
+    assert lt.parse_kld("Mean    KLD:   0.000412 ±   0.000012\n") is None  # no top-1 line: the run did not finish
+    hs = lt.parse_hellaswag("hellaswag_score: calculating\n" + _hs_lines([True, False, True, True]) + "\n\n")
+    assert hs == {"n": 4, "correct": 3, "acc_pct": 75.0, "answers": [True, False, True, True]}
+    assert lt.parse_hellaswag("1\t100.00000000%\t[0%, 100%]\n3\t66.66666667%\t[0%, 100%]") is None  # numbering skips
+    assert lt.parse_hellaswag("nothing") is None
+    other = lt.parse_hellaswag(_hs_lines([True, True, False, True]))
+    assert lt.changed_answers(hs, other) == 2 and lt.changed_answers(hs, hs) == 0
+    assert lt.changed_answers(hs, None) is None
+    assert lt.changed_answers(hs, lt.parse_hellaswag(_hs_lines([True]))) is None  # different task counts
+
+
+def _run(kld: float = 0.0004, top: float = 99.5, old: list[bool] | None = None, new: list[bool] | None = None,
+         **flags: Any) -> dict[str, Any]:
+    old = [True, False, True, True] if old is None else old
+    new = old if new is None else new
+    return {"errors": [], "kld": {"mean_kld": kld, "mean_kld_unc": 0.0, "same_top_pct": top, "same_top_unc": 0.0},
+            "old_tasks": lt.parse_hellaswag(_hs_lines(old)), "new_tasks": lt.parse_hellaswag(_hs_lines(new)), **flags}
+
+
+def test_parity_engine_verdict_fa_on_decides_and_off_is_recorded() -> None:
+    result, msg = lt.parity_engine_verdict("gpt-oss-120b", {"on": _run(), "off": _run(kld=0.3, top=80.0)})
+    assert result == "pass" and "within parity at -fa on" in msg and "-fa off: KLD 0.300000, top-1 same 80.00%" in msg
+    assert "tasks 3->3 of 4, 0 changed" in msg
+    assert lt.parity_engine_verdict("x", {"on": _run(kld=0.02), "off": _run()})[0] == "fail"
+    assert lt.parity_engine_verdict("x", {"on": _run(top=97.9), "off": _run()})[0] == "fail"
+    result, msg = lt.parity_engine_verdict("x", {"on": _run(new=[True, False, False, True]), "off": _run()})
+    assert result == "fail" and "tasks 3->2 of 4, 1 changed" in msg
+    # More correct answers on the new build with the same KLD is still parity (no fewer correct tasks).
+    assert lt.parity_engine_verdict("x", {"on": _run(old=[False, False, True, True], new=[True, False, True, True]),
+                                          "off": _run()})[0] == "pass"
+    # The old build cannot run it: nothing to compare (deferred); the new build failing is a fail.
+    assert lt.parity_engine_verdict("x", {"on": {"errors": ["v0.4.1 base run exit 1"], "old_failed": True},
+                                          "off": {}})[0] == "deferred"
+    result, msg = lt.parity_engine_verdict("x", {"on": {**_run(), "kld": None, "new_failed": True,
+                                                        "errors": ["b11474 KLD run exit 1: boom"]}, "off": _run()})
+    assert result == "fail" and "errors: b11474 KLD run exit 1: boom" in msg
+
+
+PARITY_ENGINES = [
+    {**ENGINES[0], "files": [{"name": "gpt-oss-120b-F16.gguf", "bytes": 1}]},
+    {"key": "gpt-oss-120b-abliterated", "arbiter_class": "core", "expected_decode_tok_s": [30, 55]},
+    ENGINES[1], ENGINES[2],
+    {"key": "router-qwen3.5-4b", "arbiter_class": "resident", "mode": "chat", "min_llama_cpp_tag": "b7990"},
+    {"key": "embed-qwen3-4b", "arbiter_class": "resident", "mode": "embedding", "placement": "cpu",
+     "min_llama_cpp_tag": "b6063"},
+]
+
+
+def test_parity_coverage_names_what_v25_cannot_compare(tmp_path: Path) -> None:
+    covered, notes = lt.parity_coverage(_ctx(tmp_path, PARITY_ENGINES))
+    assert covered == ["gpt-oss-120b", "deepseek-v4-flash", "router-qwen3.5-4b"]
+    text = " | ".join(notes)
+    assert "gpt-oss-120b-abliterated: not compared (unchanged by this revision" in text
+    assert "glm-5.3-flash: not comparable (first build b11279, v0.4.1 cannot load it" in text
+    assert "embed-qwen3-4b: not compared (embedding: no next-token logits" in text
+    # The real Day 1 list: the same three are covered (engines.json pin_rule).
+    real, _ = lt.parity_coverage(_real_ctx(tmp_path))
+    assert real == ["gpt-oss-120b", "deepseek-v4-flash", "router-qwen3.5-4b"]
+
+
+def test_parity_tasks_file_has_the_hellaswag_shape() -> None:
+    raw = lt.PARITY_TASKS_FILE.read_text(encoding="utf-8")
+    assert raw.endswith("\n") and raw.isascii()
+    lines = raw.split("\n")[:-1]
+    assert len(lines) % 6 == 0 and len(lines) // 6 >= 20 and all(ln.strip() for ln in lines)
+    gold = [lines[i] for i in range(1, len(lines), 6)]
+    assert set(gold) == {"0", "1", "2", "3"}  # every answer position is used
+    assert len(lines) // 6 < 1000  # --hellaswag-tasks 1000 takes them all, in file order
+
+
+def _fake_tool(path: Path, which: str, kld_on: float = 0.0004, answers: list[bool] | None = None,
+               refuse: str = "") -> str:
+    """A stand-in llama-perplexity printing what the pinned tool prints (tools/perplexity/perplexity.cpp) and logging
+    its argv; refuse=SUBSTRING makes it exit 1 for a model path containing it (v0.4.1 cannot load that file)."""
+    answers = [True, False, True, True, False, True] if answers is None else answers
+    path.write_text(f"""#!{sys.executable}
+import json, sys
+args = sys.argv[1:]
+with open({str(path) + ".calls"!r}, "a") as fh:
+    fh.write(json.dumps(args) + "\\n")
+model = args[args.index("-m") + 1]
+if {refuse!r} and {refuse!r} in model:
+    print("llama_model_load: error loading model: unknown model architecture")
+    sys.exit(1)
+fa = args[args.index("-fa") + 1]
+if "--hellaswag" in args:
+    print({_hs_lines(answers)!r})
+    sys.exit(0)
+if "--kl-divergence" in args:
+    print({_kld_text(kld_on, 99.6)!r} if fa == "on" else {_kld_text(0.25, 85.0)!r})
+    sys.exit(0)
+if "--kl-divergence-base" in args:
+    open(args[args.index("--kl-divergence-base") + 1], "wb").write(b"logits")
+print("Final estimate: PPL = 7.1100 +/- 0.05000")
+""", encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+def _calls(tool: str) -> list[list[str]]:
+    f = Path(tool + ".calls")
+    return [json.loads(ln) for ln in f.read_text().splitlines()] if f.exists() else []
+
+
+def _tools_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_ok: bool = True) -> Any:
+    ctx = _ctx(tmp_path, PARITY_ENGINES)
+    (tmp_path / "domains").mkdir()
+    (tmp_path / "domains" / "01-systems.md").write_text("# Systems\n\nA fixed corpus line.\n", encoding="utf-8")
+    kv = {"gpt-oss-120b": "q8_0", "glm-5.3-flash": "f16", "deepseek-v4-flash": "f16", "router-qwen3.5-4b": "q8_0"}
+    monkeypatch.setattr(lt, "Control", lambda *_a, **_k: object())
+    monkeypatch.setattr(lt, "_clear_for_tools", lambda *_a: 10 * lt.GB)
+    monkeypatch.setattr(lt, "require_generation_idle", lambda *_a: None)
+    monkeypatch.setattr(lt, "wait_release", lambda _b, label: (release_ok, 1.0, "GTT back" if release_ok else
+                                                              f"{label}: GTT 30 GB above the baseline"))
+    monkeypatch.setattr(ctx, "env", lambda key: {"ATLAS_MODEL_PRESENT": "1", "ATLAS_MODEL_FILE": f"/m/{key}.gguf",
+                                                 "ATLAS_KV_TYPE": kv.get(key, "")})
+    return ctx
+
+
+def test_cmd_parity_compares_both_builds_fa_on_and_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    ctx = _tools_harness(tmp_path, monkeypatch)
+    new = _fake_tool(tmp_path / "new-perplexity", "new")
+    old = _fake_tool(tmp_path / "old-perplexity", "old", refuse="deepseek")
+    assert lt.cmd_parity(ctx, argparse.Namespace(perplexity=new, parity_perplexity=old)) == 0
+    recs = _records(capsys)
+    v25 = {m.split(":")[0]: r for v, r, m in recs if v == "V25"}
+    assert v25["gpt-oss-120b"] == "pass" and v25["router-qwen3.5-4b"] == "pass"
+    assert v25["deepseek-v4-flash"] == "deferred"  # the old build refused the file: nothing to compare
+    assert recs[-1][:2] == ("V25", "deferred") and recs[-1][2].startswith(
+        "summary: gpt-oss-120b=pass, deepseek-v4-flash=deferred, router-qwen3.5-4b=pass")
+    assert "glm-5.3-flash: not comparable" in recs[-1][2]
+    saved = json.loads((ctx.results_dir / "parity.json").read_text())
+    assert saved["covered"] == ["gpt-oss-120b", "deepseek-v4-flash", "router-qwen3.5-4b"] and saved["leaks"] == []
+    assert saved["engines"]["gpt-oss-120b"]["runs"]["off"]["kld"]["mean_kld"] == 0.25  # recorded, not a verdict
+    old_calls, new_calls = _calls(old), _calls(new)
+    base = [c for c in old_calls if "--kl-divergence-base" in c and "/m/gpt-oss-120b.gguf" in c]
+    assert [c[c.index("-fa") + 1] for c in base] == ["on", "off"]
+    assert all(c[c.index("-c") + 1] == "512" and c[c.index("--chunks") + 1] == "16" and "-f" in c for c in base)
+    assert all("--cache-type-k" not in c for c in old_calls + new_calls)  # parity runs the default KV on both pins
+    kld = [c for c in new_calls if "--kl-divergence" in c]
+    assert len(kld) == 4 and all("-f" not in c for c in kld)  # gpt-oss and the router, -fa on and off
+    hs = [c for c in new_calls + old_calls if "--hellaswag" in c]
+    assert all(c[c.index("-f") + 1] == str(lt.PARITY_TASKS_FILE) for c in hs) and len(hs) == 12
+    assert not list((ctx.results_dir / "parity-work").glob("*.kld"))  # the base logits are removed after each run
+
+
+def test_cmd_parity_fails_a_changed_output_and_stops_on_a_leak(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    ctx = _tools_harness(tmp_path, monkeypatch)
+    new = _fake_tool(tmp_path / "new-perplexity", "new", kld_on=0.05)
+    old = _fake_tool(tmp_path / "old-perplexity", "old")
+    assert lt.cmd_parity(ctx, argparse.Namespace(perplexity=new, parity_perplexity=old)) == 0
+    recs = _records(capsys)
+    assert recs[-1][:2] == ("V25", "fail") and all(r == "fail" for v, r, _ in recs if v == "V25")
+    (tmp_path / "leak").mkdir()
+    ctx = _tools_harness(tmp_path / "leak", monkeypatch, release_ok=False)
+    with pytest.raises(lt.Infra, match="memory not released after a llama-perplexity run"):
+        lt.cmd_parity(ctx, argparse.Namespace(perplexity=_fake_tool(tmp_path / "leak" / "n", "new"),
+                                              parity_perplexity=_fake_tool(tmp_path / "leak" / "o", "old")))
+    recs = _records(capsys)
+    assert recs[-1][:2] == ("V25", "fail") and "LEAK:" in recs[-1][2]
+    assert json.loads((ctx.results_dir / "parity.json").read_text())["leaks"]  # written before the stop
+
+
+def test_cmd_parity_missing_builds_fail_v25_without_touching_an_engine(tmp_path: Path,
+                                                                       monkeypatch: pytest.MonkeyPatch,
+                                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    ctx = _tools_harness(tmp_path, monkeypatch)
+    monkeypatch.setattr(lt, "_clear_for_tools", lambda *_a: pytest.fail("no seat is unloaded without the tools"))
+    assert lt.cmd_parity(ctx, argparse.Namespace(perplexity=str(tmp_path / "none"),
+                                                 parity_perplexity=str(tmp_path / "none-old"))) == 0
+    recs = _records(capsys)
+    assert len(recs) == 1 and recs[0][:2] == ("V25", "fail") and "phase2/01-llama.sh builds both" in recs[0][2]
+    assert "summary" in json.loads((ctx.results_dir / "parity.json").read_text())
+
+
+def test_cmd_quality_records_each_seat_and_raises_the_kld_todo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    ctx = _tools_harness(tmp_path, monkeypatch)
+    tool = _fake_tool(tmp_path / "new-perplexity", "new")
+    assert lt.cmd_quality(ctx, argparse.Namespace(perplexity=tool)) == 0
+    recs, todos = _lines(capsys)
+    assert recs == []  # a record with a to-do, never a verdict (S-03)
+    title, detail = todos["kld-run"]
+    assert "S-03" in title and "T-03" in title
+    assert "gpt-oss-120b (q8_0 KV, -fa on): corpus PPL 7.11, tasks 4 of 6; reference: the F16-trunk GGUF" in detail
+    assert "glm-5.3-flash (f16 KV, -fa on)" in detail and "deepseek-v4-flash (f16 KV, -fa on)" in detail
+    assert "abliterated" not in detail and "router" not in detail and "embed" not in detail
+    calls = _calls(tool)
+    gpt = [c for c in calls if "/m/gpt-oss-120b.gguf" in c]
+    assert len(gpt) == 2 and all(c[c.index("--cache-type-k") + 1] == "q8_0" and c[c.index("-fa") + 1] == "on"
+                                 for c in gpt)
+    saved = json.loads((ctx.results_dir / "quality.json").read_text())
+    assert set(saved["engines"]) == {"gpt-oss-120b", "glm-5.3-flash", "deepseek-v4-flash"}
+    # Without the tool: nothing is measured, the to-do still goes out and says why.
+    assert lt.cmd_quality(ctx, argparse.Namespace(perplexity=str(tmp_path / "missing"))) == 0
+    _, todos = _lines(capsys)
+    assert "not measured:" in todos["kld-run"][1] and "is missing" in todos["kld-run"][1]

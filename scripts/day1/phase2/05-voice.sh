@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# phase2/05-voice.sh — Section 17 Phase 2 step 5: Kokoro, Chatterbox, Whisper Large-v3-Turbo, PyAnnote 3.1 (Sections
+# phase2/05-voice.sh — Section 17 Phase 2 step 5: Kokoro, Chatterbox, Whisper Large-v3-Turbo, PyAnnote (Sections
 # 14.1, 14.3, 21 V6/V7). Sourced by phase2-services.sh through run_phase_steps; defines step_05 only.
+# v0.4.0 (register C-06, approved by the Principal 2026-10-16 as the one exception made now): the diarisation pipeline
+# moves from pyannote/speaker-diarization-3.1 to pyannote/speaker-diarization-community-1 on the same pyannote.audio
+# 4.0.7 install (community-1 beats 3.1 by 1-4 DER points on 11 of 12 sets on pyannote's own table; CC-BY-4.0, gated with
+# an auto-approved form; one self-contained repo: config.yaml plus segmentation/, embedding/ and plda/, HF tree API
+# read 2026-10-16). Nemotron 3 Diarization as the primary diariser through NeMo-Speech.cpp (S-04) is phased after
+# Day 1; community-1 is then its fallback for more than eight speakers.
 #
 # Order inside the step (each part idempotent; a re-run after a failure resumes cheaply):
 #   1. Kokoro-FastAPI (CPU image), speaches (faster-whisper large-v3-turbo, CPU int8) and docling-serve from
@@ -26,12 +32,12 @@
 #      --references-dir ... -> $LISTENING_TEST_DIR and its summary $LISTENING_TEST_DIR/v7-listening-test.json);
 #      verify/v07-voice-listen.sh only reads that summary, so V7 stays under the 10-minute verify contract at the gate.
 #   5. POST /arbiter/remeasure on the step-2 orchestrator (loopback admin path) so the Section 4.1 resident set includes
-#      the voice stack; V6 (verify/v06-pyannote.sh, runs the diarisation as atlas: the 3.1 pipeline, and ONLY 3.1 passes,
-#      Sections 14.1 and 21; when pyannote.audio refuses the 3.1 id V6 is a FAIL whose message carries a diagnostic of
-#      the 4.x community pipeline PYANNOTE_FALLBACK_PIPELINE for the Principal's decision; fix round 6 restored the
-#      round-4 verdict). voice.env PYANNOTE_PIPELINE always stays the 14.1 value; PYANNOTE_PIPELINE_PROVEN records what
-#      V6 actually passed with (or `none`), and only the Principal switches the former after amending 14.1/21 (Section
-#      16.3 item 6). V7 (the fast reader); $ATLAS_ETC/voice.env written.
+#      the voice stack; V6 (verify/v06-pyannote.sh, runs the diarisation as atlas: the community-1 pipeline, and ONLY
+#      community-1 passes, Sections 14.1 and 21 as amended by v0.4.0 C-06; when pyannote.audio refuses it V6 is a FAIL
+#      whose message carries a diagnostic of the previous pipeline PYANNOTE_FALLBACK_PIPELINE (3.1) for the Principal's
+#      decision). voice.env PYANNOTE_PIPELINE always holds the 14.1 value; PYANNOTE_PIPELINE_PROVEN records what V6
+#      actually passed with (or `none`), and a script never switches the former to anything 14.1/21 do not name
+#      (Section 16.3 item 6). V7 (the fast reader); $ATLAS_ETC/voice.env written.
 #
 # WHY TWO VENVS (the task asked for PyAnnote "into that venv"): chatterbox-tts 0.1.7 pins torch==2.6.0 for Python
 # < 3.14 (voice-stt.md §3.1 VERIFIED pyproject) while pyannote.audio 4.0.7 requires torch>=2.8.0 (§5.1 VERIFIED).
@@ -111,9 +117,9 @@
 #   * $ATLAS_ETC/voice.env (root:atlas 640, also a compose --env-file): SPEACHES_PRELOAD_MODELS, SPEACHES_HF_HUB_OFFLINE,
 #     KOKORO_URL=http://127.0.0.1:8880/v1, SPEACHES_URL=http://127.0.0.1:8881/v1, STT_MODEL=<registry id>,
 #     DOCLING_URL=http://127.0.0.1:5001, VOICE_VENV=/opt/atlas/venv-voice, PYANNOTE_VENV=/opt/atlas/venv-pyannote,
-#     PYANNOTE_PIPELINE (ALWAYS the Section 14.1 value pyannote/speaker-diarization-3.1; the Principal edits it after a
-#     Section 23 row amends 14.1), PYANNOTE_PIPELINE_PROVEN (what V6 passed with: that id, or `none` when V6 failed),
-#     PYANNOTE_FALLBACK_PIPELINE (the diagnostic id V6 probes), VOICE_REFERENCES_DIR=$ATLAS_SRV/staging/voice-references-normalised (the 16 kHz mono
+#     PYANNOTE_PIPELINE (ALWAYS the Section 14.1 value: pyannote/speaker-diarization-community-1 since v0.4.0, C-06),
+#     PYANNOTE_PIPELINE_PROVEN (what V6 passed with: that id, or `none` when V6 failed),
+#     PYANNOTE_FALLBACK_PIPELINE (the diagnostic id V6 probes: 3.1, the previous pipeline), VOICE_REFERENCES_DIR=$ATLAS_SRV/staging/voice-references-normalised (the 16 kHz mono
 #     WAVs every Chatterbox clone reads; header item 4), HF_HOME=$ATLAS_SRV/engines/hf, HF_HUB_OFFLINE=1, HF_HUB_DISABLE_TELEMETRY=1,
 #     PYANNOTE_METRICS_ENABLED=0, DO_NOT_TRACK=1, LISTENING_TEST_DIR=$ATLAS_SRV/staging/listening-test,
 #     V7_SUMMARY=$LISTENING_TEST_DIR/v7-listening-test.json, CHATTERBOX_FOOTPRINT_BYTES, CHATTERBOX_DEVICE=cpu,
@@ -153,13 +159,13 @@ PYANNOTE_PIN="pyannote.audio==4.0.7"           # voice-stt.md §5.1 VERIFIED (Py
 # fetched this round); the import assertion in _voice_venv_pyannote is the check and dies with the pair named.
 PYANNOTE_TORCH_PIN="2.9.1"
 PYANNOTE_TORCHCODEC_PIN="0.8.1"
-PYANNOTE_PIPELINE="pyannote/speaker-diarization-3.1"   # Section 14.1; voice-stt.md §5.2
-# voice-stt.md §5.1 / §6 conflict 1: pyannote.audio 4.0.7 is the research's pin (the only line receiving fixes), 3.1 is
-# its "legacy" pipeline and whether 4.0.7 loads it is UNVERIFIED there; the research names the community-1 pipeline as
-# the fallback "if 3.1 fails to load". The DOCUMENT wins (CONVENTIONS line 4; Sections 14.1 and 21 name 3.1): V6 passes
-# only on 3.1 and, when 3.1 is refused, FAILS with a diagnostic saying whether this id loads, so the Principal can amend
-# 14.1/21 (Section 23) before anyone switches PYANNOTE_PIPELINE (Section 16.3 item 6; fix round 6).
-PYANNOTE_FALLBACK_PIPELINE="pyannote/speaker-diarization-community-1"
+# Section 14.1 as amended by v0.4.0 (register C-06, approved 2026-10-16): community-1 is the pipeline of pyannote.audio
+# 4.x itself (4.0.7 is the research's pin, the only line receiving fixes; voice-stt.md §5.1; 3.1 is its "legacy"
+# pipeline). V6 passes only on this id (verify/v06-pyannote.sh).
+PYANNOTE_PIPELINE="pyannote/speaker-diarization-community-1"
+# The previous pipeline, probed by V6 only as a DIAGNOSTIC when community-1 is refused, never as the pass path (it needs
+# its own two gated repos, speaker-diarization-3.1 and segmentation-3.0, whose licences the Principal no longer needs).
+PYANNOTE_FALLBACK_PIPELINE="pyannote/speaker-diarization-3.1"
 VOICE_REFERENCE_EXTS=(wav mp3 m4a)             # what the inbox may hold per persona (header item 4); ffmpeg normalises
 # uv and its managed CPython are PINNED (rule §7.9): uv 0.12.23 is the PyPI release current on 2026-10-04 (VERIFIED);
 # cpython 3.11.17 is the newest 3.11 build that uv 0.12.23 lists for linux-x86_64-gnu (VERIFIED with
@@ -554,7 +560,7 @@ _voice_venv_pyannote() {
 # _voice_normalise_references — header item 4: for every persona in config/voice-casting.json reference_recordings, take
 # <inbox>/<persona>.{wav,mp3,m4a} (the casting path's directory and stem; the first extension present in that order)
 # and transcode it with ffmpeg, AS ATLAS (untrusted media is never decoded by root; Section 16.3 item 6 spirit), to
-# 16 kHz mono 16-bit PCM WAV at $VOICE_REF_NORM_DIR/<persona>.wav (what the Chatterbox clone and the 3.1 card want).
+# 16 kHz mono 16-bit PCM WAV at $VOICE_REF_NORM_DIR/<persona>.wav (what the Chatterbox clone and the pyannote cards want).
 # Idempotent: skipped when the normalised copy is newer than its source. An absent recording is logged, not fatal:
 # V7 is recorded deferred for it (Section 22). An unreadable or undecodable one IS fatal (rule §7.4): the Principal
 # dropped a file and must know it is unusable.
@@ -830,8 +836,8 @@ _voice_pyannote_pipeline_proven() {
     [[ -n "$proven" ]] || proven="$PYANNOTE_PIPELINE"
   fi
   ensure_kv "$VOICE_ENV_FILE" PYANNOTE_PIPELINE_PROVEN "$proven"
-  if [[ "$proven" == none && "${msg:-}" == *"DIAGNOSTIC: the research's fallback"*"DOES load"* ]]; then
-    warn "pyannote: V6 FAILED ($PYANNOTE_PIPELINE refused by the installed pyannote.audio) while the community pipeline $PYANNOTE_FALLBACK_PIPELINE loads. voice.env keeps PYANNOTE_PIPELINE=$PYANNOTE_PIPELINE (Section 14.1); the Principal decides: pin a 3.1-loading pyannote.audio (PYANNOTE_PIN here), or amend 14.1/21 with a Section 23 row and then set PYANNOTE_PIPELINE=$PYANNOTE_FALLBACK_PIPELINE in $VOICE_ENV_FILE and re-run V6 (voice-stt.md §6 conflict 1)"
+  if [[ "$proven" == none && "${msg:-}" == *"DIAGNOSTIC: the previous pipeline"*"DOES load"* ]]; then
+    warn "pyannote: V6 FAILED ($PYANNOTE_PIPELINE refused by the installed pyannote.audio) while the previous pipeline $PYANNOTE_FALLBACK_PIPELINE loads. voice.env keeps PYANNOTE_PIPELINE=$PYANNOTE_PIPELINE (Section 14.1, v0.4.0 C-06); the Principal decides: pin a pyannote.audio that loads community-1 (PYANNOTE_PIN here), or amend 14.1/21 back with a Section 23 row and then set PYANNOTE_PIPELINE=$PYANNOTE_FALLBACK_PIPELINE in $VOICE_ENV_FILE and re-run V6"
   fi
   log "pyannote: PYANNOTE_PIPELINE=$PYANNOTE_PIPELINE (Section 14.1), PYANNOTE_PIPELINE_PROVEN=$proven in $VOICE_ENV_FILE"
 }
@@ -865,7 +871,7 @@ step_05() {
   _voice_render_v7
   _voice_arbiter_remeasure
   # V6: recorded pass/fail, never fatal here (the Phase 2 gate blocks on a fail; the message names the licence URLs).
-  # 3.1 only (header item 5): a refusal of the 3.1 id is a fail whose message carries the community-pipeline diagnostic.
+  # community-1 only (header item 5, C-06): a refusal of that id is a fail whose message carries the 3.1 diagnostic.
   run_verify V6 v06-pyannote.sh "$PYANNOTE_VENV" "$VOICE_HF_HOME" "$PYANNOTE_PIPELINE" "$PYANNOTE_FALLBACK_PIPELINE" \
     || warn "V6 not passed (deferred without a token, fail on a licence or pipeline problem; see the verify table), then re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 05"
   _voice_pyannote_pipeline_proven

@@ -25,10 +25,11 @@ whose text carries a sensitive-lexicon word (atlas.router.SENSITIVE_KEYWORDS: pa
 or runs past ROUTINE_MAX_CHARS is not a confirmation, it is substance, and is held at standard.
 
 The 9.2 strong cross-check has a concrete implementation here, `LlamaCrossChecker`: the other hemisphere lead (for
-Minerva, her own lead Arthur on Meditron-70B, 6.2) judges the draft on an engine the draft did not use, through a
-`client_for(engine)` the pipeline supplies (and an optional Arbiter `lease`), writing the done "cross-check" tasks row
-that is the record's provenance. api.py wires it as `cross_checker=LlamaCrossChecker(...)` (contract for the API
-writer); until it is wired, every sensitive item is held with "cross-check: pending" and cannot be approved.
+Minerva, her own lead Arthur, on DeepSeek-V4-Flash-0731 on Day 1, D-39) judges the draft on an engine the draft did not
+use, through a `client_for(engine)` the pipeline supplies (and an optional Arbiter `lease`), writing the done
+"cross-check" tasks row that is the record's provenance. api.py wires it as `cross_checker=LlamaCrossChecker(...)`
+(contract for the API writer); until it is wired, every sensitive item is held with "cross-check: pending" and cannot be
+approved.
 
 Register (6.4) decides what the gate does with a draft:
   * EXTERNAL (audience external/recipient): the full gate: the persona's Section 6.2 "speaks externally" tier is a
@@ -289,8 +290,9 @@ class Notifier(Protocol):
 
 
 # The strong cross-check (9.2): given the held item, run a second persona on a different engine and return the
-# record. `LlamaCrossChecker` below is the shipped implementation (arthur@nemotron-3-super for a corporate draft,
-# ren@gpt-oss-120b for an estate one, arthur@meditron-70b for Minerva per 6.2); the pipeline wires it with its
+# record. `LlamaCrossChecker` below is the shipped implementation (v0.4.0, D-39: arthur@deepseek-v4-flash for a
+# corporate draft on GLM-5.3-Flash, ren on the first of his engines that differs from the draft's for an estate one,
+# arthur@deepseek-v4-flash for Minerva); the pipeline wires it with its
 # `client_for` and Arbiter lease. It may raise; the gate then holds the item without a record and approve() refuses
 # until attach_cross_check() is called.
 CrossChecker = Callable[[ApprovalItem], CrossCheckRecord]
@@ -340,14 +342,19 @@ nothing else: {{"verdict": "agree" | "amended" | "disagree", "notes": "<one to t
 what must change; empty when you agree>"}}. "amended" means the draft is sound once the stated change is made; \
 "disagree" means it must not be sent as it stands."""
 _JSON_DECODER = json.JSONDecoder()
-# CONVENTIONS.md §8 Arbiter classes: `apex` (deepseek-v4-flash) is exclusive and never a cross-check engine; the
-# abliterated engine is a manual escalation, never a default (6.1 C6 / R13). Filtered by key when the registry carries
-# no EngineSpec to read `arbiter_class` from.
-_NEVER_CROSS_CHECK_ENGINES: frozenset[str] = frozenset({"deepseek-v4-flash"})
-# 6.2 Minerva "Meditron-70B cross-check": her medical drafts are judged on the medical engine, by her own lead so the
-# health data stays in the estate hemisphere (7.3). Every other persona is judged by the other hemisphere lead
-# (8.3 TF_OMEGA dual sign-off needs exactly that record; 9.1 already pairs Ren and Arthur across hemispheres).
-DEFAULT_CROSS_CHECK_PLAN: Mapping[str, tuple[str, str]] = {"minerva": ("arthur", "meditron-70b")}
+# D-39 option (a), approved 2026-10-16 (S-31): every engine that is not uncensored may serve a strong cross-check, the
+# Apex engine included. Under sequential operation DeepSeek-V4-Flash-0731 is Arthur's default seat and the only family
+# beside GLM-5.3-Flash on Day 1, so v0.3.5's exclusion of the Apex engine (it was exclusive then) would leave most
+# drafts nothing to swap to. Each strong check is a swap (50-85 s plus re-prefill, D-23); batching checks by engine is
+# phased. The abliterated engine stays a manual escalation, never a default (6.1 C6 / R13: the `-abliterated` filter in
+# _engine_allowed, unchanged). Kept as the named hook for an engine the Principal excludes; empty on Day 1.
+_NEVER_CROSS_CHECK_ENGINES: frozenset[str] = frozenset()
+# 6.2 Minerva: her medical drafts are judged by her own lead so the health data stays in the estate hemisphere (7.3),
+# on the other Day 1 family (DeepSeek-V4-Flash-0731; she drafts on GLM-5.3-Flash). S-31 points this plan at
+# Baichuan-M3 once that phased seat is pulled; until then this is the strong check. Every other persona is judged by
+# the other hemisphere lead (8.3 TF_OMEGA dual sign-off needs exactly that record; 9.1 pairs Ren and Arthur across
+# hemispheres).
+DEFAULT_CROSS_CHECK_PLAN: Mapping[str, tuple[str, str]] = {"minerva": ("arthur", "deepseek-v4-flash")}
 
 
 class LlamaCrossChecker:
@@ -355,7 +362,7 @@ class LlamaCrossChecker:
 
     `client_for(engine_key)` returns a LlamaClient for that engine (api.py: production_llama_client(arbiter,
     config.engines[k]), whose per-slot window follows the unit, S52: a draft plus prompt that cannot fit the engine's
-    slot, Meditron's 4096 tokens above all, raises ContextWindowExceeded, which the gate records as a failed
+    slot raises ContextWindowExceeded, which the gate records as a failed
     cross-check);
     `lease(engine_key, task_id)` is an optional context manager that makes the engine resident and holds the single
     generation slot for the call (the Arbiter: request_load + acquire_generation, 4.2); without it the engine must
@@ -398,7 +405,7 @@ class LlamaCrossChecker:
     def choose(self, item: ApprovalItem) -> tuple[str, str]:
         """(persona, engine) for the cross-check of `item`: the plan's pair when its engine is available and differs
         from the draft's, else the other hemisphere lead on the first of its bound engines that differs from the
-        draft's and is neither abliterated nor the Apex engine. Raises ApprovalError when no swap exists."""
+        draft's and is not abliterated (D-39: the Apex engine may check). Raises ApprovalError when no swap exists."""
         planned = self.plan.get(item.persona)
         if planned is not None and planned[0] != item.persona and self._engine_allowed(planned[1], item):
             return planned
@@ -409,7 +416,7 @@ class LlamaCrossChecker:
                 return persona, engine
         raise ApprovalError(
             f"no engine swap available for the cross-check of a {item.persona}@{item.engine} draft: {persona}'s "
-            f"bound engines {binding.all_engines} leave nothing that differs and is neither abliterated nor Apex (9.2)"
+            f"bound engines {binding.all_engines} leave nothing that differs and is not abliterated (9.2, D-39)"
         )
 
     def __call__(self, item: ApprovalItem) -> CrossCheckRecord:

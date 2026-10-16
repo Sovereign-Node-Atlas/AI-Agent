@@ -292,7 +292,8 @@ DISCLOSURE_PATTERNS: tuple[str, ...] = (
     r"\b(?:chatbot|chat\s+bot)\b",
     r"\bthis\s+(?:message|email|reply|response)\s+(?:was|is)\s+(?:written|generated|drafted|composed)\s+"
     r"(?:automatically|by\s+(?:an?\s+)?(?:ai|machine|model|bot|computer))\b",
-    r"\b(?:gpt-?oss|gpt-?\d|chatgpt|claude|llama|qwen|nemotron|deepseek|mistral|gemini|openai|anthropic)\b",
+    # Engine families by name (v0.4.0 adds GLM, the Day 1 default seat: "drafted on GLM-5.3-Flash" is a disclosure).
+    r"\b(?:gpt-?oss|gpt-?\d|chatgpt|claude|llama|qwen|nemotron|deepseek|glm|mistral|gemini|openai|anthropic)\b",
 )
 _DISCLOSURE_RE = tuple(re.compile(p, re.IGNORECASE) for p in DISCLOSURE_PATTERNS)
 _LLM_UPPER_RE = re.compile(r"\bLLMs?\b")  # case-sensitive: the acronym, not a word that happens to spell it

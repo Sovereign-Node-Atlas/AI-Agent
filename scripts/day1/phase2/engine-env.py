@@ -4,8 +4,9 @@
 Output: $ATLAS_ETC/engines/<key>.env (root:atlas 640), consumed by systemd/llama-server@.service through
 EnvironmentFile= and by the Phase 3 driver (sourceable KEY='value' lines). Each file carries:
 
-    ATLAS_ENGINE, ATLAS_MODE, ATLAS_KV_TYPE, ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_N_KEEP, ATLAS_MODEL_FILE,
-    ATLAS_MODEL_PATTERN, ATLAS_MODEL_PRESENT (1/0), ATLAS_KV_PROOF_LINES, LLAMA_ARG_HOST, LLAMA_ARG_PORT, ARGS
+    ATLAS_ENGINE, ATLAS_MODE, ATLAS_PLACEMENT (gpu/cpu), ATLAS_KV_TYPE, ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_N_KEEP,
+    ATLAS_MODEL_FILE, ATLAS_MODEL_PATTERN, ATLAS_MODEL_PRESENT (1/0), ATLAS_KV_PROOF_LINES, LLAMA_ARG_HOST,
+    LLAMA_ARG_PORT, ARGS
 
 ARGS is the complete llama-server command line (the unit runs `llama-server $ARGS`). systemd splits an unquoted $ARGS
 at whitespace with quotes respected and then REMOVED (systemd.service(5), "Command lines"), so a JSON token such as
@@ -14,27 +15,31 @@ whitespace, a quote of either kind or a backslash. Options whose value is JSON g
 instead, listed per engine under "env" in engines.json and written verbatim after LLAMA_ARG_PORT.
 
 Overrides (the contract Phase 3 relies on): $ATLAS_ETC/engines/overrides.json, an object keyed by engine key with any
-of {"kv_type": "f16|q8_0|q4_0", "ctx_size": N, "parallel": N, "coresident": true|false, "n_keep": N}. The DeepSeek KV
-ladder writes its winning cache type (and, for an f16 result, the capped ctx_size = ctx_size_f16_cap) there and re-runs
-this script, so the unit file and the env file always agree (gguf-models.md §6, §12 item 2).
+of {"kv_type": "f16|q8_0|...", "ctx_size": N, "parallel": N, "n_keep": N}. The Apex KV ladder (S-42, D-29 (a)) writes
+its winning cache type there only when the f16 rung fails and q8_0 stands, and re-runs this script, so the unit file and
+the env file always agree (gguf-models.md §6, §12 item 2).
 
-Standing profile (S52): an engine that defines a co-resident profile (ctx_size_coresident and/or parallel_coresident;
-today only qwen2.5-vl-72b, 2 x 32k) is rendered AT that profile with ATLAS_CORESIDENT=1 when overrides.json says
-nothing, so the unit the Arbiter projects from is the one that pairs with gpt-oss-120b (Section 4.1's everyday
-pairing). Its full profile (ctx_size x parallel, 8 x 32k) is rendered only for an explicit "coresident": false, the
-Principal's choice; Phase 3 never sets that field. orchestrator/src/atlas/config.py EngineSpec.standing_coresident
-states the same rule for the Arbiter's projection before a unit exists.
+No co-resident profile (S-22, v0.4.0): D-32 (a) keeps one LLM seat resident at a time, so the S52 standing two-slot
+profile (ctx_size_coresident, parallel_coresident, ATLAS_CORESIDENT, the overrides "coresident" field) is gone. Every
+unit renders engines.json's own ctx_size x parallel; a stale "coresident" field left in an old overrides.json, or an old
+co-resident key in an engine entry, is ignored (never rendered).
+
+Placement (D-14 option (e), v0.4.0): an entry with "placement": "cpu" (the Qwen3 embedder and reranker) is rendered
+with `--device none` and without `--n-gpu-layers`, so it never touches the Vulkan device (common/arg.cpp:2741-2747,
+`none` parsed at :1128 at b11474, VERIFIED); ATLAS_PLACEMENT tells Phase 2 step 4 and Phase 3 which side it runs on.
+The Arbiter charges it as the host resident set (orchestrator atlas/arbiter.py). The default is gpu.
 
 Model files are located in $ATLAS_SRV/models/<key>/ by model_file_pattern (first shard). A file that is not present yet
-(Phase 2 renders the seven large engines before Phase 3 pulls them) is rendered with ATLAS_MODEL_PRESENT=0 and the
+(Phase 2 renders the four LLM seats before Phase 3 pulls them) is rendered with ATLAS_MODEL_PRESENT=0 and the
 expected path, so `systemctl start` fails loudly with llama.cpp's own "failed to load model" rather than silently.
 
-Log verbosity (S52 fix round): every chat/vision engine runs with `--verbosity 4`. At the pinned llama.cpp (b29c606)
-common_log_get_verbosity maps the library's INFO level to TRACE (common/log.cpp:532, since 67b2b7f2f) and llama-server's
-default threshold is 3 (common/common.h:534), so without it "llama_kv_cache: size =", "llama_context: flash_attn =",
-the recurrent and compressor size lines and the compute-buffer lines never reach the journal: V4's proof and the S52
-memory records (phase3/loadtest.py) read them. Exactly 4: at 5 or with -v, --fit's trial context keeps INFO
-(common/common.cpp:1326, common/fit.cpp:52) and prints a second set of K/V lines. It changes the log level only.
+Log verbosity (S52 fix round): every chat/vision engine runs with `--verbosity 4`. At the pinned llama.cpp (b11474,
+re-verified 2026-10-16, v0.4.0 pin facts) common_log_get_verbosity maps the library's INFO level to TRACE
+(common/log.cpp:535, since 67b2b7f2f) and llama-server's default threshold is 3 (common/common.h:539), so without it
+"llama_kv_cache: size =", "llama_context: flash_attn =", the recurrent and compressor size lines and the compute-buffer
+lines never reach the journal: V4's proof and the S52 memory records (phase3/loadtest.py) read them. Exactly 4: at 5 or
+with -v, --fit's trial context keeps INFO (common/common.cpp:1267, common/fit.cpp:52) and prints a second set of K/V
+lines. It changes the log level only.
 
 --slot-save-path is Appendix B's single directory /srv/atlas/data/slots for every chat/vision engine (the orchestrator
 names slot files per engine); the directory is created only when installing, never in --print mode (read-only).
@@ -45,7 +50,12 @@ make llama-server (built with an HTTPS client) pull a model by itself outside hf
 Section 1 forbids outright), load a second model, a LoRA, a control vector or a template file from an arbitrary path,
 serve a directory over HTTP (--path) or write a log file somewhere of its choosing. The env map therefore refuses the
 LLAMA_ARG_* names in RESERVED_ENV and extra_args refuses the flags in RESERVED_FLAGS; both lists are mirrored in
-engines.json _meta (extra_args_rule, env_rule).
+engines.json _meta (extra_args_rule, env_rule). v0.4.0 (pin facts, b11474): the lists were re-read against
+common/arg.cpp at the new pin and extended with the file, network and exec options both pins accept but v0.3.5 left
+open: the draft-model aliases, -hft, the Docker model pull, -mmu, the UI and its config file and MCP proxy, the built-in
+tools and their runtime (exec_shell_command, write_file, docker:/ssh: runtimes), --agent, the MCP server configs,
+--media-path, --log-prompts-dir, --video-ffmpeg-dir, the grammar and JSON-schema files and the lookup caches. The env
+names are the real LLAMA_ARG_* names at b11474; names that exist at neither pin stay listed defensively.
 
 A model file that is not present yet is rendered with ATLAS_MODEL_PRESENT=0, ATLAS_MODEL_FILE set to the directory plus
 the FIRST pattern (systemd does not glob, so the unit fails with llama.cpp's own "failed to load model") and
@@ -69,18 +79,31 @@ import sys
 from pathlib import Path
 from typing import Any
 
-KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}  # common/arg.cpp, VERIFIED
+KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}  # common/arg.cpp:304-314, VERIFIED
 CHAT_MODES = {"chat", "vision"}
+PLACEMENTS = {"gpu", "cpu"}  # D-14 (e); orchestrator atlas/config.py PLACEMENTS states the same set
 # Generated by this script or reserved for the hf_download path; never accepted from engines.json "env" (see docstring).
+# VERIFIED at b11474 (v0.4.0 pin facts): every name below is a real set_env() name in common/arg.cpp. The token and the
+# API key are read from HF_TOKEN and LLAMA_API_KEY, which ENV_KEY_RE (LLAMA_ARG_* only) already refuses.
 RESERVED_ENV = {
     "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_MODEL", "LLAMA_ARG_MMPROJ", "LLAMA_ARG_HF_REPO", "LLAMA_ARG_HF_FILE",
-    "LLAMA_ARG_HF_TOKEN", "LLAMA_ARG_MODEL_URL", "LLAMA_ARG_API_KEY", "LLAMA_ARG_SLOT_SAVE_PATH",
-    "LLAMA_ARG_SSL_KEY_FILE", "LLAMA_ARG_SSL_CERT_FILE", "LLAMA_ARG_WEBUI", "LLAMA_ARG_ALIAS",
-    # Fix round 2: file-loading and network-path options (docstring). UNVERIFIED against common/arg.cpp at v0.4.1:
-    # the names follow llama.cpp's LLAMA_ARG_<FLAG> convention; refusing a name the server never reads costs nothing.
-    "LLAMA_ARG_RPC", "LLAMA_ARG_MODEL_DRAFT", "LLAMA_ARG_MODELS_DIR", "LLAMA_ARG_MODELS_PRESET",
-    "LLAMA_ARG_STATIC_PATH", "LLAMA_ARG_LORA", "LLAMA_ARG_CONTROL_VECTOR", "LLAMA_ARG_CHAT_TEMPLATE_FILE",
-    "LLAMA_ARG_LOG_FILE",
+    "LLAMA_ARG_MODEL_URL", "LLAMA_ARG_API_KEY_FILE", "LLAMA_ARG_SSL_KEY_FILE", "LLAMA_ARG_SSL_CERT_FILE",
+    "LLAMA_ARG_ALIAS", "LLAMA_ARG_API_PREFIX",
+    # Fix round 2: file-loading and network-path options (docstring).
+    "LLAMA_ARG_RPC", "LLAMA_ARG_MODELS_DIR", "LLAMA_ARG_MODELS_PRESET", "LLAMA_ARG_STATIC_PATH",
+    "LLAMA_ARG_CHAT_TEMPLATE_FILE", "LLAMA_ARG_LOG_FILE",
+    # v0.4.0 (pin facts): the real names v0.3.5 missed. Env is applied before argv, so none can undo a generated flag,
+    # but each could add an option the command line lacks (a draft model, a Docker pull, the UI, the built-in tools).
+    "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_SPEC_DRAFT_HF_REPO", "LLAMA_ARG_DOCKER_REPO", "LLAMA_ARG_MMPROJ_URL",
+    "LLAMA_ARG_UI", "LLAMA_ARG_UI_CONFIG", "LLAMA_ARG_UI_CONFIG_FILE", "LLAMA_ARG_UI_MCP_PROXY", "LLAMA_ARG_TOOLS",
+    "LLAMA_ARG_TOOLS_RUNTIME", "LLAMA_ARG_AGENT", "LLAMA_ARG_MCP_SERVERS_CONFIG", "LLAMA_ARG_MCP_SERVERS_JSON",
+    "LLAMA_ARG_VIDEO_FFMPEG_DIR",
+    # The device list is engines.json "placement"'s alone (D-14 (e)): an env LLAMA_ARG_DEVICE=none would move a gpu
+    # entry onto the CPU behind the Arbiter's back.
+    "LLAMA_ARG_DEVICE",
+    # Defensive: no such env name at either pin (v0.3.5's guesses, or options with no env); refusing costs nothing.
+    "LLAMA_ARG_HF_TOKEN", "LLAMA_ARG_API_KEY", "LLAMA_ARG_WEBUI", "LLAMA_ARG_MODEL_DRAFT", "LLAMA_ARG_SLOT_SAVE_PATH",
+    "LLAMA_ARG_LORA", "LLAMA_ARG_CONTROL_VECTOR",
 }
 # The same options as command-line flags; never accepted from engines.json "extra_args" (also matched as --flag=value).
 RESERVED_FLAGS = {
@@ -91,6 +114,17 @@ RESERVED_FLAGS = {
     # Fix round 2 (docstring): remote offload, second models, router mode, static files, adapters, template, log file.
     "--rpc", "-md", "--model-draft", "--models-dir", "--models-preset", "--path", "--lora", "--lora-scaled",
     "--control-vector", "--control-vector-scaled", "--control-vector-layer-range", "--chat-template-file", "--log-file",
+    # v0.4.0 (pin facts; both pins accept them, VERIFIED in common/arg.cpp at b11474): draft-model aliases, the token
+    # alias, the Docker pull, the mmproj URL alias, the UI and its file and MCP proxy, the built-in tools (shell and
+    # file writes) and their docker:/ssh: runtime, --agent (all tools plus the proxy), MCP servers, a media directory,
+    # prompt logs written to disk, an ffmpeg directory, grammar/schema files and the lookup caches.
+    "--spec-draft-model", "--spec-draft-hf", "-hft", "-dr", "--docker-repo", "-mmu", "--ui", "--no-ui",
+    "--ui-config-file", "--webui-config-file", "--ui-mcp-proxy", "--webui-mcp-proxy", "--tools", "--tools-runtime",
+    "-ag", "--agent", "--mcp-servers-config", "--mcp-servers-json", "--media-path", "--log-prompts-dir",
+    "--video-ffmpeg-dir", "--grammar-file", "-jf", "--json-schema-file", "-lcs", "--lookup-cache-static", "-lcd",
+    "--lookup-cache-dynamic",
+    # The device list is engines.json "placement"'s alone (D-14 (e), docstring "Placement").
+    "--device", "-dev",
 }
 
 
@@ -135,6 +169,8 @@ def check_token(token: str, key: str) -> str:
 
 
 ENV_KEY_RE = re.compile(r"^LLAMA_ARG_[A-Z0-9_]+$")
+# The overrides.json fields this script reads (docstring "Overrides"); S-22 retired "coresident".
+OVERRIDE_FIELDS = {"kv_type", "ctx_size", "parallel", "n_keep"}
 
 
 def env_lines(eng: dict[str, Any]) -> list[str]:
@@ -162,9 +198,14 @@ def check_extra_flag(token: str, key: str) -> str:
     return token
 
 
-def has_coresident_profile(eng: dict[str, Any]) -> bool:
-    """True when engines.json gives the engine a co-resident profile: its standing profile (docstring, S52)."""
-    return eng.get("ctx_size_coresident") is not None or eng.get("parallel_coresident") is not None
+def placement_of(eng: dict[str, Any]) -> str:
+    """engines.json "placement" (docstring "Placement"): gpu by default, cpu for the D-14 (e) companions."""
+    placement = str(eng.get("placement", "gpu"))
+    if placement not in PLACEMENTS:
+        die(f"{eng['key']}: placement {placement!r} is not one of {sorted(PLACEMENTS)}")
+    if placement == "cpu" and eng.get("arbiter_class") != "resident":
+        die(f"{eng['key']}: placement cpu is only for an always-resident companion (arbiter_class resident; D-14 (e))")
+    return placement
 
 
 def build_args(
@@ -178,13 +219,11 @@ def build_args(
     key = eng["key"]
     mode = eng.get("mode", "chat")
     kv_type = str(ov.get("kv_type", eng.get("kv_class", "none")))
-    # S52 (docstring "Standing profile"): the co-resident profile, where one is defined, is the default; only an
-    # explicit overrides.json "coresident": false selects the full one.
-    coresident = bool(ov.get("coresident", has_coresident_profile(eng)))
-    ctx_base = eng["ctx_size_coresident"] if coresident and "ctx_size_coresident" in eng else eng["ctx_size"]
-    par_base = eng["parallel_coresident"] if coresident and "parallel_coresident" in eng else eng["parallel"]
-    ctx_size = int(ov.get("ctx_size", ctx_base))
-    parallel = int(ov.get("parallel", par_base))
+    placement = placement_of(eng)
+    # S-22 (docstring "No co-resident profile"): engines.json's own profile, whatever an old entry or overrides.json
+    # says about a co-resident one.
+    ctx_size = int(ov.get("ctx_size", eng["ctx_size"]))
+    parallel = int(ov.get("parallel", eng["parallel"]))
     n_keep = int(ov.get("n_keep", eng.get("n_keep", 0)))
     if kv_type != "none" and kv_type not in KV_TYPES:
         die(f"{key}: kv type {kv_type!r} is not one of {sorted(KV_TYPES)}")
@@ -213,16 +252,21 @@ def build_args(
     if kv_type != "none":
         # Flash attention is the prerequisite for cache quantisation (Section 4.3); K and V always identical here.
         args += ["--flash-attn", "on", "--cache-type-k", kv_type, "--cache-type-v", kv_type]
-    args += ["--n-gpu-layers", "all", "--no-webui", "--metrics"]
+    if placement == "cpu":
+        # D-14 (e) (docstring "Placement"): no Vulkan device at all, so no layer offload either.
+        args += ["--device", "none"]
+    else:
+        args += ["--n-gpu-layers", "all"]
+    args += ["--no-webui", "--metrics"]
     args += [check_extra_flag(str(t), key) for t in eng.get("extra_args", [])]
     args = [check_token(t, key) for t in args]
     meta = {
         "mode": mode,
+        "placement": placement,
         "kv_type": kv_type,
         "ctx_size": ctx_size,
         "parallel": parallel,
         "n_keep": n_keep,
-        "coresident": coresident,
     }
     return args, meta
 
@@ -268,12 +312,12 @@ def render(eng: dict[str, Any], ov: dict[str, Any], opts: argparse.Namespace, in
         f"# {eng.get('display_name', key)}",
         f"ATLAS_ENGINE={sh_quote(key)}",
         f"ATLAS_MODE={sh_quote(meta['mode'])}",
+        f"ATLAS_PLACEMENT={sh_quote(meta['placement'])}",
         f"ATLAS_ARBITER_CLASS={sh_quote(str(eng.get('arbiter_class', '')))}",
         f"ATLAS_KV_TYPE={sh_quote(meta['kv_type'])}",
         f"ATLAS_CTX_SIZE={meta['ctx_size']}",
         f"ATLAS_PARALLEL={meta['parallel']}",
         f"ATLAS_N_KEEP={meta['n_keep']}",
-        f"ATLAS_CORESIDENT={1 if meta['coresident'] else 0}",
         f"ATLAS_KV_PROOF_LINES={int(eng.get('kv_proof_lines', 0))}",
         f"ATLAS_FOOTPRINT_GB={eng.get('footprint_gb', 0)}",
         f"ATLAS_MODEL_FILE={sh_quote(str(model_path))}",
@@ -319,7 +363,7 @@ def main() -> int:
     ap.add_argument("--key", action="append", default=[], help="render only these keys (default: all)")
     ap.add_argument("--set-override", nargs=3, action="append", default=[], metavar=("KEY", "FIELD", "VALUE"),
                     help="store FIELD=VALUE for KEY in overrides.json before rendering "
-                         "(kv_type, ctx_size, parallel, coresident, n_keep)")
+                         "(kv_type, ctx_size, parallel, n_keep)")
     ap.add_argument("--clear-override", nargs=2, action="append", default=[], metavar=("KEY", "FIELD"))
     ap.add_argument("--print", dest="print_key",
                     help="print the rendered file for KEY to stdout instead of installing (read-only: no directories)")
@@ -339,13 +383,11 @@ def main() -> int:
     for key, field, value in opts.set_override:
         if key not in keys:
             die(f"--set-override: unknown engine {key!r}")
-        if field not in {"kv_type", "ctx_size", "parallel", "coresident", "n_keep"}:
-            die(f"--set-override: unknown field {field!r}")
+        if field not in OVERRIDE_FIELDS:
+            die(f"--set-override: unknown field {field!r} (S-22: coresident is gone with the co-resident profile)")
         parsed: Any = value
         if field in {"ctx_size", "parallel", "n_keep"}:
             parsed = int(value)
-        elif field == "coresident":
-            parsed = value.lower() in {"1", "true", "on", "yes"}
         overrides.setdefault(key, {})[field] = parsed
     for key, field in opts.clear_override:
         overrides.get(key, {}).pop(field, None)

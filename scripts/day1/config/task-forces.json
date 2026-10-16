@@ -46,7 +46,8 @@
         {"domain": 23, "why": "Venture Partner & PE Director: private-market sleeves that compete with public allocation for the same capital."}
       ],
       "relay": [],
-      "triggers": ["capital deployment", "allocate capital", "asset allocation", "portfolio", "wealth allocation", "investment strategy", "rebalance", "deploy funds", "liquidity", "risk budget"]
+      "triggers": ["capital deployment", "allocate capital", "asset allocation", "portfolio", "wealth allocation", "investment strategy", "rebalance", "deploy funds", "liquidity", "risk budget"],
+      "notes": "v0.4.0 (S-29, D-37): no engine field on Day 1, so the dispatch runs on Silas's default, glm-5.3-flash. Phased: Ling-3.0-flash-Fin, his finance-tuned second engine (D-18), becomes this preset's engine field and a Silas override when it is pulled."
     },
     {
       "code": "TF_DELTA",
@@ -62,7 +63,8 @@
         {"domain": 6, "why": "General Counsel: facility agreements, security interests and PPSR obligations that bind the borrower."}
       ],
       "relay": [],
-      "triggers": ["bank", "banking", "loan", "credit facility", "leverage", "refinance", "debt", "lender", "covenant", "line of credit", "mortgage", "interest rate"]
+      "triggers": ["bank", "banking", "loan", "credit facility", "leverage", "refinance", "debt", "lender", "covenant", "line of credit", "mortgage", "interest rate"],
+      "notes": "v0.4.0 (S-29, D-37): no engine field on Day 1 (Silas's default, glm-5.3-flash). Phased: Ling-3.0-flash-Fin (D-18), as for TF_GAMMA."
     },
     {
       "code": "TF_EPSILON",
@@ -78,7 +80,8 @@
         {"domain": 6, "why": "General Counsel: SAFE, convertible note and shareholder agreement terms Gideon reviews in the relay."}
       ],
       "relay": ["Silas", "Gideon"],
-      "triggers": ["venture", "seed round", "startup investment", "angel", "term sheet", "safe note", "convertible note", "cap table", "series a", "pre-seed", "founder"]
+      "triggers": ["venture", "seed round", "startup investment", "angel", "term sheet", "safe note", "convertible note", "cap table", "series a", "pre-seed", "founder"],
+      "notes": "v0.4.0 (S-29, D-37): no engine field on Day 1 (Silas's default, glm-5.3-flash). Phased: Ling-3.0-flash-Fin (D-18), as for TF_GAMMA."
     },
     {
       "code": "TF_ZETA",
@@ -190,7 +193,8 @@
         {"domain": 20, "why": "Chief AI Officer: agentic systems and ATLAS's own tooling, with self-modification gated under 16.3."}
       ],
       "relay": [],
-      "triggers": ["devops", "deploy", "deployment", "server", "docker", "kubernetes", "ci/cd", "pipeline", "infrastructure", "source code", "repository", "software release"]
+      "triggers": ["devops", "deploy", "deployment", "server", "docker", "kubernetes", "ci/cd", "pipeline", "infrastructure", "source code", "repository", "software release"],
+      "notes": "v0.4.0 (S-29, D-37): no engine field on Day 1, so the dispatch runs on Valerie's default engine, which this revision leaves unchanged. Phased: Qwen3-Coder-Next, the dedicated coder seat if the Principal wants one (D-19, P-16), becomes this preset's engine field and a Valerie override when it is pulled."
     },
     {
       "code": "TF_NU",
@@ -265,7 +269,7 @@
       "default_tier": "routine",
       "dual_sign_off": false,
       "domain_cards": [
-        {"domain": 16, "why": "COO & Process Architect: calendar logic, prioritisation and triage; one card keeps the resident 4B classifier fast."}
+        {"domain": 16, "why": "COO & Process Architect: calendar logic, prioritisation and triage; one card keeps Eleanor's dispatch prompt short (her persona work runs on glm-5.3-flash, P-10; the 4B router only classifies)."}
       ],
       "relay": [],
       "triggers": ["schedule", "calendar", "meeting", "reschedule", "appointment", "availability", "book a time", "triage", "prioritise", "agenda", "reminder"]
@@ -315,7 +319,8 @@
         {"domain": 15, "why": "Chief Longevity Officer: performance physiology, protocols, bioinformatics and genomic sequencing (folded in per 8.2 C24). Synthetic biology (card 36, Tier C) loads only on an explicit match, never from this preset."}
       ],
       "relay": [],
-      "triggers": ["medical", "health", "doctor", "specialist", "blood test", "diagnosis", "medication", "longevity", "supplement", "scan results", "genomic", "fitness protocol"]
+      "triggers": ["medical", "health", "doctor", "specialist", "blood test", "diagnosis", "medication", "longevity", "supplement", "scan results", "genomic", "fitness protocol"],
+      "notes": "v0.4.0 (S-29, D-37): no engine field on Day 1, so the dispatch runs on Minerva's default, glm-5.3-flash, and her strong cross-check on Arthur's deepseek-v4-flash (D-39, approval.py). Phased: Baichuan-M3-235B, the medical cross-check (P-07, S-31), and Intern-S1 for the science subdomains of card 15 (P-15, D-17), each named here when it is pulled."
     },
     {
       "code": "TF_PHI",
@@ -364,7 +369,8 @@
         {"domain": 6, "why": "General Counsel: the legal exposure and obligations that bound every option on the table."}
       ],
       "relay": ["Ren", "Arthur"],
-      "triggers": []
+      "triggers": [],
+      "notes": "v0.4.0 (S-29, D-11, S-42): stays on deepseek-v4-flash, now UD-Q8_K_XL, until the node KLD run decides otherwise (T-03); the engine must be in the dispatching director's binding (Ren's and Arthur's persona files)."
     }
   ]
 }

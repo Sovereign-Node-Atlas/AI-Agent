@@ -16,17 +16,24 @@ the canonical set in `scripts/day1/CONVENTIONS.md` §8.
   because the hard rule routes to Arthur before task-force detection runs. Eleanor's classifier catches what the
   keywords miss (7.2 rule 2).
 - Extra keys beyond the brief: `hemisphere` (the 8.1 hemisphere tag on every task force) and, on TF_OMEGA only,
-  `engine` (`deepseek-v4-flash`, the Apex engine, 5.1) and `trigger: "principal-only"`. Unknown keys must be
-  ignored by the loader; these are informational.
+  `engine` (`deepseek-v4-flash`, the Apex engine, 5.1) and `trigger: "principal-only"`. `notes` (v0.4.0, S-29,
+  D-37) names the phased engine a preset will carry once it is pulled (Ling-3.0-flash-Fin on TF_GAMMA, TF_DELTA and
+  TF_EPSILON, Qwen3-Coder-Next on TF_MU, Baichuan-M3 and Intern-S1 on TF_UPSILON); an `engine` field is set only
+  for a Day 1 engine, and it must be in the dispatching director's binding. Unknown keys must be ignored by the
+  loader; these are informational.
 
 ## personas/<name>.md
 
 - Front matter is YAML; `#` lines are comments and record provenance. `speaks_externally_tier` on `ren.md` and
   `arthur.md` is an inference (6.2 gives tiers for directors only), marked as such in the file, to be confirmed
   with the Principal.
-- `default_engine` / `override_engines` use the CONVENTIONS §8 keys, including `qwen2.5-vl-72b`, `meditron-70b`
-  and `router-qwen3.5-4b`, which lie outside the six keys in the original brief. `config/engines.json` (5.1, 5.3)
-  must spell them identically.
+- `default_engine` / `override_engines` / `fallback_engine` use the CONVENTIONS §8 keys of the v0.4.0 Day 1 set
+  (`glm-5.3-flash`, `deepseek-v4-flash`, `gpt-oss-120b`, `gpt-oss-120b-abliterated`, `router-qwen3.5-4b`), spelled
+  exactly as in `config/engines.json` (5.1, 5.3); the loader refuses any other key. `fallback_engine` (D-40 option
+  (a)) records the engine that carries the seat if its default fails or defers in Phase 3: the arsenal's runner-up
+  where that is a Day 1 engine, else `gpt-oss-120b`, the floor (the planned runner-up is named in a comment and in
+  engines.json `phased`). It is never picked at runtime. Eleanor's `resident_model` is the router her
+  classification runs on; her persona work uses `default_engine` (P-10).
 - Body length is 250-450 words excluding front matter.
 
 ## voice-casting.json (Section 14.3)
@@ -47,6 +54,10 @@ the canonical set in `scripts/day1/CONVENTIONS.md` §8.
 - Keys beyond the brief, all intended and all fixed in configuration per 7.2 rule 4:
   `[ARTHUR:UNCENSORED]` -> `arthur-abliterated` (6.1 C6 addendum); `routes.arthur-abliterated` ->
   `gpt-oss-120b-abliterated`; `routes.deep-think:deep` -> `deepseek-v4-flash` (9.1 deep tier on the Apex engine);
+  `[ARTHUR:LONG]` -> `arthur-long` -> `glm-5.3-flash` (v0.4.0, S-30, D-38: v0.3.5's `arthur-qwen` name is refused);
   `hard_keyword_route` (`arthur`, 7.2 rule 1); `classifier_engine` (`router-qwen3.5-4b`, 5.3, 7.2 rule 2).
+- `routes.ren` -> `glm-5.3-flash` and `routes.arthur` -> `deepseek-v4-flash` (v0.4.0, S-30). `long_document_tokens`
+  stays 24000, the value set for a 32K slot, until Phase 3 has measured the per-engine slot profile (D-38, D-48):
+  a to-do, not a decision.
 - `hard_keywords` ends with `FAMILY_NAMES_PLACEHOLDER`; the orchestrator replaces it with the names listed in
   `/etc/atlas/atlas.env`. Every hard-keyword hit and every override is logged (7.2 rule 5).

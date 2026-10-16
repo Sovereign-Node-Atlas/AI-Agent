@@ -35,9 +35,9 @@
 # written copies, plus the on-node copy when the OS volume is encrypted).
 #
 # PCR 7 AND SECURE BOOT: with Secure Boot off, PCR 7 carries no image authority and the TPM unseals to any OS booted
-# on this hardware. D15 (2026-10-05, supersedes D2): the Principal enables Secure Boot in the BIOS; step 1 records a
-# to-do while it is off and never stops (policy v0.3.3); verify/v02-tpm.sh names the Secure Boot state in every V2
-# row. The mask stays --tpm2-pcrs=7 (S9, adjudicated conflict 1); a stronger mask needs a Section 23 amendment.
+# on this hardware. D15 (2026-10-05, supersedes D2): Secure Boot is required and was enabled in the BIOS by the
+# Principal (confirmed 2026-10-13; pre-flight verifies it on Day 1); should step 1 find it off, it records a to-do and
+# never stops (policy v0.3.3); verify/v02-tpm.sh names the Secure Boot state in every V2 row. The mask stays --tpm2-pcrs=7 (S9, adjudicated conflict 1); a stronger mask needs a Section 23 amendment.
 #
 # No package is installed here: cryptsetup, systemd-cryptsetup and dracut are seeded on the 26.04 Server ISO
 # (VERIFIED: the installer itself uses them for the encrypted OS volume). Their absence stops the step (step 4 brings

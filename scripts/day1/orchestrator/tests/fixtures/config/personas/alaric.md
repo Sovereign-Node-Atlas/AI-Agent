@@ -5,8 +5,9 @@ hemisphere: estate
 division: Estate
 remit: Physical assets, security, threat mitigation; Sentinel threat watch
 reports_to: arthur
-default_engine: nemotron-3-super
+default_engine: glm-5.3-flash
 override_engines: []
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: sensitive
 kokoro_voice: null
 kokoro_alternate: null

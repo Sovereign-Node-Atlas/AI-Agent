@@ -7,7 +7,10 @@ remit: Infrastructure, DevOps, AEC, cyber, AEGIS Sandbox
 reports_to: ren
 default_engine: gpt-oss-120b-abliterated
 # engine keys as canonicalised in CONVENTIONS.md §8; config/engines.json (Sections 5.1, 5.3) must use the same spelling.
-override_engines: [qwen2.5-vl-72b]
+# v0.4.0 (S-10, S-11): the retired vision engine Qwen2.5-VL-72B is removed from this map, leaving no override on Day 1;
+# her planned overrides Qwen3-Coder-Next and Intern-S1 are phased (S-32). default_engine is unchanged by this revision
+# (uncensored-seat items remain the Principal's to configure).
+override_engines: []
 speaks_externally_tier: standard
 kokoro_voice: af_nova
 kokoro_alternate: af_river

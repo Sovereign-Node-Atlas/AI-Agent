@@ -81,7 +81,7 @@ def make_store(tmp_path: Path) -> tuple[MemoryStore, StubChroma, GraphDoubles, S
         llm_base_url="http://127.0.0.1:8800/internal/v1",
         llm_model="router-qwen3.5-4b",
         embedding_url="http://127.0.0.1:8109/v1",
-        embedding_model="embed-bge-m3",
+        embedding_model="embed-qwen3-4b",
         embedding_dim=8,
         sessions=sessions,
         freeze_flag=None,
@@ -238,7 +238,7 @@ def test_graph_writes_during_the_freeze_wait_then_spool_and_the_thaw_replays_the
         llm_base_url="http://127.0.0.1:8800/internal/v1",
         llm_model="router-qwen3.5-4b",
         embedding_url="http://127.0.0.1:8109/v1",
-        embedding_model="embed-bge-m3",
+        embedding_model="embed-qwen3-4b",
         embedding_dim=8,
         sessions=SessionTags(),
         freeze_flag=flag,
@@ -401,7 +401,7 @@ def test_aegis_thaw_replays_graph_lines_with_a_graph_equipped_store(tmp_path: Pa
         llm_base_url="http://127.0.0.1:8800/internal/v1",
         llm_model="router-qwen3.5-4b",
         embedding_url="http://127.0.0.1:8109/v1",
-        embedding_model="embed-bge-m3",
+        embedding_model="embed-qwen3-4b",
         embedding_dim=8,
         sessions=SessionTags(),
         freeze_flag=flag,
@@ -1101,3 +1101,64 @@ def test_step02_seeds_the_prune_window_once_and_never_rewrites_it() -> None:
     assert 'ensure_kv "$ORCH_ENV" PRUNE_WINDOW_HOURS' not in step
     assert "ensure_kv_default()" in (day1 / "lib" / "common.sh").read_text(encoding="utf-8")
     assert prune.DEFAULT_WINDOW_HOURS == 72.0
+
+
+def test_embeddings_keep_the_1024_schema_and_queries_carry_the_instruction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S-41 / D-45 (a): Qwen3-Embedding-4B (2560 dimensions) is fitted to the 1024-dimension schema by Matryoshka
+    truncation and re-normalised; a query carries the model card's instruction prefix and a stored document none; the
+    production store embeds its queries with the prefix (MemoryStore.query) and its writes without."""
+    import math
+
+    import httpx
+
+    from atlas.memory import (
+        DEFAULT_EMBEDDING_DIM,
+        DEFAULT_EMBEDDING_MODEL,
+        DEFAULT_QUERY_INSTRUCTION,
+        fit_dimension,
+        llama_embedding_fn,
+        query_with_instruction,
+    )
+
+    assert DEFAULT_EMBEDDING_MODEL == "embed-qwen3-4b" and DEFAULT_EMBEDDING_DIM == 1024
+    long = [3.0, 4.0, *([1.0] * 2558)]
+    cut = fit_dimension(long, 2)
+    assert cut == [0.6, 0.8] and math.isclose(sum(x * x for x in fit_dimension(long, 1024)), 1.0)
+    assert fit_dimension([0.6, 0.8], 2) == [0.6, 0.8] and fit_dimension([1.0, 2.0], None) == [1.0, 2.0]
+    with pytest.raises(MemoryStoreError, match="fewer than the schema's 1024"):
+        fit_dimension([1.0] * 768, 1024)
+    with pytest.raises(MemoryStoreError, match="zero vector"):
+        fit_dimension([0.0, 0.0, 5.0], 2)
+    expected = f"Instruct: {DEFAULT_QUERY_INSTRUCTION}\nQuery:who is the trustee?"
+    assert query_with_instruction("who is the trustee?") == expected
+
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sent.append(body)
+        return httpx.Response(200, json={"data": [{"index": i, "embedding": [3.0, 4.0, *([0.0] * 2558)]}
+                                                  for i, _ in enumerate(body["input"])]})
+
+    real_client = httpx.Client
+
+    def client(*args: Any, **kw: Any) -> httpx.Client:
+        kw["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kw)
+
+    monkeypatch.setattr("atlas.engines.httpx.Client", client)
+    docs = llama_embedding_fn("http://127.0.0.1:8106/v1")
+    queries = llama_embedding_fn("http://127.0.0.1:8106/v1", instruction="Find it")
+    vec = docs(["a stored note"])[0]
+    assert len(vec) == 1024 and vec[:2] == [0.6, 0.8]
+    assert sent[-1] == {"model": "embed-qwen3-4b", "input": ["a stored note"]}
+    queries(["the trustee"])
+    assert sent[-1]["input"] == ["Instruct: Find it\nQuery:the trustee"]
+    # The store keeps the two forms apart: writes embed the document, a query the instruction form.
+    seen: list[str] = []
+    store = MemoryStore(StubChroma(), lambda t: (seen.extend(f"doc:{x}" for x in t), stub_embedding_fn(t))[1],
+                        query_embed=lambda t: (seen.extend(f"query:{x}" for x in t), stub_embedding_fn(t))[1],
+                        sessions=SessionTags(), freeze_flag=None)
+    store.write("corporate", ["the board met"], hemisphere="corporate")
+    store.query("corporate", "board", hemisphere="corporate")
+    assert seen == ["doc:the board met", "query:board"]

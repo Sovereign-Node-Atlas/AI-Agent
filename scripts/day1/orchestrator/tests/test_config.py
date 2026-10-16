@@ -29,6 +29,7 @@ from atlas.config import (
     parse_env_file,
 )
 
+GLM = "glm-5.3-flash"
 # Invented placeholder names (tests/fixtures/config/atlas.env); the real family names never enter the repository.
 FAMILY = ("Ava", "Testwood")
 
@@ -76,6 +77,22 @@ def test_settings_arbiter_headroom_default_override_and_bounds(tmp_path: Path) -
     assert Settings.from_env({**base, "ATLAS_ARBITER_HEADROOM_GIB": "18"}).arbiter_headroom_bytes == 18 * 1024**3
 
 
+def test_settings_arbiter_max_resident_default_override_and_bounds(tmp_path: Path) -> None:
+    """D-32 (approved 2026-10-16): the LLM-seat residency limit is a setting, default 1 (every seat runs alone), 2 the
+    option (b) pairing; a bad value never raises here and leaves the default plus its reason for build_arbiter."""
+    from atlas.config import ARBITER_MAX_RESIDENT_RANGE, DEFAULT_ARBITER_MAX_RESIDENT
+
+    base = {"ATLAS_ETC": str(tmp_path)}
+    assert DEFAULT_ARBITER_MAX_RESIDENT == 1 and ARBITER_MAX_RESIDENT_RANGE == (1, 2)
+    s = Settings.from_env(base)
+    assert s.arbiter_max_resident == 1 and s.arbiter_max_resident_error is None
+    assert Settings.from_env({**base, "ATLAS_ARBITER_MAX_RESIDENT": " 2 "}).arbiter_max_resident == 2
+    for bad in ("two", "1.5", "-1", "0", "3"):
+        s = Settings.from_env({**base, "ATLAS_ARBITER_MAX_RESIDENT": bad})
+        assert s.arbiter_max_resident == 1
+        assert s.arbiter_max_resident_error is not None and "ATLAS_ARBITER_MAX_RESIDENT" in s.arbiter_max_resident_error
+
+
 def test_parse_env_file(tmp_path: Path) -> None:
     f = tmp_path / "e.env"
     f.write_text("# c\nA=1\nexport B='two words'\nC=\"q\"\nbad line\n9X=nope\n")
@@ -99,20 +116,72 @@ def test_parse_env_file_unreadable_falls_back_to_the_process_env(tmp_path: Path,
 
 def test_engines_ports_follow_the_port_rule(config_dir: Path) -> None:
     engines = load_engines(config_dir, 8100)
-    # The ten llama-server engines (CONVENTIONS.md §8) come first and take the ports; the `external` list (Section 4.2
-    # class external: chatterbox, in-process, budgeted by the Arbiter but no unit) is appended with port 0.
+    # The seven Day 1 llama-server engines (CONVENTIONS.md §8, v0.4.0) come first and take the ports 8101..8107; the
+    # `external` list (Section 4.2 class external: chatterbox, in-process, budgeted by the Arbiter but no unit) is
+    # appended with port 0.
     units = {k: e for k, e in engines.items() if not e.is_external}
     assert list(units) == list(ENGINE_KEYS)
-    assert [e.port for e in units.values()] == list(range(8101, 8111))
+    assert [e.port for e in units.values()] == list(range(8101, 8101 + len(ENGINE_KEYS)))
     assert list(engines) == [*ENGINE_KEYS, "chatterbox"]
+    # The abliterated twin keeps its v0.3.5 port (8102), and the uncensored entry is otherwise untouched.
+    assert engines["gpt-oss-120b"].port == 8101 and engines["gpt-oss-120b-abliterated"].port == 8102
     ext = engines["chatterbox"]
     assert ext.is_external and ext.port == 0 and ext.index == 0 and not ext.is_resident and not ext.is_phase4
     assert ext.footprint_gb == 4 and ext.kv_class == "none" and ext.hf_repo == "" and ext.files == []
     assert engines["deepseek-v4-flash"].is_apex and engines["deepseek-v4-flash"].exclusive
-    assert engines["router-qwen3.5-4b"].is_resident
-    assert engines["gpt-oss-120b"].systemd_unit == "llama-server@gpt-oss-120b"
-    assert engines["qwen2.5-vl-72b"].parallel_coresident == 2 and engines["qwen2.5-vl-72b"].ctx_size_coresident == 65536
+    assert engines["router-qwen3.5-4b"].is_resident and engines["router-qwen3.5-4b"].placement == "gpu"
+    assert engines["embed-qwen3-4b"].placement == engines["rerank-qwen3-4b"].placement == "cpu"  # D-14 (e)
+    assert engines["glm-5.3-flash"].systemd_unit == "llama-server@glm-5.3-flash"
+    assert {k for k, e in engines.items() if e.is_llm_seat} == {
+        "gpt-oss-120b", "gpt-oss-120b-abliterated", "glm-5.3-flash", "deepseek-v4-flash"}
     assert load_engines(config_dir, 9000)["gpt-oss-120b"].port == 9001
+
+
+def test_footprint_is_the_exact_file_bytes_in_gib(config_dir: Path) -> None:
+    """D-31 / S-20: the Arbiter budgets the Hugging Face tree sizes (files[].bytes, mmproj included), not footprint_gb
+    read as GiB; an entry without byte counts (the unchanged abliterated twin) keeps the v0.3.5 upper bound."""
+    engines = load_engines(config_dir, 8100)
+    glm, dsv4 = engines["glm-5.3-flash"], engines["deepseek-v4-flash"]
+    assert glm.footprint_bytes == 156_822_111_200 + 1_128_047_296 and glm.footprint_source == "files"
+    assert dsv4.footprint_bytes == 161_869_615_520  # 150.75 GiB, where footprint_gb read as GiB was 161.87
+    assert round(dsv4.footprint_bytes / 1024**3, 2) == 150.75 < dsv4.footprint_gb
+    assert engines["gpt-oss-120b"].footprint_bytes == 65_369_017_728
+    abl = engines["gpt-oss-120b-abliterated"]
+    assert abl.files == [] and abl.footprint_source == "footprint_gb" and abl.footprint_bytes == 63 * 1024**3
+    # A file without a byte count falls back to the upper bound rather than under-count the engine.
+    partial = glm.model_copy(update={"files": [glm.files[0].model_copy(update={"bytes": None}), *glm.files[1:]]})
+    assert partial.footprint_source == "footprint_gb" and partial.footprint_bytes == int(glm.footprint_gb * 1024**3)
+
+
+def test_mmproj_and_placement_rules(config_dir: Path, tmp_path: Path) -> None:
+    """D-31: with exact bytes the mmproj must be one of files[] (else its ~1 GiB would be left out of the budget);
+    D-14 (e): only an always-resident companion may run on the CPU; placement is gpu or cpu."""
+    real = json.loads((config_dir / "engines.json").read_text(encoding="utf-8"))
+    glm = next(e for e in real["engines"] if e["key"] == "glm-5.3-flash")
+    cases = (
+        ({**glm, "files": [f for f in glm["files"] if "mmproj" not in f["name"]]}, r"mmproj 'mmproj-F16\.gguf' is not"),
+        ({**glm, "placement": "cpu"}, r"placement 'cpu' is for always-resident companions"),
+        ({**glm, "placement": "npu"}, r"placement 'npu' is not one of"),
+    )
+    for entry, msg in cases:
+        bad = {**real, "engines": [entry if e["key"] == "glm-5.3-flash" else e for e in real["engines"]]}
+        (tmp_path / "engines.json").write_text(json.dumps(bad))
+        with pytest.raises(ConfigError, match=msg):
+            load_engines(tmp_path, 8100)
+
+
+def test_port_range_is_bounded(config_dir: Path, tmp_path: Path) -> None:
+    """S-33: engines[] takes LLAMA_PORT_BASE + 1 .. + ENGINE_PORT_SLOTS (8101..8120); one more is refused, by name."""
+    from atlas.config import ENGINE_PORT_SLOTS
+
+    real = json.loads((config_dir / "engines.json").read_text(encoding="utf-8"))
+    extra = [{**real["engines"][0], "key": f"phased-{i}", "files": []} for i in range(ENGINE_PORT_SLOTS)]
+    (tmp_path / "engines.json").write_text(json.dumps({**real, "engines": [*real["engines"], *extra]}))
+    with pytest.raises(ConfigError, match=r"exceed the 20-port range 8101\.\.8120"):
+        load_engines(tmp_path, 8100)
+    fits = extra[: ENGINE_PORT_SLOTS - len(real["engines"])]
+    (tmp_path / "engines.json").write_text(json.dumps({**real, "engines": [*real["engines"], *fits]}))
+    assert max(e.port for e in load_engines(tmp_path, 8100).values()) == 8100 + ENGINE_PORT_SLOTS
 
 
 def test_engines_missing_key_fails_loudly(tmp_path: Path) -> None:
@@ -163,17 +232,19 @@ def test_external_list_is_the_only_home_of_class_external(config_dir: Path, tmp_
     assert list(load_engines(tmp_path, 8100)) == list(ENGINE_KEYS)
 
 
-def test_kv_classes_are_the_conventions_set_and_llm_engines_are_quantised(tmp_path: Path) -> None:
-    assert KV_CLASSES == {"q8_0", "q4_0", "none"}  # CONVENTIONS.md §8; f16 is what V4 exists to catch
+def test_kv_classes_are_the_conventions_set_and_llm_engines_name_their_cache(tmp_path: Path) -> None:
+    # D-29 (a): f16 where the cache is cheap (GLM, DeepSeek V4), q8_0 elsewhere; `none` is for embedding/reranking.
+    assert KV_CLASSES == {"f16", "q8_0", "q4_0", "none"}
     base = '{"key": "x", "arbiter_class": "core", "footprint_gb": 1, "ctx_size": 4096, "mode": "%s", "kv_class": "%s"}'
-    for mode, kv, msg in (("chat", "f16", "kv_class 'f16'"), ("chat", "none", "quantised kv_class"),
-                          ("vision", "none", "quantised kv_class")):
+    for mode, kv, msg in (("chat", "q3_k", "kv_class 'q3_k'"), ("chat", "none", "needs a kv_class"),
+                          ("vision", "none", "needs a kv_class")):
         (tmp_path / "engines.json").write_text('{"engines": [%s]}' % (base % (mode, kv)))
         with pytest.raises(ConfigError, match=msg):
             load_engines(tmp_path, 8100)
-    (tmp_path / "engines.json").write_text('{"engines": [%s]}' % (base % ("embedding", "none")))
-    with pytest.raises(ConfigError, match="missing from CONVENTIONS"):  # `none` on an embedding engine validates
-        load_engines(tmp_path, 8100)
+    for mode, kv in (("embedding", "none"), ("chat", "f16")):  # both validate; the key set is what is missing
+        (tmp_path / "engines.json").write_text('{"engines": [%s]}' % (base % (mode, kv)))
+        with pytest.raises(ConfigError, match="missing from CONVENTIONS"):
+            load_engines(tmp_path, 8100)
 
 
 def test_router_rules_family_names(config_dir: Path) -> None:
@@ -298,12 +369,18 @@ def test_real_config_tree_loads(tmp_path: Path, caplog: pytest.LogCaptureFixture
         cfg = load_config(settings)
     assert set(cfg.personas) == {"ren", "arthur", "gideon", "silas", "valerie", "helena", "eleanor", "alaric",
                                  "minerva", "victor"}
-    # §1 counts: "the 7 GGUF engines + 3 resident small models" are the ten llama-server units (arbiter_class !=
-    # external); engines.json's `external` list adds chatterbox (Section 4.2 "Chatterbox when invoked":
-    # Arbiter-budgeted, in-process, no unit, no port), so the whole map holds 11 and the unit count stays an honest 10.
+    # v0.4.0 Day 1 counts (CONVENTIONS.md §8): four LLM seats (gpt-oss-120b, its unchanged abliterated twin,
+    # GLM-5.3-Flash, DeepSeek-V4-Flash-0731) and three always-resident companions (the router on the iGPU, the Qwen3
+    # retrieval pair on the CPU) are the seven llama-server units (arbiter_class != external); engines.json's `external`
+    # list adds chatterbox (Section 4.2 "Chatterbox when invoked": Arbiter-budgeted, in-process, no unit, no port).
     units = [k for k, e in cfg.engines.items() if not e.is_external]
-    assert len(cfg.domain_cards) == 36 and len(cfg.task_forces) == 23 and len(units) == 10
-    assert units == list(ENGINE_KEYS) and len(cfg.engines) == 11 and cfg.engines["chatterbox"].is_external
+    assert len(cfg.domain_cards) == 36 and len(cfg.task_forces) == 23 and len(units) == len(ENGINE_KEYS) == 7
+    assert units == list(ENGINE_KEYS) and len(cfg.engines) == 8 and cfg.engines["chatterbox"].is_external
+    assert [k for k in units if cfg.engines[k].is_llm_seat] == ["gpt-oss-120b", "gpt-oss-120b-abliterated",
+                                                                "glm-5.3-flash", "deepseek-v4-flash"]
+    assert [k for k in units if cfg.engines[k].placement == "cpu"] == ["embed-qwen3-4b", "rerank-qwen3-4b"]  # D-14
+    # D-31: every Day 1 engine but the unchanged uncensored entry carries exact file bytes, so the Arbiter budgets them.
+    assert [k for k in units if cfg.engines[k].footprint_source != "files"] in ([], ["gpt-oss-120b-abliterated"])
     assert len(cfg.phase4_engines) >= 16
     drift = [ln for ln in caplog.text.splitlines() if "not in the CONVENTIONS.md §8 form" in ln]
     try:
@@ -312,6 +389,64 @@ def test_real_config_tree_loads(tmp_path: Path, caplog: pytest.LogCaptureFixture
         pytest.fail(f"the real tree loads (the service starts) but {len(drift)} domain card(s) drift from the "
                     f"CONVENTIONS.md §8 H1 triple; fix the cards (another writer's files):\n{exc}")
     assert drift == []
+
+
+def test_real_config_is_the_approved_day1_map(tmp_path: Path) -> None:
+    """v0.4.0 (approved 2026-10-16): the real tree carries the Day 1 map, and every engine reference in config/
+    resolves to an engines.json key. S-32 / D-40 (a) / P-10 persona bindings, S-30 routes, S-29 presets, S-42 / D-29 (a)
+    KV types, D-33 (c) decode bands, S-11 retirements, the sentinel unit list, and the exclusion: the uncensored entry,
+    its routes and prefixes and Valerie's default engine are exactly as in v0.3.5."""
+    tree = _real_config_tree()
+    if tree is None:
+        pytest.skip("the real config tree is not beside this checkout and ATLAS_CONFIG_DIR is unset")
+    cfg = load_config(Settings.from_env({"ATLAS_CONFIG_DIR": str(tree), "ATLAS_ETC": str(tmp_path)}))
+    glm, ds, gpt, abl = "glm-5.3-flash", "deepseek-v4-flash", "gpt-oss-120b", "gpt-oss-120b-abliterated"
+    bindings = {k: (p.default_engine, tuple(p.override_engines), p.fallback_engine) for k, p in cfg.personas.items()}
+    assert bindings == {
+        "ren": (glm, (abl, ds), gpt), "arthur": (ds, (glm, abl), glm), "gideon": (glm, (ds,), ds),
+        "silas": (glm, (), gpt), "helena": (glm, (), ds), "minerva": (glm, (), gpt), "victor": (glm, (), gpt),
+        "alaric": (glm, (), gpt), "eleanor": (glm, (), gpt), "valerie": (abl, (), None),
+    }
+    eleanor = (tree / "personas" / "eleanor.md").read_text(encoding="utf-8")
+    assert "resident_model: router-qwen3.5-4b" in eleanor and cfg.router_rules.classifier_engine == "router-qwen3.5-4b"
+    assert cfg.router_rules.routes == {"ren": glm, "arthur": ds, "ren-abliterated": abl, "arthur-long": glm,
+                                       "arthur-abliterated": abl, "deep-think:deep": ds}
+    assert cfg.router_rules.overrides["[ARTHUR:LONG]"] == "arthur-long"
+    assert cfg.router_rules.overrides["[REN:UNCENSORED]"] == "ren-abliterated"
+    assert cfg.router_rules.overrides["[ARTHUR:UNCENSORED]"] == "arthur-abliterated"
+    assert cfg.router_rules.long_document_tokens == 24000  # D-38: a measured to-do, unchanged until Phase 3
+    assert {c: t.engine for c, t in cfg.task_forces.items() if t.engine} == {"TF_OMEGA": ds}
+    # Engines: KV per D-29 (a), the Apex ladder never reaching q4_0 (S-42), projections not bands (D-33 (c)).
+    e = cfg.engines
+    assert {k: e[k].kv_class for k in ENGINE_KEYS} == {
+        gpt: "q8_0", abl: "q4_0", glm: "f16", ds: "f16", "router-qwen3.5-4b": "q8_0", "embed-qwen3-4b": "q8_0",
+        "rerank-qwen3-4b": "q8_0"}
+    assert e[ds].kv_ladder == ["f16", "q8_0"] and e[ds].ctx_size_f16_cap is None and e[ds].exclusive
+    assert e[glm].mmproj == "mmproj-F16.gguf" and e[glm].mode == "vision" and e[glm].kv_types_must_match
+    assert [k for k in ENGINE_KEYS if e[k].expected_decode_tok_s is not None] == [abl]
+    raw = json.loads((tree / "engines.json").read_text(encoding="utf-8"))
+    entries = {x["key"]: x for x in raw["engines"]}
+    old_abl = {
+        "key": abl, "mode": "chat", "arbiter_class": "core", "kv_class": "q4_0",
+        "hf_repo": "noctrex/Huihui-gpt-oss-120b-abliterated-MXFP4_MOE-GGUF", "files": [],
+        "enumerate_pattern": "*MXFP4_MOE*.gguf", "footprint_gb": 63, "ctx_size": 262144, "parallel": 8}
+    assert {k: entries[abl].get(k) for k in old_abl} == old_abl  # the exclusion: unchanged from v0.3.5
+    assert all(x.get("projected_decode_tok_s") for k, x in entries.items() if e[k].is_llm_seat and k != abl)
+    # S-11: the retired keys appear nowhere a reference could resolve; phased engines are records, not keys.
+    retired = {"nemotron-3-super", "qwen3.5-122b", "qwen2.5-vl-72b", "meditron-70b", "embed-bge-m3",
+               "rerank-bge-v2-m3"}
+    assert not retired & set(e)
+    planned = {x["planned_key"] for x in raw["phased"]}
+    assert planned == {"qwen3.8-flash-next", "nemotron-3-super", "intern-s1", "ling-3.0-flash-fin", "baichuan-m3-235b",
+                       "qwen3-coder-next", "embeddinggemma-2"} and not planned & set(e)
+    refs = {x for b in bindings.values() for x in (b[0], *b[1], b[2]) if x} | set(cfg.router_rules.routes.values())
+    assert refs <= set(e) and not refs & planned
+    # Sentinel's services feed names units that exist (llama-server@<engines.json key>).
+    feeds = json.loads((tree / "sentinel-feeds.json").read_text(encoding="utf-8"))
+    services = next(f for f in feeds["telemetry"] if f.get("id") == "services")["source"].split()
+    units = [u.split("@", 1)[1] for u in services if u.startswith("llama-server@")]
+    assert units == ["router-qwen3.5-4b", "embed-qwen3-4b", "rerank-qwen3-4b"]
+    assert all(e[u].is_resident for u in units)
 
 
 def test_load_domain_cards(config_dir: Path) -> None:
@@ -401,7 +536,12 @@ def test_load_config_cross_checks(config_dir: Path) -> None:
     cfg = load_config()
     assert set(cfg.personas) == {"ren", "arthur", "gideon", "silas", "valerie", "helena", "eleanor", "alaric",
                                  "minerva", "victor"}
-    assert cfg.personas["ren"].default_engine == "gpt-oss-120b" and cfg.personas["ren"].directors[0] == "gideon"
+    assert cfg.personas["ren"].default_engine == "glm-5.3-flash" and cfg.personas["ren"].directors[0] == "gideon"
+    # D-40: every Day 1 seat names a Day 1 fallback (gpt-oss-120b where the arsenal's runner-up is phased); P-10:
+    # Eleanor's own work runs on GLM-5.3-Flash, the router stays her classifier (resident_model).
+    assert cfg.personas["ren"].fallback_engine == "gpt-oss-120b" and cfg.personas["arthur"].fallback_engine == GLM
+    assert cfg.personas["eleanor"].default_engine == GLM
+    assert cfg.personas["eleanor"].extra["resident_model"] == "router-qwen3.5-4b"
     assert cfg.personas["ren"].extra["kokoro_voice"] == "am_onyx"
     # The fixture front matter is config/personas/*.md verbatim (Sections 6.1, 6.2): names and approval tiers.
     assert cfg.personas["arthur"].name == "Arthur Sterling" and cfg.personas["ren"].name == "Ren Ackerman"
@@ -409,7 +549,34 @@ def test_load_config_cross_checks(config_dir: Path) -> None:
     assert tiers == {"ren": "sensitive", "arthur": "sensitive", "gideon": "sensitive", "silas": "standard",
                      "valerie": "standard", "helena": "standard", "eleanor": "routine", "alaric": "sensitive",
                      "minerva": "sensitive", "victor": "routine"}
-    assert cfg.engine("nemotron-3-super").port == 8103
+    assert cfg.engine(GLM).port == 8103
     with pytest.raises(ConfigError, match="unknown engine"):
         cfg.engine("nope")
     assert cfg.router_rules.hard_keywords[-2:] == list(FAMILY)
+
+
+def test_persona_fallback_engine_must_be_an_engines_json_key(config_dir: Path, tmp_path: Path) -> None:
+    """D-40: fallback_engine is validated like default_engine and override_engines (every engine key referenced
+    anywhere must exist at Day 1), and it is recorded, never an engine the persona is bound to."""
+    from atlas.config import load_personas
+    from atlas.personas import PersonaRegistry
+
+    engines = load_engines(config_dir, 8100)
+    personas = load_personas(config_dir, engines)
+    registry = PersonaRegistry(personas, engines)
+    binding = registry.binding("silas")
+    assert binding.fallback_engine == "gpt-oss-120b" and "gpt-oss-120b" not in binding.all_engines
+    with pytest.raises(ConfigError, match="not bound"):
+        registry.engine_for("silas", "gpt-oss-120b")
+    pdir = tmp_path / "personas"
+    pdir.mkdir()
+    for f in (config_dir / "personas").glob("*.md"):
+        text = f.read_text(encoding="utf-8")
+        if f.stem == "silas":
+            text = text.replace("fallback_engine: gpt-oss-120b", "fallback_engine: qwen3.8-flash-next")
+        (pdir / f.name).write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"silas\.md: engine 'qwen3\.8-flash-next' is not a key of engines\.json"):
+        load_personas(tmp_path, engines)
+    bad = {**personas, "silas": personas["silas"].model_copy(update={"fallback_engine": "qwen3.8-flash-next"})}
+    with pytest.raises(ConfigError, match=r"qwen3\.8-flash-next"):
+        PersonaRegistry(bad, engines)

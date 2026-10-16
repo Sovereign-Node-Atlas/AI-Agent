@@ -1,16 +1,21 @@
 # llama-server@.service — one llama.cpp engine per instance, %i = engine key from config/engines.json
-# (CONVENTIONS.md §8: llama-server@gpt-oss-120b ... llama-server@rerank-bge-v2-m3).
+# (CONVENTIONS.md §8: llama-server@gpt-oss-120b ... llama-server@rerank-qwen3-4b; v0.4.0 Day 1 set, S-33).
 # Installed by phase2/01-llama.sh through render_template with ATLAS_ETC and ATLAS_SRV substituted; %i and $ARGS are
 # systemd syntax and are left untouched. The env file is rendered by phase2/engine-env.py from config/engines.json.
 #
 # Readiness: the HTTP listener starts before the model loads and /health answers 503 until "model loaded", then 200
 # (llama-cpp-vulkan research §7). ExecStartPost polls /health, so `systemctl start` returns only when the engine can
-# serve; TimeoutStartSec bounds a 155 GB load (Section 5.4 says 25-35 s from NVMe, a cold page cache can take minutes).
-# Bind: 127.0.0.1 only (CONVENTIONS.md §8), set twice — in $ARGS (--host) and as the LLAMA_ARG_HOST env var.
+# serve; TimeoutStartSec bounds a 162 GB load (DeepSeek-V4-Flash UD-Q8_K_XL, the largest Day 1 file; v0.4.0 research
+# puts a large swap through LUKS at about 50-85 s, B-05 and T-14 measure it, and a cold page cache can take minutes).
+# Bind: 127.0.0.1 only (CONVENTIONS.md §8), set twice — in $ARGS (--host) and as the LLAMA_ARG_HOST env var. At b11474
+#       --host takes a comma-separated list, but its handler clears the list first and env is applied before argv, so
+#       the two still bind once (common/arg.cpp:3323-3338, 787-811; v0.4.0 pin facts).
+# Placement: the two CPU companions (embed-qwen3-4b, rerank-qwen3-4b; D-14 (e)) run this same unit with
+#       `--device none` in $ARGS (engine-env.py); /dev/dri stays reachable but unused, so one unit serves both sides.
 # Logs: the journal (journalctl -u llama-server@<key>) is where Phase 3 reads the V4 proof line
 #       "llama_kv_cache: size = ... K (q8_0): ... V (q8_0): ..." (research conflict h) and the S52 memory records'
-#       size and compute lines. At the pinned llama.cpp these are TRACE (library INFO, common/log.cpp:532), printed
-#       only at -lv 4: engine-env.py renders `--verbosity 4` into every chat/vision engine's $ARGS (exactly 4, never
+#       size and compute lines. At the pinned llama.cpp (b11474) these are TRACE (library INFO,
+#       common/log.cpp:535), printed only at -lv 4: engine-env.py renders `--verbosity 4` into every chat/vision engine's $ARGS (exactly 4, never
 #       5 or -v; see its docstring). At the default 3 none of them reaches the journal and V4 cannot pass.
 # Control path: the orchestrator runs `sudo systemctl start|stop|restart llama-server@<key>` under
 #       /etc/sudoers.d/atlas-engines (CONVENTIONS.md §8), written by phase2/01-llama.sh.

@@ -37,9 +37,10 @@
 # handshake. A timeout records V19/V5 as DEFERRED with a to-do (policy v0.3.3: the Principal's input never stops a phase), the step
 # still completes, the gate never blocks on deferred, and `--force 05b` / `--force 07` re-runs the wait later.
 # An unencrypted OS volume (Section 3.5) is a warning plus to-do os-volume-encryption, not a stop; while it is
-# unencrypted no on-node recovery copy is kept (the written and USB copies are the only ones, doc S33). Secure Boot (D15, 2026-10-05): the Principal enables it in the BIOS; while it is off
-# the S9 PCR 7 binding unseals to any OS booted on the hardware, so step 1 warns, every V2 row notes the state and
-# to-do secure-boot stays open (see phase1/01-preflight.sh). No acknowledgement key exists any more.
+# unencrypted no on-node recovery copy is kept (the written and USB copies are the only ones, doc S33). Secure Boot (D15, 2026-10-05): required,
+# and enabled in the BIOS by the Principal (confirmed 2026-10-13); pre-flight verifies it on Day 1. Only if it is found
+# off (the S9 PCR 7 binding would then unseal to any OS booted on the hardware) does step 1 warn, every V2 row note
+# the state and to-do secure-boot open (see phase1/01-preflight.sh). No acknowledgement key exists any more.
 # Phase-1-owned settings file: /etc/atlas/network.env (LAN_DNS_SERVERS, written by step 4, read by step 7,
 # docker-egress-rules.sh and --reload-allowlist); nothing Phase 1 derives is written into atlas.env (§3 key set).
 

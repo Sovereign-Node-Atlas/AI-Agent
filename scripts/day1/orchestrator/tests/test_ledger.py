@@ -122,12 +122,12 @@ def test_arbiter_and_routing_decisions() -> None:
     ledger.insert_arbiter_decision(task_id="t1", action="load", engine="gpt-oss-120b", decision="granted",
                                    projected_bytes=10, budget_bytes=100, free_bytes=90, resident=["gpt-oss-120b"],
                                    reason="loaded")
-    ledger.insert_arbiter_decision(task_id="t2", action="load", engine="nemotron-3-super", decision="refused",
+    ledger.insert_arbiter_decision(task_id="t2", action="load", engine="deepseek-v4-flash", decision="refused",
                                    reason="over budget")
     assert [r["decision"] for r in ledger.list_arbiter_decisions()] == ["refused", "granted"]
     only = ledger.list_arbiter_decisions(task_id="t1")
     assert len(only) == 1 and json.loads(only[0]["resident_json"]) == ["gpt-oss-120b"]
-    ledger.insert_routing_decision(task_id="t3", route="arthur", engine="nemotron-3-super", reason="hard keyword",
+    ledger.insert_routing_decision(task_id="t3", route="arthur", engine="deepseek-v4-flash", reason="hard keyword",
                                    hard_keyword_hit="medical", classifier_route="ren", tier="sensitive")
     rows = ledger.list_routing_decisions(task_id="t3")
     assert rows[0]["route"] == "arthur" and rows[0]["hard_keyword_hit"] == "medical"

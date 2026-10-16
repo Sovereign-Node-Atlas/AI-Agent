@@ -110,11 +110,9 @@ def test_renders_every_engine(engine_env: ModuleType, monkeypatch: pytest.Monkey
         assert kv["ATLAS_MODEL_PATTERN"] == (eng.get("model_file_pattern") or eng["files"][0]["name"].split("/")[-1])
         assert kv["LLAMA_ARG_HOST"] == "127.0.0.1"
         assert kv["LLAMA_ARG_PORT"] == str(PORT_BASE + index)
-        # S52: an engine with a co-resident profile (the vision engine) renders it by default, ATLAS_CORESIDENT=1.
-        standing = "ctx_size_coresident" in eng or "parallel_coresident" in eng
-        want_ctx = eng.get("ctx_size_coresident", eng["ctx_size"]) if standing else eng["ctx_size"]
-        want_par = eng.get("parallel_coresident", eng["parallel"]) if standing else eng["parallel"]
-        assert kv["ATLAS_CORESIDENT"] == ("1" if standing else "0")
+        # S-22 (v0.4.0): no co-resident profile any more; every unit renders engines.json's own profile.
+        assert "ATLAS_CORESIDENT" not in kv
+        want_ctx, want_par = eng["ctx_size"], eng["parallel"]
         assert kv["ATLAS_CTX_SIZE"] == str(want_ctx)
         assert kv["ATLAS_PARALLEL"] == str(want_par)
         args = kv["ARGS"].split()
@@ -122,7 +120,14 @@ def test_renders_every_engine(engine_env: ModuleType, monkeypatch: pytest.Monkey
         assert args[args.index("--host") + 1] == "127.0.0.1"
         assert args[args.index("--ctx-size") + 1] == str(want_ctx)  # the TOTAL pool (conflict 9)
         assert args[args.index("--parallel") + 1] == str(want_par)
-        assert "--n-gpu-layers" in args and "--no-webui" in args
+        assert "--no-webui" in args
+        # D-14 (e): a cpu entry never touches the Vulkan device; every other entry offloads every layer.
+        placement = eng.get("placement", "gpu")
+        assert kv["ATLAS_PLACEMENT"] == placement
+        if placement == "cpu":
+            assert args[args.index("--device") + 1] == "none" and "--n-gpu-layers" not in args
+        else:
+            assert args[args.index("--n-gpu-layers") + 1] == "all" and "--device" not in args
         assert Path(args[args.index("--model") + 1]).is_file()
         if eng.get("mode", "chat") in {"chat", "vision"}:
             assert args[args.index("--slot-save-path") + 1] == str(tree["slots"])
@@ -220,6 +225,20 @@ def _mutated(engines: list[dict[str, Any]], key: str, **fields: Any) -> list[dic
         {"extra_args": ["--temp", "0.2 0.3"]},                  # whitespace inside a token
         {"env": {"LLAMA_ARG_HOST": "0.0.0.0"}},                 # reserved env name
         {"env": {"LLAMA_ARG_MODEL_URL": "https://x/y.gguf"}},   # reserved env name
+        # v0.4.0 pin facts: the file, network and exec options both pins accept and v0.3.5 left open.
+        {"extra_args": ["--tools", "all"]},                     # built-in shell and file tools
+        {"extra_args": ["-ag"]},                                # --agent: every tool plus the MCP proxy
+        {"extra_args": ["--tools-runtime=ssh:host"]},           # tools on a remote host
+        {"extra_args": ["--spec-draft-model", "/tmp/x.gguf"]},  # a second model from an arbitrary path
+        {"extra_args": ["-dr", "ai/x"]},                        # Docker model pull
+        {"extra_args": ["--ui"]},                               # the web UI back on
+        {"extra_args": ["--log-prompts-dir", "/tmp"]},          # the Principal's prompts written to disk
+        {"extra_args": ["--device", "none"]},                   # the device list is placement's alone (D-14 (e))
+        {"env": {"LLAMA_ARG_TOOLS": "all"}},                    # real env names at b11474
+        {"env": {"LLAMA_ARG_SPEC_DRAFT_MODEL": "/tmp/x.gguf"}},
+        {"env": {"LLAMA_ARG_UI": "1"}},
+        {"env": {"LLAMA_ARG_DEVICE": "none"}},
+        {"placement": "npu"},                                   # not a placement
         {"env": {"NOT_LLAMA": "1"}},                            # not an LLAMA_ARG_* name
         {"env": ["LLAMA_ARG_X=1"]},                             # not an object
         {"parallel": 0},                                        # never auto (gguf-models.md §1.3)
@@ -258,27 +277,29 @@ def test_duplicate_keys_and_unknown_key_are_refused(engine_env: ModuleType, monk
 # --- overrides: the contract Phase 3's KV ladder relies on ------------------------------------------------------------
 
 def test_set_and_clear_override_round_trip(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
-                                           tree: dict[str, Path]) -> None:
+                                           tree: dict[str, Path], engines: list[dict[str, Any]]) -> None:
     key = "deepseek-v4-flash"
+    own = next(e for e in engines if e["key"] == key)
+    rung = "q8_0" if own["kv_class"] != "q8_0" else "f16"  # a KV-ladder rung other than engines.json's own type
     assert _run(engine_env, monkeypatch, tree,
-                "--set-override", key, "kv_type", "f16", "--set-override", key, "ctx_size", "65536") == 0
+                "--set-override", key, "kv_type", rung, "--set-override", key, "ctx_size", "65536") == 0
     ov = json.loads(tree["overrides"].read_text(encoding="utf-8"))
-    assert ov == {key: {"kv_type": "f16", "ctx_size": 65536}}
+    assert ov == {key: {"kv_type": rung, "ctx_size": 65536}}
     kv = _kv(tree["out"] / f"{key}.env")
-    assert kv["ATLAS_KV_TYPE"] == "f16"
+    assert kv["ATLAS_KV_TYPE"] == rung
     assert kv["ATLAS_CTX_SIZE"] == "65536"
     args = kv["ARGS"].split()
-    assert args[args.index("--cache-type-k") + 1] == "f16"
-    assert args[args.index("--cache-type-v") + 1] == "f16"
+    assert args[args.index("--cache-type-k") + 1] == rung
+    assert args[args.index("--cache-type-v") + 1] == rung
     assert args[args.index("--ctx-size") + 1] == "65536"
     # A plain re-render keeps the stored override (the unit file and the env file always agree).
     assert _run(engine_env, monkeypatch, tree) == 0
-    assert _kv(tree["out"] / f"{key}.env")["ATLAS_KV_TYPE"] == "f16"
+    assert _kv(tree["out"] / f"{key}.env")["ATLAS_KV_TYPE"] == rung
     # Clearing restores engines.json's values.
     assert _run(engine_env, monkeypatch, tree,
                 "--clear-override", key, "kv_type", "--clear-override", key, "ctx_size") == 0
     kv = _kv(tree["out"] / f"{key}.env")
-    assert kv["ATLAS_KV_TYPE"] == "q4_0"
+    assert kv["ATLAS_KV_TYPE"] == own["kv_class"]
     assert kv["ATLAS_CTX_SIZE"] != "65536"
     assert json.loads(tree["overrides"].read_text(encoding="utf-8")) == {key: {}}
 
@@ -293,87 +314,90 @@ def test_override_refuses_unknown_engine_and_field(engine_env: ModuleType, monke
         _run(engine_env, monkeypatch, tree, "--set-override", "deepseek-v4-flash", "kv_type", "q3_k")
 
 
-def test_coresident_profile_is_the_standing_profile(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
-                                                   tree: dict[str, Path], engines: list[dict[str, Any]]) -> None:
-    """S52: the vision engine's co-resident profile (2 x 32k) is what it runs with NO override, so the unit the Arbiter
-    projects pairs with gpt-oss-120b (Section 4.1); only an explicit coresident=false (the Principal's choice) renders
-    the full 8 x 32k profile, and clearing it brings the standing profile back."""
-    cores = [e for e in engines if "ctx_size_coresident" in e]
-    assert [e["key"] for e in cores] == ["qwen2.5-vl-72b"], "only the vision engine defines a co-resident profile"
-    eng = cores[0]
+def test_coresident_profile_is_gone(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                                    tree: dict[str, Path], engines: list[dict[str, Any]], tmp_path: Path) -> None:
+    """S-22 (v0.4.0; replaces v0.3.5's test_coresident_profile_is_the_standing_profile): D-32 keeps one LLM seat
+    resident, so the S52 standing two-slot profile and its rendering are gone. No real entry defines one; a synthetic
+    entry that still carries v0.3.5's 2 x 32k co-resident keys, and an old overrides.json that still says coresident,
+    both render engines.json's own full profile with no ATLAS_CORESIDENT line; --set-override refuses the field."""
+    assert not [e["key"] for e in engines if "ctx_size_coresident" in e or "parallel_coresident" in e]
+    assert not hasattr(engine_env, "has_coresident_profile")
+    assert "coresident" not in engine_env.OVERRIDE_FIELDS
+    vision = next(e for e in engines if e.get("mode") == "vision")
+    gpt = next(e for e in engines if e["key"] == "gpt-oss-120b")
+    eng = {**vision, "ctx_size_coresident": 65536, "parallel_coresident": 2}
     key = eng["key"]
-    assert (eng["ctx_size_coresident"], eng["parallel_coresident"]) == (65536, 2)  # Section 4.3: 2 slots x 32k
-    assert _run(engine_env, monkeypatch, tree) == 0
-    kv = _kv(tree["out"] / f"{key}.env")
-    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == ("1", "65536", "2")
-    assert not tree["overrides"].exists()  # the standing profile needs no overrides.json at all
-    # The Principal's explicit choice of the full profile.
-    assert _run(engine_env, monkeypatch, tree, "--set-override", key, "coresident", "false") == 0
-    assert json.loads(tree["overrides"].read_text(encoding="utf-8")) == {key: {"coresident": False}}
-    kv = _kv(tree["out"] / f"{key}.env")
-    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == (
-        "0", str(eng["ctx_size"]), str(eng["parallel"]))
-    args = kv["ARGS"].split()
-    assert args[args.index("--ctx-size") + 1] == str(eng["ctx_size"]) and args[args.index("--parallel") + 1] == "8"
-    # A plain re-render keeps the choice; clearing it restores the standing profile; true is the same as the default.
-    assert _run(engine_env, monkeypatch, tree) == 0
-    assert _kv(tree["out"] / f"{key}.env")["ATLAS_PARALLEL"] == "8"
-    assert _run(engine_env, monkeypatch, tree, "--clear-override", key, "coresident") == 0
-    assert _kv(tree["out"] / f"{key}.env")["ATLAS_PARALLEL"] == "2"
-    assert _run(engine_env, monkeypatch, tree, "--set-override", key, "coresident", "true") == 0
-    kv = _kv(tree["out"] / f"{key}.env")
-    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == ("1", "65536", "2")
-    # An engine without a co-resident profile is unchanged: its full profile, ATLAS_CORESIDENT=0.
-    kv = _kv(tree["out"] / "gpt-oss-120b.env")
-    assert (kv["ATLAS_CORESIDENT"], kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == ("0", "262144", "8")
+    synthetic = _write_engines(tmp_path, [gpt, eng])
+    tree = {**tree, "out": tmp_path / "etc-synthetic", "overrides": tmp_path / "etc-synthetic" / "overrides.json"}
+    for stale in (None, {key: {"coresident": True}}, {key: {"coresident": False}}):
+        if stale is not None:
+            tree["overrides"].write_text(json.dumps(stale), encoding="utf-8")
+        assert _run(engine_env, monkeypatch, tree, engines_file=synthetic) == 0
+        kv = _kv(tree["out"] / f"{key}.env")
+        assert "ATLAS_CORESIDENT" not in kv
+        assert (kv["ATLAS_CTX_SIZE"], kv["ATLAS_PARALLEL"]) == (str(eng["ctx_size"]), str(eng["parallel"]))
+        args = kv["ARGS"].split()
+        assert args[args.index("--ctx-size") + 1] == str(eng["ctx_size"])
+        assert args[args.index("--parallel") + 1] == str(eng["parallel"])
+    with pytest.raises(SystemExit):
+        _run(engine_env, monkeypatch, tree, "--set-override", key, "coresident", "true", engines_file=synthetic)
 
 
-def test_rendered_units_pair_gpt_oss_and_vision_in_the_arbiter(engine_env: ModuleType,
-                                                               monkeypatch: pytest.MonkeyPatch,
-                                                               tree: dict[str, Path]) -> None:
-    """S52 end to end: the real engines.json rendered with no overrides, read by the real Arbiter (stub probe and
-    controller): gpt-oss-120b then qwen2.5-vl-72b PAIR within Section 4.1's budget (~164 GiB, checked at its 163 GiB
-    low end) at the 157.7 GiB the document projects, instead of the vision engine swapping gpt-oss out. With the
-    Principal's coresident=false rendered, the same requests swap, and the grant says how to restore the pair."""
+def test_cpu_placement_is_for_resident_companions_only(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                                                      tree: dict[str, Path], engines: list[dict[str, Any]],
+                                                      tmp_path: Path) -> None:
+    """D-14 (e): the real Qwen3 embedder and reranker render --device none with no layer offload; placement cpu on an
+    LLM seat (not arbiter_class resident) is refused, as atlas/config.py refuses it for the Arbiter."""
+    cpu = [e["key"] for e in engines if e.get("placement") == "cpu"]
+    assert sorted(cpu) == ["embed-qwen3-4b", "rerank-qwen3-4b"]
+    assert _run(engine_env, monkeypatch, tree) == 0
+    for key in cpu:
+        args = _kv(tree["out"] / f"{key}.env")["ARGS"].split()
+        assert args[args.index("--device") + 1] == "none" and "--n-gpu-layers" not in args
+    bad = _write_engines(tmp_path, _mutated(engines, "gpt-oss-120b", placement="cpu"))
+    with pytest.raises(SystemExit):
+        _run(engine_env, monkeypatch, tree, engines_file=bad)
+
+
+def test_rendered_units_run_one_llm_seat_in_the_arbiter(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                                                        tree: dict[str, Path]) -> None:
+    """D-32 / S-22 end to end: the real engines.json rendered with no overrides, read by the real Arbiter (stub probe
+    and controller, the engine budget 170 GiB beside the CPU retrieval pair): the Arbiter projects each seat at the
+    profile its env file renders, and one LLM seat is resident at a time, so GLM-5.3-Flash evicts gpt-oss-120b and the
+    Apex engine evicts GLM, whatever the budget would allow; the always-resident companions are never in the ledger."""
     from atlas.arbiter import GIB, Arbiter, StubProbe
     from atlas.config import load_engines
     from atlas.engines import StubController
 
     specs = load_engines(DAY1 / "config", PORT_BASE)
-    resident_set = 22 * GIB
-
-    def arbiter() -> Arbiter:
-        probe = StubProbe(total_bytes=resident_set + 163 * GIB, used_bytes=resident_set)
-        arb = Arbiter(specs, StubController(engines=specs, probe=probe), probe, release_timeout_s=60.0,
-                      poll_interval_s=1.0, sleep=lambda _s: None, engines_env_dir=tree["out"])
-        arb.measure_resident_set()
-        return arb
-
+    host = sum(Arbiter(specs, None, None).companion_projection(k).total_bytes  # type: ignore[arg-type]
+               for k, s in specs.items() if s.is_resident and s.placement == "cpu")
+    resident_set = 6 * GIB
+    probe = StubProbe(total_bytes=resident_set + 170 * GIB + host, used_bytes=resident_set)
+    arb = Arbiter(specs, StubController(engines=specs, probe=probe), probe, release_timeout_s=60.0,
+                  poll_interval_s=1.0, sleep=lambda _s: None, engines_env_dir=tree["out"])
     assert _run(engine_env, monkeypatch, tree) == 0
-    arb = arbiter()
-    assert arb.budget_bytes == 163 * GIB
-    assert arb.request_load("gpt-oss-120b", task_id="s52-1").granted
-    d = arb.request_load("qwen2.5-vl-72b", task_id="s52-2")
-    assert d.granted and d.evicted == (), d.reason
-    assert list(arb.resident) == ["gpt-oss-120b", "qwen2.5-vl-72b"]
-    assert "ATLAS_CORESIDENT=1" in d.reason and "ctx 65536 x 2 slots" in d.reason
-    assert arb.charged_bytes <= arb.budget_bytes
-    assert round(arb.charged_bytes / GIB, 1) == 157.7  # Section 4.1 "What fits together": 157.7 GiB projected
-    # The Principal's explicit 8-slot choice: the unit is projected at 8 x 32k and gpt-oss is swapped out.
-    assert _run(engine_env, monkeypatch, tree, "--set-override", "qwen2.5-vl-72b", "coresident", "false") == 0
-    arb = arbiter()
-    assert arb.request_load("gpt-oss-120b", task_id="s52-3").granted
-    d = arb.request_load("qwen2.5-vl-72b", task_id="s52-4")
-    assert d.granted and d.evicted == ("gpt-oss-120b",) and list(arb.resident) == ["qwen2.5-vl-72b"]
-    assert "--clear-override qwen2.5-vl-72b coresident" in d.reason
+    arb.measure_resident_set()
+    assert arb.budget_bytes == 170 * GIB and arb.max_resident == 1
+    assert arb.request_load("gpt-oss-120b", task_id="v040-1").granted
+    d = arb.request_load("glm-5.3-flash", task_id="v040-2")
+    assert d.granted and d.evicted == ("gpt-oss-120b",), d.reason
+    kv = _kv(tree["out"] / "glm-5.3-flash.env")
+    assert f"glm-5.3-flash.env: ctx {kv['ATLAS_CTX_SIZE']} x {kv['ATLAS_PARALLEL']} slots" in d.reason
+    assert list(arb.resident) == ["glm-5.3-flash"] and arb.charged_bytes <= arb.budget_bytes
+    apex = arb.request_load("deepseek-v4-flash", task_id="v040-3")
+    assert apex.granted and apex.evicted == ("glm-5.3-flash",) and list(arb.resident) == ["deepseek-v4-flash"]
+    assert not any(specs[k].is_resident for k in arb.resident)
 
 
 def test_reserved_lists_are_mirrored_in_engines_json_meta(engine_env: ModuleType) -> None:
     """engines.json _meta documents the two rules; the script's sets are the ones enforced (docstring)."""
     meta = json.loads(ENGINES_JSON.read_text(encoding="utf-8")).get("_meta", {})
-    for flag in ("--rpc", "--host", "--port", "--model", "--hf-repo", "--slot-save-path", "--api-key"):
+    for flag in ("--rpc", "--host", "--port", "--model", "--hf-repo", "--slot-save-path", "--api-key",
+                 "--tools", "--agent", "-ag", "--spec-draft-model", "--docker-repo", "--ui", "--media-path"):
         assert flag in engine_env.RESERVED_FLAGS
-    for name in ("LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_MODEL", "LLAMA_ARG_RPC", "LLAMA_ARG_HF_REPO"):
+    for name in ("LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_MODEL", "LLAMA_ARG_RPC", "LLAMA_ARG_HF_REPO",
+                 "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_UI", "LLAMA_ARG_TOOLS", "LLAMA_ARG_AGENT"):
         assert name in engine_env.RESERVED_ENV
     if isinstance(meta, dict) and "extra_args_rule" in meta:
         assert "--rpc" in str(meta["extra_args_rule"]) or "reserved" in str(meta["extra_args_rule"]).lower()

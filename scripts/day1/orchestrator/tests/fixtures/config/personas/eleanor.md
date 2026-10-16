@@ -5,9 +5,10 @@ hemisphere: corporate
 division: Corporate
 remit: Routing, scheduling, triage; the 4-Way Router's classifier
 reports_to: ren
-default_engine: router-qwen3.5-4b
+default_engine: glm-5.3-flash
 resident_model: router-qwen3.5-4b
 override_engines: []
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: routine
 kokoro_voice: af_sarah
 kokoro_alternate: af_heart

@@ -166,13 +166,13 @@ def test_chat_streams_sse_through_router_prompt_arbiter_and_llama(harness: dict[
     assert body.rstrip().endswith("data: [DONE]")
     chunks = _sse_chunks(body)
     head = chunks[0]["atlas"]
-    assert head["persona"] == "ren" and head["engine"] == "gpt-oss-120b" and head["hemisphere"] == "corporate"
+    assert head["persona"] == "ren" and head["engine"] == "glm-5.3-flash" and head["hemisphere"] == "corporate"
     text = "".join((c["choices"][0]["delta"].get("content") or "") for c in chunks)
     assert text == "Stub answer from the engine."
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop" and "timings" in chunks[-1]
     # The Arbiter loaded Ren's engine through the controller and released the generation lock.
-    assert ("start", "gpt-oss-120b") in harness["controller"].calls
-    assert "gpt-oss-120b" in harness["arbiter"].resident and harness["arbiter"].generating is None
+    assert ("start", "glm-5.3-flash") in harness["controller"].calls
+    assert "glm-5.3-flash" in harness["arbiter"].resident and harness["arbiter"].generating is None
     # The layered prompt (persona core + governance block, 4.4) went to the engine first.
     req = harness["llama"].made[0].requests[0]
     assert req["messages"][0]["role"] == "system"
@@ -181,7 +181,7 @@ def test_chat_streams_sse_through_router_prompt_arbiter_and_llama(harness: dict[
     # Ledger: the task is done, the routing decision is logged (7.2 rule 5).
     task_id = head["task_id"]
     row = harness["ledger"].get_task(task_id)
-    assert row["status"] == "done" and row["engine"] == "gpt-oss-120b" and row["persona"] == "ren"
+    assert row["status"] == "done" and row["engine"] == "glm-5.3-flash" and row["persona"] == "ren"
     assert harness["ledger"].list_routing_decisions(task_id=task_id)
     # The exchange was remembered in the corporate collection (not vault-tagged), temporal with D9's 90-day life.
     rows = harness["chroma"].collections["corporate"].rows
@@ -203,7 +203,7 @@ def test_chat_non_stream_returns_one_completion(harness: dict[str, Any]) -> None
 def test_ren_and_arthur_force_the_hemisphere_and_hard_rules_win(harness: dict[str, Any]) -> None:
     client: TestClient = harness["client"]
     r = _chat(client, "hi", model="arthur")
-    assert r.json()["atlas"]["persona"] == "arthur" and r.json()["atlas"]["engine"] == "nemotron-3-super"
+    assert r.json()["atlas"]["persona"] == "arthur" and r.json()["atlas"]["engine"] == "deepseek-v4-flash"
     assert r.json()["atlas"]["override"] == "[ARTHUR]" and r.json()["atlas"]["forced_lead"] == "arthur"
     r = _chat(client, "hi", model="ren")
     assert r.json()["atlas"]["persona"] == "ren" and r.json()["atlas"]["override"] == "[REN]"
@@ -224,7 +224,7 @@ def test_model_picker_ren_cannot_bypass_the_privacy_membrane(harness: dict[str, 
     r = _chat(client, "my medical results came back", model="ren")
     assert r.status_code == 200, r.text
     head = r.json()["atlas"]
-    assert head["persona"] == "arthur" and head["engine"] == "nemotron-3-super" and head["hemisphere"] == "estate"
+    assert head["persona"] == "arthur" and head["engine"] == "deepseek-v4-flash" and head["hemisphere"] == "estate"
     assert head["hard_keyword_hit"] == "medical" and head["forced_lead"] == "ren"
     assert "overruled-by-hard-rule:medical" in head["reason"]
     text = r.json()["choices"][0]["message"]["content"]
@@ -429,6 +429,7 @@ def test_arbiter_load_unload_and_remeasure_routes(harness: dict[str, Any]) -> No
     harness["arbiter"].probe.used_bytes += 7 * 1024**3
     r = client.post("/arbiter/remeasure")
     assert r.status_code == 200 and r.json()["budget_bytes"] == budget_before - 7 * 1024**3
+    assert r.json()["host_resident_set_bytes"] == harness["arbiter"].host_resident_set_bytes > 0  # D-14 (e) pair
     # ... and lazily on the next load when nothing is resident.
     harness["arbiter"].probe.used_bytes += 1024**3
     client.post("/arbiter/load", json={"engine": "gpt-oss-120b"})
@@ -558,7 +559,7 @@ def test_deep_think_quick_runs_through_the_engine(harness: dict[str, Any]) -> No
     assert r.json()["atlas"]["command"] == "deep-think" and r.json()["atlas"]["deep_think"] == "quick"
     # quick: generator + adversary + refine on ONE engine, several calls, no second engine loaded, nothing enqueued.
     engines = {s.spec.key for s in harness["llama"].made}
-    assert engines == {"gpt-oss-120b"} and len(harness["llama"].made) >= 4
+    assert engines == {"glm-5.3-flash"} and len(harness["llama"].made) >= 4
     assert harness["enqueued"] == []
 
 
@@ -593,7 +594,7 @@ def test_deep_think_standard_goes_to_the_gpu_queue_and_the_interface_returns(har
 
 def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -> None:
     """4.2 rule 3 ("exactly one may generate at any moment ... including background work"): a router-qwen3.5-4b
-    generation through /internal holds the slot, so a gpt-oss chat that arrives meanwhile QUEUES behind it (9.7 C15)
+    generation through /internal holds the slot, so a chat that arrives meanwhile QUEUES behind it (9.7 C15)
     and starts only when the 4B stream has finished. Fix round 4: the chat's ROUTING (the classifier verdict, itself a
     generation) and its Arbiter LOAD both happen inside the slot, so while queued nothing of the chat has happened yet:
     no routing row, no engine loaded, no stream; and a second weight-bearing request on an EXCLUSIVE engine queued at
@@ -639,7 +640,7 @@ def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -
     t_big.start()
     deadline = time.monotonic() + 5
     while len(deps.slot.queue) < 1:
-        assert time.monotonic() < deadline, "the gpt-oss request never queued for the slot"
+        assert time.monotonic() < deadline, "the chat request never queued for the slot"
         time.sleep(0.02)
     t_apex = threading.Thread(target=apex)
     t_apex.start()
@@ -650,7 +651,7 @@ def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -
     # Queued = nothing happened yet: the classifier has not run (its verdict is a generation), no weight-bearing engine
     # is loaded (the load happens inside the slot), nothing streamed; the Arbiter's own lock is free.
     assert harness["arbiter"].resident == {}
-    assert not any(s.spec.key in ("gpt-oss-120b", "deepseek-v4-flash") for s in harness["llama"].made)
+    assert not any(s.spec.key in ("glm-5.3-flash", "deepseek-v4-flash") for s in harness["llama"].made)
     assert harness["arbiter"].generating is None  # the Arbiter's own lock is taken only inside the slot
     assert harness["ledger"].list_routing_decisions() == []
     gate.set()
@@ -660,11 +661,12 @@ def test_resident_model_generation_holds_the_one_slot(harness: dict[str, Any]) -
     assert results["small"].status_code == 200 and results["big"].status_code == 200, results["big"].text
     assert results["apex"].status_code == 200, results["apex"].text
     assert results["big"].json()["choices"][0]["message"]["content"] == "Stub answer from the engine."
-    # Every stream was built with its own engine resident: the exclusive apex load and the gpt-oss load each happened
+    # Every stream was built with its own engine resident: the apex load and the GLM load (each a seat that runs alone,
+    # D-32) each happened
     # inside their own slot hold, so whichever went first had generated before the other's swap evicted it (the chat
     # releases the slot between its classifier hold and its generation hold, so either order is a valid FIFO).
     weight_bearing = [(k, r) for k, r in resident_at_stream if k != "router-qwen3.5-4b"]
-    assert sorted(k for k, _ in weight_bearing) == ["deepseek-v4-flash", "gpt-oss-120b"]
+    assert sorted(k for k, _ in weight_bearing) == ["deepseek-v4-flash", "glm-5.3-flash"]
     assert all(k in r for k, r in weight_bearing), resident_at_stream
     first = weight_bearing[0][0]
     assert ("stop", first) in harness["controller"].calls  # the second load swapped the first out, after its stream
@@ -780,7 +782,7 @@ def test_openwebui_task_calls_are_chores_not_principal_turns(harness: dict[str, 
     )
     assert r.status_code == 200, r.text
     head = r.json()["atlas"]
-    assert head["owui_task"] is True and head["engine"] in ("gpt-oss-120b", "nemotron-3-super")
+    assert head["owui_task"] is True and head["engine"] in ("glm-5.3-flash", "deepseek-v4-flash")
     # No rewrite: the UI parses what comes back.
     assert r.json()["choices"][0]["message"]["content"] == "Please send me the title. Vault Papers"
     assert harness["sessions"].is_vault("owui-task-chat")

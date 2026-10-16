@@ -79,8 +79,9 @@ def _email(tier: str, persona: str, body: str, recipient: str = "counterpart@exa
 
 
 def _arthur_check(item: ApprovalItem) -> CrossCheckRecord:
-    """A stub 9.2 cross-checker: Arthur on nemotron-3-super (a second persona on a different engine)."""
-    return CrossCheckRecord(engine="nemotron-3-super", persona="arthur", verdict="agree",
+    """A stub 9.2 cross-checker: Arthur on deepseek-v4-flash, his own engine and (D-39) a strong cross-check engine
+    (a second persona on a different engine from the GLM-5.3-Flash drafts)."""
+    return CrossCheckRecord(engine="deepseek-v4-flash", persona="arthur", verdict="agree",
                             notes=f"Clause reading confirmed for #{item.id}.")
 
 
@@ -94,7 +95,7 @@ def _swap_check(item: ApprovalItem) -> CrossCheckRecord:
     """A stub 9.2 cross-checker that always swaps: the other lead, on an engine the draft did not use."""
     if item.persona == "arthur":
         return CrossCheckRecord(engine="gpt-oss-120b", persona="ren", verdict="agree")
-    engine = "qwen3.5-122b" if item.engine == "nemotron-3-super" else "nemotron-3-super"
+    engine = "gpt-oss-120b" if item.engine == "deepseek-v4-flash" else "deepseek-v4-flash"
     return CrossCheckRecord(engine=engine, persona="arthur", verdict="agree")
 
 
@@ -156,12 +157,12 @@ def test_sensitive_item_is_cross_checked_automatically_and_needs_the_record(ledg
     item = queue.submit(_email("sensitive", "gideon", "Our client's position on the indemnity clause is...",
                                recipient="opposing.counsel@example.com", subject="Indemnity",
                                reason="Clause 12 exposes the Principal to uncapped liability."))
-    assert item.status == "held" and item.engine == "gpt-oss-120b"  # the drafting engine (fixture gideon)
+    assert item.status == "held" and item.engine == "glm-5.3-flash"  # the drafting engine (fixture gideon)
     assert item.cross_check is not None and item.cross_check.verdict == "agree" and item.cross_check.task_id
-    assert "cross-check: arthur@nemotron-3-super says agree" in item.note
+    assert "cross-check: arthur@deepseek-v4-flash says agree" in item.note
     notice = notifier.notices[0][0]
     assert notice.startswith(f"[sensitive] approval #{item.id} waiting: gideon (email)")
-    assert "cross-check: arthur@nemotron-3-super says agree" in notice
+    assert "cross-check: arthur@deepseek-v4-flash says agree" in notice
     assert "Clause 12" not in notice  # the director's reasoning is flagged in the ledger row, not pushed to a phone
     assert ledger.get_approval(item.id)["reasoning"].startswith("Clause 12")
     assert queue.needs_cross_check() == []
@@ -187,14 +188,14 @@ def test_sensitive_item_without_a_cross_check_cannot_be_approved(gate: Gate, led
     assert sender.sent == [] and ledger.get_approval(item.id)["status"] == "held"
     # 9.2: the record must be a second persona on a different engine.
     with pytest.raises(ApprovalError, match="second persona"):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="nemotron-3-super", persona="gideon",
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="deepseek-v4-flash", persona="gideon",
                                                            verdict="agree"))
     with pytest.raises(ApprovalError, match="different engine"):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="arthur", verdict="agree"))
-    checked = queue.attach_cross_check(item.id, _record(ledger, "arthur", "nemotron-3-super", verdict="amended",
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="glm-5.3-flash", persona="arthur", verdict="agree"))
+    checked = queue.attach_cross_check(item.id, _record(ledger, "arthur", "deepseek-v4-flash", verdict="amended",
                                                         notes="Cap the indemnity."))
     assert checked.cross_check is not None and checked.cross_check.task_id
-    assert "cross-check: arthur@nemotron-3-super says amended: Cap the indemnity." in checked.note
+    assert "cross-check: arthur@deepseek-v4-flash says amended: Cap the indemnity." in checked.note
     assert "says amended" in notifier.notices[-1][0] and len(notifier.notices) == 2  # announced again with the verdict
     assert queue.needs_cross_check() == []
     sent = queue.approve(item.id, decided_by="principal")
@@ -204,29 +205,29 @@ def test_sensitive_item_without_a_cross_check_cannot_be_approved(gate: Gate, led
 def test_hand_attached_cross_check_needs_provenance(gate: Gate, ledger: Ledger) -> None:
     # 16.2 promises a strong cross-check that actually ran; a record attached from outside the gate must name the
     # done 'cross-check' tasks row of that inference, with the same persona and engine. A fabricated "agree" on
-    # meditron-70b with no task, a task of another kind, or a task by someone else is refused.
+    # gpt-oss-120b with no task, a task of another kind, or a task by someone else is refused.
     queue, sender, _ = gate
     item = queue.submit(_email("sensitive", "gideon", "Our position is...", recipient="counsel@example.com"))
     with pytest.raises(ApprovalError, match="provenance"):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree"))
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree"))
     with pytest.raises(ApprovalError, match="provenance"):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree",
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree",
                                                            task_id="no-such-task"))
-    other_kind = ledger.insert_task("relay", status="done", persona="minerva", engine="meditron-70b")
+    other_kind = ledger.insert_task("relay", status="done", persona="minerva", engine="gpt-oss-120b")
     with pytest.raises(ApprovalError, match="not a done 'cross-check' task"):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree",
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree",
                                                            task_id=other_kind))
-    by_arthur = _inference(ledger, "arthur", "nemotron-3-super")
-    with pytest.raises(ApprovalError, match="minerva@meditron-70b"):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree",
+    by_arthur = _inference(ledger, "arthur", "deepseek-v4-flash")
+    with pytest.raises(ApprovalError, match="minerva@gpt-oss-120b"):
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree",
                                                            task_id=by_arthur))
-    unfinished = ledger.insert_task("cross-check", status="running", persona="minerva", engine="meditron-70b")
+    unfinished = ledger.insert_task("cross-check", status="running", persona="minerva", engine="gpt-oss-120b")
     with pytest.raises(ApprovalError, match="provenance"):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree",
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree",
                                                            task_id=unfinished))
     assert queue.get(item.id).cross_check is None and sender.sent == []
-    real = _inference(ledger, "minerva", "meditron-70b")
-    ok = queue.attach_cross_check(item.id, CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree",
+    real = _inference(ledger, "minerva", "gpt-oss-120b")
+    ok = queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree",
                                                             task_id=real))
     assert ok.cross_check is not None and ok.cross_check.task_id != real  # the gate's row, pointing at the inference
     gate_row = ledger.get_task(ok.cross_check.task_id)
@@ -242,20 +243,20 @@ def test_verdict_less_cross_check_row_is_not_a_record(gate: Gate, ledger: Ledger
     # the gate wrote (source "gate"/"attached") with a verdict in CROSS_CHECK_VERDICTS satisfies approve()'s backstop.
     queue, sender, _ = gate
     item = queue.submit(_email("sensitive", "gideon", "Our position is...", recipient="counsel@example.com"))
-    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="deepseek-v4-flash",
                        parent_task_id=item.task_id, payload={"approval_id": item.id})
-    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="deepseek-v4-flash",
                        parent_task_id=item.task_id, payload={"approval_id": item.id, "source": "inference"})
-    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="deepseek-v4-flash",
                        parent_task_id=item.task_id,
                        payload={"approval_id": item.id, "source": "gate", "verdict": "maybe"})
-    ledger.insert_task("cross-check", status="done", persona="arthur", engine="nemotron-3-super",
+    ledger.insert_task("cross-check", status="done", persona="arthur", engine="deepseek-v4-flash",
                        parent_task_id=item.task_id, payload={"approval_id": item.id, "verdict": "agree"})
     assert queue.get(item.id).cross_check is None
     with pytest.raises(CrossCheckRequired):
         queue.approve(item.id, decided_by="principal")
     assert sender.sent == [] and [i.id for i in queue.needs_cross_check()] == [item.id]
-    real = queue.attach_cross_check(item.id, _record(ledger, "arthur", "nemotron-3-super"))
+    real = queue.attach_cross_check(item.id, _record(ledger, "arthur", "deepseek-v4-flash"))
     assert real.cross_check is not None and queue.get(item.id).cross_check.verdict == "agree"
     assert queue.approve(item.id, decided_by="principal").status == "sent"
 
@@ -263,7 +264,7 @@ def test_verdict_less_cross_check_row_is_not_a_record(gate: Gate, ledger: Ledger
 def _fake_llama(handler: Callable[[httpx.Request], httpx.Response]) -> LlamaClient:
     # The reviewer's call counts the prompt first and keeps to the engine's per-slot window (S52).
     return LlamaClient("http://127.0.0.1:8102", transport=httpx.MockTransport(counting(handler)),
-                       window=SlotWindow("nemotron-3-super", 32768, "test"))
+                       window=SlotWindow("deepseek-v4-flash", 32768, "test"))
 
 
 def test_llama_cross_checker_runs_the_other_lead_on_another_engine(ledger: Ledger, personas: PersonaRegistry) -> None:
@@ -285,20 +286,20 @@ def test_llama_cross_checker_runs_the_other_lead_on_another_engine(ledger: Ledge
         yield
 
     checker = LlamaCrossChecker(personas, lambda e: _fake_llama(reply(e)), ledger=ledger, lease=lease,
-                                engines={"gpt-oss-120b", "nemotron-3-super", "qwen3.5-122b", "meditron-70b",
-                                         "gpt-oss-120b-abliterated", "deepseek-v4-flash"})
+                                engines={"gpt-oss-120b", "gpt-oss-120b-abliterated", "glm-5.3-flash",
+                                         "deepseek-v4-flash"})
     sender, notifier = StubSender(), StubNotifier()
     queue = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=checker)
     item = queue.submit(_email("sensitive", "gideon", "Our client's position on the indemnity clause is...",
                                recipient="opposing.counsel@example.com", reason="Clause 12 is uncapped."))
     assert item.cross_check is not None and item.cross_check.persona == "arthur"
-    assert item.cross_check.engine == "nemotron-3-super" and item.cross_check.verdict == "amended"
-    assert "cross-check: arthur@nemotron-3-super says amended: Clause 12 caps nothing; say so." in item.note
+    assert item.cross_check.engine == "deepseek-v4-flash" and item.cross_check.verdict == "amended"
+    assert "cross-check: arthur@deepseek-v4-flash says amended: Clause 12 caps nothing; say so." in item.note
     engine, body = seen[0]
-    assert engine == "nemotron-3-super" and body["response_format"] == {"type": "json_object"}
+    assert engine == "deepseek-v4-flash" and body["response_format"] == {"type": "json_object"}
     assert body["temperature"] == 0.2 and "Clause 12 is uncapped." in body["messages"][1]["content"]
     assert "Our client's position" in body["messages"][1]["content"] and "Arthur" in body["messages"][0]["content"]
-    assert leased and leased[0][0] == "nemotron-3-super"
+    assert leased and leased[0][0] == "deepseek-v4-flash"
     # Provenance: the checker's inference row (running -> done, no verdict) is the parent of nothing and the record
     # points at it; the gate's own record row (source "gate") is what reads back.
     inference = ledger.get_task(leased[0][1])
@@ -308,18 +309,24 @@ def test_llama_cross_checker_runs_the_other_lead_on_another_engine(ledger: Ledge
     assert '"source": "gate"' in gate_row["payload_json"]
     assert f'"inference_task_id": "{leased[0][1]}"' in gate_row["payload_json"]
     assert queue.approve(item.id, decided_by="principal").status == "sent"
-    # An estate draft gets Ren on gpt-oss-120b; Minerva gets her own lead on Meditron (6.2); a Ren draft whose own
-    # engine is gpt-oss-120b sends Arthur to nemotron; the Apex and abliterated engines are never chosen.
-    assert checker.choose(_email("sensitive", "alaric", "x")) == ("ren", "gpt-oss-120b")
-    assert checker.choose(_email("sensitive", "minerva", "x", engine="gpt-oss-120b")) == ("arthur", "meditron-70b")
-    assert checker.choose(_email("sensitive", "ren", "x", engine="gpt-oss-120b")) == ("arthur", "nemotron-3-super")
-    assert checker.choose(_email("sensitive", "arthur", "x", engine="nemotron-3-super")) == ("ren", "gpt-oss-120b")
-    # A draft already on the other lead's only engines leaves no swap: refused loudly, the gate holds without a record.
-    narrow = LlamaCrossChecker(personas, lambda e: _fake_llama(reply(e)), ledger=ledger, engines={"gpt-oss-120b"})
+    # D-39 (a): every engine that is not uncensored may check, the Apex engine included. An estate draft without an
+    # engine gets Ren on his default (GLM); one on GLM gets Ren on the first of his engines that differs and is not
+    # abliterated, DeepSeek-V4-Flash; Minerva gets her own lead on DeepSeek (her plan, until Baichuan-M3 is pulled); a
+    # Ren draft on GLM sends Arthur to DeepSeek and an Arthur draft on DeepSeek sends Ren to GLM. The abliterated
+    # engine is never chosen.
+    assert checker.choose(_email("sensitive", "alaric", "x")) == ("ren", "glm-5.3-flash")
+    assert checker.choose(_email("sensitive", "alaric", "x", engine="glm-5.3-flash")) == ("ren", "deepseek-v4-flash")
+    minerva = _email("sensitive", "minerva", "x", engine="glm-5.3-flash")
+    assert checker.choose(minerva) == ("arthur", "deepseek-v4-flash")
+    assert checker.choose(_email("sensitive", "ren", "x", engine="glm-5.3-flash")) == ("arthur", "deepseek-v4-flash")
+    assert checker.choose(_email("sensitive", "arthur", "x", engine="deepseek-v4-flash")) == ("ren", "glm-5.3-flash")
+    # A draft already on the other lead's only available engines leaves no swap: refused loudly, the gate holds
+    # without a record.
+    narrow = LlamaCrossChecker(personas, lambda e: _fake_llama(reply(e)), ledger=ledger, engines={"glm-5.3-flash"})
     with pytest.raises(ApprovalError, match="no engine swap"):
-        narrow.choose(_email("sensitive", "alaric", "x", engine="gpt-oss-120b"))
+        narrow.choose(_email("sensitive", "alaric", "x", engine="glm-5.3-flash"))
     held = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=narrow).submit(
-        _email("sensitive", "alaric", "Perimeter review...", engine="gpt-oss-120b"))
+        _email("sensitive", "alaric", "Perimeter review...", engine="glm-5.3-flash"))
     assert held.cross_check is None and "cross-check failed: ApprovalError: no engine swap" in held.note
 
 
@@ -349,13 +356,13 @@ def test_llama_cross_checker_never_defaults_a_verdict(ledger: Ledger, personas: 
 
 def test_failed_automatic_cross_check_holds_without_a_record(ledger: Ledger, personas: PersonaRegistry) -> None:
     def broken(item: ApprovalItem) -> CrossCheckRecord:
-        raise RuntimeError("meditron slot busy")
+        raise RuntimeError("cross-check slot busy")
 
     sender, notifier = StubSender(), StubNotifier()
     queue = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=broken)
     item = queue.submit(_email("sensitive", "gideon", "Our position is...", recipient="counsel@example.com"))
     assert item.status == "held" and item.cross_check is None
-    assert "cross-check failed: RuntimeError: meditron slot busy" in item.note
+    assert "cross-check failed: RuntimeError: cross-check slot busy" in item.note
     with pytest.raises(CrossCheckRequired):
         queue.approve(item.id, decided_by="principal")
     assert [i.id for i in queue.needs_cross_check()] == [item.id] and sender.sent == []
@@ -395,7 +402,7 @@ def test_reject_and_double_decisions(gate: Gate, ledger: Ledger) -> None:
     with pytest.raises(NotPending):
         queue.reject(item.id, decided_by="principal")
     with pytest.raises(NotPending):
-        queue.attach_cross_check(item.id, CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree"))
+        queue.attach_cross_check(item.id, CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree"))
     assert sender.sent == [] and len(ledger.list_strikes()) == 1  # one strike per rejection, not per attempt
 
 
@@ -740,7 +747,7 @@ def test_important_items_are_cross_checked(ledger: Ledger, personas: PersonaRegi
                                  important=True))
     assert marked.tier == "standard" and marked.important and marked.cross_check is not None
     assert "cross-check: Principal marked important (9.2)" in marked.note
-    assert "cross-check: arthur@nemotron-3-super says agree" in marked.note
+    assert "cross-check: arthur@deepseek-v4-flash says agree" in marked.note
     assert queue.get(marked.id).important  # round-trips through the gate's tasks row
     assert queue.approve(marked.id, decided_by="principal").status == "sent"
 
@@ -749,7 +756,7 @@ def test_dual_sign_off_needs_the_other_lead(ledger: Ledger, personas: PersonaReg
     # 8.3 TF_OMEGA "Sensitive, dual sign-off", Ren and Arthur jointly: a single approve() must not send an item that
     # only one lead has seen; the cross-check record must be the other hemisphere lead's.
     def minerva_check(item: ApprovalItem) -> CrossCheckRecord:
-        return CrossCheckRecord(engine="meditron-70b", persona="minerva", verdict="agree")
+        return CrossCheckRecord(engine="gpt-oss-120b", persona="minerva", verdict="agree")
 
     sender, notifier = StubSender(), StubNotifier()
     queue = ApprovalQueue(ledger, sender, notifier, personas=personas, cross_checker=minerva_check)
@@ -790,20 +797,20 @@ def test_gate_owns_its_tasks_row_and_items_round_trip(gate: Gate, ledger: Ledger
                                      kind="reply", body="The lease is ready.", task_id="orphan-task"))
     assert item.task_id != "orphan-task" and ledger.get_task("orphan-task") is None
     row = ledger.get_task(item.task_id)
-    assert row["kind"] == "approval" and row["parent_task_id"] == "orphan-task" and row["engine"] == "gpt-oss-120b"
+    assert row["kind"] == "approval" and row["parent_task_id"] == "orphan-task" and row["engine"] == "glm-5.3-flash"
     assert '"register": "principal"' in row["payload_json"] and '"caller_task_id": "orphan-task"' in row["payload_json"]
     again = queue.get(item.id)
-    assert again.engine == "gpt-oss-120b" and again.audience == "principal" and again.register is Register.PRINCIPAL
+    assert again.engine == "glm-5.3-flash" and again.audience == "principal" and again.register is Register.PRINCIPAL
     assert again.task_id == item.task_id and not again.dual_sign_off and not again.important
     sent = queue.approve(item.id, decided_by="principal")
     assert sent.recipient == "principal" and sender.sent[0].audience == "principal"
     assert ledger.get_task(item.task_id)["status"] == "done"  # the update hit the gate's row
     # An external item re-read: audience and engine come back too (the 9.2 different-engine rule can be enforced).
     ext = queue.submit(_email("standard", "silas", "Attached is the revised forecast.", task_id="routing-task-7"))
-    assert queue.get(ext.id).engine == "nemotron-3-super" and queue.get(ext.id).audience == "external"
+    assert queue.get(ext.id).engine == "glm-5.3-flash" and queue.get(ext.id).audience == "external"
     assert ledger.get_task(ext.task_id)["parent_task_id"] == "routing-task-7"
     with pytest.raises(ApprovalError, match="different engine"):
-        queue.attach_cross_check(ext.id, _record(ledger, "arthur", "nemotron-3-super"))
+        queue.attach_cross_check(ext.id, _record(ledger, "arthur", "glm-5.3-flash"))
 
 
 def test_notifier_receives_only_the_announcement_view(gate: Gate) -> None:
@@ -817,7 +824,7 @@ def test_notifier_receives_only_the_announcement_view(gate: Gate) -> None:
     assert seen.body == "" and seen.recipient == "" and seen.subject is None and seen.reason == ""
     assert seen.note is None and seen.disclosure is None and seen.rewrite is None
     assert "Licence position" not in message and "example.com" not in message
-    checked = queue.attach_cross_check(item.id, _record(queue.ledger, "arthur", "nemotron-3-super",
+    checked = queue.attach_cross_check(item.id, _record(queue.ledger, "arthur", "deepseek-v4-flash",
                                                         notes="Clause 12 of the draft says..."))
     assert checked.cross_check is not None and checked.cross_check.notes.startswith("Clause 12")
     _, seen2 = notifier.notices[-1]

@@ -5,8 +5,11 @@ hemisphere: corporate
 division: Corporate
 remit: Communications, brand, PR, crisis
 reports_to: ren
-default_engine: gpt-oss-120b
+# v0.4.0 (approved 2026-10-16; D-10, S-32): GLM-5.3-Flash by default (P-06); deepseek-v4-flash is the D-40 (a) fallback
+# (P-06 runner-up).
+default_engine: glm-5.3-flash
 override_engines: []
+fallback_engine: deepseek-v4-flash
 speaks_externally_tier: standard
 kokoro_voice: af_bella
 kokoro_alternate: bf_emma

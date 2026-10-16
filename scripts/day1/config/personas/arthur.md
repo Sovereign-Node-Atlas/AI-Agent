@@ -4,8 +4,12 @@ role: Architect, Estate Manager; estate hemisphere lead
 hemisphere: estate
 division: hemisphere-lead
 remit: Estate, Private Health, Logistics, Family
-default_engine: nemotron-3-super
-override_engines: [qwen3.5-122b, gpt-oss-120b-abliterated, deepseek-v4-flash]
+# v0.4.0 (approved 2026-10-16; D-10, S-32): DeepSeek-V4-Flash-0731 by default (P-02), the Apex engine's own unit;
+# glm-5.3-flash replaces the retired Qwen3.5-122B-A10B as the long-document override ([ARTHUR:LONG], D-38) and is the
+# D-40 (a) fallback (P-02 runner-up).
+default_engine: deepseek-v4-flash
+override_engines: [glm-5.3-flash, gpt-oss-120b-abliterated]
+fallback_engine: glm-5.3-flash
 # inferred: 6.2 gives a tier for directors only and 6.1 gives none for the hemisphere leads;
 # sensitive is the conservative reading. Confirm with the Principal.
 speaks_externally_tier: sensitive

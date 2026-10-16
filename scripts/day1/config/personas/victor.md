@@ -5,8 +5,11 @@ hemisphere: estate
 division: Estate
 remit: Aviation, transport, concierge
 reports_to: arthur
-default_engine: gpt-oss-120b
+# v0.4.0 (approved 2026-10-16; D-10, S-32): GLM-5.3-Flash by default (P-08). fallback_engine (D-40 (a)): the runner-up
+# Qwen3.8-Flash-Next is phased, so the Day 1 fallback is gpt-oss-120b.
+default_engine: glm-5.3-flash
 override_engines: []
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: routine
 kokoro_voice: bm_lewis
 kokoro_alternate: bm_daniel

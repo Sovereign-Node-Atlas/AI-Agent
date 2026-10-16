@@ -24,7 +24,7 @@ usage: sudo $0 <command> [options]
 commands
   phase1      Platform: pre-flight, LUKS2+TPM2, mounts, kernel parameters, firewall, reboot, desktop, Docker, WG-Easy
   phase2      Engines and services: llama.cpp (Vulkan), orchestrator, Open WebUI, memory, voice, tools, restic, sentinel
-  phase3      Core LLM pull and load tests (~690 GB; detached under systemd, resumable)
+  phase3      Core LLM pull and load tests (~450 GB, the four Day 1 LLM seats; detached under systemd, resumable)
   phase4      Multimodal engines in the ROCm container (detached under systemd, per-engine pass/fail)
   status      Done markers for every phase and the full verification table
   report      Fill sheet "4 Verification" of a copy of docs/ATLAS_BUILD_BASELINE.xlsx from verify.jsonl

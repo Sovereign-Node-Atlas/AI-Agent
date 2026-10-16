@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from atlas.arbiter import GIB, MAX_RESIDENT, ArbiterError, SysfsMemoryProbe, host_used_bytes
+from atlas.arbiter import GIB, ArbiterError, SysfsMemoryProbe, host_used_bytes
 from atlas.config import (
     ConfigError,
     EngineSpec,
@@ -140,19 +140,22 @@ def cmd_engines_list(args: argparse.Namespace) -> int:
     controller = SystemdEngineController(engines=engines)
     rows: list[dict[str, Any]] = []
     for spec in engines.values():
-        ctx_size, parallel = spec.profile()  # the standing profile (S52: the vision engine's co-resident 2 x 32k)
         rows.append({
             "key": spec.key, "class": spec.arbiter_class, "mode": spec.mode, "kv": spec.kv_class,
-            "footprint_gb": spec.footprint_gb, "ctx_size": ctx_size, "parallel": parallel,
+            "footprint_gb": spec.footprint_gb, "footprint_gib": round(spec.footprint_bytes / GIB, 2),
+            "footprint_source": spec.footprint_source, "placement": spec.placement,
+            "ctx_size": spec.ctx_size, "parallel": spec.parallel,
             "port": spec.port, "unit": spec.systemd_unit,
             "state": "-" if args.no_state else _unit_state(controller, spec.key, spec),
         })
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
-    fmt = "{key:<26} {class:<10} {mode:<10} {kv:<5} {footprint_gb:>8} {ctx_size:>8} {parallel:>3} {port:>5} {state}"
-    print(fmt.format(key="engine", **{"class": "class"}, mode="mode", kv="kv", footprint_gb="GB", ctx_size="ctx",
-                     parallel="np", port="port", state="unit"))
+    # D-31: the GiB column is what the Arbiter budgets (exact file bytes where engines.json carries them).
+    fmt = ("{key:<26} {class:<10} {mode:<10} {kv:<5} {placement:<4} {footprint_gib:>8} {ctx_size:>8} {parallel:>3} "
+           "{port:>5} {state}")
+    print(fmt.format(key="engine", **{"class": "class"}, mode="mode", kv="kv", placement="on", footprint_gib="GiB",
+                     ctx_size="ctx", parallel="np", port="port", state="unit"))
     for r in rows:
         print(fmt.format(**r))
     return 0
@@ -178,6 +181,10 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     out["host"] = {"headroom_bytes": unit.arbiter_headroom_bytes}
     if unit.arbiter_headroom_error:  # the orchestrator refuses to start with it (build_arbiter)
         out["host"]["error"] = unit.arbiter_headroom_error
+    # D-32: the LLM-seat residency limit the unit runs with (ATLAS_ARBITER_MAX_RESIDENT, same file, same rule).
+    out["max_resident"] = unit.arbiter_max_resident
+    if unit.arbiter_max_resident_error:
+        out["max_resident_error"] = unit.arbiter_max_resident_error
     meminfo = probe.host_meminfo()
     if meminfo is not None:
         out["host"].update(mem_total_bytes=meminfo[0], mem_available_bytes=meminfo[1])
@@ -192,7 +199,7 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     for spec in engines.values():
         state = _unit_state(controller, spec.key, spec)
         out["engines"][spec.key] = state
-        if state == "active" and not spec.is_resident:
+        if state == "active" and spec.is_llm_seat:
             active.append(spec)
     # The in-process ledger lives in the running orchestrator; the CLI shows the durable trail instead.
     if settings.db_path.is_file():
@@ -222,7 +229,9 @@ def cmd_arbiter_status(args: argparse.Namespace) -> int:
     print("engine units:")
     for key, state in out["engines"].items():
         print(f"  {key:<26} {state}")
-    print(f"weight-bearing units active: {', '.join(s.key for s in active) or 'none'} (limit {MAX_RESIDENT})")
+    limit = f"limit {out['max_resident']}" + (f"; orchestrator.env: {out['max_resident_error']}"
+                                               if "max_resident_error" in out else "")
+    print(f"LLM seats active: {', '.join(s.key for s in active) or 'none'} ({limit}, ATLAS_ARBITER_MAX_RESIDENT)")
     print(f"last {len(out['decisions'])} ledger decisions:")
     for d in out["decisions"]:
         print(f"  #{d['id']} {d['action']:<10} {d['decision']:<8} {d['engine'] or '-':<26} task={d['task_id'] or '-'} "

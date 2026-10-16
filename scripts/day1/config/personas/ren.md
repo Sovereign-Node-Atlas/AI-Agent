@@ -4,8 +4,12 @@ role: Vanguard, Prime Director; corporate hemisphere lead
 hemisphere: corporate
 division: hemisphere-lead
 remit: Corporate, Enterprise, Infrastructure, AEC
-default_engine: gpt-oss-120b
+# v0.4.0 (approved 2026-10-16; D-10, S-32): GLM-5.3-Flash by default (P-01); deepseek-v4-flash stays an override because
+# TF_OMEGA dispatches on Ren's binding (the Apex, 6.1). fallback_engine (D-40 (a)): the runner-up Qwen3.8-Flash-Next is
+# phased, so the Day 1 fallback is gpt-oss-120b. A record for Phase 3 and the Principal, never picked at runtime.
+default_engine: glm-5.3-flash
 override_engines: [gpt-oss-120b-abliterated, deepseek-v4-flash]
+fallback_engine: gpt-oss-120b
 # inferred: 6.2 gives a tier for directors only and 6.1 gives none for the hemisphere leads;
 # sensitive is the conservative reading. Confirm with the Principal.
 speaks_externally_tier: sensitive

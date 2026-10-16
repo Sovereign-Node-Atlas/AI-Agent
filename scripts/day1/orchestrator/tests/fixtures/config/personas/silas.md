@@ -5,9 +5,10 @@ hemisphere: corporate
 division: Corporate
 remit: 'CFO: capital, audit, banking'
 reports_to: ren
-default_engine: nemotron-3-super
+default_engine: glm-5.3-flash
 engine_settings: code interpreter mandatory for all arithmetic
 override_engines: []
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: standard
 kokoro_voice: am_eric
 kokoro_alternate: am_echo

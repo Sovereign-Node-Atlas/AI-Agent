@@ -151,7 +151,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from atlas import __version__, deep_think
 from atlas.approval import ApprovalError, ApprovalItem, ApprovalQueue, CrossCheckRequired, NotPending, SendError
 from atlas.arbiter import (
-    APEX_KEY,
     DEEP_THINK_TIERS,
     Arbiter,
     ArbiterError,
@@ -380,9 +379,8 @@ class HttpEngineStreamer:
 def engine_window(arbiter: Arbiter, spec: EngineSpec) -> SlotWindow:
     """S52: the per-slot window of the profile the unit really runs, read on every request: the env file the Arbiter
     projects from (Arbiter.unit_profile; for a resident small model, which the Arbiter does not budget and so does
-    not read, the same file directly), else engines.json (engines.window_for). Never a hard-coded figure: the vision
-    engine's standing profile is whatever phase2/engine-env.py rendered (2 x 32k unless overrides.json says
-    otherwise)."""
+    not read, the same file directly), else engines.json (engines.window_for). Never a hard-coded figure: a unit's
+    profile is whatever phase2/engine-env.py rendered from engines.json and overrides.json."""
     profile = arbiter.unit_profile(spec.key)
     if profile is None and spec.is_resident and arbiter.engines_env_dir is not None:
         profile = read_unit_profile(Path(arbiter.engines_env_dir) / f"{spec.key}.env")
@@ -899,7 +897,7 @@ def build_app(deps: AppDeps) -> FastAPI:
             raise HTTPException(422, f"tier must be one of {DEEP_THINK_TIERS}")
         _maybe_remeasure(deps)
         plan = deep_think.plan(req.tier, deps.arbiter, task_id=req.task_id)
-        resident = [k for k in deps.arbiter.resident if k != APEX_KEY]
+        resident = _resident_seats(deps)
         return {
             "requested": plan.requested,
             "granted": plan.granted,
@@ -1025,7 +1023,9 @@ def build_app(deps: AppDeps) -> FastAPI:
             measured = deps.arbiter.measure_resident_set()
         except ArbiterError as exc:
             raise HTTPException(409, str(exc)) from exc
-        return {"resident_set_bytes": measured, "budget_bytes": deps.arbiter.budget_bytes}
+        # D-14 (e): the CPU retrieval pair is re-measured with it, as the host resident set.
+        return {"resident_set_bytes": measured, "host_resident_set_bytes": deps.arbiter.host_resident_set_bytes,
+                "budget_bytes": deps.arbiter.budget_bytes}
 
     @app.get("/arbiter/status", dependencies=admin)
     def arbiter_status() -> dict[str, Any]:
@@ -1577,6 +1577,13 @@ def _remember_turn(deps: AppDeps, info: RouteInfo, session_id: str, user_text: s
         log.error("chat turn not remembered: %s", exc)
 
 
+def _resident_seats(deps: AppDeps) -> list[str]:
+    """The resident LLM seats (D-32: at most one by default), the engine a quick Deep Think runs on with no swap (9.1).
+    v0.3.5 left the Apex engine out because it was resident only for a deep run or TF_OMEGA; v0.4.0 makes it Arthur's
+    default seat (P-02), so it is a seat like the others. Class-external loads (Chatterbox) are not seats."""
+    return [k for k, r in list(deps.arbiter.resident.items()) if r.spec.is_llm_seat]
+
+
 def _run_deep_think(deps: AppDeps, tier: str, info: RouteInfo, task_id: str) -> str:
     """Section 9.1 through the Arbiter: plan (rule 8), then every call loads and takes the generation lock."""
     if tier not in DEEP_THINK_TIERS:
@@ -1604,7 +1611,7 @@ def _run_deep_think(deps: AppDeps, tier: str, info: RouteInfo, task_id: str) -> 
             _close_quietly(streamer)
         return "".join(parts)
 
-    resident = [k for k in deps.arbiter.resident if k != APEX_KEY]
+    resident = _resident_seats(deps)
     res = deep_think.run(
         plan.granted,
         info.message,

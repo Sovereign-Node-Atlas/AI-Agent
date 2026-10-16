@@ -8,9 +8,10 @@
 #   unlocked it without a keyboard). OS_LUKS_DEVICE must carry a systemd-tpm2 token bound to PCR 7 as well (S9);
 #   "-" (no LUKS under "/") is DEFERRED, exit 2, once everything about the data volume passed: Section 3.5 wants
 #   LUKS2 on the OS volume, which only a reinstall gives, so it is the Principal's to-do os-volume-encryption (policy
-#   v0.3.3), never reported as a pass and never a red row. Secure Boot (D15, decided 2026-10-05: the Principal enables it in the BIOS): while it is
-#   still off, a binding to PCR 7 alone ties the unlock to nothing an attacker's own boot medium would change, so the
-#   state is a NOTE in every V2 message and a to-do (secure-boot), never a failure (policy v0.3.3). Exit 0 pass,
+#   v0.3.3), never reported as a pass and never a red row. Secure Boot (D15, decided 2026-10-05: required; enabled in
+#   the BIOS by the Principal, confirmed 2026-10-13): should it be found off, a binding to PCR 7 alone ties the unlock to
+#   nothing an attacker's own boot medium would change, so the state is a NOTE in every V2 message and a to-do
+#   (secure-boot), never a failure (policy v0.3.3). Exit 0 pass,
 #   1 fail, 2 deferred (OS volume unencrypted). Must run as root.
 export ATLAS_LOG_TO_STDERR=1
 # shellcheck source=lib/common.sh
@@ -71,8 +72,9 @@ pcr_ok() { [[ ",$1," == *",7,"* ]]; }
 
 # sb_check LIST WHAT -> returns 1 (and prints why) when Secure Boot is off and the binding is PCR 7 alone, unless
 # acknowledged. A list with more PCRs (0, 4) binds to firmware/boot-manager code and does not need the acknowledgement.
-# Policy v0.3.3 / D15: Secure Boot off is recorded in the V2 message (the Principal enables it, phase1/01-preflight.sh
-# records the to-do); it never fails V2, which proves the enrolment itself.
+# Policy v0.3.3 / D15: Secure Boot found off is recorded in the V2 message (it is required and was enabled by the
+# Principal on 2026-10-13; phase1/01-preflight.sh records the to-do if it is not); it never fails V2, which proves the
+# enrolment itself.
 sb_check() {
   local list="$1" what="$2"
   [[ "$sb" == enabled ]] && return 0

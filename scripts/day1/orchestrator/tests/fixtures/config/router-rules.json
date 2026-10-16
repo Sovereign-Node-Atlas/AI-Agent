@@ -8,10 +8,10 @@
     "[DEEP THINK:DEEP]": "deep-think:deep"
   },
   "routes": {
-    "ren": "gpt-oss-120b",
-    "arthur": "nemotron-3-super",
+    "ren": "glm-5.3-flash",
+    "arthur": "deepseek-v4-flash",
     "ren-abliterated": "gpt-oss-120b-abliterated",
-    "arthur-qwen": "qwen3.5-122b",
+    "arthur-long": "glm-5.3-flash",
     "deep-think:deep": "deepseek-v4-flash"
   },
   "classifier_engine": "router-qwen3.5-4b",

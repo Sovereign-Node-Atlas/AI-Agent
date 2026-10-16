@@ -6,8 +6,8 @@ Every task runs in a Celery worker process, NOT in the orchestrator's process. T
 the orchestrator, so a task that needs a model calls the orchestrator's loopback API (`OrchestratorClient`): its
 /internal/v1/chat/completions loads a weight-bearing engine through the Arbiter (4.2 rule 2) and generates under the
 orchestrator's ONE generation slot (rule 3: "exactly one may generate at any moment ... including background work").
-Every generation holds that slot, the three resident small models (router-qwen3.5-4b, bge-m3's chat use, the
-reranker) included (fix round 2, atlas.api.GenerationSlot): a 4B call for a BLUF or a summary queues behind a running
+Every generation holds that slot, the resident small models (router-qwen3.5-4b and any generation on the retrieval
+companions) included (fix round 2, atlas.api.GenerationSlot): a 4B call for a BLUF or a summary queues behind a running
 chat generation AND a chat generation queues behind the 4B call, strict FIFO (rule 4; 9.7 C15 in both directions).
 The only model call outside the slot is the router's classifier verdict (7.2 rule 2), which precedes every generation.
 A client may therefore wait up to ATLAS_GENERATION_WAIT_S (atlas.api.DEFAULT_GENERATION_WAIT_S, 1800 s) in the FIFO

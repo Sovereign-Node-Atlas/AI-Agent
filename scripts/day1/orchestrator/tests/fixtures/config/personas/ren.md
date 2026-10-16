@@ -4,8 +4,9 @@ role: Vanguard, Prime Director; corporate hemisphere lead
 hemisphere: corporate
 division: hemisphere-lead
 remit: Corporate, Enterprise, Infrastructure, AEC
-default_engine: gpt-oss-120b
+default_engine: glm-5.3-flash
 override_engines: [gpt-oss-120b-abliterated, deepseek-v4-flash]
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: sensitive
 kokoro_voice: am_onyx
 kokoro_alternate: am_michael

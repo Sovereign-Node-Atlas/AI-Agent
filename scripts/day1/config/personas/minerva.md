@@ -5,10 +5,15 @@ hemisphere: estate
 division: Estate
 remit: Private health, longevity; medical data
 reports_to: arthur
-default_engine: gpt-oss-120b
+# v0.4.0 (approved 2026-10-16; D-10, S-32): GLM-5.3-Flash by default (P-07), which is also the vision and long-document
+# engine, so the retired Qwen2.5-VL-72B, Qwen3.5-122B-A10B and Meditron-70B leave the overrides (S-10, S-11). Her strong
+# cross-check runs on Arthur's deepseek-v4-flash on Day 1 (D-39, approval.py); Baichuan-M3 is phased (S-31).
+# fallback_engine (D-40 (a)): the runner-up Intern-S1 is phased, so the Day 1 fallback is gpt-oss-120b.
+default_engine: glm-5.3-flash
 engine_settings: retrieval-grounded
 # engine keys as canonicalised in CONVENTIONS.md §8; config/engines.json (Sections 5.1, 5.3) must use the same spelling.
-override_engines: [qwen2.5-vl-72b, qwen3.5-122b, meditron-70b]
+override_engines: []
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: sensitive
 kokoro_voice: af_kore
 kokoro_alternate: bf_isabella

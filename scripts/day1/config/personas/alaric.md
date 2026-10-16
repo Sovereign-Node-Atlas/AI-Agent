@@ -5,8 +5,11 @@ hemisphere: estate
 division: Estate
 remit: Physical assets, security, threat mitigation; Sentinel threat watch
 reports_to: arthur
-default_engine: nemotron-3-super
+# v0.4.0 (approved 2026-10-16; D-10, S-32): GLM-5.3-Flash by default (the approved Day 1 map). fallback_engine (D-40
+# (a)): his runner-up is GLM itself, so the Day 1 fallback is the floor, gpt-oss-120b.
+default_engine: glm-5.3-flash
 override_engines: []
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: sensitive
 kokoro_voice: null
 kokoro_alternate: null

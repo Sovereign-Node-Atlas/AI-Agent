@@ -38,7 +38,7 @@
 # its own listener (allowlist, fix round 3: ORCH_PORT, EMBED_PORT and OPENWEBUI_PORT from $ATLAS_ETC/core.env, Kokoro
 # 8880, speaches 8881, docling 5001) and every NEW udp over lo (no DNS: every backend is an IP literal). The former
 # denylist (3128, 6379, 8000) left SSH 22, Cockpit 9090, xrdp 3389, dnsmasq 53, ntfy 8090, WG-Easy 51821 and every
-# llama-server port 8101-8110 reachable from a root-in-container process that parses untrusted uploads; the last would
+# llama-server port 8101-8120 reachable from a root-in-container process that parses untrusted uploads; the last would
 # have let it drive engines directly, bypassing the Engine Arbiter and the ledger. Kernel log prefix
 # "[ATLAS openwebui egress] " (25 chars: iptables' LOG stores at most 29). Replies
 # to LAN/WireGuard clients are ESTABLISHED and never match. The unit atlas-openwebui-egress.service (systemd/, installed here)

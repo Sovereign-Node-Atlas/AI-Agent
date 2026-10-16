@@ -372,7 +372,7 @@ _gate_services() {
   # the Open WebUI egress chain V12 relies on, and atlas-aegis-trigger.path, the manual AEGIS trigger of step 7).
   for u in docker squid cockpit.socket xrdp atlas-ddns.timer atlas-docker-egress.service atlas-openwebui-egress.service \
            atlas-orchestrator atlas-celery-cpu atlas-celery-gpu atlas-celery-beat \
-           llama-server@router-qwen3.5-4b llama-server@embed-bge-m3 llama-server@rerank-bge-v2-m3 \
+           llama-server@router-qwen3.5-4b llama-server@embed-qwen3-4b llama-server@rerank-qwen3-4b \
            atlas-sentinel.timer atlas-prune.timer atlas-aegis.timer atlas-aegis-trigger.path atlas-restic-check.timer; do
     _gate_unit "$u"
   done
@@ -437,7 +437,7 @@ _gate_services() {
   _gate_http ntfy "http://127.0.0.1:8090/v1/health"
   _gate_http docling "http://127.0.0.1:5001/docs"
   local key port
-  for key in router-qwen3.5-4b embed-bge-m3 rerank-bge-v2-m3; do
+  for key in router-qwen3.5-4b embed-qwen3-4b rerank-qwen3-4b; do  # the three resident companions (v0.4.0, D-14 (e))
     port="$(_gate_engine_port "$key")"
     if [[ -n "$port" ]]; then
       _gate_http "llama-server@$key" "http://127.0.0.1:$port/health"
@@ -623,7 +623,7 @@ step_10() {
   if gate phase2 V3b V6 V12 V13 V14a V15 V16 V17 V18 V20 V23 -- V7 V10a; then
     _gate_vault_pending_note
     echo
-    echo "Phase 3 (core LLM pull, ~690 GB, detached under systemd) starts with:"
+    echo "Phase 3 (core LLM pull, ~450 GB for the four Day 1 LLM seats, D-42 (b); detached under systemd) starts with:"
     echo "    sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase3"
     echo "Follow it with:  journalctl -u atlas-day1-phase3 -f"
     notify "Phase 2 gate PASS. Next: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase3"

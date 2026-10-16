@@ -175,7 +175,7 @@
     },
     {
       "id": "services",
-      "source": "systemctl is-active atlas-orchestrator atlas-celery-cpu atlas-celery-gpu atlas-celery-beat llama-server@router-qwen3.5-4b llama-server@embed-bge-m3 llama-server@rerank-bge-v2-m3 docker squid atlas-ddns.timer atlas-aegis.timer",
+      "source": "systemctl is-active atlas-orchestrator atlas-celery-cpu atlas-celery-gpu atlas-celery-beat llama-server@router-qwen3.5-4b llama-server@embed-qwen3-4b llama-server@rerank-qwen3-4b docker squid atlas-ddns.timer atlas-aegis.timer",
       "thresholds": {
         "inactive_alert": true
       }
@@ -208,7 +208,7 @@
   "detection": {
     "history_window": 24,
     "rule": "statistics first; thresholds above; a model is invoked only when a threshold trips (Section 9.3)",
-    "escalation": "resident engine (router-qwen3.5-4b) or Eleanor's model first; a large engine only on anomaly, requested through the Engine Arbiter (4.2)"
+    "escalation": "resident engine (router-qwen3.5-4b) first; a large engine (v0.4.0: gpt-oss-120b, the Sentinel escalation engine, D-12) only on anomaly, requested through the Engine Arbiter (4.2)"
   },
   "alert": {
     "format": "BLUF",

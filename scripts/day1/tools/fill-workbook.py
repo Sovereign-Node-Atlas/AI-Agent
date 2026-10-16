@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Fill sheet "4 Verification" of docs/ATLAS_BUILD_BASELINE.xlsx from the Day 1 verify.jsonl.
 
-Section 21 of the framework review lists V1..V24. The Day 1 scripts record results with
-`record_v` (lib/common.sh) as JSON lines: {"ts","phase","id","result","msg"} where result is
-one of pass|fail|deferred|info and id is V1..V24 or a half: V3a/V3b, V14a/V14b, or V10a (the Phase 2
+Section 21 of the framework review lists V1..V25 (v0.4.0 adds V25, the llama.cpp output-parity test of the re-pin,
+S-02; V21 is now the single-residency proof, S-24, and V22 covers every newer-architecture engine, S-26). The Day 1
+scripts record results with `record_v` (lib/common.sh) as JSON lines: {"ts","phase","id","result","msg"} where result
+is one of pass|fail|deferred|info and id is V1..V25 or a half: V3a/V3b, V14a/V14b, or V10a (the Phase 2
 resident-router half of V10; CONVENTIONS.md §4).
 
 Rules for turning records into one row per V-item:
@@ -14,7 +15,9 @@ Rules for turning records into one row per V-item:
   * info records never set Pass; they are written into the evidence column with the row left
     as "Not yet run" unless another record exists (V1 is informational only, Section 21);
   * V10's verdict is the Phase 3 load test's V10 record alone; the Phase 2 V10a record (resident
-    router) is prepended to its evidence and, while no V10 exists yet, shown as "Not yet run".
+    router) is prepended to its evidence and, while no V10 exists yet, shown as "Not yet run";
+  * V10, V22 and V25 are written per engine and then once as a summary (phase3/loadtest.py), the summary last, so
+    the latest record per id is the summary and carries the verdict.
 
 Usage:
   fill-workbook.py [--verify /var/lib/atlas/day1/verify.jsonl] [--workbook docs/ATLAS_BUILD_BASELINE.xlsx]
@@ -32,6 +35,7 @@ RESULT_WORD = {"pass": "Pass", "fail": "Fail", "deferred": "Deferred"}
 HALVES = {"V3": ("V3a", "V3b"), "V14": ("V14a", "V14b")}
 EVIDENCE_ONLY = {"V10": "V10a"}  # Phase 2 half shown as evidence; the verdict is the Phase 3 record
 PER_ENGINE = {"V4"}
+LAST_V = 25  # Section 21 V1..V25 (v0.4.0: V25 output parity, S-02)
 
 
 def load_records(path: Path) -> list[dict]:
@@ -117,7 +121,7 @@ def main() -> int:
         return 2
     records = load_records(verify)
     latest = latest_by_id(records)
-    table = {f"V{n}": combine(f"V{n}", records, latest) for n in range(1, 25)}
+    table = {f"V{n}": combine(f"V{n}", records, latest) for n in range(1, LAST_V + 1)}
 
     if args.print:
         for vid, (word, evidence) in table.items():

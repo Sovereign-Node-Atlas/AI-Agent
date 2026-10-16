@@ -101,11 +101,11 @@ out="$( gate 3 V2 V19 2>/dev/null )"
 check "gate: missing id shown as missing" grep -q '^V19 *missing' <<<"$out"
 check "gate: FAIL line names the blocker" grep -q '^PHASE 3 GATE: FAIL (V19=missing)' <<<"$out"
 # V4 per engine: latest per engine prefix, any fail blocks
-quiet record_v V4 pass "gpt-oss-120b: K q4_0 V q4_0"
-quiet record_v V4 fail "meditron-70b: kv fallback"
+quiet record_v V4 pass "gpt-oss-120b: K q8_0 V q8_0"
+quiet record_v V4 fail "glm-5.3-flash: kv fallback"
 ( gate 3 V4 ) >/dev/null 2>&1; rc=$?
 check "gate: V4 per-engine fail blocks" test "$rc" -eq 1
-quiet record_v V4 pass "meditron-70b: K q8_0 V q8_0"
+quiet record_v V4 pass "glm-5.3-flash: K f16 V f16"
 ( gate 3 V4 ) >/dev/null 2>&1; rc=$?
 check "gate: V4 latest per engine pass -> return 0" test "$rc" -eq 0
 

@@ -41,9 +41,10 @@ STRIKE_KINDS: frozenset[str] = frozenset(
     }
 )
 DEFAULT_K = 3
-# Chroma distances are L2 (default space) on bge-m3 unit-length vectors: 0 = identical, ~1.41 = orthogonal. The
-# threshold is a distance ceiling; 0.9 keeps clearly related scars and drops the unrelated pile. TODO tune on the node
-# against real scars (the value is a defensible default, not a measured one).
+# Chroma distances are L2 (default space) on unit-length vectors (v0.4.0: Qwen3-Embedding-4B fitted to 1024 dimensions
+# and re-normalised, atlas.memory.fit_dimension): 0 = identical, ~1.41 = orthogonal. The threshold is a distance
+# ceiling; 0.9 keeps clearly related scars and drops the unrelated pile. It was chosen for bge-m3 and is not re-derived
+# for the new embedder. TODO tune on the node against real scars (a defensible default, not a measured one; T-15).
 DEFAULT_THRESHOLD = 0.9
 
 __all__ = ["DEFAULT_K", "DEFAULT_THRESHOLD", "STRIKE_KINDS", "Scar", "format_scars", "record_strike", "retrieve_scars"]

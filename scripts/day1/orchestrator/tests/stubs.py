@@ -37,7 +37,11 @@ class FakeClock:
 def make_arbiter(
     engines: dict[str, EngineSpec], *, budget_gib: float = 170.0, ledger: Any = None
 ) -> tuple[Arbiter, StubController, StubProbe]:
-    probe = StubProbe(total_bytes=int(RESIDENT_SET + budget_gib * GIB), used_bytes=RESIDENT_SET)
+    # `budget_gib` is the ENGINE budget: the probe also carries the host resident set of the CPU-placed retrieval
+    # pair (D-14 (e)), which the Arbiter charges beside the GPU resident set.
+    host = sum(Arbiter(engines, None, None).companion_projection(k).total_bytes  # type: ignore[arg-type]
+               for k, s in engines.items() if s.is_resident and s.placement == "cpu")
+    probe = StubProbe(total_bytes=int(RESIDENT_SET + budget_gib * GIB) + host, used_bytes=RESIDENT_SET)
     controller = StubController(engines=engines, probe=probe)
     clock = FakeClock()
     arb = Arbiter(

@@ -21,7 +21,7 @@
 #
 # Network design (adjudicated conflict 4; Section 3.6, 12.5; CONVENTIONS.md §8):
 #   * open-webui runs with network_mode: host. The two host services it must call, the orchestrator ($ORCH_PORT) and
-#     the bge-m3 llama-server ($LLAMA_PORT_BASE+9), listen on 127.0.0.1 only (llama-server@.service, atlas-orchestrator
+#     the embedder llama-server (embed-qwen3-4b, $LLAMA_PORT_BASE+6 since v0.4.0), listen on 127.0.0.1 only (llama-server@.service, atlas-orchestrator
 #     .service), which a bridged container cannot reach. On the host network Open WebUI listens on 0.0.0.0:$OPENWEBUI_PORT
 #     and ufw (Phase 1 step 4: "allow in on <LAN iface> ... port $OPENWEBUI_PORT" and the same on br-atlas-wg) is what
 #     makes it "bound to LAN, WireGuard and loopback" — exactly the pattern used for SSH, Cockpit and xrdp. Its outbound
@@ -29,10 +29,10 @@
 #     variables are blanked below, AND phase2/03-openwebui.sh installs a permanent cgroup fence
 #     (/usr/local/sbin/atlas-openwebui-egress, unit atlas-openwebui-egress.service): every NEW connection whose socket
 #     belongs to this container's cgroup is dropped unless it goes over lo, and on lo only NEW tcp connections to the
-#     orchestrator ($ORCH_PORT), the bge-m3 llama-server ($EMBED_PORT), its own listener ($OPENWEBUI_PORT: the
+#     orchestrator ($ORCH_PORT), the embedder llama-server ($EMBED_PORT), its own listener ($OPENWEBUI_PORT: the
 #     healthcheck below curls it from inside the container), Kokoro 8880, speaches 8881 and docling 5001 pass; every
 #     other NEW tcp (squid 3128, Redis 6379, ChromaDB 8000, SSH, Cockpit, xrdp, ntfy, WG-Easy, the llama-server engines
-#     8101-8110) and all NEW udp over lo are dropped (allowlist, fix round 3). verify/v12-openwebui-offline.sh proves
+#     8101-8120) and all NEW udp over lo are dropped (allowlist, fix round 3). verify/v12-openwebui-offline.sh proves
 #     the start-up window; the fence enforces the same rule at run time for the lazy paths (RAG loaders, a malicious
 #     document naming a proxy).
 #   * redis and chromadb publish on 127.0.0.1 only (loopback is the subset of "loopback, LAN and WireGuard" that
@@ -53,7 +53,7 @@
 #     name, because it is on the host network.
 #
 # Interpolation (defaults in brackets): ATLAS_SRV [/srv/atlas], ATLAS_ETC [/etc/atlas], TZ [UTC], OPENWEBUI_PORT [3000],
-#   ORCH_PORT [8800], EMBED_PORT [8109], OPENWEBUI_DATA_DIR, REDIS_DATA_DIR, CHROMA_DATA_DIR. Nothing here needs a
+#   ORCH_PORT [8800], EMBED_PORT [8106], OPENWEBUI_DATA_DIR, REDIS_DATA_DIR, CHROMA_DATA_DIR. Nothing here needs a
 #   proxy: redis and chromadb never leave the node, open-webui must not (V12). `$$VAR` is a container-shell variable
 #   (compose leaves it alone), used where a secret must not pass through the interpolation file.
 #
@@ -241,15 +241,18 @@ services:
       ENABLE_OPENAI_API: "true"
       OPENAI_API_BASE_URL: "http://127.0.0.1:${ORCH_PORT:-8800}/v1"
       DEFAULT_MODELS: "atlas"
-      # --- retrieval: bge-m3 on llama-server (engine index 9, step 4, used on demand); vectors in Open WebUI's OWN
+      # --- retrieval: Qwen3-Embedding-4B on llama-server (embed-qwen3-4b, engine index 6, on the CPU, step 4; D-45 (a),
+      #     D-14 (e)). Open WebUI calls /v1/embeddings itself, so its own vectors are the native 2560 dimensions with no
+      #     query instruction (the orchestrator's client truncates to 1024 and prefixes queries, S-41; the two stores
+      #     are separate and never compared). Vectors in Open WebUI's OWN
       #     embedded store under /app/backend/data/vector_db (inside the data dir, in the restic include set). The
       #     shared ChromaDB is the orchestrator's Vector Cortex (10.1) and comes up in step 4, after this container
       #     (fix round: Section 17 order). The token splitter would fetch a tiktoken encoding on first use, so the
       #     character splitter is pinned and the cache dir is local (research: lazy fetch UNVERIFIED for 0.11.4).
       RAG_EMBEDDING_ENGINE: "openai"
-      RAG_OPENAI_API_BASE_URL: "http://127.0.0.1:${EMBED_PORT:-8109}/v1"
+      RAG_OPENAI_API_BASE_URL: "http://127.0.0.1:${EMBED_PORT:-8106}/v1"
       RAG_OPENAI_API_KEY: "atlas-local"
-      RAG_EMBEDDING_MODEL: "embed-bge-m3"
+      RAG_EMBEDDING_MODEL: "embed-qwen3-4b"
       RAG_EMBEDDING_BATCH_SIZE: "16"
       RAG_TEXT_SPLITTER: "character"
       TIKTOKEN_CACHE_DIR: "/app/backend/data/cache/tiktoken"

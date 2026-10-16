@@ -136,6 +136,8 @@ def test_only_principal_facing_text_is_rewritten(audience: str) -> None:
         "Our virtual assistant will follow up.",
         "Regards, the chatbot",
         "This was drafted on gpt-oss-120b.",
+        "This was drafted on GLM-5.3-Flash.",  # v0.4.0: the Day 1 default seat
+        "DeepSeek reviewed the clause.",
     ],
 )
 def test_disclosure_check_flags_admissions(text: str) -> None:

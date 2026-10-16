@@ -73,6 +73,9 @@ class EngineBinding:
     persona: str
     default_engine: str
     override_engines: tuple[str, ...]
+    # D-40: the engine that carries the seat when its default fails or defers in Phase 3. Recorded, never a binding:
+    # not in all_engines, so neither engine_for() nor the cross-checker ever picks it on its own.
+    fallback_engine: str | None = None
 
     @property
     def all_engines(self) -> tuple[str, ...]:
@@ -98,7 +101,7 @@ class PersonaRegistry(Mapping[str, Persona]):
                 raise ConfigError(f"persona {key}: speaks_externally_tier {p.speaks_externally_tier!r} "
                                   f"is not one of {TIERS}")
             if self._engines is not None:
-                for ek in (p.default_engine, *p.override_engines):
+                for ek in (p.default_engine, *p.override_engines, *([p.fallback_engine] if p.fallback_engine else [])):
                     if ek not in self._engines:
                         raise ConfigError(f"persona {key}: engine {ek!r} is not a key of engines.json")
             external_tier(p)  # 6.2 agreement and the lead minimums, at load (ConfigError), not at the first item
@@ -153,7 +156,8 @@ class PersonaRegistry(Mapping[str, Persona]):
 
     def binding(self, key: str) -> EngineBinding:
         p = self[key]
-        return EngineBinding(persona=key, default_engine=p.default_engine, override_engines=tuple(p.override_engines))
+        return EngineBinding(persona=key, default_engine=p.default_engine, override_engines=tuple(p.override_engines),
+                             fallback_engine=p.fallback_engine)
 
     def engine_for(self, key: str, override: str | None = None) -> str:
         """The engine key a persona runs on: its default, or `override` when the persona is bound to it.

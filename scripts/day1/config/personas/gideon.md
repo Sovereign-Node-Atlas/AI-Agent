@@ -5,9 +5,13 @@ hemisphere: corporate
 division: Corporate
 remit: Legal & Compliance
 reports_to: ren
-default_engine: gpt-oss-120b
+# v0.4.0 (approved 2026-10-16; D-10, S-32): GLM-5.3-Flash by default (P-03), which is also the long-document engine, so
+# Qwen3.5-122B-A10B (retired, S-11) leaves the overrides; deepseek-v4-flash stays for TF_OMEGA and is the D-40 (a)
+# fallback (P-03 runner-up).
+default_engine: glm-5.3-flash
 engine_settings: high reasoning, retrieval-grounded
-override_engines: [qwen3.5-122b, deepseek-v4-flash]
+override_engines: [deepseek-v4-flash]
+fallback_engine: deepseek-v4-flash
 speaks_externally_tier: sensitive
 # 14.3 is conditional (bm_george only if Arthur takes bm_daniel); Arthur holds bm_george and Ren holds am_onyx,
 # so no primary is free. Null pending the V7 listening test; see voice-casting.json kokoro_note.

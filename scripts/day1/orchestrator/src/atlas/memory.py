@@ -17,9 +17,13 @@ Rules this module is the code path for (rule §7.7: code, not prompt instruction
     restic's include set exactly like the Chroma persist dir they are destined for.
   * Telemetry (rule §7.1, 12.1): the chromadb client is built with Settings(anonymized_telemetry=False) so no PostHog
     beacon is attempted on client start (chromadb-client 1.5.9 defaults it on; VERIFIED in the fix-round review).
-  * Embeddings come from the resident bge-m3 llama-server (EMBEDDING_URL, /v1/embeddings; gguf-models.md §9) and are
-    always passed explicitly to Chroma: the client's default embedding function would download a model from the
-    internet, which rule §7.1 forbids.
+  * Embeddings come from the resident Qwen3-Embedding-4B llama-server on the CPU (v0.4.0: D-14 (e), D-45 (a), approved
+    2026-10-16; EMBEDDING_URL, /v1/embeddings) and are always passed explicitly to Chroma: the client's default
+    embedding function would download a model from the internet, which rule §7.1 forbids. S-41: the 1024-dimension
+    schema is kept by truncating each vector to its first EMBEDDING_DIM components (the model is Matryoshka-trained)
+    and re-normalising it; a query (MemoryStore.query) carries the model card's instruction prefix
+    ("Instruct: <task>\nQuery:<text>", EMBEDDING_QUERY_INSTRUCTION), a stored document none. Vectors from bge-m3 and
+    Qwen3-Embedding are not interchangeable, so the change happens before Day 1 while every collection is empty.
   * The temporal flag (9.6): every document carries `ts` and `temporal`; `expires_at` when the writer gave a TTL.
     tasks/prune.py sweeps on those fields. Scars (`scars`) are exempt and never carry `temporal`.
 
@@ -92,6 +96,9 @@ TIKTOKEN_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b
 __all__ = [
     "COLLECTIONS",
     "COLLECTION_HEMISPHERES",
+    "DEFAULT_EMBEDDING_DIM",
+    "DEFAULT_EMBEDDING_MODEL",
+    "DEFAULT_QUERY_INSTRUCTION",
     "ChromaLike",
     "CollectionLike",
     "EmbeddingFn",
@@ -106,7 +113,9 @@ __all__ = [
     "WriteResult",
     "build_memory_store",
     "check_chroma_proxy",
+    "fit_dimension",
     "llama_embedding_fn",
+    "query_with_instruction",
     "tiktoken_cache_file",
 ]
 
@@ -328,13 +337,43 @@ def stub_embedding_fn(texts: Sequence[str]) -> list[list[float]]:
     return out
 
 
-# --- the real embedding function: bge-m3 on llama-server --------------------------------------------------------------
+# --- the real embedding function: Qwen3-Embedding-4B on llama-server --------------------------------------------------
+
+DEFAULT_EMBEDDING_MODEL = "embed-qwen3-4b"  # CONVENTIONS.md §8 key (engines.json), the llama-server alias
+DEFAULT_EMBEDDING_DIM = 1024  # S-41: the Chroma and LightRAG schema, kept from bge-m3 by truncation
+# The Qwen3-Embedding card's query form, get_detailed_instruct(): f"Instruct: {task}\nQuery:{query}"; documents carry
+# no prefix. The task wording is ATLAS's (UNVERIFIED for retrieval quality; T-15 measures the pair on the node).
+DEFAULT_QUERY_INSTRUCTION = "Given a question or a note, retrieve the stored passages that answer or relate to it"
+
+
+def query_with_instruction(text: str, instruction: str = DEFAULT_QUERY_INSTRUCTION) -> str:
+    """S-41: a query in the instruction-aware form the Qwen3-Embedding model card prescribes."""
+    return f"Instruct: {instruction}\nQuery:{text}"
+
+
+def fit_dimension(vector: Sequence[float], dim: int | None) -> list[float]:
+    """S-41: the first `dim` components, re-normalised to unit length (Matryoshka truncation), so a 2560-dimension
+    Qwen3-Embedding-4B vector fits the 1024-dimension schema. A vector already at `dim` (or `dim` None) is returned
+    as it is; a shorter one is an error, never padded."""
+    v = [float(x) for x in vector]
+    if dim is None or len(v) == dim:
+        return v
+    if len(v) < dim:
+        raise MemoryStoreError(f"embedding server returned {len(v)} dimensions, fewer than the schema's {dim}")
+    cut = v[:dim]
+    norm = sum(x * x for x in cut) ** 0.5
+    if norm == 0.0:
+        raise MemoryStoreError("embedding truncated to a zero vector; the server's output is unusable")
+    return [x / norm for x in cut]
 
 
 def llama_embedding_fn(
-    embedding_url: str, model: str = "embed-bge-m3", *, timeout_s: float = 120.0, batch: int = 16
+    embedding_url: str, model: str = DEFAULT_EMBEDDING_MODEL, *, timeout_s: float = 120.0, batch: int = 16,
+    dim: int | None = DEFAULT_EMBEDDING_DIM, instruction: str | None = None,
 ) -> EmbeddingFn:
-    """POST {EMBEDDING_URL}/embeddings (OpenAI shape, VERIFIED gguf-models.md §9); EMBEDDING_URL ends in /v1."""
+    """POST {EMBEDDING_URL}/embeddings (OpenAI shape, VERIFIED gguf-models.md §9); EMBEDDING_URL ends in /v1. Each
+    vector is fitted to `dim` (fit_dimension, S-41); with `instruction` every input is sent in the query form
+    (query_with_instruction), which is for queries only, never for stored documents."""
     from atlas.engines import EngineError, LlamaClient
 
     base = embedding_url.rstrip("/")
@@ -346,8 +385,10 @@ def llama_embedding_fn(
         out: list[list[float]] = []
         for i in range(0, len(texts), batch):
             chunk = list(texts[i : i + batch])
+            if instruction is not None:
+                chunk = [query_with_instruction(t, instruction) for t in chunk]
             try:
-                out.extend(client.embeddings(chunk, model=model))
+                out.extend(fit_dimension(v, dim) for v in client.embeddings(chunk, model=model))
             except EngineError as exc:
                 raise MemoryStoreError(
                     f"embedding request to {base} failed: {exc} (is llama-server@{model} active?)"
@@ -368,6 +409,7 @@ class MemoryStore:
         backend: ChromaLike,
         embed: EmbeddingFn,
         *,
+        query_embed: EmbeddingFn | None = None,
         sessions: SessionTags | None = None,
         freeze_flag: str | Path | None = DEFAULT_FREEZE_FLAG,
         freeze_wait_s: float = 120.0,
@@ -378,6 +420,9 @@ class MemoryStore:
     ) -> None:
         self.backend = backend
         self.embed = embed
+        # S-41: queries may need another form than stored documents (the Qwen3-Embedding instruction prefix); a store
+        # built without one embeds both alike (the stub tests, an older caller).
+        self.query_embed = query_embed or embed
         self.sessions = sessions or SessionTags()
         self.freeze_flag = Path(freeze_flag) if freeze_flag else None
         self.freeze_wait_s = freeze_wait_s
@@ -637,7 +682,7 @@ class MemoryStore:
         self.check_access(collection, hemisphere, "read")
         if not text.strip() or k < 1:
             return []
-        vec = self.embed([text])[0]
+        vec = self.query_embed([text])[0]  # S-41: the query form (instruction prefix) where the model wants one
         col = self.collection(collection)
         try:
             res = col.query(
@@ -784,7 +829,8 @@ class LightRAGStore:
     model (R6: extraction on Eleanor's model); every such call holds the orchestrator's ONE generation slot like any
     weight-bearing generation (atlas.api.GenerationSlot, 4.2 rule 3, 9.7 C15), so an extraction never runs beside a
     chat generation and a chat queues behind an extraction in FIFO order. Embeddings go straight to the resident
-    bge-m3 server.
+    embedding server (Qwen3-Embedding-4B, fitted to embedding_dim; LightRAG's embedding_func is one function for its
+    documents and its queries alike, so both take the document form, no instruction prefix).
 
     AEGIS freeze (9.5, fix round 2): an insert or delete during the freeze waits `freeze_wait_s`, then is SPOOLED to
     `spool_dir` (the same directory as MemoryStore's; ops `graph-insert` / `graph-delete`) and replayed by
@@ -934,7 +980,7 @@ class LightRAGStore:
         import numpy as np  # a lightrag dependency (services-tools.md §2.2)
 
         self._check_tokenizer_cache()
-        embed = llama_embedding_fn(self.embedding_url, self.embedding_model)
+        embed = llama_embedding_fn(self.embedding_url, self.embedding_model, dim=self.embedding_dim)
         llm_base, llm_model = self.llm_base_url, self.llm_model
         api_key = self.internal_token or "atlas-local"  # the /internal secret when the node has one (class docstring)
 
@@ -1190,7 +1236,8 @@ def build_memory_store(
     env: Mapping[str, str] | None = None, *, sessions: SessionTags | None = None, with_graph: bool = True
 ) -> MemoryStore:
     """From /etc/atlas/memory.env (phase2/04-memory.sh contract: CHROMA_URL, EMBEDDING_URL, EMBEDDING_MODEL,
-    EMBEDDING_DIM, LIGHTRAG_WORKING_DIR, TIKTOKEN_CACHE_DIR) and orchestrator.env (ORCH_URL, MEMORY_SPOOL_DIR)."""
+    EMBEDDING_DIM, EMBEDDING_QUERY_INSTRUCTION (optional), LIGHTRAG_WORKING_DIR, TIKTOKEN_CACHE_DIR) and
+    orchestrator.env (ORCH_URL, MEMORY_SPOOL_DIR)."""
     env = dict(os.environ if env is None else env)
     chroma_url = env.get("CHROMA_URL", "").strip()
     embedding_url = env.get("EMBEDDING_URL", "").strip()
@@ -1216,15 +1263,20 @@ def build_memory_store(
     except Exception as exc:
         raise MemoryStoreError(f"ChromaDB client for {chroma_url} could not be created: {exc}") from exc
     sessions = sessions or SessionTags.from_env(env)
-    embed = llama_embedding_fn(embedding_url, env.get("EMBEDDING_MODEL") or "embed-bge-m3")
+    model = env.get("EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
+    try:
+        dim = int(env.get("EMBEDDING_DIM") or DEFAULT_EMBEDDING_DIM)  # S-41: the 1024-dimension schema
+    except ValueError as exc:
+        raise MemoryStoreError(f"EMBEDDING_DIM={env.get('EMBEDDING_DIM')!r} is not an integer") from exc
+    if dim < 1:
+        raise MemoryStoreError(f"EMBEDDING_DIM={dim} must be a positive number of dimensions")
+    instruction = env.get("EMBEDDING_QUERY_INSTRUCTION") or DEFAULT_QUERY_INSTRUCTION
+    embed = llama_embedding_fn(embedding_url, model, dim=dim)
+    query_embed = llama_embedding_fn(embedding_url, model, dim=dim, instruction=instruction)
     freeze_flag = env.get("AEGIS_FREEZE_FLAG") or DEFAULT_FREEZE_FLAG
     spool_dir = env.get("MEMORY_SPOOL_DIR") or DEFAULT_SPOOL_DIR
     graph: LightRAGStore | None = None
     if with_graph and env.get("LIGHTRAG_WORKING_DIR"):
-        try:
-            dim = int(env.get("EMBEDDING_DIM") or 1024)  # bge-m3 dense dimension (gguf-models.md; UNVERIFIED here)
-        except ValueError as exc:
-            raise MemoryStoreError(f"EMBEDDING_DIM={env.get('EMBEDDING_DIM')!r} is not an integer") from exc
         orch = (env.get("ORCH_URL") or f"http://127.0.0.1:{env.get('ORCH_PORT') or 8800}").rstrip("/")
         from atlas.tasks import internal_token  # the same ORCH_INTERNAL_TOKEN_FILE reader as OrchestratorClient
 
@@ -1233,7 +1285,7 @@ def build_memory_store(
             llm_base_url=f"{orch}/internal/v1",
             llm_model=env.get("ATLAS_CLASSIFIER_ENGINE") or "router-qwen3.5-4b",
             embedding_url=embedding_url,
-            embedding_model=env.get("EMBEDDING_MODEL") or "embed-bge-m3",
+            embedding_model=model,
             embedding_dim=dim,
             sessions=sessions,
             freeze_flag=freeze_flag,
@@ -1241,4 +1293,5 @@ def build_memory_store(
             tiktoken_cache_dir=env.get("TIKTOKEN_CACHE_DIR") or None,
             internal_token=internal_token(env),
         )
-    return MemoryStore(backend, embed, sessions=sessions, freeze_flag=freeze_flag, graph=graph, spool_dir=spool_dir)
+    return MemoryStore(backend, embed, query_embed=query_embed, sessions=sessions, freeze_flag=freeze_flag, graph=graph,
+                       spool_dir=spool_dir)

@@ -1,23 +1,31 @@
 {
   "_meta": {
-    "purpose": "Test fixture: config/engines.json trimmed to the fields the atlas package reads; keys, classes, footprints, ctx and parallel are the real values (CONVENTIONS.md \u00a78)."
+    "purpose": "Test fixture: config/engines.json for the v0.4.0 Day 1 set (approved 2026-10-16) trimmed to the fields the atlas package reads; keys, order, classes, files[] bytes (Hugging Face tree sizes, D-31), placement (D-14 (e)) and KV types (D-29) as the orchestrator expects them (CONVENTIONS.md §8; v040 log_code.md). The gpt-oss-120b-abliterated entry is the v0.3.5 one, unchanged."
   },
   "engines": [
     {
       "key": "gpt-oss-120b",
-      "display_name": "gpt-oss-120b (MXFP4, native)",
+      "display_name": "gpt-oss-120b (F16 trunk, native MXFP4 experts) — fast utility and fallback floor",
       "mode": "chat",
       "arbiter_class": "core",
-      "kv_class": "q4_0",
-      "hf_repo": "ggml-org/gpt-oss-120b-GGUF",
+      "kv_class": "q8_0",
+      "hf_repo": "unsloth/gpt-oss-120b-GGUF",
       "arch": "gpt-oss",
-      "footprint_gb": 63,
+      "files": [
+        {
+          "name": "gpt-oss-120b-F16.gguf",
+          "bytes": 65369017728,
+          "sha256": "2d1f0298ae4b6c874d5a468598c5ce17c1763b3fea99de10b1a07df93cef014f",
+          "verify": "research-snippet"
+        }
+      ],
+      "footprint_gb": 65.37,
       "ctx_size": 262144,
       "ctx_per_slot": 32768,
       "parallel": 8,
       "n_keep": 4096,
       "kv_proof_lines": 2,
-      "model_file_pattern": "gpt-oss-120b-mxfp4-00001-of-00003.gguf",
+      "model_file_pattern": "gpt-oss-120b-F16.gguf",
       "port": 8101
     },
     {
@@ -38,144 +46,195 @@
       "port": 8102
     },
     {
-      "key": "nemotron-3-super",
-      "display_name": "NVIDIA Nemotron 3 Super 120B-A12B (Q8_0)",
-      "mode": "chat",
+      "key": "glm-5.3-flash",
+      "display_name": "GLM-5.3-Flash (UD-IQ4_XS + glm5v mmproj F16) — default seat, vision, long documents",
+      "mode": "vision",
       "arbiter_class": "core",
-      "kv_class": "q8_0",
-      "hf_repo": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
-      "arch": "nemotron_h_moe",
-      "footprint_gb": 123,
+      "kv_class": "f16",
+      "hf_repo": "unsloth/GLM-5.3-Flash-GGUF",
+      "subdir": "UD-IQ4_XS",
+      "arch": "glm5-next",
+      "files": [
+        {
+          "name": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+          "bytes": 9429984,
+          "sha256": "c2f3b6ab98d3df844f322ea376059202d2eaeedcee1f0eff455345b86a137dbd",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+          "bytes": 49989334176,
+          "sha256": "7d64cf0395672c4322012841abec502ea7e20518299bb5e3069003f06f9e6de9",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00003-of-00005.gguf",
+          "bytes": 49607025280,
+          "sha256": "7c2c63c9c30f8060428fdf2ac935dbf2ee9ad8f771d62b6ae47a7f7f2c1520e7",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00004-of-00005.gguf",
+          "bytes": 49486530144,
+          "sha256": "06c90f191871317c92dd9d25a353b687aed44c50f3ac6c713e9fe410bc2d26dd",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00005-of-00005.gguf",
+          "bytes": 7729791616,
+          "sha256": "66ebf9ec85e04d3f44af674ae4f694acbc89cc53db75e42f2f4d3646bf321c0d",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "mmproj-F16.gguf",
+          "bytes": 1128047296,
+          "sha256": "922b809664d6a89cc1e40bfeaa63618000edc6651baf4082ce0718a784adf947",
+          "verify": "research-snippet"
+        }
+      ],
+      "mmproj": "mmproj-F16.gguf",
+      "footprint_gb": 157.95,
       "ctx_size": 262144,
       "ctx_per_slot": 32768,
       "parallel": 8,
       "n_keep": 4096,
-      "kv_proof_lines": 1,
-      "model_file_pattern": "*-00001-of-*.gguf",
+      "kv_types_must_match": true,
+      "kv_proof_lines": 2,
+      "model_file_pattern": "GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
       "port": 8103
     },
     {
-      "key": "qwen3.5-122b",
-      "display_name": "Qwen3.5-122B-A10B (Q8_0)",
-      "mode": "chat",
-      "arbiter_class": "core",
-      "kv_class": "q8_0",
-      "hf_repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
-      "arch": "qwen35moe",
-      "footprint_gb": 130,
-      "ctx_size": 262144,
-      "ctx_per_slot": 32768,
-      "parallel": 8,
-      "n_keep": 4096,
-      "kv_proof_lines": 1,
-      "model_file_pattern": "Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf",
-      "port": 8104
-    },
-    {
       "key": "deepseek-v4-flash",
-      "display_name": "DeepSeek V4 Flash 0731 (UD-Q4_K_XL) \u2014 Apex engine",
+      "display_name": "DeepSeek-V4-Flash-0731 (UD-Q8_K_XL) — Arthur and the Apex engine",
       "mode": "chat",
       "arbiter_class": "apex",
       "exclusive": true,
-      "kv_class": "q4_0",
+      "kv_class": "f16",
       "hf_repo": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+      "subdir": "UD-Q8_K_XL",
       "arch": "deepseek4",
-      "footprint_gb": 155,
-      "ctx_size": 32768,
-      "ctx_per_slot": 32768,
+      "files": [
+        {
+          "name": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+          "bytes": 5257408,
+          "sha256": "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00002-of-00005.gguf",
+          "bytes": 49215492960,
+          "sha256": "3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf",
+          "bytes": 49700372160,
+          "sha256": "7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00004-of-00005.gguf",
+          "bytes": 49466495968,
+          "sha256": "6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3",
+          "verify": "research-snippet"
+        },
+        {
+          "name": "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00005-of-00005.gguf",
+          "bytes": 13481997024,
+          "sha256": "ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea",
+          "verify": "research-snippet"
+        }
+      ],
+      "footprint_gb": 161.87,
+      "ctx_size": 131072,
+      "ctx_per_slot": 131072,
       "parallel": 1,
       "n_keep": 4096,
+      "kv_ladder": [
+        "f16",
+        "q8_0"
+      ],
+      "kv_types_must_match": true,
       "kv_proof_lines": 4,
-      "model_file_pattern": "DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf",
-      "port": 8105
-    },
-    {
-      "key": "qwen2.5-vl-72b",
-      "display_name": "Qwen2.5-VL-72B-Instruct (Q8_0 + mmproj Q8_0) \u2014 vision engine",
-      "mode": "vision",
-      "arbiter_class": "vision",
-      "kv_class": "q8_0",
-      "hf_repo": "ggml-org/Qwen2.5-VL-72B-Instruct-GGUF",
-      "arch": "qwen2vl",
-      "footprint_gb": 79,
-      "ctx_size": 262144,
-      "ctx_per_slot": 32768,
-      "ctx_size_coresident": 65536,
-      "parallel": 8,
-      "parallel_coresident": 2,
-      "n_keep": 4096,
-      "kv_proof_lines": 1,
-      "mmproj": "mmproj-Qwen2.5-VL-72B-Instruct-Q8_0.gguf",
-      "model_file_pattern": "Qwen2.5-VL-72B-Instruct-Q8_0-00001-of-00002.gguf",
-      "port": 8106
-    },
-    {
-      "key": "meditron-70b",
-      "display_name": "Meditron-70B (Q8_0, joined from raw byte splits)",
-      "mode": "chat",
-      "arbiter_class": "crosscheck",
-      "kv_class": "q8_0",
-      "hf_repo": "TheBloke/meditron-70B-GGUF",
-      "arch": "llama",
-      "footprint_gb": 74,
-      "ctx_size": 4096,
-      "ctx_per_slot": 4096,
-      "parallel": 1,
-      "n_keep": 1024,
-      "kv_proof_lines": 1,
-      "model_file_pattern": "meditron-70b.Q8_0.gguf",
-      "port": 8107
+      "model_file_pattern": "DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+      "port": 8104
     },
     {
       "key": "router-qwen3.5-4b",
-      "display_name": "Qwen3.5-4B (Q8_0) \u2014 Eleanor / router / classifier",
+      "display_name": "Qwen3.5-4B (Q8_0) — the router / classifier (Eleanor classifies here only)",
       "mode": "chat",
       "arbiter_class": "resident",
       "kv_class": "q8_0",
       "hf_repo": "unsloth/Qwen3.5-4B-GGUF",
       "arch": "qwen35",
-      "footprint_gb": 4.5,
+      "files": [
+        {
+          "name": "Qwen3.5-4B-Q8_0.gguf",
+          "bytes": 4482403488,
+          "sha256": "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1",
+          "verify": "research-snippet"
+        }
+      ],
+      "footprint_gb": 4.48,
       "ctx_size": 32768,
       "ctx_per_slot": 8192,
       "parallel": 4,
       "n_keep": 2048,
       "kv_proof_lines": 1,
       "model_file_pattern": "Qwen3.5-4B-Q8_0.gguf",
-      "port": 8108
+      "port": 8105
     },
     {
-      "key": "embed-bge-m3",
-      "display_name": "bge-m3 (Q8_0) \u2014 embeddings",
+      "key": "embed-qwen3-4b",
+      "display_name": "Qwen3-Embedding-4B (Q8_0) — embeddings, on the CPU",
       "mode": "embedding",
       "arbiter_class": "resident",
-      "kv_class": "none",
-      "hf_repo": "ggml-org/bge-m3-Q8_0-GGUF",
-      "arch": "bert",
-      "footprint_gb": 0.7,
-      "ctx_size": 8192,
-      "ctx_per_slot": 8192,
+      "kv_class": "q8_0",
+      "placement": "cpu",
+      "hf_repo": "Qwen/Qwen3-Embedding-4B-GGUF",
+      "arch": "qwen3",
+      "files": [
+        {
+          "name": "Qwen3-Embedding-4B-Q8_0.gguf",
+          "bytes": 4279660224,
+          "sha256": "b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d",
+          "verify": "research-snippet"
+        }
+      ],
+      "footprint_gb": 4.28,
+      "ctx_size": 4096,
+      "ctx_per_slot": 4096,
       "parallel": 1,
       "n_keep": 0,
       "kv_proof_lines": 0,
-      "model_file_pattern": "bge-m3*q8_0*.gguf",
-      "port": 8109
+      "model_file_pattern": "Qwen3-Embedding-4B-Q8_0.gguf",
+      "port": 8106
     },
     {
-      "key": "rerank-bge-v2-m3",
-      "display_name": "bge-reranker-v2-m3 (Q8_0) \u2014 reranker",
+      "key": "rerank-qwen3-4b",
+      "display_name": "Qwen3-Reranker-4B (Q8_0, rank head) — reranker, on the CPU",
       "mode": "reranking",
       "arbiter_class": "resident",
-      "kv_class": "none",
-      "hf_repo": "gpustack/bge-reranker-v2-m3-GGUF",
-      "arch": "bert",
-      "footprint_gb": 0.7,
-      "ctx_size": 8192,
-      "ctx_per_slot": 8192,
+      "kv_class": "q8_0",
+      "placement": "cpu",
+      "hf_repo": "Voodisss/Qwen3-Reranker-4B-GGUF-llama_cpp",
+      "arch": "qwen3",
+      "files": [
+        {
+          "name": "Qwen3-Reranker-4B.Q8_0.gguf",
+          "bytes": 4279678912,
+          "sha256": "102ac400d68f02877c2fdfecf0732872652298448352b6faf28ec7f8dca8c913",
+          "verify": "research-snippet"
+        }
+      ],
+      "footprint_gb": 4.28,
+      "ctx_size": 4096,
+      "ctx_per_slot": 4096,
       "parallel": 1,
       "n_keep": 0,
       "kv_proof_lines": 0,
-      "model_file_pattern": "bge-reranker-v2-m3-Q8_0.gguf",
-      "port": 8110
+      "model_file_pattern": "Qwen3-Reranker-4B.Q8_0.gguf",
+      "port": 8107
     }
   ],
   "external": [

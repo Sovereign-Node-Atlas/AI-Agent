@@ -201,7 +201,7 @@ _orch_preflight_smb_cred() {
 _core_env_write() {
   [[ -s "$ATLAS_ETC/docker.env" ]] || die "$ATLAS_ETC/docker.env is missing (Phase 1 step 6 writes it)"
   local embed_port
-  embed_port="$(engine_port_of embed-bge-m3)" || die "cannot compute the embed-bge-m3 port from config/engines.json"
+  embed_port="$(engine_port_of embed-qwen3-4b)" || die "cannot compute the embed-qwen3-4b port from config/engines.json"
   {
     echo "# Written by ATLAS Phase 2 step 2 (phase2/02-orchestrator.sh). Compose interpolation for docker/core/compose.yml:"
     echo "#   docker compose -f $CORE_COMPOSE --env-file $CORE_ENV up -d <service>"
@@ -462,6 +462,11 @@ _orch_env_write() {
   # key. Seeded once with ensure_kv_default: a Principal-approved value, edited here as root (16.3 item 6), survives a
   # re-run of this step, which ensure_kv would silently reset to 72. Workers read the file only at start.
   ensure_kv_default "$ORCH_ENV" PRUNE_WINDOW_HOURS 72
+  # ATLAS_ARBITER_MAX_RESIDENT (v0.4.0; D-32 option (a), S-23, approved 2026-10-16): one LLM seat resident at a time,
+  # the always-resident companions never counted. A setting (atlas/config.py, range 1..2) so that option (b), two seats
+  # where a pair fits, can return without a code change; seeded once like PRUNE_WINDOW_HOURS, so the Principal's value
+  # survives a re-run of this step. The orchestrator reads it at start; a bad value stops only the Arbiter.
+  ensure_kv_default "$ORCH_ENV" ATLAS_ARBITER_MAX_RESIDENT 1
   ensure_kv "$ORCH_ENV" TZ "$TZ"
   ensure_kv "$ORCH_ENV" DOMAIN "$DOMAIN"
   ensure_kv "$ORCH_ENV" PRINCIPAL_USER "$PRINCIPAL_USER"

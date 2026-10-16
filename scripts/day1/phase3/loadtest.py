@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Phase 3 load tests: the measuring half of scripts/day1/phase3-models.sh (ATLAS_FRAMEWORK_REVIEW.md Section 17
-Phase 3 steps 2-4; Section 21 V4, V10, V14b, V21, V22; Section 4.2 rules 1-9; R19).
+Phase 3 steps 2-4; Section 21 V4, V10, V14b, V21, V22, V25; Section 4.2 rules 1-9; R19).
+
+v0.4.0 (approved by the Principal 2026-10-16; register D-26 (c)): the Day 1 engines are gpt-oss-120b, its unchanged
+abliterated twin, glm-5.3-flash and deepseek-v4-flash (S-34, D-42 (b)); one LLM seat is resident at a time (D-32 (a));
+V10 records decode against the research projection and fails only below a per-seat floor the Principal sets (D-33
+(c)); V21 is a single-residency proof (S-24); V22 covers every newer-architecture engine (S-26); V25 is the output
+parity of the re-pin (S-02); the `quality` record (S-03) raises the KLD to-do.
 
 Run as root by the driver. Stdout carries ONLY lines of the form
     RECORD<TAB><ID><TAB><pass|fail|deferred|info><TAB><message>
-which the driver turns into verify.jsonl records with record_v, and (the `memory` subcommand only, S52)
+which the driver turns into verify.jsonl records with record_v, and (the `memory`, `quality` and `summarize`
+subcommands, S52 / S-03 / D-33 (c))
     TODO<TAB><ID><TAB><title><TAB><detail>
 which it raises with lib/common.sh todo_add; everything else goes to stderr (the unit's journal).
 Exit status 0 means "measured and recorded" (a failed engine is a recorded fail, not an exit code); non-zero means an
@@ -22,20 +29,33 @@ Subcommands (global options first, see main()):
                             records (S52, never a verdict) its context memory from the load log beside the Arbiter's
                             projection for the same profile, its host RAM after the load and after the tests, the
                             prompt-cache/checkpoint lines and whether context shift was switched off ("memory").
-                            DeepSeek (kv_ladder) runs the engines.json ladder with a coherence prompt instead.
+                            The Apex (kv_ladder) runs the engines.json ladder with a coherence prompt instead: f16
+                            first, q8_0 only when f16 fails (S-42).
                             A result whose engine is NOT resident afterwards (not loaded, failed, the ladder) says
                             so in "resident_after": the driver reads it to know what the next swap releases.
     finish [--previous PREV]
                             unload the last resident engine and credit its release check
-    summarize               print the V10 lines (one per engine, then the summary the gate reads) and V22
-    coresident --text KEY --vision KEY
-                            Section 17 step 3: both resident (vision at its standing co-resident profile, S52:
-                            parallel_coresident / ctx_size_coresident with ATLAS_CORESIDENT=1, asserted on the
-                            rendered env before the load; no temporary override), GTT delta within [0.85 x 142 GB,
-                            min(142 + 28 + 10 GB, the Arbiter's live budget)], two generation requests through the
-                            orchestrator, the second proven to queue (V21), then the real-engine refusal and Deep
-                            Think downgrade of Section 21 V14 (V14b). A rule-5 leak in its cleanup fails V21 AND
-                            stops the phase (exit 2) after the records are written, as step 02 does.
+    summarize               print the V10 lines (one per engine, then the summary the gate reads), the V22 lines
+                            (one per newer-architecture engine, then their summary) and the decode-floors to-do
+                            while any seat has no floor (D-33 (c), D-47)
+    residency --first KEY --second KEY
+                            Section 17 step 3 (v0.4.0, S-24, D-32 (a)): the single-residency proof. FIRST is loaded
+                            through the Arbiter, then SECOND: the Arbiter must evict FIRST (its unit stopped, the
+                            ledger holds SECOND alone, the GTT delta is SECOND's alone within [0.85 x its weights,
+                            the Arbiter's live budget]); two generation requests through the orchestrator to the
+                            resident seat, the second proven to queue (V21). Slot save and restore is phased (S-35,
+                            T-13). Then, with nothing resident, the real-engine refusal and Deep Think downgrade of
+                            Section 21 V14 (V14b). A rule-5 leak fails V21 AND stops the phase (exit 2) after the
+                            records are written, as step 02 does.
+    parity                  S-02 (V25): the engines both llama.cpp builds load (the pin b11474 and the old pin
+                            v0.4.1, built beside it by phase2/01-llama.sh) compared with llama-perplexity: the old
+                            build writes the base logits of a fixed corpus, the new build scores them with
+                            --kl-divergence, and both score a small deterministic task set (HellaSwag-format file
+                            beside this script), flash attention on and off. Every seat is unloaded through the
+                            Arbiter first; each run is followed by the rule-5 release poll.
+    quality                 S-03: the KLD record of each Day 1 seat on the pin (perplexity of the fixed corpus and
+                            the deterministic task set at the seat's own KV type), raised as the to-do kld-run: the
+                            reference-based KLD run of T-03 needs reference files Day 1 does not pull.
     table                   the Section 17 step 4 table from the result files, plus every baseline_deviation
     memory                  S52 (end of Phase 3, step 04): the context memory, host-RAM caches and context-shift
                             records of every load (result files) plus the resident chat engines' current journals
@@ -43,24 +63,36 @@ Subcommands (global options first, see main()):
                             Records only: it never fails the phase (a parse miss is UNKNOWN)
 
 Verdicts fixed by the baseline (the document wins over this file and over engines.json, CONVENTIONS.md preamble):
-  * Section 21 V10 "measured tok/s within the expected bands": a decode rate under the band's lower bound is a V10
-    fail for that engine (no tolerance factor; a tolerance would have to be a declared baseline_deviation).
-  * Section 23 S6 / engines.json known_issue (nemotron-3-super): the 8k prefill is followed by an alive check; a
-    server that died is a V10 FAIL carrying the issue number #20732 in its message (engines.json: "fail when it does
-    not" answer /health), never a hang and never a silent pass; alive with the request failed is a fail too.
-  * Section 4.3 / Section 23 S2: the DeepSeek ladder loads f16, then q8_0, then q4_0, "running a coherence prompt at
-    each rung", and keeps the LOWEST rung that loaded, proved its K/V types and answered coherently. Every rung is
-    tried whatever the rung above did (a q8_0 that failed to load for memory does not hide a q4_0 that fits); only a
-    missing model file or a rule-5 leak ends the ladder early. engines.json kv_ladder_rule items (3)/(4) still say
-    "stops at the first failing rung": the document wins; its writer is asked to align the text (see notes).
+  * Section 21 V10 under D-33 option (c) (v0.4.0, S-25, B-04, B-06): load, generation at 512 and 8k tokens, swap and
+    release gate the engine; the decode rate is recorded beside engines.json projected_decode_tok_s (a research
+    projection, never measured on the PRO 495) and FAILS only below a non-null decode_floor_tok_s, the per-seat floor
+    the Principal sets with the deep-tier floor (D-47). A null floor means record only, and `summarize` raises the
+    to-do decode-floors. An entry that still carries a v0.3.5 expected_decode_tok_s band (the abliterated entry,
+    left exactly as v0.3.5 has it) keeps the v0.3.5 rule: below the band's lower bound is a V10 fail, and it is
+    left out of the to-do.
+  * Section 23 S6 / an engines.json known_issue naming llama.cpp #20732 (Nemotron 3 Super, phased after Day 1): the
+    8k prefill is followed by an alive check; a server that died is a V10 FAIL carrying the issue number in its
+    message, never a hang and never a silent pass; alive with the request failed is a fail too. Every engine gets
+    the alive check; only the message names the issue.
+  * The Apex KV ladder (engines.json kv_ladder_rule, S-42, D-29 (a); replaces v0.3.5's descent to a q4_0 target):
+    the HIGHEST-precision coherent rung that fits stands. f16 is loaded first at the entry's own profile; when it
+    loads, proves its K/V lines and answers the coherence prompt it stands and nothing is written to overrides.json.
+    q8_0 is tried only when f16 failed to load or was incoherent, and a coherent q8_0 is written to overrides.json.
+    q4_0 is never a rung. No coherent rung: V4 and V22 deferred (R19), overrides cleared.
+  * Section 21 V22 / R19 generalised (S-26, D-33 (c)): every engine whose support is newer than the rest has a
+    deferrable row: the Apex (as before) and each engine whose min_llama_cpp_tag is newer than the parity build
+    v0.4.1 (b10964), on Day 1 glm-5.3-flash (glm5-next, b11279). Its failure is recorded as V22 deferred, and its V4
+    and V10 rows as deferred with the reason, so it never blocks the Phase 3 gate (its seats fall back to their
+    D-40 fallback_engine). Each such engine gets a V22 line, then a V22 summary line, the one the gate reads.
   * Section 4.2 rule 3 for the requests this script sends straight to a llama-server port (POST /completion timing
     points, the coherence prompts, the solo timings): the driver stops every other path to a generation (the
     Sentinel/prune timers, atlas-celery-gpu, the atlas-openwebui container) for steps 02/03, and this script waits
     for the orchestrator's single generation slot to be free (GET /health "generating"/"generation_queue", api.py)
     before each such request and stops (Infra) when it is not free within GENERATION_IDLE_WAIT_S.
 
-Result files: <results-dir>/<key>.json, one per engine (schema: EngineResult below), plus baseline.json and
-coresident.json. A result with "ok": true AND "released": true makes the driver skip that engine on a re-run
+Result files: <results-dir>/<key>.json, one per engine (schema: EngineResult below), plus baseline.json,
+residency.json (step 03), parity.json (step 02b, V25) and quality.json (step 02c, S-03). A result with "ok": true
+AND "released": true makes the driver skip that engine on a re-run
 (file-level resumability, CONVENTIONS.md §7.3; an engine saved while still resident is re-tested unless `prepare`
 credited its release on the re-run). <results-dir>/pending-overrides.json journals every TEMPORARY overrides.json
 change (ladder rungs, the V14b probe profile) before it is written; every subcommand
@@ -68,19 +100,21 @@ that touches the node restores and deletes it first, so an interrupted run never
 SIGTERM (`systemctl stop atlas-day1-phase3`) is turned into an exception in the main thread so every finally block runs.
 
 Facts typed here and where they were VERIFIED (research/llama-cpp-vulkan.md, research/gguf-models.md, 2026-09-22;
-the research files are cited through config/engines.json _meta where this checkout does not carry them):
+the research files are cited through config/engines.json _meta where this checkout does not carry them; v0.4.0: every
+llama.cpp fact below re-read in the source at the new pin b11474 = b9acf138 on 2026-10-16, line numbers at b11474):
   * GET /health is 503 while loading and 200 {"status":"ok"} once loaded (server README, server.cpp).
   * POST /completion and POST /v1/chat/completions carry a top-level "timings" object: cache_n, prompt_n, prompt_ms,
     prompt_per_second (prefill tok/s), predicted_n, predicted_ms, predicted_per_second (decode tok/s) (README).
   * POST /tokenize {"content": ...} -> {"tokens": [...]} (README).
   * The V4 proof line, one per attention sub-cache, in the unit's journal (research conflict h; llama-kv-cache.cpp):
         llama_kv_cache: size = ... K (q8_0): ... MiB, V (q8_0): ... MiB
-    gpt-oss prints two (iswa), DeepSeek V4 four (dsv4); hybrids also print
+    gpt-oss prints two (iswa), DeepSeek V4 four (dsv4), GLM-5.3-Flash two (glm5-next: the MLA attention cache, then
+    the DSA indexer cache, src/llama-memory-hybrid-idx.cpp:68); hybrids also print
         llama_memory_recurrent: size = ... R (f32): ... S (f32): ...      (expected, never a failure)
     plus "llama_context: flash_attn = enabled"; hard-error lines that mean the request was refused (server exits):
     "Flash Attention not supported, set to disabled", "quantized V cache requires flash_attn",
     "does not support different K", "does not divide n_embd_head". No ^ anchor: --log-timestamps may prefix lines.
-    The size and flash_attn lines are library INFO, which the pin logs as TRACE (common/log.cpp:532, since
+    The size and flash_attn lines are library INFO, which the pin logs as TRACE (common/log.cpp:535, since
     67b2b7f2f): they reach the journal only at -lv 4, which phase2/engine-env.py renders into every chat engine
     (--verbosity 4); at llama-server's default 3 the journal has none and V4 is unproven on every engine.
     Research conflict 11: llama.cpp errors out at context creation instead of falling back; the proof is the log line
@@ -88,8 +122,9 @@ the research files are cited through config/engines.json _meta where this checko
   * /props does not expose the KV cache types (README): when the journal has no proof line, V4 is a fail with reason.
   * GTT in use: /sys/class/drm/card*/device/mem_info_gtt_used, bytes (amdgpu_gtt_mgr.c); the Arbiter's counter.
   * Nemotron 3 Super: llama.cpp issue #20732, GPU memory fault at ~20k-token prompts on Vulkan/HIP (conflict f).
-  * DeepSeek V4: K and V types must be identical (llama-context.cpp), --parallel explicit (issue #26654), quantised
-    KV disputed (issues #25382, #26423; conflict b); kernel 7.x DeviceLost needs amdgpu.lockup_timeout (issue #25664).
+  * DeepSeek V4 and glm5-next (MLA): K and V types must be identical (src/llama-context.cpp:3907-3910), --parallel
+    explicit (issue #26654), quantised KV on deepseek4 disputed (issues #25382, #26423; conflict b); kernel 7.x
+    DeviceLost needs amdgpu.lockup_timeout (issue #25664).
   * --reasoning-format defaults to auto (VERIFIED, engines.json extra_args_rule): a thinking model's <think> block
     lands in message.reasoning_content and message.content holds only what follows it.
   # UNVERIFIED: the per-request "cache_prompt": false field of POST /completion — README field (not re-read in the
@@ -99,54 +134,58 @@ the research files are cited through config/engines.json _meta where this checko
     "chat_template_kwargs": {"thinking": false} is NOT sent (unverified for this template).
 
 S52 Phase 3 items: records, never a verdict and never an Infra stop (a line that is not found is UNKNOWN). The log
-lines, VERIFIED against llama.cpp b29c606 (the pinned build, phase2/01-llama.sh LLAMA_CPP_COMMIT). llama-server logs
-with prefix and timestamps on (common/common.cpp:391-392), "M.SS.mmm.uuu I " before a line, "W " before a warning,
-"D " before a debug line (common/log.cpp:141-154), so no pattern is anchored. Every library line below (K/V,
-recurrent, DSV4, flash_attn, compute buffers, the mmproj's too: the server routes clip's log through
-common_log_default_callback, tools/server/server-context.cpp:1159) is INFO, which the pin logs as TRACE
-(common/log.cpp:532): at llama-server's default -lv 3 none reaches the journal, so phase2/engine-env.py renders every
+lines, VERIFIED against llama.cpp b11474 (the pinned build, phase2/01-llama.sh LLAMA_CPP_COMMIT; re-read 2026-10-16,
+every format string unchanged since b29c606, only the lines moved). llama-server logs with prefix and timestamps on
+(common/common.cpp:394-395), "M.SS.mmm.uuu I " before a line, "W " before a warning, "D " before a debug line
+(common/log.cpp:125-141; colours only on a tty, so the journal has none), so no pattern is anchored. Every library
+line below (K/V, recurrent, DSV4, flash_attn, compute buffers, the mmproj's too: the server routes clip's log through
+common_log_default_callback, tools/server/server-context.cpp:1275) is INFO, which the pin logs as TRACE
+(common/log.cpp:535): at llama-server's default -lv 3 none reaches the journal, so phase2/engine-env.py renders every
 chat engine with --verbosity 4 (exactly 4: see --fit below). Only the srv/slot INF and WRN lines print at -lv 3.
   * context memory, one line per K/V sub-cache (src/llama-kv-cache.cpp:301):
         "llama_kv_cache: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB"
     On gpt-oss "llama_kv_cache_iswa: creating non-SWA KV cache, size = %u cells" / "creating     SWA KV cache, ..."
     (src/llama-kv-cache-iswa.cpp:83, 100), on DeepSeek V4 those and "llama_kv_cache_dsv4: creating DSV4 CSA
-    compressed|HCA compressed|lightning-indexer KV cache, size = %u cells" (src/llama-kv-cache-dsv4.cpp:1289-1305)
-    come just before the size line of the sub-cache they name. The hybrids' recurrent state
-    (src/llama-memory-recurrent.cpp:133)
+    compressed|HCA compressed|lightning-indexer KV cache, size = %u cells" (src/llama-kv-cache-dsv4.cpp:1292-1308),
+    on glm5-next "llama_memory_hybrid_idx: creating indexer KV cache, size = %u cells" (src/llama-memory-hybrid-idx.cpp:
+    68, before the indexer's own size line; the MLA attention cache's line comes first, untagged), come just before
+    the size line of the sub-cache they name. The hybrids' recurrent state (src/llama-memory-recurrent.cpp:140)
         "llama_memory_recurrent: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, ..."
-    and DeepSeek V4's compressor states (src/llama-kv-cache-dsv4.cpp:998)
+    and DeepSeek V4's compressor states (src/llama-kv-cache-dsv4.cpp:1001)
         "llama_dsv4_comp_state: %s ratio = %u, state = %u x %u, streams = %u, rs_seq = %u, layers = %zu, size =
         %7.2f MiB" (one line in the log)
     are context memory too. Their sum is set beside the Arbiter's projection for the same profile (arbiter.py
     projected_footprint, run in the orchestrator's venv: see arbiter_projection).
-  * compute buffers, per buffer type: "sched_reserve: %10s compute buffer size = %8.2f MiB" (src/llama-context.cpp:692;
+  * compute buffers, per buffer type: "sched_reserve: %10s compute buffer size = %8.2f MiB" (src/llama-context.cpp:744;
     printed again whenever the scheduler re-reserves, so the largest per buffer is kept) and the mmproj's
-    "reserve_compute_meta: ..." in the same format (tools/mtmd/clip.cpp:3773). --fit (on by default, common/common.h:
-    476) builds a trial context first (common/fit.cpp:263). Below -lv 5 its lines are demoted to debug and dropped
-    (common/common.cpp:1326, common/fit.cpp:52), so at the rendered -lv 4 the journal has the served context's
-    lines only; at -lv 5 or -v they keep INFO and print as "I " beside the real ones. parse_memory_lines therefore
-    discards everything before --fit's closing TRACE line "common_fit_params: fitting params to free memory took"
-    (common/fit.cpp:902, printed at every verbosity that shows the trial); the served context and the mmproj load
-    after it (tools/server/server-context.cpp:1099, 1162), so nothing is counted twice.
+    "reserve_compute_meta: ..." in the same format (tools/mtmd/clip.cpp:3822). --fit (on by default, common/common.h:
+    481) builds a trial context first (common/fit.cpp:263, byte-identical to v0.4.1). Below -lv 5 its lines are demoted
+    to debug and dropped (common/common.cpp:1267, common/fit.cpp:52), so at the rendered -lv 4 the journal has the
+    served context's lines only; at -lv 5 or -v they keep INFO and print as "I " beside the real ones.
+    parse_memory_lines therefore discards everything before --fit's closing TRACE line
+    "common_fit_params: fitting params to free memory took" (common/fit.cpp:902, printed at every verbosity that
+    shows the trial); the served context and the mmproj load after it (tools/server/server-context.cpp:1208, 1295),
+    so nothing is counted twice.
   * "srv    load_model: initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'" (tools/server/
-    server-context.cpp:1250): the real slot window, logged AFTER the context-shift check, so a load log that has it
+    server-context.cpp:1383): the real slot window, logged AFTER the context-shift check, so a load log that has it
     covers that check.
-  * context shift switched off (warnings, tools/server/server-context.cpp:1176 and 1188):
+  * context shift switched off (warnings, tools/server/server-context.cpp:1309 and 1321):
         "ctx_shift is not supported by multimodal, it will be disabled" / "... by this context, it will be disabled"
     Every chat engine starts with --context-shift (phase2/engine-env.py), so a load log with the slot line and no such
-    warning means it stayed on.
+    warning means it stayed on. At b11474 only text-only glm5-next keeps it (RoPE type none); the glm5v mmproj turns it
+    off on the Day 1 GLM unit, and deepseek4 (dsv4), gpt-oss (iSWA) and the qwen35 router (IMROPE) cannot shift.
   * host-RAM caches outside the Arbiter's budget: the prompt cache (--cache-ram, default 8192 MiB per server, idle slots
     copied into it on every new task: --cache-idle-slots on) and the context checkpoints (--ctx-checkpoints, default
-    32 per slot, thinned to 8192 tokens apart when full) (common/common.h:628-632; flags common/arg.cpp:1695, 1713;
-    tools/server/server-context.cpp:2309-2340). Checkpoints are
-    made only where the cache cannot roll back: sliding-window or recurrent layers (tools/server/server-context.cpp:
-    3460-3473). Their sizes are TRACE lines (verbosity 4): " - cache state: %zu prompts, %.3f MiB (limits: ...)"
-    (tools/server/server-task.cpp:1894) and "created context checkpoint %d of %d (pos_min = ..., size = %.3f MiB)"
-    (server-context.cpp:2369); llama-server's default verbosity is 3 (common/common.h:534; LOG_TRC common/log.h:121),
+    32 per slot, at least 8192 tokens apart) (common/common.h:634-638; flags common/arg.cpp:1700, 1718, 1734).
+    Checkpoints are made only where the cache cannot roll back: sliding-window or recurrent layers
+    (tools/server/server-context.cpp:3708-3721; glm5-next's KDA layers test as recurrent, so GLM makes them too,
+    INFERRED). Their sizes are TRACE lines (verbosity 4): " - cache state: %zu prompts, %.3f MiB (limits: ...)"
+    (tools/server/server-task.cpp:1905) and "created context checkpoint %d of %d (pos_min = ..., size = %.3f MiB)"
+    (server-context.cpp:2573); llama-server's default verbosity is 3 (common/common.h:539; LOG_TRC common/log.h:122),
     which leaves only the warnings: an eviction from a full prompt cache (" - making room for prompt cache entry,
     removing oldest entry (size = %.3f MiB)", " - cache size limit reached, removing oldest entry (size = %.3f MiB)",
-    server-task.cpp:1753, 1873; the token-limit and oversize forms at 1887 and 1732) and "erasing old context
-    checkpoint (... size = %.3f MiB)" (server-context.cpp:2335). Both kinds are parsed; the TRACE lines are there
+    server-task.cpp:1764, 1884; the token-limit and oversize forms at 1898 and 1743) and "erasing old context
+    checkpoint (... size = %.3f MiB)" (server-context.cpp:2539). Both kinds are parsed; the TRACE lines are there
     because every chat engine runs at -lv 4 (phase2/engine-env.py), and a journal without them (an engine started
     before that render, a rotated journal) leaves the figure UNKNOWN. Phase 3 changes no engine setting, and it
     measures the RAM itself, read-only: VmRSS, VmHWM, RssAnon, RssFile and RssShmem of the unit's MainPID (systemctl
@@ -232,37 +271,35 @@ ORCH_WAIT_S = 300.0  # atlas-orchestrator.service: ExecStartPre waits up to 180 
 ORCH_TRANSIENT_STATES = ("active", "activating", "reloading", "deactivating")  # systemd ActiveState: wait, do not fail
 PENDING_FILE = "pending-overrides.json"
 ENGINE_ENV_GROUP = "atlas"  # engine-env.py installs root:atlas 640 (CONVENTIONS.md §2)
-REQUEST_TIMEOUT_S = 1200.0  # an 8k prefill on a dense 72B at Q8_0 plus 128 decoded tokens at ~3 tok/s
+REQUEST_TIMEOUT_S = 1200.0  # an 8k prefill plus 128 decoded tokens on the slowest Day 1 seat (DeepSeek, ~7 tok/s)
 PREFILL_SHORT = 512
 PREFILL_LONG = 8192
 N_PREDICT = 128
-# Section 21 V10 "measured tok/s within the expected bands" (Section 5.1 figures in engines.json): a decode rate
-# under the band's lower bound is a V10 fail; there is no tolerance factor (one would be a baseline_deviation the
-# gate table must show, engines.json baseline_deviation_rule). Above the band is informational.
+# Section 21 V10 under D-33 option (c) (v0.4.0; module docstring "Verdicts"): decode is recorded beside engines.json
+# projected_decode_tok_s and fails only below a non-null decode_floor_tok_s (the Principal's per-seat floor, D-47).
 QUEUED_RETRY_S = 15.0  # re-POST interval after an Arbiter "queued" answer (its own load_wait_s is the real queue)
 SETTLE_DELTA_BYTES = 256 * 1024 * 1024  # two GTT readings 10 s apart closer than this = the counter has settled
 GENERATION_IDLE_WAIT_S = 600.0  # Section 4.2 rule 3 belt: how long a direct request waits for the generation slot
-# V21 cache allowance above the pair's weights (residency_bounds). This window counts the weights as decimal GB
-# (142e9 bytes); Section 4.1 (v0.3.5) gives "~22 GiB for both caches" against the weights read as GiB under its
-# ~164 GiB budget, which is ~34 GB of room in this window's units. 28 GB (the v0.3.4 figure) is kept: with the slack
-# below the uncapped bound is 180e9 bytes, above any budget of 163 to 166 GiB (175.0e9 to 178.2e9), so the live budget
-# cap decides; 22 GiB here (175.6e9 uncapped) would set the bound below most of that range and fail a pair the Arbiter
-# granted inside its budget.
+# V21 (v0.4.0, S-24): the single-residency window for the GTT delta once the second seat is loaded and the first has
+# been evicted (residency_bounds): at least RESIDENCY_LOW_FACTOR of the SECOND seat's weights (exact bytes, D-31), at
+# most its weights plus the cache allowance plus allocator slack, CAPPED at the Arbiter's live budget. Any first seat
+# left beside a 146-151 GiB second one would overflow the budget cap (D-32: no pair fits), so the cap is what proves
+# one seat; the ledger and the first unit's state prove it a second way.
 RESIDENCY_CACHE_BYTES = 28 * GB
 RESIDENCY_SLACK_BYTES = 10 * GB  # allocator overhead on top of the caches before the delta is out of tolerance
-RESIDENCY_LOW_FACTOR = 0.85  # less than this fraction of the weights on the counter = the pair is not resident
+RESIDENCY_LOW_FACTOR = 0.85  # less than this fraction of the weights on the counter = the seat is not resident
 # Fallback only, when /arbiter/status carries no budget_bytes (the Arbiter has not measured its resident set, and then
 # it grants nothing). 170e9 bytes = 158.3 GiB, the v0.3.4 "~170 GB" figure, below the ~164 GiB Section 4.1 now
 # expects: the stricter bound, kept rather than raised to a figure this script cannot measure.
 DEFAULT_BUDGET_BYTES = 170 * GB
 TASK_ID = "phase3-loadtest"
 UNIT_PREFIX = "llama-server@"
-P3_CLASSES = {"core", "apex", "vision", "crosscheck"}
+P3_CLASSES = {"core", "apex"}  # S-34 (v0.4.0): the Day 1 LLM seats; the vision and cross-check classes are retired
 ORCH_CHAT_PATH = "/internal/v1/chat/completions"
 LLAMA_CHAT_PATH = "/v1/chat/completions"
 ADMIN_TOKEN_HEADER = "X-Atlas-Token"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
-NEMOTRON_ISSUE_ID = "#20732"  # engines.json known_issue of nemotron-3-super names it; Section 23 S6 rules on it
+NEMOTRON_ISSUE_ID = "#20732"  # Section 23 S6: an engines.json known_issue that names it (Nemotron 3 Super, phased)
 NEMOTRON_ISSUE = f"llama.cpp issue {NEMOTRON_ISSUE_ID} (Vulkan/HIP memory fault at ~20k-token prompts)"
 DEVICELOST_ISSUE = "llama.cpp issue #25664 (kernel 7.x amdgpu lockup_timeout; Phase 1 GRUB line)"
 DEEPSEEK_KV_ISSUES = "llama.cpp issues #25382/#26423"
@@ -270,6 +307,33 @@ COHERENCE_TOKENS_FACTUAL = 1024
 COHERENCE_TOKENS_SUMMARY = 2048
 COHERENCE_RETRY_FACTOR = 4
 V14B_MAX_DOUBLINGS = 8
+# S-26 / S-02: llama.cpp v0.4.1, the old pin built beside the new one for V25 only, is build b10964. An engine whose
+# min_llama_cpp_tag is newer cannot load there: it is a "newer architecture" (V22 row, R19 generalised) and V25
+# cannot cover it.
+PARITY_PIN_BUILD = 10964
+DEEP_THINK_GENERATOR = "glm-5.3-flash"  # atlas/arbiter.py DEEP_THINK_GENERATOR: the V14b probe of choice (both tiers)
+DECODE_FLOOR_TODO_ID = "decode-floors"
+KLD_TODO_ID = "kld-run"
+# S-02 (V25) and S-03: llama-perplexity runs. A 512-token window over 16 chunks of the fixed corpus (about 8k tokens,
+# the domain profiles under config/domains, present on the node) keeps the base-logits file near 1-2 GB per engine; the
+# deterministic task set is the HellaSwag-format file beside this script (6 lines per task: context, gold index, four
+# endings; tools/perplexity/perplexity.cpp hellaswag_score, identical at both pins), scored by log-likelihood, so no
+# sampling and no chat template is involved and both builds see byte-identical input. The file holds 24 commonsense
+# tasks written for this project (no third-party data; six per gold index), no comments and no blank lines (the tool
+# refuses a line count that is not a multiple of 6), and --hellaswag-tasks 1000 above the count keeps the file order.
+PARITY_CTX = 512
+PARITY_CHUNKS = 16
+PARITY_TASK_CTX = 2048
+PARITY_FA = ("on", "off")  # production renders -fa on (phase2/engine-env.py); off is the #28956 exposure check
+PARITY_TOOL_TIMEOUT_S = 3600.0
+# V25 thresholds at -fa on, INFERRED (no published build-to-build figure exists): two builds scoring the SAME file
+# should agree far closer than a KV quantisation does (q8_0 K/V is task-lossless at a mean KLD of 0.0018, register
+# D-29), so a mean KLD above 0.01 or fewer than 98 % identical top-1 tokens, or fewer correct tasks on the new build,
+# is a changed output. -fa off is recorded beside it, never a verdict: the old pin's non-FA Vulkan path carries the
+# KV-view bug fixed in #28956, so a difference there is the old build's.
+PARITY_MAX_MEAN_KLD = 0.01
+PARITY_MIN_SAME_TOP_PCT = 98.0
+PARITY_TASKS_FILE = Path(__file__).resolve().with_name("parity-tasks.txt")
 
 KV_LINE_RE = re.compile(r"llama_kv_cache: size = .*K \((\w+)\): .*V \((\w+)\):")
 RECURRENT_RE = re.compile(r"llama_memory_recurrent: size = .*R \((\w+)\): .*S \((\w+)\):")
@@ -284,14 +348,15 @@ EXTERNAL_STOP_MARKS = ("Received SIGTERM", "Stopping ", "Deactivated successfull
 
 # S52 Phase 3 items (module docstring: the pinned format strings these follow, file and line). Records only.
 MIB = 1024**2
-DEBUG_LINE_RE = re.compile(r"^\s*\d+\.\d{2}\.\d{3}\.\d{3} D ")  # common/log.cpp:154: a debug line
+DEBUG_LINE_RE = re.compile(r"^\s*\d+\.\d{2}\.\d{3}\.\d{3} D ")  # common/log.cpp:125-141: a debug line
 # common/fit.cpp:902, LOG_TRC after every --fit run: the K/V and compute lines before it were the trial context's
-# (printed at -lv 5 and -v, where common/common.cpp:1326 keeps them at INFO), never the served one's.
+# (printed at -lv 5 and -v, where common/common.cpp:1267 keeps them at INFO), never the served one's.
 FIT_END_RE = re.compile(r"common_fit_params: fitting params to free memory took")
 KV_SIZE_RE = re.compile(r"llama_kv_cache: size = +([0-9.]+) MiB \( *(\d+) cells, +(\d+) layers, +(\d+)/(\d+) seqs\), "
                         r"K \((\w+)\): +[0-9.]+ MiB, V \((\w+)\): +[0-9.]+ MiB")
 ISWA_PART_RE = re.compile(r"llama_kv_cache_iswa: creating +(non-SWA|SWA) KV cache, size = \d+ cells")
 DSV4_PART_RE = re.compile(r"llama_kv_cache_dsv4: creating DSV4 (.+?) KV cache, size = \d+ cells")
+IDX_PART_RE = re.compile(r"llama_memory_hybrid_idx: creating indexer KV cache, size = \d+ cells")  # glm5-next
 RECURRENT_SIZE_RE = re.compile(r"llama_memory_recurrent: size = +([0-9.]+) MiB \( *(\d+) cells, +(\d+) layers")
 DSV4_STATE_RE = re.compile(r"llama_dsv4_comp_state: (\w+) ratio = \d+, state = \d+ x \d+, streams = (\d+), "
                            r"rs_seq = \d+, layers = \d+, size = +([0-9.]+) MiB")
@@ -307,7 +372,7 @@ CKPT_ERASED_RE = re.compile(r"erasing old context checkpoint \(pos_min = -?\d+, 
                             r"size = ([0-9.]+) MiB\)")
 CKPT_CREATED_RE = re.compile(r"created context checkpoint (\d+) of (\d+) \(pos_min = -?\d+, pos_max = -?\d+, "
                              r"n_tokens = -?\d+, size = ([0-9.]+) MiB\)")  # TRACE
-# llama-server's defaults at the pin (common/common.h:628-632): the figures the cache-ram to-do weighs.
+# llama-server's defaults at the pin (common/common.h:634-638 at b11474): the figures the cache-ram to-do weighs.
 LLAMA_CACHE_RAM_DEFAULT_MIB = 8192
 LLAMA_CTX_CHECKPOINTS_DEFAULT = 32
 LLAMA_CHECKPOINT_MIN_STEP = 8192
@@ -767,10 +832,8 @@ def pending_begin(ctx: Ctx, key: str, fields: Sequence[str], why: str, clear_alw
     """Journal a TEMPORARY overrides.json change BEFORE it is written: the prior value of every field (restored on
     end), or "clear" for the fields in clear_always (never a legitimate persistent override). A SIGKILL, OOM or power
     cut between the render and its restore then cannot leave a probe profile (a 256x ctx_size, an f16 ladder rung) in
-    a production unit env file: pending_recover() restores it at the start of the next invocation. `coresident` is
-    never journalled (S52): the vision engine's co-resident profile is its standing one, and an overrides.json
-    coresident=false is the Principal's persistent choice, which Phase 3 never sets and never clears on an engine that
-    defines a co-resident profile (the Apex ladder clears the field on deepseek-v4-flash, which defines none)."""
+    a production unit env file: pending_recover() restores it at the start of the next invocation. (S-22, v0.4.0: the
+    co-resident profile and its overrides field are gone, so nothing here journals or clears `coresident`.)"""
     entry: dict[str, Any] = {"id": f"{key}:{why}:{now_iso()}:{random.randrange(10**6)}", "key": key, "why": why,
                              "set": {}, "clear": []}
     for f in fields:
@@ -805,8 +868,7 @@ def pending_recover(ctx: Ctx) -> None:
             f"({entry.get('why')}; id {entry.get('id')}): restoring set={entry.get('set')} clear={entry.get('clear')}")
         env = pending_restore(ctx, entry)
         log(f"RECOVERY: {entry.get('key')} env restored (kv {env.get('ATLAS_KV_TYPE')}, ctx "
-            f"{env.get('ATLAS_CTX_SIZE')}, parallel {env.get('ATLAS_PARALLEL')}, "
-            f"coresident {env.get('ATLAS_CORESIDENT')})")
+            f"{env.get('ATLAS_CTX_SIZE')}, parallel {env.get('ATLAS_PARALLEL')})")
     pending_path(ctx).unlink(missing_ok=True)
 
 
@@ -1195,6 +1257,8 @@ def parse_memory_lines(lines: Sequence[str]) -> dict[str, Any]:
             tag = m.group(1)
         elif m := DSV4_PART_RE.search(ln):
             tag = f"DSV4 {m.group(1)}"
+        elif IDX_PART_RE.search(ln):
+            tag = "indexer"  # glm5-next's DSA indexer cache (module docstring); the MLA attention line before is "full"
         elif m := KV_SIZE_RE.search(ln):
             parts.append({"part": tag or "full", "mib": _fnum(m.group(1)), "cells": int(m.group(2)),
                           "layers": int(m.group(3)), "seqs": int(m.group(4)), "streams": int(m.group(5)),
@@ -1347,7 +1411,7 @@ def memory_record(env: dict[str, str], parsed: dict[str, Any], projection: dict[
     return {
         "label": label,
         "profile": {"ctx": int(env.get("ATLAS_CTX_SIZE") or 0), "parallel": int(env.get("ATLAS_PARALLEL") or 1),
-                    "kv": env.get("ATLAS_KV_TYPE", ""), "coresident": env.get("ATLAS_CORESIDENT") == "1"},
+                    "kv": env.get("ATLAS_KV_TYPE", "")},
         "measured": parsed,
         "projected": projection,
         "ctx_shift": shift,
@@ -1683,20 +1747,88 @@ def register_footprint(ctl: Control, res: EngineResult, baseline: int) -> None:
     log(f"{res.key}: footprint {res.footprint_note}")
 
 
+def _band_text(band: Any) -> str:
+    lo, hi = band[0], band[1]
+    return f"{lo}" if lo == hi else f"{lo}-{hi}"
+
+
 def check_band(res: EngineResult, spec: dict[str, Any]) -> None:
-    """Section 21 V10 'measured tok/s within the expected bands' (Section 5.1 figures in engines.json)."""
-    band = spec.get("expected_decode_tok_s")
-    if not band or res.decode_tps_512 is None:
-        return
-    lo, hi = float(band[0]), float(band[1])
+    """Section 21 V10 under D-33 option (c) (module docstring "Verdicts"): the decode rate at 512 tokens is recorded
+    beside the research projection (projected_decode_tok_s) and is a V10 fail only below a non-null
+    decode_floor_tok_s, the per-seat floor the Principal sets (D-47). With no floor it is a record, never a verdict.
+    An entry that still carries a v0.3.5 expected_decode_tok_s band (the unchanged abliterated entry is the only one)
+    keeps the v0.3.5 rule: its band's lower bound is the floor, as before this revision."""
     d = res.decode_tps_512
-    if d < lo:
-        # V10 fail, no tolerance: the baseline says "within the expected bands" and declares no deviation.
-        res.band_fail = f"decode {d} tok/s below the expected band {band[0]}-{band[1]} (Section 5.1; V10 fail)"
-    elif d > hi:
-        res.band_note = f"decode {d} tok/s above the expected band {band[0]}-{band[1]} (informational)"
+    if d is None:
+        return
+    floor = spec.get("decode_floor_tok_s")
+    band = spec.get("expected_decode_tok_s")
+    proj = spec.get("projected_decode_tok_s")
+    if floor is None and band:
+        lo, hi = float(band[0]), float(band[1])
+        if d < lo:
+            res.band_fail = (f"decode {d} tok/s below the expected band {_band_text(band)} tok/s (the entry's v0.3.5 "
+                             "band, its rule unchanged; V10 fail)")
+        elif d > hi:
+            res.band_note = f"decode {d} tok/s above the expected band {_band_text(band)} tok/s (informational)"
+        else:
+            res.band_note = f"decode {d} tok/s within the expected band {_band_text(band)} tok/s"
+        return
+    versus = f" vs {_band_text(proj)} tok/s projected" if proj else " (no projection recorded)"
+    if floor is not None and d < float(floor):
+        # V10 fail, no tolerance: the Principal's floor is the verdict (D-33 (c), D-47).
+        res.band_fail = f"decode {d} tok/s below the seat's floor {floor} tok/s{versus} (D-33 (c); V10 fail)"
+    elif floor is not None:
+        res.band_note = f"decode {d} tok/s at or above the floor {floor} tok/s{versus}"
     else:
-        res.band_note = f"decode {d} tok/s within the expected band {band[0]}-{band[1]}"
+        res.band_note = (f"decode {d} tok/s{versus}; no floor set "
+                         "(D-33 (c): recorded, not a verdict; to-do decode-floors)")
+
+
+def build_number(tag: Any) -> int | None:
+    """'b11279' -> 11279; anything else (None, a v-tag) -> None."""
+    m = re.fullmatch(r"b(\d+)", str(tag or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def is_newer_arch(spec: dict[str, Any]) -> bool:
+    """S-26: support newer than the old pin v0.4.1 (b10964), so the engine cannot load there (module docstring)."""
+    n = build_number(spec.get("min_llama_cpp_tag"))
+    return n is not None and n > PARITY_PIN_BUILD
+
+
+def is_v22_engine(spec: dict[str, Any]) -> bool:
+    """The engines with a deferrable V22 row (R19 generalised, S-26): the Apex and every newer architecture."""
+    return spec.get("arbiter_class") == "apex" or is_newer_arch(spec)
+
+
+def v4_verdict(spec: dict[str, Any], ok: bool, msg: str) -> tuple[str, str]:
+    """V4 for one engine: a failure of a newer-architecture engine defers (R19 generalised, S-26: it never blocks the
+    Phase 3 gate; V22 carries it), every other failure is a fail."""
+    if ok:
+        return "pass", msg
+    if is_newer_arch(spec):
+        return "deferred", f"{msg} [newer architecture ({spec.get('arch') or '?'}, first build "  \
+            f"{spec.get('min_llama_cpp_tag')}): deferred without blocking, see V22; R19 generalised, S-26]"
+    return "fail", msg
+
+
+def set_v22(res: EngineResult, spec: dict[str, Any]) -> None:
+    """The V22 row of a newer-architecture engine tested by test_engine (the Apex's comes from its ladder): pass when
+    it loaded, generated and released, else deferred with the reason (R19 generalised, S-26)."""
+    if not is_newer_arch(spec) or spec.get("kv_ladder"):
+        return
+    head = (f"{res.key} ({spec.get('arch') or '?'}, first build {spec.get('min_llama_cpp_tag')}; "
+            f"pin {PARITY_PIN_BUILD} cannot load it)")
+    if res.ok and res.kv_proof_ok:
+        res.v22_result = "pass"
+        res.v22_msg = (f"{head}: loads, proves {res.kv_applied or res.kv_requested} KV, generates at 512 and 8k "
+                       f"(decode {fmt_num(res.decode_tps_512)} tok/s) and releases its memory")
+        return
+    why = (res.load_error or res.band_fail or (res.release_note if res.released is False else "")
+           or ("V4 not proven: " + res.kv_proof_msg if res.load_ok and not res.kv_proof_ok else "") or "not ok")
+    res.v22_result = "deferred"
+    res.v22_msg = f"{head}: deferred without blocking the phase (R19 generalised, S-26): {why[:300]}"
 
 
 def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict[str, str]) -> None:
@@ -1725,9 +1857,10 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
     require_generation_idle(ctx.orch_url, f"{key} 8k point")
     r, note = measure_point(port, PREFILL_LONG, "8k")
     log(f"{key}: {note}")
-    # Section 23 S6 (engines.json known_issue of nemotron-3-super names #20732): the 8k prefill test checks the server
-    # is still alive afterwards (never a hang) and records the issue number. The verdict is engines.json's: "pass with
-    # the '#20732 checked, server alive' note when /health answers, fail when it does not". Section 21 V10 wants load,
+    # Section 23 S6 (an engines.json known_issue naming #20732; Nemotron 3 Super's, phased after Day 1): the 8k
+    # prefill test checks the server is still alive afterwards (never a hang) and records the issue number. The
+    # verdict is engines.json's: "pass with the '#20732 checked, server alive' note when /health answers, fail when it
+    # does not". Section 21 V10 wants load,
     # generate, swap and release at 8k as at 512: a server that is dead after 8k has not shown that, and its footprint
     # is never registered (rule 1), so for every engine a death at 8k is a V10 FAIL; Nemotron's carries the issue
     # number in the message (the S6 "warning with the issue number" is recorded beside the fail, not instead of it).
@@ -1779,11 +1912,9 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     if spec.get("kv_ladder"):
         ladder_engine(ctx, ctl, key, previous, baseline, res)
         return
-    # Step 2 measures the unit as production runs it: the standing profile (S52: the vision engine's co-resident
-    # 2 x 32k) or whatever overrides.json says, e.g. the Principal's coresident=false. The footprint registered here
-    # (rule 1) is charged by the Arbiter at the profile it was measured at only (arbiter.py measured_profile): an
-    # 8 x 32k figure never stands for the 2 x 32k unit once the override is cleared, which runs at its projection until
-    # measured itself. Nothing in Phase 3 sets or clears the vision engine's coresident field.
+    # Step 2 measures the unit as production runs it: engines.json's profile or whatever overrides.json says (S-22:
+    # there is no co-resident profile any more). The footprint registered here (rule 1) is charged by the Arbiter at
+    # the profile it was measured at only (arbiter.py measured_profile).
     env = ctx.render(key)
     res.kv_requested = env.get("ATLAS_KV_TYPE", spec.get("kv_class", ""))
     # The previous engine is released BEFORE the model-file check: an engine that never loads must not leave the
@@ -1796,8 +1927,9 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
                           "not found (step 01)")
         res.resident_after = False
         finalize_control(res, ctl)
+        set_v22(res, spec)
         res.save(ctx)
-        record("V4", "fail", f"{key}: not loaded ({res.load_error})")
+        record("V4", *v4_verdict(spec, False, f"{key}: not loaded ({res.load_error})"))
         return
     port = int(env["LLAMA_ARG_PORT"])
     proof_lines = int(env.get("ATLAS_KV_PROOF_LINES", spec.get("kv_proof_lines", 0)) or 0)
@@ -1811,8 +1943,9 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
         log(f"{key}: LOAD FAILED: {res.load_error}")
         stop_and_release(ctx, ctl, key, baseline, res)  # rule 5: the counter is polled even when the unit is gone
         finalize_control(res, ctl)
+        set_v22(res, spec)
         res.save(ctx)
-        record("V4", "fail", f"{key}: not loaded ({res.load_error[:300]})")
+        record("V4", *v4_verdict(spec, False, f"{key}: not loaded ({res.load_error[:300]})"))
         halt_if_leaked(ctx, res)
         return
     res.load_ok = True
@@ -1822,7 +1955,7 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     inv = unit_invocation_id(key)
     res.kv_proof_ok, res.kv_proof_msg, res.kv_applied = prove_kv(key, res.kv_requested, proof_lines, inv, since, port)
     log(f"{key}: V4 {'PASS' if res.kv_proof_ok else 'FAIL'}: {res.kv_proof_msg}")
-    record("V4", "pass" if res.kv_proof_ok else "fail", res.kv_proof_msg)
+    record("V4", *v4_verdict(spec, res.kv_proof_ok, res.kv_proof_msg))
     host_load = host_memory(key)  # S52 (b): before any request, so the tests' cache growth can be told apart
     run_measurements(ctx, res, key, port, env)
     take_memory_record(ctx, res, key, env, inv, since, host_load)  # S52 (a)-(c): a record, never a verdict
@@ -1836,13 +1969,14 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
     res.ok = (res.load_ok and res.generated and not res.load_error and not res.band_fail
               and not res.crashed_at_8k and res.released is not False)
     finalize_control(res, ctl)
+    set_v22(res, spec)
     res.save(ctx)
     log(f"{key}: result ok={res.ok} decode512={res.decode_tps_512} decode8k={res.decode_tps_8k} "
         f"prefill512={res.prefill_tps_512} prefill8k={res.prefill_tps_8k} warnings={res.warnings}")
     halt_if_leaked(ctx, res)
 
 
-# --- the DeepSeek KV ladder (engines.json kv_ladder_rule; Section 4.3; Section 23 S2; R19) ----------------------------
+# --- the Apex KV ladder (engines.json kv_ladder_rule; S-42, D-29 (a); Section 4.3; R19) -------------------------------
 
 
 @dataclass
@@ -1868,20 +2002,18 @@ def rung_verdict(r: dict[str, Any]) -> str:
 
 
 def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any]], base_kv: str,
-                  f16_cap: int | None, stop_reason: str, released: bool | None, release_note: str,
-                  decode_512: float | None, prefill_512: float | None) -> LadderVerdict:
-    """Pure decision of the ladder (Section 4.3; Section 23 S2; Section 21 V4/V22; R19; engines.json kv_ladder_rule
-    where it agrees with the document). Every rung f16 -> q8_0 -> q4_0 is tried (a coherence prompt "at each rung");
-    the winner is the LOWEST rung (last in list order) that loaded, printed its proof lines and answered coherently,
-    whatever the rungs above it did (a q8_0 that failed to load for memory does not hide a q4_0 that fits):
-      * q4_0 (the Section 4.3 target) -> V4 pass, overrides cleared (the rungs above were the path down);
-      * q8_0 -> V4 pass with the note that q4_0 was refused or incoherent (issues #25382, #26423), written to overrides;
-      * f16 only -> V4 DEFERRED (unquantised KV is exactly the fallback V4 exists to catch), kv_type=f16 and
-        ctx_size=ctx_size_f16_cap written to overrides, V22 still passes with the note (S2);
+                  stop_reason: str, released: bool | None, release_note: str,
+                  decode_512: float | None, prefill_512: float | None, quant: str = "") -> LadderVerdict:
+    """Pure decision of the ladder (engines.json kv_ladder_rule under S-42 / D-29 (a); Section 21 V4/V22; R19). The
+    rungs are tried in list order, f16 then q8_0, and the FIRST rung that loaded, printed its proof lines and answered
+    coherently stands (the highest precision that fits; ladder_engine stops there, so a later rung is never tried
+    after a winner):
+      * the entry's own kv_class (f16) -> V4 pass, overrides cleared;
+      * q8_0 -> V4 pass with the note that f16 failed to load or was incoherent, kv_type written to overrides;
       * no coherent rung at all -> V4 and V22 deferred with the reason (R19 keeps the phase unblocked);
       * a winner whose measurement failed (request error, death at 8k) is still the winner (a measurement failure is
         not incoherence) but V22 records deferred with that reason (R19).
-    A rung the loop never reached (model file missing, a rule-5 leak ended the ladder) is listed as "not tried"."""
+    q4_0 is never a rung (D-29 (a)). A rung the loop never reached is listed as "not tried"."""
     summary = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in rungs)
     untried = [kv for kv in ladder if kv not in {r["kv"] for r in rungs}]
     if untried:
@@ -1893,48 +2025,30 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
             winner="", v4_result="deferred",
             v4_msg=f"{key}: no KV type proven coherent, V22 deferred (R19): {reason}",
             v22_result="deferred",
-            v22_msg=f"DeepSeek V4 Flash deferred without blocking the phase (R19): {reason}; ladder: {summary}",
+            v22_msg=f"{key}: deferred without blocking the phase (R19): {reason}; ladder: {summary}",
             set_ov=[], clear_ov=["kv_type", "ctx_size"], note="overrides cleared", deviation="", summary=summary)
-    wrung = winners[-1]  # rungs are in list order, so the last winner is the lowest coherent rung
+    wrung = winners[0]  # rungs are in list order: the first winner is the highest-precision coherent rung
     winner = str(wrung["kv"])
-    below = [r for r in rungs if ladder.index(r["kv"]) > ladder.index(winner)]
-    detail = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in below) or "not reached"
-    above_failed = [r for r in rungs if ladder.index(r["kv"]) < ladder.index(winner) and r not in winners]
-    if above_failed:
-        # The document keeps the lowest coherent setting; a failure above it is recorded, not a reason to stop.
-        summary += "; note: rungs above the winner failed (" + ", ".join(
-            f"{r['kv']}={rung_verdict(r)}" for r in above_failed) + "), the lowest coherent rung stands (Section 4.3)"
-    base_rung = next((r for r in rungs if r["kv"] == base_kv), None)
-    base_state = rung_verdict(base_rung) if base_rung else "not tried"
+    above = [r for r in rungs if ladder.index(r["kv"]) < ladder.index(winner)]
+    detail = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in above)
     measure_error = str(wrung.get("measure_error") or "")
     ok = released is not False and not measure_error
     perf = f"decode {decode_512} tok/s at 512, prefill {prefill_512} tok/s"
     if winner == base_kv:
+        note = "overrides cleared"
         v = LadderVerdict(winner, "pass",
-                          f"{key}: {winner} applied and coherent, the Section 4.3 target reached (ladder: {summary}; "
+                          f"{key}: {winner} applied and coherent, the highest-precision rung (S-42; ladder: {summary}; "
                           "overrides cleared)", "pass" if ok else "deferred", "", [], ["kv_type", "ctx_size"],
-                          "baseline kept (overrides cleared)", "", summary)
-    elif winner == "f16":
-        cap = int(f16_cap) if f16_cap else None
-        set_ov = [("kv_type", "f16")] + ([("ctx_size", str(cap))] if cap else [])
-        note = f"f16 override written, ctx capped to {cap}" if cap else "f16 override written (no ctx_size_f16_cap)"
-        deviation = (f"KV f16 instead of Section 4.3 q4_0: no quantised rung usable on this build ({detail}; "
-                     f"{DEEPSEEK_KV_ISSUES}); {note}")
-        v = LadderVerdict(winner, "deferred",
-                          f"{key}: unquantised KV: every quantised rung below f16 failed ({detail}; "
-                          f"{DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
-                          "pass" if ok else "deferred", "", set_ov, [], note, deviation, summary)
+                          note, "", summary)
     else:
         note = f"{winner} written to overrides.json"
-        deviation = (f"KV {winner} instead of Section 4.3 q4_0: q4_0 {base_state} on this build "
-                     f"({DEEPSEEK_KV_ISSUES})")
         v = LadderVerdict(winner, "pass",
-                          f"{key}: {winner} applied (Section 4.3 setting {base_kv} {base_state}: {detail}; "
-                          f"{DEEPSEEK_KV_ISSUES}); {note} (ladder: {summary})",
-                          "pass" if ok else "deferred", "", [("kv_type", winner)], ["ctx_size"], note, deviation,
-                          summary)
-    v.v22_msg = (f"DeepSeek V4 Flash 0731 UD-Q4_K_XL loads and generates coherently with {winner} KV ({perf}; "
-                 f"{v.note})" + (f"; unquantised KV, see V4 deferred ({DEEPSEEK_KV_ISSUES})" if winner == "f16" else "")
+                          f"{key}: {winner} applied because the {base_kv} rung did not stand ({detail or 'not tried'}; "
+                          f"{DEEPSEEK_KV_ISSUES}); {note} (S-42; ladder: {summary})", "pass" if ok else "deferred", "",
+                          [("kv_type", winner)],
+                          ["ctx_size"], note, "", summary)
+    v.v22_msg = (f"{key}{' ' + quant if quant else ''} loads and generates coherently with {winner} KV ({perf}; "
+                 f"{v.note})"
                  + (f"; deferred: measurement failed at {winner}: {measure_error[:200]} (R19)" if measure_error else "")
                  + (f"; deferred: {release_note} (R19)" if released is False else ""))
     return v
@@ -1945,38 +2059,28 @@ LADDER_RUNG_FIELDS = ("decode_tps_512", "decode_tps_8k", "prefill_tps_512", "pre
 
 
 def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseline: int, res: EngineResult) -> None:
-    """DeepSeek V4 Flash (research conflict b; Section 4.3; Section 23 S2): "Phase 3 loads f16, then q8_0, then q4_0,
-    running a coherence prompt at each rung, and keeps the lowest coherent setting". EVERY rung is loaded, proved (V4
-    lines) and asked the coherence prompt, whatever the rung above did: a q8_0 that fails to load (its KV at 32768 is
-    about the bytes of the f16 rung at its 16384 cap) must not hide a q4_0 that fits, and the document says "at each
-    rung". The winner is the lowest rung that loaded, proved and answered coherently (decide_ladder); a coherent rung
-    whose measurement fails (request error, death at 8k) is not incoherence and still counts, with V22 deferred when it
-    is the winner (R19). The f16 rung is the control that attributes an incoherent quantised rung to KV quantisation
-    rather than to the build or the model. Only a missing model file or a rule-5 leak ends the ladder early (the leak
-    stops the phase, Infra, after the result is saved). Every rung's overrides are journalled (pending-overrides.json)
-    so an interrupted ladder cannot leave an f16 profile behind. engines.json kv_ladder_rule (3)/(4) still describe an
-    early stop; the document wins (CONVENTIONS.md preamble) and its writer is asked to align the text."""
+    """The Apex (engines.json kv_ladder_rule, S-42, D-29 (a); Section 4.3): the HIGHEST-precision coherent rung that
+    fits stands. f16 is loaded first at the entry's own ctx_size and parallel, proved (V4 lines) and asked the
+    coherence prompt; when it stands, nothing more is loaded. q8_0 is tried only when f16 failed to load (refused
+    type, OOM, DeviceLost) or was incoherent or unproven; q4_0 is never a rung. A coherent rung whose measurement fails
+    (request error, death at 8k) is not incoherence: it still stands, with V22 deferred (R19). Only a missing model
+    file or a rule-5 leak ends the ladder early (the leak stops the phase, Infra, after the result is saved). Every
+    rung's overrides are journalled (pending-overrides.json) so an interrupted ladder cannot leave a probe rung
+    behind."""
     spec = ctx.spec(key)
     ladder: list[str] = list(spec["kv_ladder"])
-    f16_cap = spec.get("ctx_size_f16_cap")
-    base_kv = spec.get("kv_class", "q4_0")
+    base_kv = spec.get("kv_class", ladder[0] if ladder else "f16")
     proof_lines = int(spec.get("kv_proof_lines", 0) or 0)
     res.kv_requested = f"ladder {'->'.join(ladder)}"
     t_swap = time.monotonic()
     _, res.swap_note = swap_out(ctx, ctl, previous, baseline)
     swap_measured = False
     stop_reason = ""
-    pending = pending_begin(ctx, key, ["kv_type", "ctx_size"], "DeepSeek KV ladder rungs")
+    pending = pending_begin(ctx, key, ["kv_type", "ctx_size"], "Apex KV ladder rungs")
     for kv in ladder:
         rung: dict[str, Any] = {"kv": kv, "load_ok": False, "coherent": False, "kv_proof_ok": False, "note": ""}
         res.ladder.append(rung)
-        set_ov: list[tuple[str, str]] = [("kv_type", kv)]
-        clear_ov: list[str] = ["coresident"]
-        if kv == "f16" and f16_cap:
-            set_ov.append(("ctx_size", str(int(f16_cap))))
-        else:
-            clear_ov.append("ctx_size")
-        env = ctx.render(key, set_ov, clear_ov)
+        env = ctx.render(key, [("kv_type", kv)], ["ctx_size"])
         if env.get("ATLAS_MODEL_PRESENT") != "1":
             stop_reason = f"model file {env.get('ATLAS_MODEL_FILE')} not found (step 01)"
             rung["note"] = stop_reason
@@ -1990,8 +2094,7 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
             rung["note"] = f"load failed: {exc}"
             if "ErrorDeviceLost" in str(exc):
                 rung["note"] += f" [{DEVICELOST_ISSUE}]"
-            log(f"{key}: rung {kv} {rung['note']}; the next rung is still tried (Section 4.3: a coherence prompt at "
-                "each rung, the lowest coherent setting is kept)")
+            log(f"{key}: rung {kv} {rung['note']}; the next rung is tried (S-42: q8_0 only after f16 fails)")
             stop_and_release(ctx, ctl, key, baseline, res)  # rule 5: polled even when the unit never came up
             rung["released"] = res.released
             if res.released is False:
@@ -2015,7 +2118,7 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         log(f"{key}: rung {kv} coherence {'ok' if coherent else 'FAIL'}: {detail}")
         won = coherent and ok
         if won:
-            # Per-rung measurement into res (reset first so a rung never inherits the one above), copied into the rung.
+            # Per-rung measurement into res (reset first so a rung never inherits the one before), copied into the rung.
             res.load_error, res.band_fail, res.band_note, res.crashed_at_8k, res.prefill_8k_note = "", "", "", False, ""
             res.footprint_bytes, res.footprint_note = None, ""
             run_measurements(ctx, res, key, port, env)
@@ -2031,20 +2134,18 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         if res.released is False:
             stop_reason = f"memory not released after the {kv} rung: {res.release_note}"
             break
-        if not won:
-            log(f"{key}: rung {kv} {rung_verdict(rung)}; the next rung is still tried (Section 4.3: a coherence "
-                "prompt at each rung)")
-        elif rung.get("measure_error"):
-            log(f"{key}: rung {kv} is coherent and proven but its measurement failed ({rung['measure_error'][:160]}): "
-                "it stands as a winner (V22 deferred if it is the lowest, R19); the next rung is still tried")
-        else:
-            log(f"{key}: rung {kv} coherent and proven: current winner; descending")
-    standing = next((r for r in reversed(res.ladder) if r.get("coherent") and r.get("kv_proof_ok")), {})
-    v = decide_ladder(key, ladder, res.ladder, base_kv, f16_cap, stop_reason, res.released, res.release_note,
-                      standing.get("decode_tps_512"), standing.get("prefill_tps_512"))
+        if won:
+            log(f"{key}: rung {kv} coherent and proven: it stands (S-42: the highest-precision coherent rung)"
+                + (f"; its measurement failed ({rung['measure_error'][:160]}): V22 deferred (R19)"
+                   if rung.get("measure_error") else ""))
+            break
+        log(f"{key}: rung {kv} {rung_verdict(rung)}; the next rung is tried (S-42)")
+    standing = next((r for r in res.ladder if r.get("coherent") and r.get("kv_proof_ok")), {})
+    v = decide_ladder(key, ladder, res.ladder, base_kv, stop_reason, res.released, res.release_note,
+                      standing.get("decode_tps_512"), standing.get("prefill_tps_512"), str(spec.get("quant") or ""))
     ctx.render(key, v.set_ov, v.clear_ov)
     pending_end(ctx, pending)
-    # The result's figures are the winner's (the rung that stands), not the last rung tried.
+    # The result's figures are the winner's (the rung that stands).
     wrung = standing if v.winner else None
     for f in LADDER_RUNG_FIELDS:
         setattr(res, f, wrung.get(f) if wrung else EngineResult.__dataclass_fields__[f].default)
@@ -2099,8 +2200,9 @@ def cmd_prepare(ctx: Ctx, _args: argparse.Namespace) -> int:
     total = gtt_total_bytes()
     log(f"prepare: baseline GTT used {fmt_gb(cur)} of {fmt_gb(total)} (residents only; control via {ctl.mode})")
     if cur > 40 * GB:
-        log(f"prepare: WARNING baseline {fmt_gb(cur)} is far above the ~17 GB resident set of Section 4.1; "
-            "something weight-bearing is still loaded outside the llama-server@ units")
+        log(f"prepare: WARNING baseline {fmt_gb(cur)} is far above the resident set on the GTT counter (v0.4.0: the "
+            "router, about 5 GB; the Qwen3 embedder/reranker pair runs on the CPU, D-14 (e)); something "
+            "weight-bearing is still loaded outside the llama-server@ units")
     ctx.results_dir.mkdir(parents=True, exist_ok=True)
     (ctx.results_dir / "baseline.json").write_text(json.dumps({
         "gtt_used_bytes": cur, "gtt_total_bytes": total, "measured_at": now_iso(), "control_mode": ctl.mode,
@@ -2139,13 +2241,20 @@ def fmt_num(v: float | None) -> str:
 
 
 def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
-    """Section 21 V10 per engine: load, generate (512 and 8k), swap, release, tok/s within the band."""
+    """Section 21 V10 per engine (D-33 option (c)): load, generate (512 and 8k), swap, release; decode recorded beside
+    the projection and failing only below the seat's floor (check_band)."""
+    floor = spec.get("decode_floor_tok_s")
     band = spec.get("expected_decode_tok_s")
-    band_s = f"{band[0]}-{band[1]}" if band else "n/a"
+    proj = spec.get("projected_decode_tok_s")
+    if floor is None and band:
+        ref = f"expected band {_band_text(band)}, v0.3.5 rule"
+    else:
+        ref = (f"projected {_band_text(proj)}" if proj else "no projection") + (f", floor {floor}" if floor is not None
+                                                                                else ", no floor")
     if not res.load_ok:
         return "fail", f"{res.key}: load FAILED ({res.load_error[:200]}) [control {res.control_mode or '?'}]"
     parts = [f"{res.key}: load ok (KV {res.kv_applied or res.kv_requested}, control {res.control_mode or '?'})",
-             f"decode {fmt_num(res.decode_tps_512)}/{fmt_num(res.decode_tps_8k)} tok/s at 512/8k (expected {band_s})",
+             f"decode {fmt_num(res.decode_tps_512)}/{fmt_num(res.decode_tps_8k)} tok/s at 512/8k ({ref})",
              f"prefill {fmt_num(res.prefill_tps_512)}/{fmt_num(res.prefill_tps_8k)} tok/s",
              f"swap {fmt_num(res.swap_s)}s",
              f"footprint {fmt_gb(res.footprint_bytes) if res.footprint_bytes is not None else '-'}",
@@ -2153,13 +2262,13 @@ def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
     if res.prefill_8k_note:
         parts.append(f"8k: {res.prefill_8k_note[:120]}")
     if res.band_fail:
-        parts.append(f"BAND FAIL: {res.band_fail}")
+        parts.append(f"FLOOR FAIL: {res.band_fail}")
     if res.warnings:
         parts.append("warn: " + " | ".join(w[:160] for w in res.warnings))
     if res.load_error:
         parts.append(f"error: {res.load_error[:200]}")
-    # A death at 8k fails the engine; for nemotron-3-super the issue number rides in the message (known_issue_note,
-    # Section 23 S6 / engines.json known_issue: "fail when it does not" answer /health).
+    # A death at 8k fails the engine; where engines.json's known_issue names #20732 (Nemotron 3 Super, phased) the
+    # issue number rides in the message (known_issue_note, Section 23 S6).
     if res.crashed_at_8k and res.known_issue_note and NEMOTRON_ISSUE_ID not in "; ".join(parts):
         parts.append(f"S6: {res.known_issue_note[:160]}")
     ok = (res.generated and not res.load_error and not res.crashed_at_8k and not res.stopped_externally
@@ -2167,49 +2276,83 @@ def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
     return ("pass" if ok else "fail"), "; ".join(parts)
 
 
+DECODE_FLOOR_TODO_TITLE = ("Set a decode floor per LLM seat (D-33 (c), D-47): until you do, Phase 3 records each "
+                           "seat's decode rate beside its projection and never fails it on speed")
+
+
+def raise_decode_floor_todo(ctx: Ctx) -> None:
+    """D-33 (c) / D-47: the floors are the Principal's input. While any Phase 3 seat has a null decode_floor_tok_s the
+    to-do decode-floors carries every seat's measured decode beside its projection (re-raised by each summarize)."""
+    items: list[str] = []
+    for key in ctx.core_keys():
+        spec = ctx.spec(key)
+        if spec.get("decode_floor_tok_s") is not None or spec.get("expected_decode_tok_s"):
+            continue  # a floor set, or a v0.3.5 band kept with its rule (check_band): a verdict exists already
+        res = load_result(ctx, key)
+        proj = spec.get("projected_decode_tok_s")
+        measured = (f"{fmt_num(res.decode_tps_512)}/{fmt_num(res.decode_tps_8k)} tok/s at 512/8k"
+                    if res is not None and res.decode_tps_512 is not None else "not measured")
+        items.append(f"{key}: {measured}, projected {_band_text(proj) if proj else 'none'} tok/s")
+    if items:
+        todo(DECODE_FLOOR_TODO_ID, DECODE_FLOOR_TODO_TITLE,
+             "Measured in Phase 3 step 02: " + " | ".join(items) + ". Set decode_floor_tok_s (tok/s at 512 tokens) on "
+             "each engines.json entry you want gated, together with the deep-tier floor of D-47; below it V10 fails. "
+             "Null (the default) is record only. Phase 3 changed no engine setting.")
+
+
 def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
     failed: list[str] = []
     warned: list[str] = []
     missing: list[str] = []
-    off_band: list[str] = []
-    apex_lines: list[str] = []
+    off_floor: list[str] = []
+    v22_lines: list[str] = []
+    v22_results: list[str] = []
     for key in ctx.core_keys():
         spec = ctx.spec(key)
         res = load_result(ctx, key)
-        is_apex = spec.get("arbiter_class") == "apex"
+        deferrable = is_v22_engine(spec)
         if res is None:
-            if is_apex:
-                record("V10", "deferred", f"{key}: no ladder result [Apex: see V22]")
-                record("V22", "deferred", f"{key}: no ladder result recorded (R19)")
-                apex_lines.append(f"{key}=deferred")
+            if deferrable:
+                record("V10", "deferred", f"{key}: no load-test result [newer architecture or Apex: see V22]")
+                record("V22", "deferred", f"{key}: no result recorded (R19)")
+                v22_lines.append(f"{key}=deferred")
+                v22_results.append("deferred")
             else:
                 missing.append(key)
                 record("V10", "fail", f"{key}: no load-test result (step 02 did not reach it)")
             continue
         result, msg = v10_line(res, spec)
-        if is_apex:
-            # R19: the Apex engine has its own row (V22); its V10 line is informational and never fails the summary.
-            record("V10", "pass" if result == "pass" else "deferred", msg + " [Apex: see V22]")
-            apex_lines.append(f"{key}={res.v22_result or 'deferred'}")
-            record("V22", res.v22_result or "deferred", res.v22_msg or f"{key}: no ladder result recorded (R19)")
+        if deferrable:
+            # R19 generalised (S-26): an engine with its own V22 row never fails the V10 summary; its V10 line is a
+            # record (pass or deferred) and V22 carries the verdict, deferrable.
+            record("V10", "pass" if result == "pass" else "deferred", msg + " [see V22]")
+            v22 = res.v22_result or "deferred"
+            record("V22", v22, res.v22_msg or f"{key}: no V22 result recorded (R19)")
+            v22_lines.append(f"{key}={v22}")
+            v22_results.append(v22)
             continue
         record("V10", result, msg)
         if result != "pass":
             failed.append(key)
         elif res.warnings:
             warned.append(key)
-        if res.band_fail or "under the expected band" in res.band_note:
-            off_band.append(key)
-    tested = [k for k in ctx.core_keys() if ctx.spec(k).get("arbiter_class") != "apex"]
+        if res.band_fail:
+            off_floor.append(key)
+    tested = [k for k in ctx.core_keys() if not is_v22_engine(ctx.spec(k))]
     if failed or missing:
         record("V10", "fail", f"summary: {len(failed) + len(missing)} of {len(tested)} engines failed "
-               f"({', '.join(failed + missing)}); off-band: {', '.join(off_band) or 'none'}; "
-               f"warns: {', '.join(warned) or 'none'}; apex: {', '.join(apex_lines) or '-'}")
+               f"({', '.join(failed + missing)}); below their floor: {', '.join(off_floor) or 'none'}; "
+               f"warns: {', '.join(warned) or 'none'}; V22 engines: {', '.join(v22_lines) or '-'}")
     else:
-        bands = "within the expected bands" if not off_band else f"tok/s under band for {', '.join(off_band)}"
         record("V10", "pass", f"summary: all {len(tested)} engines load, generate, swap and release memory at their "
-               f"fixed quantisations, {bands}; warns: {', '.join(warned) or 'none'}; "
-               f"apex: {', '.join(apex_lines) or '-'}")
+               f"fixed quantisations; decode recorded beside the projections (D-33 (c)); warns: "
+               f"{', '.join(warned) or 'none'}; V22 engines: {', '.join(v22_lines) or '-'}")
+    if v22_lines:
+        # R19 generalised: deferrable, never a fail; the gate reads this line (the latest V22).
+        verdict = "pass" if all(r == "pass" for r in v22_results) else "deferred"
+        record("V22", verdict, f"summary: {', '.join(v22_lines)} (newer architectures and the Apex, R19 "
+               "generalised, S-26: a deferred engine never blocks the phase; its seats use their D-40 fallback)")
+    raise_decode_floor_todo(ctx)
     return 0
 
 
@@ -2229,10 +2372,10 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
         if res.baseline_deviation and res.baseline_deviation != str(spec.get("baseline_deviation") or ""):
             deviations.append((key, res.baseline_deviation))
         notes = []
-        if res.arbiter_class == "apex":
+        if is_v22_engine(spec):
             notes.append(f"V22 {res.v22_result or '?'}")
         if res.band_fail:
-            notes.append("BELOW BAND")
+            notes.append("BELOW FLOOR")
         if res.warnings:
             notes.append("warn")
         if res.prefill_8k_note:
@@ -2250,10 +2393,12 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
     widths = [max(len(str(r[i])) for r in [cols, *rows]) for i in range(len(cols))]
     for r in [cols, *rows]:
         print("  ".join(str(c).ljust(w) for c, w in zip(r, widths, strict=True)), file=sys.stderr)
-    co = ctx.results_dir / "coresident.json"
-    if co.is_file():
-        d = json.loads(co.read_text(encoding="utf-8"))
-        print(f"two-residency: {d.get('summary', '-')}", file=sys.stderr)
+    for name, label in (("residency.json", "single residency"), ("parity.json", "output parity (V25)"),
+                        ("quality.json", "KLD record (S-03)")):
+        f = ctx.results_dir / name
+        if f.is_file():
+            d = json.loads(f.read_text(encoding="utf-8"))
+            print(f"{label}: {d.get('summary', '-')}", file=sys.stderr)
     # engines.json baseline_deviation_rule: every deviation from a closed value is printed here, never only in the file.
     print("Baseline deviations (engines.json baseline_deviation_rule):" if deviations else
           "Baseline deviations: none", file=sys.stderr)
@@ -2548,7 +2693,7 @@ def cmd_memory(ctx: Ctx, _args: argparse.Namespace) -> int:
     return 0
 
 
-# --- two-residency (Section 17 step 3; V21) and the real-engine Arbiter proof (V14b) ---------------------------------
+# --- single residency (Section 17 step 3; V21, S-24) and the real-engine Arbiter proof (V14b) -----------------------
 
 
 def queue_proof(a: dict[str, Any], b: dict[str, Any], solo_second_s: float) -> tuple[bool, str]:
@@ -2574,25 +2719,26 @@ def queue_proof(a: dict[str, Any], b: dict[str, Any], solo_second_s: float) -> t
 
 
 def residency_bounds(weights_bytes: int, budget_bytes: int) -> tuple[int, int]:
-    """Pure V21 window for the GTT delta of the resident pair (Section 17 step 3 "confirm both hold at ~142 GB"):
-    at least RESIDENCY_LOW_FACTOR of the weights (less means one engine is not really resident), at most the weights
-    plus the cache allowance (RESIDENCY_CACHE_BYTES; Section 4.1 expects ~22 GiB for both caches) plus allocator slack,
-    CAPPED at the live engine budget: a pair that overflowed the Arbiter's budget (~164 GiB expected, Section 4.1) can
-    never pass the residency half of V21."""
+    """Pure V21 window for the GTT delta of the one resident seat (S-24, v0.4.0): at least RESIDENCY_LOW_FACTOR of its
+    weights (less means it is not really resident), at most the weights plus the cache allowance and allocator slack,
+    CAPPED at the live engine budget: a second seat left beside a 146-151 GiB one overflows the Arbiter's budget, so
+    the cap is the memory half of the single-residency proof (D-32 (a))."""
     low = int(RESIDENCY_LOW_FACTOR * weights_bytes)
     high = min(weights_bytes + RESIDENCY_CACHE_BYTES + RESIDENCY_SLACK_BYTES, int(budget_bytes))
     return low, high
 
 
 def pick_probe_key(ctx: Ctx, exclude: Sequence[str]) -> str:
-    """The engine whose unit profile is rendered over budget for the V14b proof: nemotron-3-super by preference (the
-    Deep Think adversary engine, so one over-budget profile makes both the standard and the deep tier not fit), else
-    the first non-Apex core engine that is not part of the pair."""
-    cands = [k for k in ctx.core_keys() if k not in exclude and ctx.spec(k).get("arbiter_class") != "apex"]
-    if "nemotron-3-super" in cands:
-        return "nemotron-3-super"
+    """The engine whose unit profile is rendered over budget for the V14b proof: the Deep Think generator
+    glm-5.3-flash by preference (v0.4.0, S-43: it is in both the standard and the deep tier, so one over-budget
+    profile makes both not fit), else the first non-Apex core engine not excluded. The unchanged abliterated entry is
+    never a probe (its env file is left exactly as v0.3.5 renders it)."""
+    cands = [k for k in ctx.core_keys() if k not in exclude and ctx.spec(k).get("arbiter_class") != "apex"
+             and not k.endswith("-abliterated")]
+    if DEEP_THINK_GENERATOR in cands:
+        return DEEP_THINK_GENERATOR
     if not cands:
-        raise Infra("no engine left for the V14b over-budget proof (engines.json lists only the pair?)")
+        raise Infra("no engine left for the V14b over-budget proof (engines.json lists no non-Apex seat?)")
     return cands[0]
 
 
@@ -2626,7 +2772,7 @@ def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: d
     try:
         before = plan("deep")
         out["v14b_plan_deep_before"] = before
-        log(f"coresident/V14b: deep-think plan before the proof: granted={before.get('granted')} "
+        log(f"residency/V14b: deep-think plan before the proof: granted={before.get('granted')} "
             f"({before.get('reason')}; required {fmt_gb(before.get('required_bytes') or 0)}, "
             f"budget {fmt_gb(before.get('budget_bytes') or 0)})")
         ctx_over = base_ctx
@@ -2639,7 +2785,7 @@ def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: d
             if p.get("granted") != "standard":
                 over = True
                 break
-            log(f"coresident/V14b: {key} at ctx {ctx_over} still fits the standard tier "
+            log(f"residency/V14b: {key} at ctx {ctx_over} still fits the standard tier "
                 f"(required {fmt_gb(p.get('required_bytes') or 0)} of budget {fmt_gb(p.get('budget_bytes') or 0)})")
         if not over:
             return False, (f"could not render {key} over budget within {V14B_MAX_DOUBLINGS} doublings of ctx_size "
@@ -2675,174 +2821,173 @@ def arbiter_refusal_proof(ctx: Ctx, ctl: Control, exclude: Sequence[str], out: d
     finally:
         env_back = pending_restore(ctx, pending)
         pending_end(ctx, pending)
-        log(f"coresident/V14b: {key} env restored (ctx {env_back.get('ATLAS_CTX_SIZE')}, "
+        log(f"residency/V14b: {key} env restored (ctx {env_back.get('ATLAS_CTX_SIZE')}, "
             f"parallel {env_back.get('ATLAS_PARALLEL')})")
 
 
-def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
-    text_key, vision_key = args.text, args.vision
-    tspec, vspec = ctx.spec(text_key), ctx.spec(vision_key)
+def engine_weights_bytes(spec: dict[str, Any]) -> int:
+    """The weights the Arbiter budgets (D-31): the exact sum of files[].bytes when every file has one, else
+    footprint_gb read as decimal GB (the unchanged abliterated entry, enumerated files)."""
+    files = spec.get("files") or []
+    if files and all(f.get("bytes") for f in files):
+        return sum(int(f["bytes"]) for f in files)
+    return int(float(spec.get("footprint_gb") or 0) * GB)
+
+
+def cmd_residency(ctx: Ctx, args: argparse.Namespace) -> int:
+    """Section 17 step 3 as v0.4.0 restates it (S-24; D-32 option (a): one LLM seat resident at a time; replaces the
+    v0.3.5 two-residency test): FIRST is loaded through the Arbiter, then SECOND, and the Arbiter must evict FIRST to
+    make room (rule 3 at limit 1, rule 7 for every seat): the ledger holds SECOND alone, FIRST's unit is stopped and
+    the GTT delta is SECOND's alone (residency_bounds). Then two generation requests through the orchestrator to the
+    resident seat; the second must start after the first finished (rules 3, 4). Slot save and restore across the
+    swap is phased after Day 1 (S-35, T-13), so V21 says so instead of testing it. Then, with nothing resident, the
+    real-engine refusal and Deep Think downgrade of Section 21 V14 (V14b)."""
+    first, second = args.first, args.second
+    ctx.spec(first)
+    sspec = ctx.spec(second)
     ctl = Control(ctx.orch_url, ctx.admin_token)
     pending_recover(ctx)
     saved_baseline = read_baseline(ctx)
-    out: dict[str, Any] = {"text": text_key, "vision": vision_key, "control_mode": ctl.mode, "tested_at": now_iso()}
-    # Whatever is resident (an interrupted step 03 leaves BOTH engines) goes through the Arbiter first and the counter
-    # is polled once against the saved baseline after the last unload (clear_residents: never a multi-resident counter
-    # attributed to a single unload). The test's own baseline is the SETTLED counter measured now: the saved one may
-    # be hours old, and the delta that proves ~142 GB must not include whatever else was loaded since.
+    out: dict[str, Any] = {"first": first, "second": second, "control_mode": ctl.mode, "tested_at": now_iso()}
+    # Whatever is resident goes through the Arbiter first and the counter is polled once against the saved baseline
+    # after the last unload (clear_residents). The test's own baseline is the SETTLED counter measured now.
     ledger = ctl.resident_keys()
     resident = [k for k in ctx.core_keys() if unit_active(k) or k in ledger]
-    _, _, clear_note, baseline = clear_residents(ctl, resident, saved_baseline, "coresident")
+    _, _, clear_note, baseline = clear_residents(ctl, resident, saved_baseline, "residency")
     out["cleared_first"] = {"engines": resident, "note": clear_note}
     out["baseline_bytes"] = baseline
     out["saved_baseline_bytes"] = saved_baseline
     if abs(baseline - saved_baseline) > RELEASE_TOLERANCE_BYTES:
-        log(f"coresident: baseline for this test {fmt_gb(baseline)} (settled now) differs from baseline.json "
+        log(f"residency: baseline for this test {fmt_gb(baseline)} (settled now) differs from baseline.json "
             f"{fmt_gb(saved_baseline)}: the resident set changed since step 02; the settled figure is used")
-    budget = int((ctl.status() or {}).get("budget_bytes") or 0) or DEFAULT_BUDGET_BYTES
+    st = ctl.status() or {}
+    budget = int(st.get("budget_bytes") or 0) or DEFAULT_BUDGET_BYTES
+    out["max_resident"] = st.get("max_resident")
     loaded: list[str] = []
-    used_after: dict[str, int] = {}  # GTT used right after each load, so each unload has a measured release target
 
     def cleanup() -> list[str]:
-        # Reverse order: after unloading the vision engine the counter must be back where it was with the text engine
-        # alone; after unloading the text engine it must be back at the baseline (Section 4.2 rule 5, per engine).
+        # Every engine of this test still resident is unloaded through the Arbiter and the counter must come back to
+        # the baseline (Section 4.2 rule 5).
         problems: list[str] = []
-        for i, k in reversed(list(enumerate(loaded))):
-            target = baseline if i == 0 else used_after.get(loaded[i - 1], baseline)
-            ok, _, note = unload_and_release(ctl, k, target)
+        for k in [k for k in loaded if unit_active(k) or k in ctl.resident_keys()]:
+            ok, _, note = unload_and_release(ctl, k, baseline)
             out[f"released_{k}"] = ok
             out[f"release_note_{k}"] = note
             if not ok:
-                problems.append(f"{k} did not release after the two-residency test ({note})")
-        # Nothing to restore (S52): both units ran as rendered for production, the vision engine at its standing
-        # co-resident profile, which it keeps after this step.
+                problems.append(f"{k} did not release after the single-residency test ({note})")
         return problems
 
-    def finish(v21: tuple[str, str], v14b: tuple[str, str]) -> int:
+    def finish(v21: tuple[str, str]) -> int:
         problems = cleanup()
         if problems:
-            # Section 4.2 rule 5 is part of the two-residency proof itself: a leak fails V21, never a stale V10.
+            # Section 4.2 rule 5 is part of the residency proof itself: a leak fails V21, never a stale V10.
             v21 = ("fail", f"{v21[1]}; release: {' | '.join(problems)}")
+            v14b = ("fail", "not attempted: memory still held after the residency test")
+        else:
+            # V14b with nothing resident: the probe engine is rendered over budget and must be refused, the deep
+            # tier downgraded (arbiter_refusal_proof); nothing is loaded.
+            try:
+                ok, msg = arbiter_refusal_proof(ctx, ctl, (), out, loaded)
+            except (RuntimeError, Infra) as exc:
+                ok, msg = False, f"proof aborted: {exc}"
+            log(f"residency: V14b {'PASS' if ok else 'FAIL'}: {msg}")
+            v14b = ("pass" if ok else "fail", msg)
+            more = cleanup()  # a granted over-budget probe load (the proof failed) is unloaded too
+            if more:
+                problems = more
+                v14b = ("fail", f"{v14b[1]}; release: {' | '.join(more)}")
         out["v21"] = v21
         out["v14b"] = v14b
         out["control_mode"] = ctl.mode
         out["summary"] = f"V21 {v21[0]}: {v21[1][:200]} | V14b {v14b[0]}: {v14b[1][:200]}"
-        (ctx.results_dir / "coresident.json").write_text(json.dumps(out, indent=2, default=str) + "\n",
-                                                          encoding="utf-8")
+        (ctx.results_dir / "residency.json").write_text(json.dumps(out, indent=2, default=str) + "\n",
+                                                         encoding="utf-8")
         record("V21", *v21)
         record("V14b", *v14b)
         if problems:
             # Rule 5, as in step 02 (halt_if_leaked): the records are written, then the phase STOPS, so the driver
             # does not mark step 03 done and resume background generation with memory still held.
-            raise Infra(f"two-residency cleanup: {' | '.join(problems)}: the phase stops here, as the Arbiter halts "
-                        f"(Section 4.2 rule 5); recorded in {ctx.results_dir / 'coresident.json'}. Check the GTT "
+            raise Infra(f"single-residency cleanup: {' | '.join(problems)}: the phase stops here, as the Arbiter halts "
+                        f"(Section 4.2 rule 5); recorded in {ctx.results_dir / 'residency.json'}. Check the GTT "
                         f"counter and the llama-server@ units, restart {ORCH_UNIT}.service, then re-run step 03")
         return 0
 
-    # Section 4.3: the vision engine runs 2 slots while co-resident "keeping the pair inside the ~22 GiB of cache the
-    # 142 GB combination leaves". Since S52 that is its STANDING profile, so both units are rendered exactly as
-    # production runs them (no temporary override, nothing restored afterwards) and the rendered vision profile must
-    # BE engines.json's parallel_coresident / ctx_size_coresident before anything is loaded, or the delta accepted
-    # below would be an 8-slot profile's.
-    want_par, want_ctx = vspec.get("parallel_coresident"), vspec.get("ctx_size_coresident")
-    if want_par is None or want_ctx is None:
-        raise Infra(f"engines.json: {vision_key} has no parallel_coresident/ctx_size_coresident (Section 4.3)")
-    tenv = ctx.render(text_key)
-    venv = ctx.render(vision_key)
-    if venv.get("ATLAS_CORESIDENT") != "1":
-        if ctx.override_of(vision_key, "coresident") is False:
-            raise Infra(f"overrides.json sets coresident=false for {vision_key}: the Principal's choice of its full "
-                        "profile (S52), at which the Section 4.1 pair does not form; Phase 3 does not override it. To "
-                        f"test the pair: engine-env.py --clear-override {vision_key} coresident, then re-run step 03")
-        raise Infra(f"engine-env.py did not render {vision_key} with ATLAS_CORESIDENT=1 (its standing co-resident "
-                    "profile, S52)")
-    if venv.get("ATLAS_PARALLEL") != str(int(want_par)) or venv.get("ATLAS_CTX_SIZE") != str(int(want_ctx)):
-        raise Infra(f"engine-env.py rendered {vision_key} co-resident as parallel {venv.get('ATLAS_PARALLEL')}, ctx "
-                    f"{venv.get('ATLAS_CTX_SIZE')}; engines.json says parallel_coresident {want_par}, "
-                    f"ctx_size_coresident {want_ctx} (Section 4.3)")
-    for key, env in ((text_key, tenv), (vision_key, venv)):
+    fenv = ctx.render(first)
+    senv = ctx.render(second)
+    for key, env in ((first, fenv), (second, senv)):
         if env.get("ATLAS_MODEL_PRESENT") != "1":
-            return finish(("fail", f"{key}: model file not present ({env.get('ATLAS_MODEL_FILE')})"),
-                          ("fail", f"{key} not loadable"))
+            return finish(("fail", f"{key}: model file not present ({env.get('ATLAS_MODEL_FILE')})"))
+    secs: dict[str, float] = {}
+    for key, env in ((first, fenv), (second, senv)):
         try:
-            secs = ctl.load(key, int(env["ATLAS_CTX_SIZE"]), int(env["ATLAS_PARALLEL"]), int(env["LLAMA_ARG_PORT"]))
+            secs[key] = ctl.load(key, int(env["ATLAS_CTX_SIZE"]), int(env["ATLAS_PARALLEL"]),
+                                 int(env["LLAMA_ARG_PORT"]))
         except RuntimeError as exc:
             out[f"load_error_{key}"] = str(exc)
             if unit_active(key) or key in ctl.resident_keys():
-                loaded.append(key)  # stop it in cleanup even if half-loaded
-            beside = loaded[0] if loaded and loaded[0] != key else "nothing"
-            return finish(("fail", f"{key} failed to load beside {beside}: {str(exc)[:200]}"),
-                          ("fail", f"{key} not loaded; Arbiter proof not testable"))
+                loaded.append(key)  # unload it in cleanup even if half-loaded
+            return finish(("fail", f"{key} failed to load: {str(exc)[:200]}"))
         loaded.append(key)
+        out[f"decision_{key}"] = ctl.last_decision
         time.sleep(3)
-        used_after[key] = gtt_used_bytes()
-        log(f"coresident: {key} loaded in {secs:.0f}s (ctx {env['ATLAS_CTX_SIZE']}, parallel {env['ATLAS_PARALLEL']}); "
-            f"GTT used {fmt_gb(used_after[key])}")
-    # Rule 3: the Arbiter may have evicted the text engine to fit the vision one; the ledger says.
-    ledger = ctl.resident_keys()
-    gone = [k for k in loaded if k not in ledger]
-    if gone:
-        loaded[:] = [k for k in loaded if k in ledger]
-        why = (f"the Arbiter evicted {gone} to load {vision_key} (resident now: {ledger}; last decision: "
-               f"{short(ctl.last_decision, 200)}); the pair does not co-reside at these profiles")
-        return finish(("fail", why), ("fail", f"pair not resident; {why}"))
+        log(f"residency: {key} loaded in {secs[key]:.0f}s (ctx {env['ATLAS_CTX_SIZE']}, parallel "
+            f"{env['ATLAS_PARALLEL']}); GTT used {fmt_gb(gtt_used_bytes())}; Arbiter: "
+            f"{short(ctl.last_decision.get('reason', ''), 200)}")
+    # Rule 3 at limit 1 / rule 7 (D-32 (a)): the grant of SECOND must have evicted FIRST.
+    ledger = [k for k in ctl.resident_keys() if k in ctx.core_keys()]
+    first_gone = first not in ledger and not unit_active(first)
+    single = ledger == [second] and first_gone
+    out["ledger_after_second"] = ledger
+    reason = str((out.get(f"decision_{second}") or {}).get("reason", ""))
+    one_msg = (f"loading {second} evicted {first} (ledger {ledger}; Arbiter: {short(reason, 160)}; limit "
+               f"{out['max_resident'] if out['max_resident'] is not None else '?'})" if single else
+               f"NOT single residency after loading {second}: ledger {ledger}, {first} unit "
+               f"{'still active' if unit_active(first) else 'stopped'} (Arbiter: {short(reason, 160)})")
     time.sleep(5)
     used = gtt_used_bytes()
     delta = used - baseline
-    weights = int((float(tspec["footprint_gb"]) + float(vspec["footprint_gb"])) * GB)  # Section 4.1: 63 + 79 = 142 GB
+    weights = engine_weights_bytes(sspec)
     low, high = residency_bounds(weights, budget)
-    residency_ok = low <= delta <= high
-    mem_msg = (f"GTT delta {fmt_gb(delta)} for {text_key}+{vision_key} (weights {fmt_gb(weights)} + both caches, "
-               f"~22 GiB expected by Section 4.1; accepted {fmt_gb(low)}-{fmt_gb(high)}, the upper bound capped at the "
-               f"Arbiter's budget {fmt_gb(budget)}; used {fmt_gb(used)}, baseline {fmt_gb(baseline)}, vision at "
-               f"parallel {venv['ATLAS_PARALLEL']}, ctx {venv['ATLAS_CTX_SIZE']})")
+    memory_ok = low <= delta <= high
+    mem_msg = (f"GTT delta {fmt_gb(delta)} for {second} alone (weights {fmt_gb(weights)} + its caches; accepted "
+               f"{fmt_gb(low)}-{fmt_gb(high)}, the upper bound capped at the Arbiter's budget {fmt_gb(budget)}; used "
+               f"{fmt_gb(used)}, baseline {fmt_gb(baseline)})")
     out.update({"gtt_used_bytes": used, "gtt_delta_bytes": delta, "weights_bytes": weights, "budget_bytes": budget,
-                "accepted_low_bytes": low, "accepted_high_bytes": high, "residency_ok": residency_ok})
-    log(f"coresident: {'OK' if residency_ok else 'OUT OF TOLERANCE'}: {mem_msg}")
+                "accepted_low_bytes": low, "accepted_high_bytes": high, "single": single, "memory_ok": memory_ok})
+    log(f"residency: {'OK' if single and memory_ok else 'NOT PROVEN'}: {one_msg}; {mem_msg}")
 
-    # Solo timings of each engine (direct to the llama-server port) give the wall-clock reference for the concurrent
-    # run. Nothing else generates meanwhile: the driver stops atlas-sentinel.timer, atlas-prune.timer,
-    # atlas-celery-gpu.service and the atlas-openwebui container around steps 02/03 (Section 4.2 rule 3: one
-    # generation at a time, background work too), and the generation slot is checked free before each direct request.
-    tport, vport = int(tenv["LLAMA_ARG_PORT"]), int(venv["LLAMA_ARG_PORT"])
-    q_text = [{"role": "user", "content": "Write a 250-word essay about the history of lighthouses."}]
-    q_vision = [{"role": "user", "content": "Describe, in about 150 words, how a suspension bridge carries its load."}]
-    require_generation_idle(ctx.orch_url, f"coresident solo timing {text_key}")
-    solo_t = chat(f"http://127.0.0.1:{tport}", text_key, q_text, 256)
-    require_generation_idle(ctx.orch_url, f"coresident solo timing {vision_key}")
-    solo_v = chat(f"http://127.0.0.1:{vport}", vision_key, q_vision, 160)
-    if solo_t["error"] or solo_v["error"]:
-        why = f"solo generation failed: text={solo_t['error'][:120]!r} vision={solo_v['error'][:120]!r}"
-        return finish(("fail", f"{mem_msg}; {why}"), ("fail", f"not attempted: {why}"))
-    d_t = solo_t["t_recv"] - solo_t["t_send"]
-    d_v = solo_v["t_recv"] - solo_v["t_send"]
-    log(f"coresident: solo durations text {d_t:.1f}s, vision {d_v:.1f}s")
+    # Solo timing of the resident seat (direct to its port) for the wall-clock reference; nothing else generates
+    # meanwhile (the driver stops the timers, atlas-celery-gpu and the Open WebUI container around this step).
+    sport = int(senv["LLAMA_ARG_PORT"])
+    q_a = [{"role": "user", "content": "Write a 250-word essay about the history of lighthouses."}]
+    q_b = [{"role": "user", "content": "Describe, in about 150 words, how a suspension bridge carries its load."}]
+    require_generation_idle(ctx.orch_url, f"residency solo timing {second}")
+    solo = chat(f"http://127.0.0.1:{sport}", second, q_b, 160)
+    if solo["error"]:
+        return finish(("fail", f"{one_msg}; {mem_msg}; solo generation failed: {solo['error'][:160]!r}"))
+    d_solo = solo["t_recv"] - solo["t_send"]
+    log(f"residency: solo duration of the second request's prompt on {second}: {d_solo:.1f}s")
 
-    # Two requests at once THROUGH THE ORCHESTRATOR (/internal/v1/chat/completions, model = engine key); the Arbiter
-    # must run the second only after the first finished (Section 4.2 rules 3, 4).
+    # Two requests at once THROUGH THE ORCHESTRATOR to the one resident seat; the second must run only after the
+    # first finished (Section 4.2 rules 3, 4: one generation at a time).
     results: dict[str, dict[str, Any]] = {}
     seen_queue: list[str] = []
-    seen_generating: set[str] = set()
     stop_poll = threading.Event()
 
     def poll() -> None:
         while not stop_poll.is_set():
-            st = ctl.status()
-            if st:
-                gen = st.get("generating") or {}
-                if isinstance(gen, dict) and gen.get("engine"):
-                    seen_generating.add(str(gen["engine"]))
-                if st.get("generation_queue"):
-                    seen_queue.append(json.dumps(st["generation_queue"])[:80])
+            st2 = ctl.status()
+            if st2 and st2.get("generation_queue"):
+                seen_queue.append(json.dumps(st2["generation_queue"])[:80])
             time.sleep(0.5)
 
-    def fire(name: str, model: str, msgs: list[dict[str, str]], max_tokens: int) -> None:
-        results[name] = chat(ctx.orch_url, model, msgs, max_tokens, path=ORCH_CHAT_PATH)
+    def fire(name: str, msgs: list[dict[str, str]], max_tokens: int) -> None:
+        results[name] = chat(ctx.orch_url, second, msgs, max_tokens, path=ORCH_CHAT_PATH)
 
     poller = threading.Thread(target=poll, daemon=True)
     poller.start()
-    th_a = threading.Thread(target=fire, args=("first", text_key, q_text, 256))
-    th_b = threading.Thread(target=fire, args=("second", vision_key, q_vision, 160))
+    th_a = threading.Thread(target=fire, args=("first", q_a, 256))
+    th_b = threading.Thread(target=fire, args=("second", q_b, 160))
     th_a.start()
     time.sleep(0.5)
     th_b.start()
@@ -2853,36 +2998,355 @@ def cmd_coresident(ctx: Ctx, args: argparse.Namespace) -> int:
     a, b = results["first"], results["second"]
     out["concurrent"] = {"first": {k: v for k, v in a.items() if k not in ("content", "reasoning")},
                          "second": {k: v for k, v in b.items() if k not in ("content", "reasoning")},
-                         "queue_seen": seen_queue[:5], "generating_seen": sorted(seen_generating)}
+                         "queue_seen": seen_queue[:5]}
     if a["error"] or b["error"]:
-        why = (f"orchestrator chat failed: first(model={text_key})={a['error'][:140]!r} "
-               f"second(model={vision_key})={b['error'][:140]!r} "
+        why = (f"orchestrator chat failed: first={a['error'][:140]!r} second={b['error'][:140]!r} "
                f"(contract: POST {ORCH_CHAT_PATH} with model = engine key, see loadtest.py header)")
-        v14b_ok, v14b_msg = False, "not attempted: " + why
-        try:
-            v14b_ok, v14b_msg = arbiter_refusal_proof(ctx, ctl, (text_key, vision_key), out, loaded)
-        except (RuntimeError, Infra) as exc:
-            v14b_msg = f"proof aborted: {exc}"
-        return finish(("fail", f"{mem_msg}; {why}"), ("pass" if v14b_ok else "fail", v14b_msg))
-    ok, proof = queue_proof(a, b, d_v)
+        return finish(("fail", f"{one_msg}; {mem_msg}; {why}"))
+    ok, proof = queue_proof(a, b, d_solo)
     if seen_queue:
         proof += f"; Arbiter status showed a generation queue ({seen_queue[0]})"
-    if seen_generating:
-        proof += f"; generating seen: {sorted(seen_generating)}"
-    log(f"coresident: queueing {'PROVEN' if ok else 'NOT proven'}: {proof}")
+    log(f"residency: queueing {'PROVEN' if ok else 'NOT proven'}: {proof}")
     verb = "queued behind" if ok else "did NOT wait for"
-    v21 = ("pass" if (ok and residency_ok) else "fail",
-           f"{mem_msg}; second generation request ({vision_key}) {verb} the first ({text_key}); {proof}"
-           f"{'' if residency_ok else '; memory out of tolerance'}")
+    passed = ok and single and memory_ok
+    return finish(("pass" if passed else "fail",
+                   f"{one_msg}; {mem_msg}; the second generation request to {second} {verb} the first; {proof}; "
+                   "slot save and restore across the swap: phased after Day 1 (S-35, T-13), not tested"
+                   + ("" if memory_ok else "; memory out of tolerance")))
 
-    # V14b: refusal and downgrade against the real engine set while the pair is resident.
+
+# --- S-02 output parity of the re-pin (V25) and S-03 KLD record ----------------------------------------------------
+#
+# Both run llama-perplexity, a measuring tool, not an engine unit: every LLM seat is first unloaded through the Arbiter
+# (clear_residents, so its ledger is empty and the counter settles), background generation is stopped by the driver
+# around the step, the orchestrator's generation slot must be idle before each run, and the GTT counter is polled back
+# to the settled baseline after each run (Section 4.2 rule 5; a leak stops the phase after the records are written).
+# The resident companions stay up (the router on the iGPU, the Qwen3 pair on the CPU: never charged). Outputs (VERIFIED
+# at both pins, tools/perplexity/perplexity.cpp): "Final estimate: PPL = %.4lf +/- %.5lf" (:647), "Mean    KLD:
+# %10.6lf ± %10.6lf" (:1926), "Same top p: %6.3lf ± %5.3lf %%" (:1982) and one "%zu\t%3.8lf%%\t[...]" line per
+# HellaSwag task with the running acc_norm (:988).
+
+PPL_RE = re.compile(r"Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)")
+KLD_MEAN_RE = re.compile(r"Mean +KLD: +([0-9.eE+-]+) ± +([0-9.eE+-]+)")
+SAME_TOP_RE = re.compile(r"Same top p: +([0-9.]+) ± +([0-9.]+) %")
+PPL_Q_RE = re.compile(r"Mean PPL\(Q\) +: +([0-9.]+)")
+PPL_BASE_RE = re.compile(r"Mean PPL\(base\) +: +([0-9.]+)")
+HS_LINE_RE = re.compile(r"^(\d+)\t([0-9.]+)%\t\[")
+
+
+def parse_ppl(text: str) -> float | None:
+    m = PPL_RE.search(text)
+    return float(m.group(1)) if m else None
+
+
+def parse_kld(text: str) -> dict[str, float] | None:
+    """The KLD statistics of one `--kl-divergence` run; None when the run printed none (it failed)."""
+    mean, top = KLD_MEAN_RE.search(text), SAME_TOP_RE.search(text)
+    if not mean or not top:
+        return None
+    out = {"mean_kld": float(mean.group(1)), "mean_kld_unc": float(mean.group(2)),
+           "same_top_pct": float(top.group(1)), "same_top_unc": float(top.group(2))}
+    for name, rx in (("ppl_q", PPL_Q_RE), ("ppl_base", PPL_BASE_RE)):
+        if m := rx.search(text):
+            out[name] = float(m.group(1))
+    return out
+
+
+def parse_hellaswag(text: str) -> dict[str, Any] | None:
+    """Per-task correctness from the running acc_norm lines (task i: round(acc_i * i) - round(acc_(i-1) * (i-1))),
+    in file order (every task is taken, see PARITY_TASKS_FILE; a shuffled subset would use std::mt19937 seeded 1,
+    identical at both pins). None when no task line was printed or the numbering skips."""
+    accs: list[float] = []
+    for ln in text.splitlines():
+        if m := HS_LINE_RE.match(ln.strip("\r")):
+            if int(m.group(1)) != len(accs) + 1:
+                return None
+            accs.append(float(m.group(2)))
+    if not accs:
+        return None
+    correct, prev = [], 0
+    for i, acc in enumerate(accs, start=1):
+        now = round(acc * i / 100.0)
+        correct.append(now - prev == 1)
+        prev = now
+    return {"n": len(accs), "correct": sum(correct), "acc_pct": accs[-1], "answers": correct}
+
+
+def changed_answers(a: dict[str, Any] | None, b: dict[str, Any] | None) -> int | None:
+    if not a or not b or a["n"] != b["n"]:
+        return None
+    return sum(1 for x, y in zip(a["answers"], b["answers"], strict=True) if x != y)
+
+
+def parity_engine_verdict(key: str, runs: dict[str, dict[str, Any]]) -> tuple[str, str]:
+    """Pure V25 verdict for one engine (module constants; -fa on decides, -fa off is recorded): (result, message).
+    The old build failing to run it is deferred (nothing to compare); the new build failing, a KLD above
+    PARITY_MAX_MEAN_KLD, fewer than PARITY_MIN_SAME_TOP_PCT identical top-1 tokens or fewer correct tasks is a fail."""
+    parts: list[str] = []
+    verdict = "pass"
+    for fa in PARITY_FA:
+        r = runs.get(fa) or {}
+        kld, old_t, new_t = r.get("kld"), r.get("old_tasks"), r.get("new_tasks")
+        errors = r.get("errors") or []
+        bits = []
+        if kld:
+            bits.append(f"KLD {kld['mean_kld']:.6f}, top-1 same {kld['same_top_pct']:.2f}%")
+        if old_t and new_t:
+            ch = changed_answers(old_t, new_t)
+            bits.append(f"tasks {old_t['correct']}->{new_t['correct']} of {new_t['n']}"
+                        + (f", {ch} changed" if ch is not None else ""))
+        if errors:
+            bits.append("errors: " + "; ".join(e[:160] for e in errors))
+        parts.append(f"-fa {fa}: " + (", ".join(bits) or "not run"))
+        if fa != "on":
+            continue
+        if r.get("old_failed"):
+            verdict = "deferred"
+            continue
+        if r.get("new_failed") or not kld or not new_t or not old_t:
+            verdict = "fail"
+            continue
+        if (kld["mean_kld"] > PARITY_MAX_MEAN_KLD or kld["same_top_pct"] < PARITY_MIN_SAME_TOP_PCT
+                or new_t["correct"] < old_t["correct"]):
+            verdict = "fail"
+    return verdict, (f"{key}: b11474 vs v0.4.1 {'within' if verdict == 'pass' else 'NOT within'} parity at -fa on "
+                     f"(mean KLD <= {PARITY_MAX_MEAN_KLD}, top-1 >= {PARITY_MIN_SAME_TOP_PCT}%, no fewer correct "
+                     f"tasks; -fa off recorded only): " + " | ".join(parts))
+
+
+def parity_coverage(ctx: Ctx) -> tuple[list[str], list[str]]:
+    """(covered keys, notes on the others): chat engines both pins load (min_llama_cpp_tag not newer than v0.4.1),
+    LLM seats and the resident router alike. The embedder and reranker have no next-token logits to compare; the
+    unchanged abliterated entry is left as v0.3.5 has it (the uncensored seat is the Principal's to configure)."""
+    covered, notes = [], []
+    for key in ctx.order:
+        spec = ctx.spec(key)
+        mode = spec.get("mode", "chat")
+        if mode not in CHAT_MODES:
+            notes.append(f"{key}: not compared ({mode}: no next-token logits; T-15 checks it at the pin)")
+        elif key.endswith("-abliterated"):
+            notes.append(f"{key}: not compared (unchanged by this revision; the Principal's to configure)")
+        elif is_newer_arch(spec):
+            notes.append(f"{key}: not comparable (first build {spec.get('min_llama_cpp_tag')}, v0.4.1 cannot load it; "
+                         "T-03 and T-04 cover it)")
+        elif spec.get("arbiter_class") in P3_CLASSES or spec.get("arbiter_class") == "resident":
+            covered.append(key)
+    return covered, notes
+
+
+def build_corpus(ctx: Ctx, work: Path) -> Path:
+    """The fixed corpus: the domain profiles shipped with the scripts (config/domains/*.md), concatenated in name
+    order, so both builds and every engine read byte-identical text on the node with no download."""
+    files = sorted((ctx.engines_path.parent / "domains").glob("*.md"))
+    if not files:
+        raise Infra(f"no corpus: {ctx.engines_path.parent / 'domains'} has no *.md (CONVENTIONS.md §1 layout)")
+    out = work / "corpus.txt"
+    out.write_text("\n\n".join(f.read_text(encoding="utf-8") for f in files), encoding="utf-8")
+    return out
+
+
+def run_tool(cmd: list[str], work: Path, timeout: float = PARITY_TOOL_TIMEOUT_S) -> tuple[int, str]:
+    """One llama-perplexity run with a scrubbed environment (no proxy, no HF variables, the RADV cache in the work
+    directory); returns (exit code, stdout+stderr)."""
+    env = {"PATH": "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": str(work),
+           "XDG_CACHE_HOME": str(work / "cache"), "NO_PROXY": "*", "no_proxy": "*", "LC_ALL": "C.UTF-8"}
     try:
-        v14b_ok, v14b_msg = arbiter_refusal_proof(ctx, ctl, (text_key, vision_key), out, loaded)
-    except (RuntimeError, Infra) as exc:
-        v14b_ok, v14b_msg = False, f"proof aborted: {exc}"
-    log(f"coresident: V14b {'PASS' if v14b_ok else 'FAIL'}: {v14b_msg}")
-    v14b = ("pass" if v14b_ok else "fail", v14b_msg)
-    return finish(v21, v14b)
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                           check=False, env=env, cwd=str(work))
+    except subprocess.TimeoutExpired:
+        return 124, f"{cmd[0]} timed out after {timeout:.0f}s"
+    except OSError as exc:
+        return 127, f"{cmd[0]}: {exc}"
+    return p.returncode, (p.stdout or "") + "\n" + (p.stderr or "")
+
+
+class Measured:
+    """The guard around every direct tool run (section comment): generation idle before, release polled after."""
+
+    def __init__(self, ctx: Ctx, baseline: int, out: dict[str, Any]) -> None:
+        self.ctx, self.baseline, self.out = ctx, baseline, out
+        self.leaks: list[str] = []
+
+    def run(self, label: str, cmd: list[str], work: Path) -> tuple[int, str]:
+        require_generation_idle(self.ctx.orch_url, label)
+        log(f"{label}: {' '.join(cmd)[:300]}")
+        rc, text = run_tool(cmd, work)
+        ok, _secs, note = wait_release(self.baseline, label)
+        if not ok:
+            self.leaks.append(f"{label}: {note}")
+        self.out.setdefault("runs", []).append({"label": label, "rc": rc, "release": note,
+                                                "tail": " ".join(text.split())[-400:]})
+        return rc, text
+
+
+def _ppl_args(model: str, fa: str, kv: str = "") -> list[str]:
+    args = ["-m", model, "-ngl", "all", "-fa", fa]
+    if kv and kv != "none":
+        args += ["--cache-type-k", kv, "--cache-type-v", kv]
+    return args
+
+
+def _clear_for_tools(ctx: Ctx, ctl: Control, who: str) -> int:
+    """Every LLM seat unloaded through the Arbiter; returns the settled counter (the tools' baseline)."""
+    ledger = ctl.resident_keys()
+    resident = [k for k in ctx.core_keys() if unit_active(k) or k in ledger]
+    _, _, note, settled = clear_residents(ctl, resident, read_baseline_optional(ctx), who)
+    log(f"{who}: every LLM seat unloaded through the Arbiter ({note}); baseline {fmt_gb(settled)}")
+    return settled
+
+
+def cmd_parity(ctx: Ctx, args: argparse.Namespace) -> int:
+    """S-02 (V25): see the section comment and parity_engine_verdict."""
+    ctl = Control(ctx.orch_url, ctx.admin_token)
+    pending_recover(ctx)
+    ctx.results_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Any] = {"tested_at": now_iso(), "new": args.perplexity, "old": args.parity_perplexity}
+    covered, notes = parity_coverage(ctx)
+    out["covered"], out["not_covered"] = covered, notes
+    missing = [b for b in (args.perplexity, args.parity_perplexity) if not os.access(b, os.X_OK)]
+    if missing:
+        msg = (f"summary: the llama-perplexity build(s) {missing} are missing (phase2/01-llama.sh builds both: "
+               f"sudo {os.environ.get('ATLAS_ENTRY', './atlas-day1.sh')} phase2 --force 01)")
+        (ctx.results_dir / "parity.json").write_text(json.dumps({**out, "summary": msg}, indent=2) + "\n",
+                                                      encoding="utf-8")
+        record("V25", "fail", msg)
+        return 0
+    baseline = _clear_for_tools(ctx, ctl, "parity")
+    work = ctx.results_dir / "parity-work"
+    work.mkdir(parents=True, exist_ok=True)
+    corpus = build_corpus(ctx, work)
+    guard = Measured(ctx, baseline, out)
+    verdicts: dict[str, str] = {}
+    out["engines"] = {}
+    try:
+        for key in covered:
+            env = ctx.env(key)
+            model = env.get("ATLAS_MODEL_FILE", "")
+            if env.get("ATLAS_MODEL_PRESENT") != "1":
+                verdicts[key] = "deferred"
+                record("V25", "deferred", f"{key}: model file not present ({model})")
+                continue
+            runs: dict[str, dict[str, Any]] = {}
+            for fa in PARITY_FA:
+                r: dict[str, Any] = {"errors": []}
+                base = work / f"{key}-fa{fa}.kld"
+                rc, text = guard.run(f"parity {key} v0.4.1 -fa {fa} base logits", [
+                    args.parity_perplexity, *_ppl_args(model, fa), "-f", str(corpus), "-c", str(PARITY_CTX),
+                    "-b", str(PARITY_CTX), "--chunks", str(PARITY_CHUNKS), "--kl-divergence-base", str(base)], work)
+                r["old_ppl"] = parse_ppl(text)
+                if rc != 0 or not base.is_file():
+                    r["old_failed"] = True
+                    r["errors"].append(f"v0.4.1 base run exit {rc}: {' '.join(text.split())[-200:]}")
+                else:
+                    rc, text = guard.run(f"parity {key} b11474 -fa {fa} KLD", [
+                        args.perplexity, *_ppl_args(model, fa), "-c", str(PARITY_CTX), "-b", str(PARITY_CTX),
+                        "--kl-divergence-base", str(base), "--kl-divergence"], work)
+                    r["kld"] = parse_kld(text)
+                    if rc != 0 or r["kld"] is None:
+                        r["new_failed"] = True
+                        r["errors"].append(f"b11474 KLD run exit {rc}: {' '.join(text.split())[-200:]}")
+                base.unlink(missing_ok=True)
+                for which, binary in (("old", args.parity_perplexity), ("new", args.perplexity)):
+                    rc, text = guard.run(f"parity {key} {which} build -fa {fa} task set", [
+                        binary, *_ppl_args(model, fa), "-f", str(PARITY_TASKS_FILE), "--hellaswag",
+                        "--hellaswag-tasks", "1000", "-c", str(PARITY_TASK_CTX)], work)
+                    tasks = parse_hellaswag(text)
+                    r[f"{which}_tasks"] = tasks
+                    if rc != 0 or tasks is None:
+                        r[f"{which}_failed"] = True
+                        r["errors"].append(f"{which} task run exit {rc}: {' '.join(text.split())[-160:]}")
+                runs[fa] = r
+            result, msg = parity_engine_verdict(key, runs)
+            out["engines"][key] = {"runs": runs, "result": result, "msg": msg}
+            verdicts[key] = result
+            record("V25", result, msg)
+    finally:
+        out["leaks"] = guard.leaks
+    results = set(verdicts.values())
+    summary_result = "fail" if "fail" in results or guard.leaks else ("pass" if results == {"pass"} else "deferred")
+    out["summary"] = (f"summary: {', '.join(f'{k}={v}' for k, v in verdicts.items()) or 'nothing compared'}; "
+                      + "; ".join(notes) + (f"; LEAK: {' | '.join(guard.leaks)}" if guard.leaks else ""))
+    (ctx.results_dir / "parity.json").write_text(json.dumps(out, indent=2, default=str) + "\n", encoding="utf-8")
+    record("V25", summary_result, out["summary"])
+    if guard.leaks:
+        raise Infra(f"parity: memory not released after a llama-perplexity run ({' | '.join(guard.leaks)}): the phase "
+                    "stops here (Section 4.2 rule 5); check the GTT counter, then re-run step 02b")
+    return 0
+
+
+KLD_REFERENCE_NOTE = {
+    "glm-5.3-flash": ("UD-IQ4_XS is lossy (mean KLD 0.117 on Unsloth's own harness); its Q8_0 reference (317 GiB) "
+                      "exceeds memory, so T-03 measures a task delta against published full-precision scores or "
+                      "streamed base logits"),
+    "deepseek-v4-flash": ("UD-Q8_K_XL is bit-exact to the official weights (KLD about 0 by construction); T-03 scores "
+                          "the q8_0 KV rung against f16 on the same file"),
+    "gpt-oss-120b": ("the F16-trunk GGUF with native MXFP4 experts is the highest-precision file; no higher reference "
+                     "exists to pull"),
+}
+KLD_TODO_TITLE = ("KLD run (T-03): score each Day 1 seat against a reference with llama-perplexity --kl-divergence on "
+                  "Wikitext-2 plus a domain corpus (S-03)")
+
+
+def cmd_quality(ctx: Ctx, args: argparse.Namespace) -> int:
+    """S-03 (a record with a to-do, as S52 did for kv-estimates): each Day 1 LLM seat (core/apex chat or vision, the
+    unchanged abliterated entry excepted) is scored by the pin's llama-perplexity at its own KV type with -fa on: the
+    perplexity of the fixed corpus and the deterministic task set, the figures a later reference run (T-03) compares
+    against. Raised as the to-do kld-run with the figures and each seat's reference status; never a verdict, never an
+    Infra stop for a measurement (a rule-5 leak still stops the phase)."""
+    ctl = Control(ctx.orch_url, ctx.admin_token)
+    pending_recover(ctx)
+    ctx.results_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Any] = {"tested_at": now_iso(), "tool": args.perplexity, "engines": {}}
+    items: list[str] = []
+    if not os.access(args.perplexity, os.X_OK):
+        items.append(f"not measured: {args.perplexity} is missing (phase2/01-llama.sh S-01 builds it)")
+    else:
+        baseline = _clear_for_tools(ctx, ctl, "quality")
+        work = ctx.results_dir / "quality-work"
+        work.mkdir(parents=True, exist_ok=True)
+        corpus = build_corpus(ctx, work)
+        guard = Measured(ctx, baseline, out)
+        for key in ctx.core_keys():
+            spec = ctx.spec(key)
+            if key.endswith("-abliterated") or spec.get("mode", "chat") not in CHAT_MODES:
+                continue
+            env = ctx.env(key)
+            kv = env.get("ATLAS_KV_TYPE", spec.get("kv_class", ""))
+            rec: dict[str, Any] = {"kv": kv}
+            if env.get("ATLAS_MODEL_PRESENT") != "1":
+                rec["error"] = f"model file not present ({env.get('ATLAS_MODEL_FILE')})"
+            else:
+                model = env["ATLAS_MODEL_FILE"]
+                rc, text = guard.run(f"quality {key} perplexity", [
+                    args.perplexity, *_ppl_args(model, "on", kv), "-f", str(corpus), "-c", str(PARITY_CTX),
+                    "-b", str(PARITY_CTX), "--chunks", str(PARITY_CHUNKS)], work)
+                rec["ppl"] = parse_ppl(text) if rc == 0 else None
+                rc, text = guard.run(f"quality {key} task set", [
+                    args.perplexity, *_ppl_args(model, "on", kv), "-f", str(PARITY_TASKS_FILE), "--hellaswag",
+                    "--hellaswag-tasks", "1000", "-c", str(PARITY_TASK_CTX)], work)
+                rec["tasks"] = parse_hellaswag(text) if rc == 0 else None
+                if rec["ppl"] is None or rec["tasks"] is None:
+                    rec["error"] = f"a run printed no result (exit {rc}: {' '.join(text.split())[-160:]})"
+            out["engines"][key] = rec
+            t = rec.get("tasks")
+            items.append(f"{key} ({kv} KV, -fa on): corpus PPL "
+                         f"{'UNKNOWN' if rec.get('ppl') is None else round(rec['ppl'], 4)}, tasks "
+                         f"{'UNKNOWN' if not t else str(t['correct']) + ' of ' + str(t['n'])}"
+                         + (f" ({rec['error'][:160]})" if rec.get("error") else "")
+                         + f"; reference: {KLD_REFERENCE_NOTE.get(key, 'none recorded')}")
+        out["leaks"] = guard.leaks
+    out["summary"] = " | ".join(items) or "no seat measured"
+    (ctx.results_dir / "quality.json").write_text(json.dumps(out, indent=2, default=str) + "\n", encoding="utf-8")
+    todo(KLD_TODO_ID, KLD_TODO_TITLE,
+         "Measured in Phase 3 step 02c on the pin b11474 (the fixed corpus of config/domains, 512-token windows; the "
+         "deterministic task set phase3/parity-tasks.txt): " + out["summary"] + ". These are the figures a reference "
+         "run compares against. The KLD itself needs a reference file per seat that Day 1 does not pull (T-03, D-02: "
+         "GLM's seats stay provisional until it runs); the changed-answer count is taken against the same task set. "
+         "Phase 3 changed no engine setting; only the Principal closes this to-do.")
+    if out.get("leaks"):
+        raise Infra(f"quality: memory not released after a llama-perplexity run ({' | '.join(out['leaks'])}): the "
+                    "phase stops here (Section 4.2 rule 5); check the GTT counter, then re-run step 02c")
+    return 0
 
 
 # --- main -------------------------------------------------------------------------------------------------------------
@@ -2903,6 +3367,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="ORCH_ADMIN_TOKEN_FILE of orchestrator.env when configured (X-Atlas-Token for /arbiter/*)")
     ap.add_argument("--atlas-python", default=str(Path(os.environ.get("ATLAS_OPT", "/opt/atlas")) / "venv/bin/python"),
                     help="$ATLAS_OPT/venv/bin/python: runs the Arbiter's own projection for the S52 memory record")
+    ap.add_argument("--perplexity", default="/usr/local/bin/llama-perplexity",
+                    help="the pin's llama-perplexity (phase2/01-llama.sh, S-01)")
+    parity_tool = Path(os.environ.get("ATLAS_OPT", "/opt/atlas")) / "llama-parity/dist/bin/llama-perplexity"
+    ap.add_argument("--parity-perplexity", default=str(parity_tool),
+                    help="the old pin v0.4.1's llama-perplexity, built beside it for V25 only (S-02)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("prepare").set_defaults(fn=cmd_prepare)
     p = sub.add_parser("engine")
@@ -2915,10 +3384,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("summarize").set_defaults(fn=cmd_summarize)
     sub.add_parser("table").set_defaults(fn=cmd_table)
     sub.add_parser("memory").set_defaults(fn=cmd_memory)
-    p = sub.add_parser("coresident")
-    p.add_argument("--text", required=True)
-    p.add_argument("--vision", required=True)
-    p.set_defaults(fn=cmd_coresident)
+    p = sub.add_parser("residency")
+    p.add_argument("--first", required=True, help="the seat loaded first, which the second must evict (S-24)")
+    p.add_argument("--second", required=True)
+    p.set_defaults(fn=cmd_residency)
+    sub.add_parser("parity").set_defaults(fn=cmd_parity)
+    sub.add_parser("quality").set_defaults(fn=cmd_quality)
     args = ap.parse_args(argv)
     # `systemctl stop atlas-day1-phase3` sends SIGTERM to the whole cgroup: turn it into an exception in the main
     # thread so every finally block (override restores, pending journal) runs before exit (CONVENTIONS.md §7.3, §7.4).

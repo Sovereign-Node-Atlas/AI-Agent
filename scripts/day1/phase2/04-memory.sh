@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # phase2/04-memory.sh — Section 17 Phase 2 step 4: ChromaDB, LightRAG (D7), Docling, and the three resident small
-# models of D4 (Section 5.3, 10.1, 10.2, 15.1). Sourced by phase2-services.sh through run_phase_steps; defines step_04.
+# models (Section 5.3, 10.1, 10.2, 15.1). Sourced by phase2-services.sh through run_phase_steps; defines step_04.
+#
+# v0.4.0 retrieval change, approved by the Principal 2026-10-16 and made BEFORE Day 1 (D-45 option (a), S-36, S-41,
+# C-02, C-03; D-14 option (e) as the first line of the v0.4.0 analysis recommends): the bge pair (D4) is replaced by
+# Qwen3-Embedding-4B and Qwen3-Reranker-4B (Q8_0, the rank-head conversion), both on the CPU (engines.json placement
+# cpu: phase2/engine-env.py renders --device none), so ChromaDB and LightRAG are first indexed with the new embedder
+# while the corpus is still empty and no re-embed is ever needed. The 1024-dimension schema of the six Section 10.1
+# collections and of LightRAG is kept: the server returns the native 2560 dimensions and the orchestrator's client
+# truncates each vector to its first EMBEDDING_DIM=1024 components and re-normalises it (Matryoshka; atlas/memory.py
+# fit_dimension), and prefixes queries, never stored documents, with the card's "Instruct: ...\nQuery:" form
+# (EMBEDDING_QUERY_INSTRUCTION below). The router stays on the iGPU (P-10: classification only).
 #
 # Order inside the step (each part idempotent, so a re-run after a failure resumes cheaply):
-#   1. Pull router-qwen3.5-4b, embed-bge-m3, rerank-bge-v2-m3 with hf_download, hashes resolved from the HF tree API at
+#   1. Pull router-qwen3.5-4b, embed-qwen3-4b, rerank-qwen3-4b with hf_download, hashes resolved from the HF tree API at
 #      pull time and recorded in $ATLAS_SRV/models/<key>/MANIFEST.json (gguf-models.md §0/§11.1, research conflict a).
 #      The tree API is queried ANONYMOUSLY first; the token is loaded only on a 401/403 (gated repo), so the secret is
-#      never read into a shell variable for the ten public engines.json repos, and it is only ever sent to
+#      never read into a shell variable for the public engines.json repos, and it is only ever sent to
 #      https://huggingface.co (HF_ENDPOINT set to anything else stops the step; rule §7.2).
 #   2. Re-render $ATLAS_ETC/engines/*.env (model files now present), enable the three llama-server@ units and start
 #      them THROUGH THE ORCHESTRATOR'S CONTROL PATH (svc_user_run -> sudo systemctl start), which proves
@@ -32,8 +42,9 @@
 #      copy scripts/day1/config/tiktoken/cl100k_base.tiktoken, then $ATLAS_SRV/staging/inbox/cl100k_base.tiktoken (the
 #      Principal's drop directory, CONVENTIONS §2), then a ONE-TIME download through the allowlist proxy from
 #      TIKTOKEN_URL (openaipublic.blob.core.windows.net, config/allowlist.txt "LightRAG tokenizer table": an ADDITION to
-#      the Section 12.5 enumeration pending the Principal's Section 23 row, as that file's comment says; if the line is
-#      struck, this path fails loudly and the step defers with the inbox remedy). Whichever path delivers it, the copy is verified against the
+#      the Section 12.5 enumeration under its build-mirror clause, confirmed by the Principal on 2026-10-16 with the
+#      other three S29 hosts (register B-69); if the line is ever struck, this path fails loudly and the step defers
+#      with the inbox remedy). Whichever path delivers it, the copy is verified against the
 #      sha256 tiktoken itself pins, seeded into TIKTOKEN_CACHE_DIR under the cache name tiktoken expects (sha1 of the
 #      blob URL) and proven with the network pointed at a closed port, so LIGHTRAG_TIKTOKEN_CACHED=1 is the NORMAL
 #      outcome. Only when all three fail does the step complete with LIGHTRAG_TIKTOKEN_CACHED=0 in memory.env, a WARN
@@ -99,21 +110,22 @@
 #     ghcr.io for the docling-serve image (the voice writer relies on it already) and, since fix round 5,
 #     openaipublic.blob.core.windows.net for the one-time tiktoken table fetch of header item 4 (the fix-round-3
 #     withdrawal is reversed: a table that is never there in practice left LIGHTRAG_TIKTOKEN_CACHED=0 the usual outcome;
-#     fix round 6: the host is a Section 12.5 addition the Principal approves, recorded as pending in the allowlist
-#     comment with a Section 23 row requested; the review sandbox cannot vendor the file, HTTP 403).
+#     fix round 6: the host is a Section 12.5 addition the Principal approves; confirmed 2026-10-16, register B-69; the
+#     review sandbox cannot vendor the file, HTTP 403).
 #   * $ATLAS_SRV/staging/inbox (phase1/03-mounts.sh, $PRINCIPAL_USER:atlas 2770) is where the Principal may drop
 #     cl100k_base.tiktoken; the file is verified by sha256 before use and left in place. config/tiktoken/README.md and
 #     SHA256SUMS describe the vendored copy (first in the search order) and how to commit it.
 #   * lib/common.sh hf_download: as of this round it still puts the bearer token on curl's argv (`-H "Authorization:
 #     Bearer $HF_TOKEN"`), readable by every local account in /proc/<pid>/cmdline for the whole transfer. REQUESTED of
 #     that writer: read the header from stdin (`printf ... | curl -H @- ...`, curl >= 7.55) as hf_tree_lfs below does.
-#     This file's pull path does not depend on the fix: none of the ten engines.json repos is gated, so
+#     This file's pull path does not depend on the fix: none of the engines.json repos is gated, so
 #     pull_engine_files calls hf_download through hf_download_public, which keeps the token out of the call entirely.
 #   * orchestrator/src/atlas/memory.py _check_tokenizer_cache names the allowlist as the remedy for a missing tiktoken
 #     table; with this round the remedy is the inbox drop below (cross-writer: that message should name it).
 # Contract this file defines for others:
 #   * $ATLAS_ETC/memory.env (root:atlas 640): CHROMA_URL, CHROMA_COLLECTIONS, ROUTER_URL, EMBEDDING_URL, RERANK_URL,
-#     EMBEDDING_MODEL, EMBEDDING_DIM, LIGHTRAG_WORKING_DIR, TIKTOKEN_CACHE_DIR, LIGHTRAG_TIKTOKEN_CACHED (1 when
+#     EMBEDDING_MODEL (embed-qwen3-4b), EMBEDDING_DIM (1024, the truncated schema), EMBEDDING_QUERY_INSTRUCTION (S-41;
+#     written once, kept when hand-edited), LIGHTRAG_WORKING_DIR, TIKTOKEN_CACHE_DIR, LIGHTRAG_TIKTOKEN_CACHED (1 when
 #     cl100k_base is in TIKTOKEN_CACHE_DIR, 0 when the seed was deferred for lack of a verified copy),
 #     DOCLING_ARTIFACTS_PATH, DOCLING_SERVER_URL, HF_HOME, HF_HUB_OFFLINE, the telemetry opt-outs, HF_TOKEN_PATH /
 #     HF_STORED_TOKENS_PATH (root-only cache dir), and the loopback pins for any defaulted OpenAI-compatible client
@@ -121,11 +133,17 @@
 #     SDK resolves api.openai.com unless told otherwise): OPENAI_BASE_URL=<ROUTER_URL>, OPENAI_API_KEY=atlas-local-no-cloud,
 #     LLM_BINDING=openai, LLM_BINDING_HOST=<ROUTER_URL>, LLM_MODEL=router-qwen3.5-4b, EMBEDDING_BINDING=openai,
 #     EMBEDDING_BINDING_HOST=<EMBEDDING_URL> (LightRAG's own server knobs, env.example names).
-#   * hf_tree_lfs / pull_engine_files below are the reference implementation of the manifest-at-pull-time rule; the
-#     Phase 3 driver may `source` this file (it only defines functions) and call pull_engine_files <key> for the seven
-#     large engines (it handles enumerate_pattern, join_into and the research-snippet hash comparison).
+#   * hf_tree_lfs / engine_tree_lfs / pull_engine_files below are the reference implementation of the
+#     manifest-at-pull-time rule; the Phase 3 driver extracts them (it never runs step_04) and calls
+#     pull_engine_files <key> for the LLM seats (it handles enumerate_pattern, join_into, a root-level file of a subdir
+#     entry such as glm-5.3-flash's mmproj-F16.gguf, and the research-snippet hash comparison).
 
-ATLAS_RESIDENT_KEYS=(router-qwen3.5-4b embed-bge-m3 rerank-bge-v2-m3)
+ATLAS_RESIDENT_KEYS=(router-qwen3.5-4b embed-qwen3-4b rerank-qwen3-4b)
+MEM_EMBED_MODEL="embed-qwen3-4b"                     # S-41 / D-45 (a): EMBEDDING_MODEL, the llama-server alias
+# S-41: the query form of the Qwen3-Embedding card, get_detailed_instruct() ("Instruct: <task>\nQuery:<text>"); the
+# same text as orchestrator/src/atlas/memory.py DEFAULT_QUERY_INSTRUCTION. Written to memory.env once (ensure_kv_default),
+# so a task the Principal tunes there survives a re-run of this step; stored documents never carry it.
+MEM_QUERY_INSTRUCTION="Given a question or a note, retrieve the stored passages that answer or relate to it"
 ATLAS_CHROMA_COLLECTIONS=(corporate estate scars documents_corporate documents_estate sentinel)   # Section 10.1
 ATLAS_CACHE_DIR="/var/cache/atlas"                   # build caches (pip, tool HOME); never under $ATLAS_STATE (CONVENTIONS §2)
 HF_BASE="https://huggingface.co"                     # the ONLY host the HF token is ever sent to (rule §7.2)
@@ -185,7 +203,7 @@ PY
 # hf_tree_lfs REPO [SUBDIR] — one line per file entry: "<path>\t<bytes>\t<sha256|none>". The sha256 is lfs.oid; a file
 # stored outside LFS (none expected for .gguf) prints "none" and hf_download then records its computed hash instead.
 # Anonymous first; the token is loaded and sent only when the repo answers 401/403 (gated), and only to $HF_BASE
-# (fix round 3): the ten engines.json repos are public, so the secret is never read for them.
+# (fix round 3): the engines.json repos are public, so the secret is never read for them.
 _hf_endpoint_check() {
   if [[ -n "${HF_ENDPOINT:-}" && "${HF_ENDPOINT%/}" != "$HF_BASE" ]]; then
     die "HF_ENDPOINT is set to '$HF_ENDPOINT'; this step only talks to $HF_BASE and sends the token nowhere else (rule §7.2). Unset it (atlas.env or the environment) and re-run"
@@ -246,8 +264,26 @@ PY
   rm -f "$body"
 }
 
+# engine_tree_lfs KEY — hf_tree_lfs for one engines.json entry: its subdir, plus the repo root when files[] names a file
+# without the subdir prefix (files_rule, v0.4.0: glm-5.3-flash's mmproj-F16.gguf sits at the root of
+# unsloth/GLM-5.3-Flash-GGUF, outside UD-IQ4_XS/). The tree API lists one level (directories are skipped), so the root
+# listing adds only root files; a subdir entry is matched by its full path first, so nothing is taken twice.
+engine_tree_lfs() {
+  local key="$1" repo subdir rootless
+  repo="$(ej "$key" hf_repo)"; subdir="$(ej "$key" subdir)"
+  [[ -n "$repo" ]] || die "engine_tree_lfs: $key has no hf_repo"
+  hf_tree_lfs "$repo" "$subdir"
+  [[ -n "$subdir" ]] || return 0
+  rootless="$(ej "$key" files | python3 -c '
+import json, sys
+print(sum(1 for line in sys.stdin if line.strip() and "/" not in json.loads(line)["name"]))')"
+  if (( rootless > 0 )); then
+    hf_tree_lfs "$repo" ""
+  fi
+}
+
 # hf_download_public REPO FILE DEST SHA256 — hf_download (lib/common.sh: resumable, through the proxy, sha256-verified)
-# WITHOUT a bearer token. None of the ten engines.json repos is gated, so the token is never needed here, and today's
+# WITHOUT a bearer token. None of the engines.json repos is gated, so the token is never needed here, and today's
 # hf_download would put it on curl's argv for every local account to read (header, cross-writer request). hf_download
 # takes the token from $HF_TOKEN or from $ATLAS_ETC/secrets/hf-token.env; an empty $HF_TOKEN does not stop the file
 # read, so the call runs with ATLAS_ETC pointed at an empty directory (CONVENTIONS §4: every node path is overridable)
@@ -274,7 +310,7 @@ pull_engine_files() {
   # Capture first, then split: a die inside a process substitution only ends that subshell and the outer shell would
   # continue with an empty array; an assignment from a failing command substitution propagates under set -e.
   local tree tree_lines=()
-  tree="$(hf_tree_lfs "$repo" "$subdir")" || die "pull_engine_files: tree listing of $repo${subdir:+/$subdir} failed (see the message above)"
+  tree="$(engine_tree_lfs "$key")" || die "pull_engine_files: tree listing of $repo${subdir:+/$subdir} failed (see the message above)"
   [[ -n "$tree" ]] || die "pull_engine_files: $repo${subdir:+/$subdir} lists no files"
   mapfile -t tree_lines <<<"$tree"
 
@@ -291,9 +327,6 @@ for line in sys.argv[2:]:
 PY
 )
     (( ${#wanted[@]} > 0 )) || die "pull_engine_files: no file in $repo${subdir:+/$subdir} matches enumerate_pattern '$pattern'; tree: $(printf '%s ' "${tree_lines[@]%%$'\t'*}")"
-    if [[ "$key" == embed-bge-m3 && ${#wanted[@]} -ne 1 ]]; then
-      die "pull_engine_files: expected exactly one bge-m3 Q8_0 file, got ${#wanted[@]}: $(printf '%s ' "${wanted[@]%%$'\t'*}")"
-    fi
   else
     local f name sha
     while IFS= read -r f; do
@@ -396,7 +429,7 @@ PY
 # --- resident units ---------------------------------------------------------------------------------------------------
 _mem_render_envs() {
   # stderr is kept (rule §7.4: the failing reason must be logged); only the expected "model file not present yet" note
-  # for the seven large engines (pulled in Phase 3) is filtered.
+  # for the four LLM seats (pulled in Phase 3) is filtered.
   python3 "$ATLAS_DAY1_DIR/phase2/engine-env.py" \
     --engines "$ATLAS_DAY1_DIR/config/engines.json" \
     --out "$ATLAS_ETC/engines" --models-dir "$ATLAS_SRV/models" --slots-dir "$ATLAS_SRV/data/slots" \
@@ -514,23 +547,43 @@ _mem_check_residents() {
   run_verify V10a v10a-router-resident.sh \
     || die "the resident router model did not answer a chat completion; see verify.jsonl V10a and journalctl -u llama-server@router-qwen3.5-4b"
 
-  # Embeddings: /v1/embeddings must return a 1024-dim vector (bge-m3 dense dimension, FlagEmbedding README VERIFIED;
-  # LightRAG's EMBEDDING_DIM=1024 and the Chroma collections depend on it).
-  port="$(engine_port embed-bge-m3)"
-  resp="$(curl -s --noproxy '*' --max-time 120 -H 'Content-Type: application/json' \
-          -d '{"model":"embed-bge-m3","input":"A.T.L.A.S. resident embedding check"}' "http://127.0.0.1:$port/v1/embeddings" || true)"
-  local dim
-  dim="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d["data"][0]["embedding"]))' "$resp" 2>/dev/null || echo 0)"
-  [[ "$dim" == "$(ej embed-bge-m3 embedding_dim)" ]] \
-    || die "embed-bge-m3 returned an embedding of dimension '$dim' (expected $(ej embed-bge-m3 embedding_dim)); response: ${resp:0:200}"
-  log "embed-bge-m3: /v1/embeddings ok, $dim dimensions"
+  # Embeddings (S-41, D-45 (a)): /v1/embeddings must return a vector of AT LEAST the schema's EMBEDDING_DIM (1024):
+  # the server returns Qwen3-Embedding-4B's native 2560 dimensions, and the orchestrator's client keeps the first 1024
+  # and re-normalises them (Matryoshka; atlas/memory.py fit_dimension), so a shorter vector would break the six
+  # collections and LightRAG. The query form is embedded beside the bare text: both must embed, and the instruction
+  # must change the fitted vector (it is part of the input the model sees; documents never carry it).
+  local ekey="$MEM_EMBED_MODEL" want body dim
+  want="$(ej "$ekey" embedding_dim)"
+  port="$(engine_port "$ekey")"
+  body="$(python3 -c 'import json,sys; t="A.T.L.A.S. resident embedding check"; print(json.dumps({"model": sys.argv[1], "input": [t, f"Instruct: {sys.argv[2]}\nQuery:{t}"]}))' "$ekey" "$MEM_QUERY_INSTRUCTION")"
+  resp="$(curl -s --noproxy '*' --max-time 120 -H 'Content-Type: application/json' -d "$body" \
+          "http://127.0.0.1:$port/v1/embeddings" || true)"
+  dim="$(python3 - "$resp" "$want" <<'PY' 2>/dev/null || echo 0
+import json, math, sys
+d, want = json.loads(sys.argv[1]), int(sys.argv[2])
+doc, query = (row["embedding"] for row in sorted(d["data"], key=lambda r: r["index"]))
+def fit(v):  # atlas/memory.py fit_dimension: the first `want` components, re-normalised
+    head = v[:want]
+    n = math.sqrt(sum(x * x for x in head)) or 1.0
+    return [x / n for x in head]
+cos = sum(a * b for a, b in zip(fit(doc), fit(query)))
+assert len(doc) >= want and len(query) == len(doc) and cos < 0.9999, (len(doc), cos)
+print(len(doc))
+PY
+)"
+  (( dim >= want )) \
+    || die "$ekey returned no usable embedding pair (native dimension '$dim', the schema needs at least $want; or the query form embedded to the same vector as the bare text); response: ${resp:0:200}"
+  log "$ekey: /v1/embeddings ok, native $dim dimensions, truncated to $want and re-normalised by the client (S-41); the query form differs from the document form"
 
-  # Reranker: the relevant document must outscore the irrelevant one (server README example, VERIFIED endpoint).
-  port="$(engine_port rerank-bge-v2-m3)"
-  resp="$(curl -s --noproxy '*' --max-time 120 -H 'Content-Type: application/json' \
-          -d '{"model":"rerank-bge-v2-m3","query":"What is a panda?","top_n":2,"documents":["hi","The giant panda is a bear species endemic to China."]}' \
+  # Reranker: the relevant document must outscore the irrelevant one (server README example, VERIFIED endpoint). This
+  # is also T-15's check on the node that the Voodisss conversion carries the rank head (pooling RANK, cls.output.weight):
+  # a GGUF without it is a plain causal model, which cannot score the pair with a clear gap.
+  local rkey=rerank-qwen3-4b
+  port="$(engine_port "$rkey")"
+  body="$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1], "query": "What is a panda?", "top_n": 2, "documents": ["hi", "The giant panda is a bear species endemic to China."]}))' "$rkey")"
+  resp="$(curl -s --noproxy '*' --max-time 120 -H 'Content-Type: application/json' -d "$body" \
           "http://127.0.0.1:$port/v1/rerank" || true)"
-  python3 - "$resp" <<'PY' || die "rerank-bge-v2-m3 did not rank the panda sentence above 'hi' (or /v1/rerank failed): ${resp:0:200}"
+  python3 - "$resp" <<'PY' || die "$rkey did not rank the panda sentence above 'hi' (or /v1/rerank failed; is the rank head in the GGUF? T-15): ${resp:0:200}"
 import json, sys
 d = json.loads(sys.argv[1])
 res = d["results"]
@@ -538,7 +591,7 @@ scores = {r["index"]: float(r["relevance_score"]) for r in res}
 assert scores[1] > scores[0], scores
 print(f"rerank ok: panda={scores[1]:.3f} hi={scores[0]:.3f}")
 PY
-  log "rerank-bge-v2-m3: /v1/rerank ok"
+  log "$rkey: /v1/rerank ok (on the CPU, D-14 (e); no Day 1 code path calls it yet, register D-14 analysis 2.1)"
 }
 
 # --- ChromaDB ---------------------------------------------------------------------------------------------------------
@@ -657,7 +710,7 @@ _mem_chroma_collections() {
   local name code
   for name in "${ATLAS_CHROMA_COLLECTIONS[@]}"; do
     code="$(curl -s --noproxy '*' --max-time 30 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
-            -d "{\"name\":\"$name\",\"get_or_create\":true,\"metadata\":{\"atlas\":\"day1\",\"embedding\":\"bge-m3\",\"dim\":1024}}" "$base" || true)"
+            -d "{\"name\":\"$name\",\"get_or_create\":true,\"metadata\":{\"atlas\":\"day1\",\"embedding\":\"$MEM_EMBED_MODEL\",\"dim\":$(ej "$MEM_EMBED_MODEL" embedding_dim),\"vectors\":\"truncated-renormalised\"}}" "$base" || true)"
     case "$code" in
       200|201) ;;
       *) die "ChromaDB refused to create collection '$name' (HTTP ${code:-none} at $base); the v2 collections path is UNVERIFIED, check the server version with: curl $CHROMA_URL/api/v2/version" ;;
@@ -674,7 +727,23 @@ if missing:
     sys.exit(1)
 print("collections:", sorted(n for n in names if n in sys.argv[2:]))
 PY
-  log "ChromaDB collections present: ${ATLAS_CHROMA_COLLECTIONS[*]}"
+  # D-45 (a): the collections must be the new embedder's. get_or_create returns an existing collection unchanged, so
+  # one created by an earlier run with bge-m3 metadata would keep vectors the new model cannot be compared with (D-45:
+  # not interchangeable even at the same 1024-dim schema; Chroma 1.5.9 never compacts, R27). Before Day 1 the corpus
+  # is empty, so the remedy is to delete such a collection and re-run this step; nothing is deleted here.
+  python3 - "$listing" "$MEM_EMBED_MODEL" "${ATLAS_CHROMA_COLLECTIONS[@]}" <<'PY' || die "a Section 10.1 collection was created for another embedder (see above): delete it while the corpus is still empty (curl -X DELETE $base/<name>) and re-run: sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase2 --force 04 (D-45 (a), S-41)"
+import json, sys
+listing, model, wanted = json.loads(sys.argv[1]), sys.argv[2], set(sys.argv[3:])
+stale = []
+for c in listing:
+    meta = c.get("metadata") or {}
+    if c.get("name") in wanted and meta.get("embedding") not in (None, model):
+        stale.append(f"{c['name']} (embedding {meta.get('embedding')})")
+if stale:
+    print("collections created for another embedder:", ", ".join(stale), file=sys.stderr)
+    sys.exit(1)
+PY
+  log "ChromaDB collections present: ${ATLAS_CHROMA_COLLECTIONS[*]} (embedding $MEM_EMBED_MODEL, $(ej "$MEM_EMBED_MODEL" embedding_dim)-dim schema)"
   # Second observation window (fix round 3): Chroma's product telemetry, where present, fires per collection operation.
   _mem_chroma_telemetry_check "$MEM_CHROMA_SINCE" "after collection operations"
 }
@@ -985,15 +1054,19 @@ _mem_docling_serve_up() {
 _mem_write_env() {
   local f="$ATLAS_ETC/memory.env" router_url embed_url
   router_url="http://127.0.0.1:$(engine_port router-qwen3.5-4b)/v1"
-  embed_url="http://127.0.0.1:$(engine_port embed-bge-m3)/v1"
+  embed_url="http://127.0.0.1:$(engine_port "$MEM_EMBED_MODEL")/v1"
   [[ -e "$f" ]] || { : >"$f"; }
   ensure_kv "$f" CHROMA_URL "$CHROMA_URL"
   ensure_kv "$f" CHROMA_COLLECTIONS "\"${ATLAS_CHROMA_COLLECTIONS[*]}\""
   ensure_kv "$f" ROUTER_URL "$router_url"
   ensure_kv "$f" EMBEDDING_URL "$embed_url"
-  ensure_kv "$f" RERANK_URL "http://127.0.0.1:$(engine_port rerank-bge-v2-m3)/v1"
-  ensure_kv "$f" EMBEDDING_MODEL embed-bge-m3
-  ensure_kv "$f" EMBEDDING_DIM "$(ej embed-bge-m3 embedding_dim)"
+  ensure_kv "$f" RERANK_URL "http://127.0.0.1:$(engine_port rerank-qwen3-4b)/v1"
+  ensure_kv "$f" EMBEDDING_MODEL "$MEM_EMBED_MODEL"
+  # S-41: the 1024-dim schema, kept by truncation and re-normalisation in the client (header).
+  ensure_kv "$f" EMBEDDING_DIM "$(ej "$MEM_EMBED_MODEL" embedding_dim)"
+  # S-41: the query instruction (header MEM_QUERY_INSTRUCTION); double-quoted for systemd's EnvironmentFile and for
+  # step 02's `source` alike, as CHROMA_COLLECTIONS is. Kept when the Principal has edited it (ensure_kv_default).
+  ensure_kv_default "$f" EMBEDDING_QUERY_INSTRUCTION "\"$MEM_QUERY_INSTRUCTION\""
   ensure_kv "$f" LIGHTRAG_WORKING_DIR "$ATLAS_SRV/data/graph"
   ensure_kv "$f" TIKTOKEN_CACHE_DIR "$ATLAS_SRV/data/graph/tiktoken"
   ensure_kv "$f" LIGHTRAG_TIKTOKEN_CACHED "$MEM_TIKTOKEN_CACHED"   # header contract: 0 = seed deferred (no verified copy)

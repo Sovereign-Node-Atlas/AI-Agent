@@ -8,9 +8,9 @@
 #     32-char prefix was silently truncated, fix round 3) and DROPPED; replies to LAN/WireGuard clients are ESTABLISHED
 #     and never match;
 #   * on loopback an ALLOWLIST (fix round 3; the former denylist 3128/6379/8000 left SSH, Cockpit, xrdp, dnsmasq, ntfy,
-#     WG-Easy's admin and every llama-server port 8101-8110 open to a root-in-container process that parses untrusted
+#     WG-Easy's admin and every llama-server port 8101-8120 open to a root-in-container process that parses untrusted
 #     uploads; the engines would have been drivable past the Engine Arbiter and the ledger): a NEW tcp connection from
-#     that cgroup over lo is allowed ONLY to the orchestrator (ORCH_PORT), the bge-m3 llama-server (EMBED_PORT), its own
+#     that cgroup over lo is allowed ONLY to the orchestrator (ORCH_PORT), the embedder llama-server (EMBED_PORT), its own
 #     listener (OPENWEBUI_PORT: the compose healthcheck curls it from inside the container) — all three read from
 #     $ATLAS_ETC/core.env, written by phase2/02-orchestrator.sh — and Kokoro 8880, speaches 8881, docling 5001 (fixed
 #     loopback publishes of docker/core/compose.voice.yml); every other NEW tcp and EVERY NEW udp over lo (no DNS: every

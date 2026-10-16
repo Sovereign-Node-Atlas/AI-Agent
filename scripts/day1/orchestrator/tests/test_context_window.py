@@ -136,11 +136,11 @@ def test_exchanges_keep_their_replies_and_the_current_turn_keeps_its_image() -> 
     fit = fit_to_window(msgs, 100, W, count)
     # The tool result goes with the reply that called it; the image message is part of the current turn.
     assert fit.messages == [sysm, u2, a2, image, text] and fit.dropped_turns == 2 and fit.dropped_messages == 5
-    tight = fit_to_window(msgs, 100, SlotWindow("qwen2.5-vl-72b", 600, "test"), _Count(per_image=300))
+    tight = fit_to_window(msgs, 100, SlotWindow("glm-5.3-flash", 600, "test"), _Count(per_image=300))
     assert tight.messages == [sysm, image, text] and tight.dropped_turns == 3  # every exchange went, the image did not
     # Dropping the image just sent would make [SYS, NOW] fit a 400-token slot; it is never dropped: the request fails.
     with pytest.raises(ContextWindowExceeded, match="alone are 433 tokens after dropping all 3 earlier exchange"):
-        fit_to_window(msgs, 100, SlotWindow("qwen2.5-vl-72b", 400, "test"), _Count(per_image=300))
+        fit_to_window(msgs, 100, SlotWindow("glm-5.3-flash", 400, "test"), _Count(per_image=300))
 
 
 def test_max_tokens_is_clamped_so_the_reply_never_reaches_the_slot_end() -> None:
@@ -162,13 +162,13 @@ def test_max_tokens_is_clamped_so_the_reply_never_reaches_the_slot_end() -> None
     long = [_m("system", 100), _m("user", 200), _m("assistant", 200), _m("user", 300)]
     fit = fit_to_window(long, 1000, W, _Count())
     assert fit.messages == [long[0], long[3]] and fit.max_tokens == 568 and 568 >= MIN_REPLY_TOKENS
-    # When even the prefix and the current turn cannot take the reserve (Meditron's 4096-token slot reserves 1024 of a
+    # When even the prefix and the current turn cannot take the reserve (a 4096-token slot reserves 1024 of a
     # 4096 reply), every earlier exchange goes, though both small ones would fit beside a 512-token reply, and the
     # reply is clamped to the room: 4096 - 32 - 3200 = 864, between the minimum reply and the reserve.
-    meditron = SlotWindow("meditron-70b", 4096, "test")
+    small = SlotWindow("embed-qwen3-4b", 4096, "test")  # a 4096-token slot, as on the retrieval pair
     big = [_m("system", 200), _m("user", 25), _m("assistant", 25), _m("user", 25), _m("assistant", 25),
            _m("user", 3000)]
-    fit = fit_to_window(big, 4096, meditron, _Count())
+    fit = fit_to_window(big, 4096, small, _Count())
     assert fit.messages == [big[0], big[5]] and fit.dropped_turns == 2 and fit.max_tokens == 864
 
 
@@ -176,7 +176,7 @@ def test_max_tokens_is_clamped_so_the_reply_never_reaches_the_slot_end() -> None
     (32768, 4096, 4096),  # a 32k slot keeps the pipeline's default reply (atlas.api.DEFAULT_MAX_TOKENS) whole
     (32768, 32768, 8192),  # a max_tokens at the window reserves a quarter of the slot, not the slot
     (8192, 4096, 2048),  # the router's slot: LightRAG's gleaning call (no max_tokens, so 4096) keeps its input text
-    (4096, 4096, 1024),  # Meditron's slot
+    (4096, 4096, 1024),  # a 4096-token slot
     (1000, 1000, MIN_REPLY_TOKENS),  # a quarter of a small slot is under the minimum reply: the minimum
     (32768, 200, 200),  # a reply smaller than the cap (the classifier's verdict) is reserved as asked
     (32768, None, MIN_REPLY_TOKENS),  # no max_tokens at all: the minimum, then the whole remaining room
@@ -198,7 +198,7 @@ def test_history_goes_only_as_far_as_the_bounded_reply_reserve_needs(
 @pytest.mark.parametrize(("tokens", "asked", "reserve"), [
     (32768, 32768, 8192),  # the cap: a quarter of a 32k slot
     (8192, 4096, 2048),  # the router's slot
-    (4096, 4096, 1024),  # Meditron's slot
+    (4096, 4096, 1024),  # a 4096-token slot
     (1000, 300, 300),  # under the cap: the reply asked for
 ])
 def test_the_reserve_boundary_is_exact(tokens: int, asked: int, reserve: int, caplog: pytest.LogCaptureFixture) -> None:
@@ -277,17 +277,18 @@ def test_image_tokens_are_counted_by_the_engine_or_charged_the_documented_estima
                                      {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
     ]}
     pinned = StubLlamaServer(per_image=1234)
-    client = LlamaClient(URL, transport=pinned.transport(), window=SlotWindow("qwen2.5-vl-72b", 32768, "test"))
+    client = LlamaClient(URL, transport=pinned.transport(), window=SlotWindow("glm-5.3-flash", 32768, "test"))
     assert client.count_prompt_tokens(body) == stub_prompt_tokens(body, per_image=1234)  # image tokens included
     assert [p for p, _ in pinned.requests] == [COUNT_PATH]  # one round trip
     older = StubLlamaServer(count_route=False)  # a build without the count route: /apply-template + /tokenize
-    client = LlamaClient(URL, transport=older.transport(), window=SlotWindow("qwen2.5-vl-72b", 32768, "test"))
+    client = LlamaClient(URL, transport=older.transport(), window=SlotWindow("glm-5.3-flash", 32768, "test"))
     with caplog.at_level(logging.WARNING, logger="atlas.engines"):
         n = client.count_prompt_tokens(body)
         client.count_prompt_tokens(body)
     # "<system> read drawings <user> what is this <__media__>" is 8 tokens; the pair does not see the image, so the
-    # Qwen2.5-VL ceiling (4096 image tokens + <|vision_start|>/<|vision_end|>) is charged per image part.
-    assert IMAGE_TOKENS_ESTIMATE == 4096 + 2 and n == 8 + IMAGE_TOKENS_ESTIMATE
+    # glm5v ceiling of the v0.4.0 vision engine (8,000 image tokens + <|begin_of_image|>/<|end_of_image|>) is charged
+    # per image part.
+    assert IMAGE_TOKENS_ESTIMATE == 8000 + 2 and n == 8 + IMAGE_TOKENS_ESTIMATE
     assert [p for p, _ in older.requests[:3]] == [COUNT_PATH, "/apply-template", "/tokenize"]
     assert older.requests[2][1]["add_special"] is True and older.requests[2][1]["parse_special"] is True
     assert len([r for r in caplog.records if "answered 404" in r.getMessage()]) == 1  # said once, not per request
@@ -318,7 +319,7 @@ def test_a_client_without_a_window_refuses_to_generate(engines: dict[str, Engine
     with pytest.raises(EngineError, match="no per-slot window"):
         bare.chat([{"role": "user", "content": "x"}])
     assert server.requests == []
-    assert LlamaClient.for_engine(engines["meditron-70b"]).window().tokens == 4096  # engines.json by default
+    assert LlamaClient.for_engine(engines["router-qwen3.5-4b"]).window().tokens == 8192  # engines.json by default
 
 
 # --- the window: the profile the unit runs (api.engine_window) --------------------------------------------------------
@@ -329,16 +330,16 @@ def test_the_window_is_the_profile_the_unit_runs(engines: dict[str, EngineSpec],
     # No env file: engines.json, its smallest per-slot figure.
     assert engine_window(arbiter, engines["gpt-oss-120b"]).tokens == 32768
     assert engine_window(arbiter, engines["router-qwen3.5-4b"]).tokens == 8192
-    assert engine_window(arbiter, engines["meditron-70b"]).tokens == 4096
-    vision = window_for(engines["qwen2.5-vl-72b"])
+    assert engine_window(arbiter, engines["deepseek-v4-flash"]).tokens == 131072  # one 128K slot (Day 1 default)
+    vision = window_for(engines["glm-5.3-flash"])  # the vision engine: GLM-5.3-Flash with its glm5v mmproj
     assert vision.tokens == 32768 and "no unit env file" in vision.source
     arbiter.engines_env_dir = tmp_path
-    _env(tmp_path, "qwen2.5-vl-72b", 65536, 2, coresident=1)  # the standing co-resident profile (S52)
-    w = engine_window(arbiter, engines["qwen2.5-vl-72b"])
-    assert w.tokens == 32768 and "qwen2.5-vl-72b.env" in w.source and "x 2 slots" in w.source
-    _env(tmp_path, "qwen2.5-vl-72b", 49152, 2)  # whatever is rendered is the window, never a fixed figure
-    assert engine_window(arbiter, engines["qwen2.5-vl-72b"]).tokens == 24576
-    _env(tmp_path, "deepseek-v4-flash", 16384, 1, kv="f16")  # the KV ladder's f16 result (ctx_size_f16_cap, S2)
+    _env(tmp_path, "glm-5.3-flash", 65536, 2, coresident=1)  # an env file from before S-22: the line changes nothing
+    w = engine_window(arbiter, engines["glm-5.3-flash"])
+    assert w.tokens == 32768 and "glm-5.3-flash.env" in w.source and "x 2 slots" in w.source
+    _env(tmp_path, "glm-5.3-flash", 49152, 2)  # whatever is rendered is the window, never a fixed figure
+    assert engine_window(arbiter, engines["glm-5.3-flash"]).tokens == 24576
+    _env(tmp_path, "deepseek-v4-flash", 16384, 1, kv="f16")  # a smaller rendered window is the window
     assert engine_window(arbiter, engines["deepseek-v4-flash"]).tokens == 16384
     _env(tmp_path, "router-qwen3.5-4b", 8192, 4)  # resident: outside the Arbiter's budget, read for the window anyway
     assert engine_window(arbiter, engines["router-qwen3.5-4b"]).tokens == 2048
@@ -399,15 +400,15 @@ def api(config_dir: Path, tmp_path: Path) -> dict[str, Any]:
 
 
 def test_the_api_answers_413_for_a_request_that_cannot_fit(api: dict[str, Any]) -> None:
-    _env(api["env"], "gpt-oss-120b", 2048, 1, kv="q4_0")  # a 2048-token slot for Ren's engine
+    _env(api["env"], "glm-5.3-flash", 2048, 1, kv="f16")  # a 2048-token slot for Ren's engine
     client: TestClient = api["client"]
     huge = [{"role": "user", "content": " ".join(["clause"] * 3000)}]
     r = client.post("/v1/chat/completions", json={"model": "ren", "messages": huge})
     assert r.status_code == 413
     err = r.json()["error"]
     assert err["status"] == 413 and err["type"] == "context_window_exceeded"
-    assert "gpt-oss-120b" in err["message"] and "window of 2048 tokens" in err["message"]
-    assert "gpt-oss-120b.env" in err["message"] and "shorten it or use document retrieval" in err["message"]
+    assert "glm-5.3-flash" in err["message"] and "window of 2048 tokens" in err["message"]
+    assert "glm-5.3-flash.env" in err["message"] and "shorten it or use document retrieval" in err["message"]
     assert api["server"].generations == []  # nothing was sent
     row = api["ledger"].get_task(err["task_id"])
     assert row["status"] == "failed" and "ContextWindowExceeded" in row["error"]
@@ -417,8 +418,8 @@ def test_the_api_answers_413_for_a_request_that_cannot_fit(api: dict[str, Any]) 
         body = "".join(s.iter_text())
     chunk = next(c for c in _sse(body) if "error" in c)
     assert chunk["error"]["status"] == 413 and chunk["error"]["type"] == "context_window_exceeded"
-    assert chunk["choices"][0]["delta"]["content"].startswith("\n[ATLAS] gpt-oss-120b: ")
-    r = client.post("/internal/v1/chat/completions", json={"model": "gpt-oss-120b", "messages": huge})
+    assert chunk["choices"][0]["delta"]["content"].startswith("\n[ATLAS] glm-5.3-flash: ")
+    r = client.post("/internal/v1/chat/completions", json={"model": "glm-5.3-flash", "messages": huge})
     assert r.status_code == 413 and r.json()["error"]["type"] == "context_window_exceeded"
     assert api["server"].generations == [] and api["arbiter"].generating is None
 
@@ -426,7 +427,7 @@ def test_the_api_answers_413_for_a_request_that_cannot_fit(api: dict[str, Any]) 
 def test_a_long_chat_is_trimmed_at_exchange_boundaries_and_still_answers(
     api: dict[str, Any], caplog: pytest.LogCaptureFixture
 ) -> None:
-    _env(api["env"], "gpt-oss-120b", 8192, 1, kv="q4_0")
+    _env(api["env"], "glm-5.3-flash", 8192, 1, kv="f16")
     history = [*_exchanges(30, 300), {"role": "user", "content": "and finally, the summary please"}]
     with caplog.at_level(logging.INFO, logger="atlas.engines"):
         r = api["client"].post("/v1/chat/completions", json={"model": "ren", "messages": history, "max_tokens": 500})
@@ -439,7 +440,7 @@ def test_a_long_chat_is_trimmed_at_exchange_boundaries_and_still_answers(
     assert 0 < len(kept) < 30 and kept == [str(i) for i in range(30 - len(kept), 30)]  # the newest ones
     assert stub_prompt_tokens(gen) + 500 + CONTEXT_MARGIN_TOKENS <= 8192
     (rec,) = [r for r in caplog.records if r.name == "atlas.engines"]
-    assert "engine=gpt-oss-120b window=8192 (gpt-oss-120b.env" in rec.getMessage()
+    assert "engine=glm-5.3-flash window=8192 (glm-5.3-flash.env" in rec.getMessage()
 
 
 def test_a_fitting_chat_keeps_its_history_whatever_max_tokens_it_asks_for(api: dict[str, Any]) -> None:

@@ -47,7 +47,7 @@ if [[ "$ATLAS_DRY_RUN" != "1" ]]; then
 fi
 
 # --- Hugging Face token (CONVENTIONS.md §2: /etc/atlas/secrets/hf-token.env, HF_TOKEN=..., atlas:atlas 600) ----------
-# Needed by step 5 (PyAnnote 3.1, gated) and Phase 4 (FLUX.1-dev, Stable Audio Open, gated); step 4's resident models
+# Needed by step 5 (pyannote speaker-diarization-community-1, gated; C-06, v0.4.0) and Phase 4 (FLUX.1-dev, Stable Audio Open, gated); step 4's resident models
 # are public and are pulled without the token (phase2/04-memory.sh hf_download_public). Prompted once, never echoed,
 # never logged.
 # Ownership (fix round 2, aligned with CONVENTIONS §2 instead of arguing with it): the FILE is atlas:atlas 600, because
@@ -88,7 +88,7 @@ hf_token_prompt() {
   ask tok "HF token (input hidden; Enter to skip and leave it for later): " secret
   if [[ -z "$tok" ]]; then
     todo_add input-hf-token "Hugging Face token not provided: PyAnnote (V6), FLUX.1-dev and Stable Audio Open are deferred" \
-      "Create a read token at huggingface.co, accept the licences of pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0, black-forest-labs/FLUX.1-dev and stabilityai/stable-audio-open-1.0, then: sudo bash -c 'umask 077; printf \"HF token: \"; IFS= read -rs t; echo; printf \"HF_TOKEN=%s\\n\" \"\$t\" > $tokf; chown atlas:atlas $tokf; chmod 600 $tokf' and re-run: atlas-day1.sh phase2 --force 05"
+      "Create a read token at huggingface.co, accept the licences of pyannote/speaker-diarization-community-1 (the one pyannote repo V6 needs since v0.4.0, C-06), black-forest-labs/FLUX.1-dev and stabilityai/stable-audio-open-1.0, then: sudo bash -c 'umask 077; printf \"HF token: \"; IFS= read -rs t; echo; printf \"HF_TOKEN=%s\\n\" \"\$t\" > $tokf; chown atlas:atlas $tokf; chmod 600 $tokf' and re-run: atlas-day1.sh phase2 --force 05"
     return 0
   fi
   if [[ ! "$tok" =~ ^hf_[A-Za-z0-9_]+$ ]]; then

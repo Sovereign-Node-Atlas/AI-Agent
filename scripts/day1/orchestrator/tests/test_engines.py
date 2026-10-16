@@ -165,13 +165,13 @@ def test_systemd_controller_uses_plain_sudo_and_the_unit_name(engines: dict[str,
     ctl = SystemdEngineController(runner=runner)  # no engines map: no health re-check, no network
     ctl.start("gpt-oss-120b")
     ctl.stop("gpt-oss-120b")
-    ctl.restart("nemotron-3-super")
+    ctl.restart("glm-5.3-flash")
     assert ctl.is_active("gpt-oss-120b") is True
     cmds = [c for c, _ in runner.calls]
     assert cmds == [
         ["sudo", "-n", "systemctl", "start", "llama-server@gpt-oss-120b"],
         ["sudo", "-n", "systemctl", "stop", "llama-server@gpt-oss-120b"],
-        ["sudo", "-n", "systemctl", "restart", "llama-server@nemotron-3-super"],
+        ["sudo", "-n", "systemctl", "restart", "llama-server@glm-5.3-flash"],
         ["systemctl", "is-active", "--quiet", "llama-server@gpt-oss-120b"],  # status needs no sudo
     ]
     for cmd, kw in runner.calls:
@@ -189,11 +189,34 @@ def test_systemd_controller_uses_plain_sudo_and_the_unit_name(engines: dict[str,
 
 def test_systemd_controller_failure_names_the_journal() -> None:
     ctl = SystemdEngineController(runner=FakeRunner(rc=1, stderr="Job for llama-server@x.service failed"))
-    with pytest.raises(EngineControlError, match=r"journalctl -u llama-server@qwen3\.5-122b"):
-        ctl.start("qwen3.5-122b")
-    assert ctl.is_active("qwen3.5-122b") is False
+    with pytest.raises(EngineControlError, match=r"journalctl -u llama-server@deepseek-v4-flash"):
+        ctl.start("deepseek-v4-flash")
+    assert ctl.is_active("deepseek-v4-flash") is False
     with pytest.raises(EngineControlError, match="not in the sudoers fragment"):
         ctl._systemctl("enable", "x", 1.0)
+
+
+def test_systemd_controller_reads_a_units_main_pid_without_sudo(engines: dict[str, EngineSpec]) -> None:
+    """D-14 (e): the Arbiter measures a CPU companion's VmRSS through its unit's MainPID; `systemctl show` needs no
+    sudo, a stopped unit answers 0 (None here), and a failure is None, never an exception (the projection stands in)."""
+
+    class ShowRunner(FakeRunner):
+        def __init__(self, out: str, rc: int = 0) -> None:
+            super().__init__(rc=rc)
+            self.out = out
+
+        def __call__(self, cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+            self.calls.append((cmd, kw))
+            return subprocess.CompletedProcess(cmd, self.rc, stdout=self.out, stderr="")
+
+    runner = ShowRunner("4242\n")
+    ctl = SystemdEngineController(engines=engines, runner=runner)
+    assert ctl.main_pid("embed-qwen3-4b") == 4242
+    assert runner.calls[0][0] == ["systemctl", "show", "-p", "MainPID", "--value", "llama-server@embed-qwen3-4b"]
+    assert SystemdEngineController(engines=engines, runner=ShowRunner("0\n")).main_pid("embed-qwen3-4b") is None
+    assert SystemdEngineController(engines=engines, runner=ShowRunner("", rc=1)).main_pid("embed-qwen3-4b") is None
+    with pytest.raises(EngineControlError):
+        ctl.main_pid("not a key")  # the same key check as every systemctl call
 
 
 def test_systemd_controller_refuses_keys_that_are_not_bare_unit_names(engines: dict[str, EngineSpec]) -> None:

@@ -122,11 +122,17 @@ __all__ = [
 TIER_ORDER: dict[str, int] = {t: i for i, t in enumerate(TIERS)}  # routine < standard < sensitive
 DEEP_THINK_DEPTHS: tuple[str, ...] = ("quick", "standard", "deep")  # 9.1
 FAMILY_NAME_CATEGORY = "family-name"  # what a FAMILY_NAMES hit is called outside the ledger (10.4; module docstring)
-# 6.2 "Override" column: Gideon "Qwen3.5-122B for long contracts", Minerva "Qwen3.5-122B for records"; 6.3 "Qwen3.5
-# loads only for long documents". The engine key is CONVENTIONS.md §8's.
-LONG_DOCUMENT_ENGINE = "qwen3.5-122b"
+# D-38 (approved 2026-10-16): the long-document engine is GLM-5.3-Flash (AA-LCR 80.0, MRCR 128K 62.9), the default seat
+# of most directors, so a long-document dispatch usually costs no swap; it replaces Qwen3.5-122B-A10B (retired, S-11).
+# A director whose default is another engine and who lists it among its overrides runs a long-document dispatch on it
+# (6.2 "Override" column). The engine key is CONVENTIONS.md §8's.
+LONG_DOCUMENT_ENGINE = "glm-5.3-flash"
+# The route Arthur's long-document trigger and the [ARTHUR:LONG] prefix take (router-rules.json `routes` key; S-30
+# renames v0.3.5's "arthur-qwen", named after the engine it no longer runs on).
+LONG_DOCUMENT_ROUTE = "arthur-long"
 # Override actions that name a persona route (router-rules.json `routes` keys). Every other action is a command.
-PERSONA_ACTIONS: frozenset[str] = frozenset({"ren", "arthur", "ren-abliterated", "arthur-qwen", "arthur-abliterated"})
+PERSONA_ACTIONS: frozenset[str] = frozenset({"ren", "arthur", "ren-abliterated", LONG_DOCUMENT_ROUTE,
+                                            "arthur-abliterated"})
 # UNVERIFIED: ~4 characters per token for English prose (a common rule of thumb) — the long-document trigger's
 # fallback when the classifier gives no verdict; the classifier's `long_document` field is the primary signal and an
 # exact count would need the resident tokenizer (LlamaClient.tokenize), which the router does not call per message.
@@ -347,7 +353,7 @@ class LlamaClassifier:
 @dataclass(frozen=True)
 class OverrideMatch:
     key: str  # the prefix as typed and configured, e.g. "[ARTHUR:LONG]"
-    action: str  # the configured action, e.g. "arthur-qwen"
+    action: str  # the configured action, e.g. "arthur-long"
     payload: str | None  # text between a "...:"-style key and its closing "]"
     body: str  # the message with the prefix removed (payload kept for payload keys)
 
@@ -566,7 +572,7 @@ class RoutingDecision:
         to prevent (a director's prompt on the lead's model).
     """
 
-    route: str  # a `routes` key of router-rules.json: ren, arthur, ren-abliterated, arthur-qwen, ...
+    route: str  # a `routes` key of router-rules.json: ren, arthur, ren-abliterated, arthur-long, ...
     persona: str  # the hemisphere lead that synthesises and speaks: ren | arthur (16.1 rule 1, 8.5 step 7)
     hemisphere: str
     engine: str  # the LEAD's engine (CONVENTIONS.md §8 key; the Apex engine for TF_OMEGA / deep tier): synthesis only
@@ -667,6 +673,10 @@ class Router:
         for action in self.rules.overrides.values():
             if action in PERSONA_ACTIONS and action not in self.rules.routes:
                 raise ConfigError(f"router-rules.json override action {action!r} has no route")
+        if "arthur-qwen" in self.rules.routes or "arthur-qwen" in self.rules.overrides.values():
+            # S-30 (v0.4.0): the long-document route is "arthur-long" now; the old name would be a dead command.
+            raise ConfigError(f"router-rules.json still names the v0.3.5 route 'arthur-qwen': rename it "
+                              f"{LONG_DOCUMENT_ROUTE!r} (routes key and the [ARTHUR:LONG] action; D-38, S-30)")
         self._hard_route = self.rules.hard_keyword_route
         if self._hard_route not in self.rules.routes:
             raise ConfigError(f"router-rules.json hard_keyword_route {self._hard_route!r} has no route")
@@ -830,9 +840,9 @@ class Router:
         est_tokens = len(body) // CHARS_PER_TOKEN_ESTIMATE
         long_doc = bool(verdict and verdict.long_document) or est_tokens >= self.rules.long_document_tokens
         if long_doc:
-            if route == "arthur" and "arthur-qwen" in self.rules.routes:
-                route = "arthur-qwen"
-                reasons.append("long-document:arthur-qwen")
+            if route == "arthur" and LONG_DOCUMENT_ROUTE in self.rules.routes:
+                route = LONG_DOCUMENT_ROUTE
+                reasons.append(f"long-document:{LONG_DOCUMENT_ROUTE}")
             else:
                 # No corporate long-document route exists in router-rules.json (7.1 names it for Arthur only); the
                 # engine stays as routed and the flag is carried for the caller (a director's 6.2 override is below).
@@ -885,8 +895,8 @@ class Router:
             # Apex engine for a director whose file does not list it is a ConfigError, not a silent widening.
             dispatch_engine = self.personas.engine_for(dispatch_persona, tf.engine or None)
             reasons.append(f"dispatch:{dispatch_persona}@{dispatch_engine}(8.5 step 4)")
-            # 6.2 "Override" column: a director bound to Qwen3.5 for long documents (Gideon: long contracts; Minerva:
-            # records) runs a long-document dispatch on it (6.3 "Qwen3.5 loads only for long documents"); the Apex
+            # 6.2 "Override" column (D-38): a director bound to the long-document engine as an override runs a
+            # long-document dispatch on it (a director whose default it is already does); the Apex
             # engine of a preset is never displaced.
             if (
                 long_doc

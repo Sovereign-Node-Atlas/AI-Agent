@@ -30,48 +30,60 @@ DEFAULT_CONFIG_DIR = Path("/opt/atlas/day1/config")
 DEFAULT_ETC_DIR = Path("/etc/atlas")
 DEFAULT_DB_PATH = Path("/srv/atlas/data/orchestrator/atlas.sqlite3")
 DEFAULT_LLAMA_PORT_BASE = 8100
-# Section 4.1 (v0.3.5, S44; S48; S49): memory the Engine Arbiter never budgets to an engine. Its resident set is read
-# from mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/
+# Section 4.1 (v0.3.5, S44; S48; S49): memory the Engine Arbiter never budgets to an engine. Its GPU resident set is
+# read from mem_info_gtt_used, which counts GPU buffer objects only, so the CPU-side rows of the 4.1 table (Ubuntu/XFCE/
 # Docker/Cockpit 4 GB, Open WebUI/ChromaDB/graph store ~3 GB, Kokoro/Whisper/PyAnnote 3 GB, orchestrator/Celery/Redis/
 # Sentinel/ntfy/WG-Easy 2 GB: ~12 GB) never show on it, and without a reserve they were budgeted to engines on a node
 # with no swap. 16 GiB = those ~12 GiB plus room for transient CPU work (Celery CPU workers, Docling, the Phase 2
 # tools) and kernel overhead; measured CPU-side use is logged against it at every measurement, so a node that needs
-# more says so (raise the override then).
-# The Apex fit: the Phase 3 KV ladder of the Apex engine (S2) projects 160.0 GiB at f16 (ctx 16384), 160.3 at q8_0 and
-# 157.8 at q4_0, and the f16 rung is the fallback when quantised KV is incoherent. Every rung fits while
-# pool - GPU resident set R (6-8 GiB) - reserve >= 160.3 GiB; the pool is min(GTT total, MemTotal) (S47), so at 16 GiB
-# that needs MemTotal >= ~182.3-184.3 GiB. Phase 1 step 4 removes the crash-kernel reservation kdump-tools puts on the
-# GRUB line (option (c) of 2026-10-10, S48: 4096 MiB plus a 256 MiB low block, 4.25 GiB, taken out of MemTotal at every
-# boot), so MemTotal is expected at ~187-188 GiB: 192 GiB less the 512 MiB UMA carve-out (3.2), the ~3 GiB page map and
-# ~0.5 GiB of firmware and kernel (an estimate until V3a records the real figure), ~3-5 GiB above that threshold.
-# Were the reservation to survive (MemTotal ~183-184 GiB), the f16 and q8_0 rungs would be refused at R = 8 GiB; that
-# is why V3a fails on any crashkernel= or reserved crash memory. (While the reservation stood, the default was 12 GiB.)
-# All of that assumes every page of MemTotal can back GTT, which holds only with kexec handover off: Phase 1 step 4 puts
-# kho=off on the kernel line (S49). Ubuntu's 7.0 kernel has it on by default (CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y,
-# VERIFIED) and then sets aside 200 % of the early kernel memblock reservations twice over (lowmem + global, plus node
-# 0's; the ~3 GiB page map dominates) as MIGRATE_CMA pageblocks: about 13 GiB (12.8-13.8, INFERRED) that stay inside
-# MemTotal but that TTM/GTT pages (no __GFP_MOVABLE) can never use, so only about 174 GiB could back GTT and the f16 and
-# q8_0 rungs (166-168 GiB with R) would likely fail with a Vulkan out-of-memory in Phase 3 although granted. MemTotal
-# itself is the same either way. V3a fails while any of that scratch is set aside.
+# more says so (raise the override then). The retrieval pair on the CPU (D-14 (e), v0.4.0: placement "cpu") is NOT in
+# this reserve: the Arbiter budgets it as its own host resident set (atlas.arbiter, module docstring "Budget").
+# The v0.4.0 fit (D-31, D-32; INFERRED until Phase 3 measures it): one LLM seat runs alone against
+# pool - GPU resident set (router only, ~5.5 GiB) - this reserve - the CPU retrieval pair (~9-10 GiB right-sized), about
+# 156-157 GiB on the expected node. GLM-5.3-Flash (147.10 GiB of files with its mmproj) and DeepSeek-V4-Flash-0731
+# UD-Q8_K_XL (150.75 GiB) both project inside it at their Day 1 profiles with the compute-buffer term of
+# atlas.arbiter (DEFAULT_COMPUTE_BUFFER_GIB); before D-31 the 161.87 GB DeepSeek file was read as 161.87 GiB and
+# refused. The pool is min(GTT total, MemTotal) (S47), so the margin needs MemTotal at its expected ~187-188 GiB:
+# 192 GiB less the 512 MiB UMA carve-out (3.2), the ~3 GiB page map and ~0.5 GiB of firmware and kernel (an estimate
+# until V3a records the real figure). Phase 1 step 4 removes kdump-tools' crash-kernel reservation (S48: 4.25 GiB out of
+# MemTotal at every boot), which V3a fails on, and puts kho=off on the kernel line (S49): Ubuntu's 7.0 kernel has kexec
+# handover on by default (CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y, VERIFIED) and then sets aside about 13 GiB of MemTotal
+# (12.8-13.8, INFERRED) as MIGRATE_CMA pageblocks that TTM/GTT pages (no __GFP_MOVABLE) can never use. V3a fails while
+# any of that scratch is set aside.
 # ATLAS_ARBITER_HEADROOM_GIB in orchestrator.env overrides it (whole GiB, within ARBITER_HEADROOM_RANGE_GIB); a bad
 # value stops only the Arbiter's construction (build_arbiter), never another reader of the settings (the backup
 # freeze, Sentinel, Celery tasks).
 DEFAULT_ARBITER_HEADROOM_GIB = 16
-ARBITER_HEADROOM_RANGE_GIB: tuple[int, int] = (4, 64)  # 4 = the OS row of 4.1 alone; 64 would refuse the Apex engine
+ARBITER_HEADROOM_RANGE_GIB: tuple[int, int] = (4, 64)  # 4 = the OS row of 4.1 alone; 64 would refuse every Day 1 seat
+# D-32 (approved 2026-10-16, option (a); S-23): how many LLM seats (mode chat/vision, never a resident companion, a
+# class-external or a Phase 4 load) may be resident at once. 1 = every LLM seat runs alone with the whole budget and is
+# exclusive; 2 brings back v0.3.5's pairing of seats that fit (option (b)) without a code change, the Apex engine
+# staying exclusive. ATLAS_ARBITER_MAX_RESIDENT in orchestrator.env overrides it (whole number within the range); a bad
+# value stops only the Arbiter's construction, like the headroom.
+DEFAULT_ARBITER_MAX_RESIDENT = 1
+ARBITER_MAX_RESIDENT_RANGE: tuple[int, int] = (1, 2)
 
-# CONVENTIONS.md §8: the names that must agree across every file.
+# CONVENTIONS.md §8: the names that must agree across every file. The v0.4.0 Day 1 set (approved 2026-10-16; D-10,
+# D-12, D-14, D-45, D-59), in engines.json order: gpt-oss-120b (fast utility and fallback floor, F16-trunk GGUF) and its
+# abliterated twin keep ports 8101 and 8102 as in v0.3.5 (the uncensored entry is unchanged by this revision), then the
+# two seats GLM-5.3-Flash (Ren, Gideon, Silas, Helena, Minerva, Victor, Alaric, Eleanor's persona work, the vision
+# engine through its glm5v mmproj and the long-document route) and DeepSeek-V4-Flash-0731 (Arthur, the Apex), then the
+# always-resident companions: the router on the iGPU and the Qwen3 4B retrieval pair on the CPU (D-14 (e)). Phased
+# engines are appended after these when they come in, so no Day 1 port moves (ENGINE_PORT_SLOTS).
 ENGINE_KEYS: tuple[str, ...] = (
     "gpt-oss-120b",
     "gpt-oss-120b-abliterated",
-    "nemotron-3-super",
-    "qwen3.5-122b",
+    "glm-5.3-flash",
     "deepseek-v4-flash",
-    "qwen2.5-vl-72b",
-    "meditron-70b",
     "router-qwen3.5-4b",
-    "embed-bge-m3",
-    "rerank-bge-v2-m3",
+    "embed-qwen3-4b",
+    "rerank-qwen3-4b",
 )
+# S-33: the llama-server port range, LLAMA_PORT_BASE + 1 .. LLAMA_PORT_BASE + ENGINE_PORT_SLOTS (8101..8120 at the
+# default base). The Day 1 set uses 8101..8107; the full arsenal plus its companions comes to about 15-18 units, so 20
+# leaves room for the phased seats without another change to the range. load_engines refuses an engines[] list longer
+# than this rather than hand out a port outside it.
+ENGINE_PORT_SLOTS = 20
 PERSONA_KEYS: tuple[str, ...] = (
     "ren", "arthur", "gideon", "silas", "valerie", "helena", "eleanor", "alaric", "minerva", "victor",
 )
@@ -81,13 +93,19 @@ ARBITER_CLASSES: frozenset[str] = frozenset({"core", "apex", "vision", "crossche
 # never starts or stops itself: the caller runs it in-process (Chatterbox inside phase2/voice_render.py) and POSTs
 # /arbiter/load before and /arbiter/unload after. Such entries live in engines.json's `external` list, not `engines[]`:
 # they take no port (the §8 port rule counts engines[] only), no llama-server@ unit, no sudoers line
-# (phase2/01-llama.sh counts exactly ten engines[]) and no env file (phase2/engine-env.py renders engines[] only).
+# (phase2/01-llama.sh writes one per engines[] key) and no env file (phase2/engine-env.py renders engines[] only).
 EXTERNAL_MODE = "external"
-# CONVENTIONS.md §8 names q8_0 and q4_0 only; `none` is the embedding/reranker entry (no KV cache to quantise). f16 is
-# NOT a class: Section 4.3 wants a quantised cache on every LLM engine, and V4 exists to catch a silent f16 fallback.
-# (The Arbiter's KV_CLASS_FACTOR still knows f16 for projections passed explicitly, e.g. the DeepSeek KV ladder.)
-KV_CLASSES: frozenset[str] = frozenset({"q8_0", "q4_0", "none"})
+# The KV cache type of an engine (S-17, D-29 option (a) approved 2026-10-16): f16 where the cache is cheap
+# (GLM-5.3-Flash 19,712 B/token, DeepSeek-V4-Flash 6,880 B/token), q8_0 elsewhere, q4_0 nowhere new (it stays only on
+# the unchanged gpt-oss-120b-abliterated entry). `none` is an entry that renders no --cache-type flag: a non-causal
+# embedder has no cache, and a causal one (the Qwen3 retrieval pair) then runs llama.cpp's default f16, which the
+# Arbiter projects.
+KV_CLASSES: frozenset[str] = frozenset({"f16", "q8_0", "q4_0", "none"})
 LLM_MODES: frozenset[str] = frozenset({"chat", "vision"})
+# D-14 option (e), approved 2026-10-16 (answers.md section 2): where a llama-server runs. `gpu` (the default) is on the
+# iGPU and shows on mem_info_gtt_used; `cpu` (phase2/engine-env.py renders --device none) is host memory the GTT counter
+# never shows, so the Arbiter budgets it as a host resident set. Only an always-resident companion may run on the CPU.
+PLACEMENTS: frozenset[str] = frozenset({"gpu", "cpu"})
 # config/phase4-engines.json entries (Section 15.2) carry this mode and the Arbiter class `phase4` (§8): containers,
 # never llama-server units, so the Arbiter records their measured footprint (Phase 4 step 5) and refuses to load them.
 PHASE4_MODE = "phase4"
@@ -169,6 +187,10 @@ class Settings:
     # A bad override leaves the default here and its reason in arbiter_headroom_error, which build_arbiter raises.
     arbiter_headroom_bytes: int = DEFAULT_ARBITER_HEADROOM_GIB * 1024**3
     arbiter_headroom_error: str | None = None
+    # D-32: the LLM-seat residency limit (DEFAULT_ARBITER_MAX_RESIDENT; ATLAS_ARBITER_MAX_RESIDENT overrides). A bad
+    # override leaves the default here and its reason in arbiter_max_resident_error, which build_arbiter raises.
+    arbiter_max_resident: int = DEFAULT_ARBITER_MAX_RESIDENT
+    arbiter_max_resident_error: str | None = None
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -196,6 +218,17 @@ class Settings:
                 headroom_error = f"ATLAS_ARBITER_HEADROOM_GIB={headroom_raw} is outside {lo}..{hi} GiB (Section 4.1)"
             else:
                 headroom_gib = int(headroom_raw)
+        resident_raw = (merged.get("ATLAS_ARBITER_MAX_RESIDENT") or "").strip()
+        max_resident, max_resident_error = DEFAULT_ARBITER_MAX_RESIDENT, None
+        if resident_raw:
+            lo, hi = ARBITER_MAX_RESIDENT_RANGE
+            if not re.fullmatch(r"[0-9]+", resident_raw):
+                max_resident_error = f"ATLAS_ARBITER_MAX_RESIDENT={resident_raw!r} is not a whole number of LLM seats"
+            elif not lo <= int(resident_raw) <= hi:
+                max_resident_error = (f"ATLAS_ARBITER_MAX_RESIDENT={resident_raw} is outside {lo}..{hi} LLM seats "
+                                      "(D-32, Section 4.2 rule 3)")
+            else:
+                max_resident = int(resident_raw)
         return cls(
             config_dir=cfg,
             etc_dir=etc_dir,
@@ -206,6 +239,8 @@ class Settings:
             extra=extra,
             arbiter_headroom_bytes=headroom_gib * 1024**3,
             arbiter_headroom_error=headroom_error,
+            arbiter_max_resident=max_resident,
+            arbiter_max_resident_error=max_resident_error,
         )
 
 
@@ -243,11 +278,13 @@ class EngineSpec(BaseModel):
     footprint_gb: float
     ctx_size: int  # the TOTAL KV pool across slots (research conflict 9)
     ctx_per_slot: int | None = None
-    ctx_size_coresident: int | None = None
     ctx_size_f16_cap: int | None = None
     parallel: int = 1
-    parallel_coresident: int | None = None
+    # S-22 (v0.4.0): the standing co-resident profile of S52 (ctx_size_coresident, parallel_coresident) is gone with the
+    # pairing it served (D-32: one LLM seat resident); an engines.json that still carries those keys loads, and they
+    # are ignored like any unknown key.
     n_keep: int = 0
+    placement: str = "gpu"  # PLACEMENTS: gpu | cpu (D-14 (e): the Qwen3 retrieval pair runs on the CPU)
     kv_ladder: list[str] = Field(default_factory=list)
     kv_types_must_match: bool = False
     expected_decode_tok_s: tuple[float, float] | None = None
@@ -255,8 +292,12 @@ class EngineSpec(BaseModel):
     min_llama_cpp_tag: str | None = None
     known_issue: str | None = None
     notes: str = ""
-    # Optional extension (not in the shipped engines.json): f16 bytes of K+V per token, overriding the arbiter table.
+    # Optional extensions (S-17), each overriding the Arbiter's table for this key (atlas.arbiter): f16 bytes of K+V per
+    # token; the per-sequence state that does not grow with context (recurrent and sliding-window caches, compressor
+    # state), charged once per slot; and the compute buffers in GiB. A phased engine brings its figures this way.
     kv_bytes_per_token_f16: int | None = None
+    kv_state_bytes_per_sequence: int | None = None
+    compute_buffer_gib: float | None = None
     # Filled by the loader: 1-based position in engines.json and the port it implies (§8 port rule).
     index: int = 0
     port: int = 0
@@ -272,16 +313,41 @@ class EngineSpec(BaseModel):
     @classmethod
     def _kv_known(cls, v: str) -> str:
         if v not in KV_CLASSES:
-            raise ValueError(f"kv_class {v!r} is not one of {sorted(KV_CLASSES)} (CONVENTIONS.md §8; f16 is not a "
-                             "class: Section 4.3 quantises the cache of every LLM engine)")
+            raise ValueError(f"kv_class {v!r} is not one of {sorted(KV_CLASSES)} (CONVENTIONS.md §8; D-29: f16 where "
+                             "the cache is cheap, q8_0 elsewhere)")
+        return v
+
+    @field_validator("placement")
+    @classmethod
+    def _placement_known(cls, v: str) -> str:
+        if v not in PLACEMENTS:
+            raise ValueError(f"placement {v!r} is not one of {sorted(PLACEMENTS)} (D-14)")
         return v
 
     @model_validator(mode="after")
-    def _llm_engines_have_a_quantised_cache(self) -> EngineSpec:
-        # Section 4.3: every chat/vision engine runs a quantised KV cache; `none` is for embedding/reranking only.
+    def _llm_engines_name_their_cache(self) -> EngineSpec:
+        # Section 4.3 (D-29): every chat/vision engine names its KV cache type (f16, q8_0 or q4_0); `none` is for
+        # embedding/reranking entries only.
         if self.mode in LLM_MODES and self.kv_class == "none":
-            raise ValueError(f"mode {self.mode!r} needs a quantised kv_class (q8_0 or q4_0, Section 4.3), not 'none'")
+            raise ValueError(f"mode {self.mode!r} needs a kv_class (f16, q8_0 or q4_0, Section 4.3), not 'none'")
+        # D-14 (e): the CPU placement is for an always-resident companion; a seat on the CPU would be budgeted by
+        # nobody (it is not on the GTT counter and not a resident set).
+        if self.placement == "cpu" and self.arbiter_class != "resident":
+            raise ValueError(f"placement 'cpu' is for always-resident companions (arbiter_class 'resident'), not "
+                             f"{self.arbiter_class!r} (D-14)")
+        # D-31: when the files carry exact byte counts, the mmproj must be one of them, or its bytes would be left out
+        # of the budget (the vision engine's glm5v mmproj is about 1.05 GiB).
+        if self.mmproj and self._exact_bytes() is not None and self.mmproj not in {
+                f.name.rsplit("/", 1)[-1] for f in self.files}:
+            raise ValueError(f"mmproj {self.mmproj!r} is not in files[]; its bytes must be counted (D-31)")
         return self
+
+    def _exact_bytes(self) -> int | None:
+        """The sum of files[].bytes when every file carries a positive count, else None (D-31)."""
+        sizes = [f.bytes for f in self.files]
+        if not sizes or any(b is None or b <= 0 for b in sizes):
+            return None
+        return sum(b for b in sizes if b is not None)
 
     @property
     def is_resident(self) -> bool:
@@ -291,6 +357,13 @@ class EngineSpec(BaseModel):
     @property
     def is_apex(self) -> bool:
         return self.arbiter_class == "apex" or self.exclusive
+
+    @property
+    def is_llm_seat(self) -> bool:
+        """An LLM seat (D-32): a chat or vision llama-server unit the Arbiter loads on demand. The residency limit
+        (Settings.arbiter_max_resident) counts these only; always-resident companions, class-external loads and Phase 4
+        containers never count against it."""
+        return self.mode in LLM_MODES and not (self.is_resident or self.is_phase4 or self.is_external)
 
     @property
     def is_phase4(self) -> bool:
@@ -304,31 +377,21 @@ class EngineSpec(BaseModel):
         return self.arbiter_class == "external"
 
     @property
-    def standing_coresident(self) -> bool:
-        """S52: an engine that defines a co-resident profile (today only the vision engine, 2 x 32k) runs it as its
-        STANDING profile, alone or beside gpt-oss-120b, so Section 4.1's everyday pairing forms in production.
-        phase2/engine-env.py renders it unless overrides.json says "coresident": false (the Principal's choice of the
-        full ctx_size x parallel profile); the Arbiter projects it before a unit env file exists."""
-        return self.ctx_size_coresident is not None or self.parallel_coresident is not None
-
-    def profile(self, coresident: bool | None = None) -> tuple[int, int]:
-        """(ctx_size, parallel) of the co-resident profile (True), the full one (False) or the standing one (None).
-        A field the co-resident profile does not define falls back to the full value, as in phase2/engine-env.py."""
-        co = self.standing_coresident if coresident is None else coresident
-        return (self.ctx_size_coresident if co and self.ctx_size_coresident else self.ctx_size,
-                self.parallel_coresident if co and self.parallel_coresident else self.parallel)
+    def footprint_bytes(self) -> int:
+        """Weights, in bytes (D-31 option (a), S-20, approved 2026-10-16): the exact sum of files[].bytes, the Hugging
+        Face tree sizes (lfs.size) the pull also records in <models>/<key>/MANIFEST.json, mmproj included, when every
+        file carries its count. The budget side is binary throughout (sysfs mem_info_gtt_* bytes, the ~157 GiB Day 1
+        budget), and bytes need no unit. An entry without exact counts keeps the v0.3.5 rule: `footprint_gb` read as
+        GiB, the upper bound (7.4 % above decimal GB, the right side for the hard pre-flight of Section 4.3). Either
+        way the measured footprint (Arbiter.register_measured / confirm_loaded) replaces it once known.
+        """
+        exact = self._exact_bytes()
+        return exact if exact is not None else int(self.footprint_gb * 1024**3)
 
     @property
-    def footprint_bytes(self) -> int:
-        """Weights, in bytes, reading the Section 4.1/5.1 `footprint_gb` figure as GiB (binary).
-
-        The budget side is binary throughout (sysfs mem_info_gtt_* bytes, amdgpu.gttsize in MiB, the ~164 GiB budget
-        Section 4.1 expects), and the document's figures are GGUF file sizes whose unit it does not state. Reading them
-        as GiB is the upper bound (7.4 % above decimal GB), which is the right side for the hard pre-flight of Section
-        4.3 (the OOM backstop errs high); the measured footprint (Arbiter.register_measured / confirm_loaded) replaces
-        it once known.
-        """
-        return int(self.footprint_gb * 1024**3)
+    def footprint_source(self) -> str:
+        """Where footprint_bytes comes from: 'files' (exact bytes, D-31) or 'footprint_gb' (read as GiB)."""
+        return "files" if self._exact_bytes() is not None else "footprint_gb"
 
     @property
     def systemd_unit(self) -> str:
@@ -349,6 +412,11 @@ def load_engines(cfg_dir: Path | None = None, port_base: int | None = None) -> d
     entries = data.get("engines") if isinstance(data, dict) else data
     if not isinstance(entries, list) or not entries:
         raise ConfigError(f"{path}: no engines[] list")
+    if len(entries) > ENGINE_PORT_SLOTS:
+        # S-33: the port range is LLAMA_PORT_BASE + 1 .. + ENGINE_PORT_SLOTS; an engine past it would get a port nothing
+        # else (ufw, the bind rule, CONVENTIONS.md §8) expects.
+        raise ConfigError(f"{path}: {len(entries)} engines[] entries exceed the {ENGINE_PORT_SLOTS}-port range "
+                          f"{port_base + 1}..{port_base + ENGINE_PORT_SLOTS} (CONVENTIONS.md §8 port rule, S-33)")
     out: dict[str, EngineSpec] = {}
     for index, raw in enumerate(entries, start=1):
         if not isinstance(raw, dict) or "key" not in raw:
@@ -368,8 +436,8 @@ def load_engines(cfg_dir: Path | None = None, port_base: int | None = None) -> d
     if missing:
         raise ConfigError(f"{path}: engine keys missing from CONVENTIONS.md §8 set: {missing}")
     # The `external` list (Section 4.2 "Chatterbox when invoked"; EXTERNAL_MODE comment): Arbiter-budgeted in-process
-    # loads with no port (0) and no unit, appended after the ten engines[] so nothing that counts or indexes engines[]
-    # changes (phase2/01-llama.sh, phase2/engine-env.py, the §8 port rule).
+    # loads with no port (0) and no unit, appended after engines[] so nothing that counts or indexes engines[] changes
+    # (phase2/01-llama.sh, phase2/engine-env.py, the §8 port rule).
     extras = data.get("external", []) if isinstance(data, dict) else []
     if not isinstance(extras, list):
         raise ConfigError(f"{path}: `external` must be a list of engine entries")
@@ -402,6 +470,8 @@ class RouterRules(BaseModel):
     overrides: dict[str, str]
     routes: dict[str, str]
     classifier_engine: str = "router-qwen3.5-4b"
+    # D-38 (approved 2026-10-16): the long-document route now runs on GLM-5.3-Flash; this trigger, set for a 32K slot,
+    # is re-set (S-30) once Phase 3 has measured the per-engine slot profile (D-48), a to-do until then.
     long_document_tokens: int = 24000
     max_domain_cards: int = 3
 
@@ -518,6 +588,10 @@ class Persona(BaseModel):
     reports_to: str | None = None
     default_engine: str
     override_engines: list[str] = Field(default_factory=list)
+    # D-40 option (a), approved 2026-10-16: the engine that carries this persona's seat if its default fails or defers
+    # in Phase 3 (the arsenal's runner-up where it is a Day 1 engine, else gpt-oss-120b, the floor every seat can use).
+    # A record for the Principal and Phase 3, never a silent runtime substitute: engine_for() does not pick it.
+    fallback_engine: str | None = None
     speaks_externally_tier: str = "sensitive"
     directors: list[str] = Field(default_factory=list)
     deep_think_role: str | None = None
@@ -554,7 +628,8 @@ def load_personas(cfg_dir: Path | None = None, engines: dict[str, EngineSpec] | 
         if persona.hemisphere not in HEMISPHERES:
             raise ConfigError(f"{path}: hemisphere {persona.hemisphere!r} is not one of {HEMISPHERES}")
         if engines is not None:
-            for ek in [persona.default_engine, *persona.override_engines]:
+            fallback = [persona.fallback_engine] if persona.fallback_engine else []
+            for ek in [persona.default_engine, *persona.override_engines, *fallback]:
                 if ek not in engines:
                     raise ConfigError(f"{path}: engine {ek!r} is not a key of engines.json (CONVENTIONS.md §8)")
         out[key] = persona

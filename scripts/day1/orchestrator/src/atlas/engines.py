@@ -31,30 +31,31 @@ The per-slot window (S52). Every generation request this package sends to a llam
 LlamaClient._open_chat, which first fits the request to the engine's per-slot window (fit_to_window; HttpEngineStreamer
 in atlas.api, the router's classifier and the approval cross-checker all hold a LlamaClient;
 tests/test_context_window.py fails when any other code in atlas/ posts to a generation endpoint). Facts, VERIFIED in the
-source of the pinned build (llama.cpp v0.4.1 = b29c606, phase2/01-llama.sh) unless marked:
+source of the pinned build (llama.cpp build tag b11474 = b9acf138, phase2/01-llama.sh; re-read for v0.4.0 on
+2026-10-16, lines moved from v0.4.1 = b29c606 but the behaviour is unchanged) unless marked:
   * ATLAS passes an explicit --parallel, so the KV cache is not unified and each slot is its own stream of
-    ctx_size / parallel cells, padded UP to a multiple of 256 (src/llama-context.cpp:288-302); the window a slot
-    enforces is that figure capped at the model's training context (tools/server/server-context.cpp:4027-4036,
+    ctx_size / parallel cells, padded UP to a multiple of 256 (src/llama-context.cpp:292-306); the window a slot
+    enforces is that figure capped at the model's training context (tools/server/server-context.cpp:4377-4385,
     n_ctx_slot()). ctx_size // parallel is therefore never above the enforced window while every per-slot figure is
     at or below its model's training context, which engines.json's notes say for every engine (INFERRED).
   * A prompt longer than the slot is REJECTED, never truncated: HTTP 400 {"error": {"type":
-    "exceed_context_size_error", "n_prompt_tokens", "n_ctx"}} (server-context.cpp:3196-3215, 4243-4246, 4380-4392
-    for a stream; server-common.cpp:68-70; server-task.cpp:1503-1506).
-  * Context shift is turned off per context where the cache cannot shift (server-context.cpp:1174-1189 "ctx_shift is
-    not supported by this context"; src/llama-kv-cache.cpp:1188-1196, src/llama-kv-cache-dsv4.cpp:1448-1452): on 6
-    of the 8 chat engines, both gpt-oss (iSWA), Qwen3.5-122B and the router (IMROPE), Qwen2.5-VL (MROPE + mmproj)
-    and DeepSeek V4 (dsv4 cache). There generation stops at the slot end with finish "length" once
-    prompt + generated + 1 >= n_ctx (server-context.cpp:1884-1891). Section 4.3's `--context-shift --keep` holds on
-    Nemotron and Meditron only (S52); the rule below is the same for every engine.
+    "exceed_context_size_error", "n_prompt_tokens", "n_ctx"}} (server-context.cpp:3407-3426, 4595, 4732 for a stream;
+    server-common.cpp:68-69; server-task.cpp:1514-1515).
+  * Context shift is turned off per context where the cache cannot shift (server-context.cpp:1307-1322 "ctx_shift is
+    not supported by this context" / "by multimodal"; src/llama-kv-cache.cpp:1208-1217, src/llama-kv-cache-dsv4.cpp:
+    1451-1455): on every Day 1 chat engine but GLM-5.3-Flash text-only, i.e. gpt-oss-120b (iSWA), the router (IMROPE),
+    DeepSeek V4 (dsv4 cache) and GLM-5.3-Flash with its glm5v mmproj (multimodal). There generation stops at the slot
+    end with finish "length" once prompt + generated + 1 >= n_ctx (server-context.cpp:2019-2025). The rule below is
+    the same for every engine.
   * POST /v1/chat/completions/input_tokens takes a chat-completions body and answers {"input_tokens": N}: the same
-    template pass (oaicompat_chat_params_parse) and tokenizer call (add_special, parse_special) as the generation, and
-    on an --mmproj server process_mtmd_prompt over placeholder bitmaps, whose size includes every image token
-    (tools/server/server.cpp:276-277; server-context.cpp:4946-4948, 5488-5537; server-common.cpp:505-515, 930-970).
-    POST /apply-template and POST /tokenize (server.cpp:272, 274; server-context.cpp:5060-5118; tools/server/
-    README.md "/tokenize", "/apply-template") are the fallback when that route answers 404 (a build other than the
-    pin); that pair does not see images, so each image part is charged IMAGE_TOKENS_ESTIMATE.
+    template pass and tokenizer call (add_special, parse_special) as the generation, and on an --mmproj server
+    process_mtmd_prompt over placeholder bitmaps, whose size includes every image token (tools/server/server.cpp:
+    294-295; server-context.cpp:5950-5999). POST /apply-template and POST /tokenize (server.cpp:290, 292) are the
+    fallback when that route answers 404 (a build other than the pin); that pair does not see images, so each image
+    part is charged IMAGE_TOKENS_ESTIMATE.
   * n_predict has the aliases max_tokens and max_completion_tokens (server-schema.cpp:44-48); without any of them
-    the server's default is -1 (unbounded), so an unclamped request on those six engines runs into the slot end.
+    the server's default is -1 (unbounded), so an unclamped request on an engine without context shift runs into the
+    slot end.
 """
 
 from __future__ import annotations
@@ -108,7 +109,7 @@ class ContextWindowExceeded(EngineError):
 # --- the per-slot window (S52; module docstring) ----------------------------------------------------------------------
 
 CHAT_PATH = "/v1/chat/completions"
-COUNT_PATH = "/v1/chat/completions/input_tokens"  # server.cpp:277 at the pin; 404 on a build without it
+COUNT_PATH = "/v1/chat/completions/input_tokens"  # server.cpp:294-295 at the pin; 404 on a build without it
 # Room kept between prompt + max_tokens and the slot end. The server stops at prompt + generated + 1 >= n_ctx, so 1
 # would do with an exact count; the rest covers a count that drifts by a few tokens (none is known at the pin).
 CONTEXT_MARGIN_TOKENS = 32
@@ -117,12 +118,12 @@ CONTEXT_MARGIN_TOKENS = 32
 # policy figure, not a measurement: gpt-oss at reasoning_effort high may spend more than this on analysis alone.
 MIN_REPLY_TOKENS = 512
 # Fallback counting only (/apply-template + /tokenize do not see images): the most tokens one image can cost on the
-# vision engine at the pin. Qwen2.5-VL's projector limits an image to 4096 tokens (tools/mtmd/clip.cpp:1651-1660
-# set_limit_image_tokens(8, 4096); clip-model.h:190-195), the resize keeps (w/28) x (h/28) at or under that for any
-# aspect ratio up to 4096:1 (mtmd-image.cpp:122-155, 766-780; INFERRED arithmetic beyond that ratio), and mtmd wraps
-# each image in <|vision_start|> ... <|vision_end|>, 2 more tokens (mtmd.cpp:693-703). VERIFIED for the pinned source;
-# engines.json passes no --image-max-tokens. The primary count (COUNT_PATH) includes image tokens exactly.
-IMAGE_TOKENS_ESTIMATE = 4096 + 2
+# vision engine at the pin. v0.4.0 (D-20, S-10): the vision engine is GLM-5.3-Flash with its glm5v mmproj, whose header
+# gives image_max_pixels 6,272,000, patch_size 14 and merge 2, so one image is at most 6,272,000 / (14 x 14 x 2 x 2) =
+# 8,000 tokens, wrapped in <|begin_of_image|> ... <|end_of_image|>, 2 more (tools/mtmd/clip.cpp:1782-1794, 4217-4225;
+# mtmd-image.cpp:801-840; mtmd.cpp:871-876; VERIFIED at b11474, v040 pin_facts.md). engines.json passes no
+# --image-max-tokens. The primary count (COUNT_PATH) includes image tokens exactly.
+IMAGE_TOKENS_ESTIMATE = 8000 + 2
 PREFIX_ROLES: frozenset[str] = frozenset({"system", "developer"})  # the stable layered prefix (Section 4.4)
 
 
@@ -138,10 +139,9 @@ class SlotWindow:
 def window_for(spec: EngineSpec, ctx: int | None = None, parallel: int | None = None, *,
                source: str | None = None) -> SlotWindow:
     """The per-slot window of `spec`: ctx // parallel of the rendered unit when given (atlas.api.engine_window passes
-    the env file's ATLAS_CTX_SIZE / ATLAS_PARALLEL), else the SMALLEST per-slot figure engines.json gives the engine
-    (ctx_per_slot, ctx_size / parallel and, where defined, the co-resident profile). Without its env file a unit
-    cannot start (llama-server@.service EnvironmentFile), so that fallback serves tests and an unreadable env dir;
-    the smallest figure is safe whichever profile the unit would render."""
+    the env file's ATLAS_CTX_SIZE / ATLAS_PARALLEL), else the SMALLER per-slot figure engines.json gives the engine
+    (ctx_per_slot, ctx_size / parallel). Without its env file a unit cannot start (llama-server@.service
+    EnvironmentFile), so that fallback serves tests and an unreadable env dir."""
     if ctx is not None and parallel is not None:
         if parallel < 1 or ctx < parallel:
             raise EngineError(f"{spec.key}: ctx {ctx} x {parallel} slots is not a usable profile")
@@ -149,10 +149,6 @@ def window_for(spec: EngineSpec, ctx: int | None = None, parallel: int | None = 
     figures = {f"ctx_size {spec.ctx_size} / parallel {spec.parallel}": spec.ctx_size // max(1, spec.parallel)}
     if spec.ctx_per_slot:
         figures[f"ctx_per_slot {spec.ctx_per_slot}"] = spec.ctx_per_slot
-    if spec.ctx_size_coresident or spec.parallel_coresident:
-        co_ctx = spec.ctx_size_coresident or spec.ctx_size
-        co_par = spec.parallel_coresident or spec.parallel
-        figures[f"co-resident {co_ctx} / {co_par}"] = co_ctx // max(1, co_par)
     name, tokens = min(figures.items(), key=lambda kv: kv[1])
     return SlotWindow(spec.key, tokens, source or f"engines.json {name}, no unit env file")
 
@@ -212,8 +208,8 @@ def fit_to_window(messages: Sequence[Mapping[str, Any]], max_tokens: int | None,
     reserve: min(max_tokens, max(min_reply, window // 4)), or min_reply when no max_tokens is given. The oldest
     exchanges go, whole, and only the fewest (found by bisection) that make prompt + reserve + margin fit, so a
     conversation that leaves the reserve is sent whole whatever max_tokens it asks for. With the pipeline's
-    4096-token default (atlas.api.DEFAULT_MAX_TOKENS) a 32k slot thus reserves all 4096, the router's 8192-token slot
-    2048 and Meditron's 4096-token slot 1024; a max_tokens of 8192 or more (the window, say) on a 32k slot reserves
+    4096-token default (atlas.api.DEFAULT_MAX_TOKENS) a 32k slot thus reserves all 4096 and the router's 8192-token
+    slot 2048; a max_tokens of 8192 or more (the window, say) on a 32k slot reserves
     8192. When the prefix and the current turn alone cannot take the reserve, every earlier exchange goes (that
     branch does not bisect). max_tokens is then clamped so prompt + max_tokens + margin never passes the window (a
     request without one gets the whole remaining room), so generation never reaches the slot end. When the room left
@@ -278,7 +274,7 @@ def fit_to_window(messages: Sequence[Mapping[str, Any]], max_tokens: int | None,
 
 def requested_max_tokens(body: Mapping[str, Any]) -> int | None:
     """The reply limit a chat body asks for: n_predict wins over its aliases max_tokens / max_completion_tokens at the
-    pin (server-common.cpp:1417-1422, server-schema.cpp:44-48); the smallest one given is taken, so a body carrying
+    pin (server-common.cpp:1486-1487, server-schema.cpp:44-48); the smallest one given is taken, so a body carrying
     two never gets the larger one. None (or a negative value, -1 = unbounded) means no limit."""
     given = [int(body[k]) for k in ("n_predict", "max_tokens", "max_completion_tokens")
              if isinstance(body.get(k), int) and not isinstance(body.get(k), bool) and body[k] >= 0]
@@ -442,15 +438,16 @@ class LlamaClient:
     def _count_by_template(self, body: Mapping[str, Any]) -> int:
         if not self._fallback_logged:
             self._fallback_logged = True
-            log.warning("%s: %s answered 404 (not llama.cpp v0.4.1?); counting with /apply-template + /tokenize and "
-                        "%d tokens per image part", self.base_url, COUNT_PATH, IMAGE_TOKENS_ESTIMATE)
+            log.warning("%s: %s answered 404 (not the pinned llama.cpp build?); counting with /apply-template + "
+                        "/tokenize and %d tokens per image part", self.base_url, COUNT_PATH, IMAGE_TOKENS_ESTIMATE)
         r = self._http.post("/apply-template", json=body)
         _raise_for_status(r, "apply-template")
         prompt = r.json().get("prompt")
         if not isinstance(prompt, str):
             raise EngineError(f"apply-template: {r.request.url} returned no prompt string")
-        # add_special=true, parse_special=true is what the generation tokenizes with (VERIFIED, server-context.cpp:
-        # 4293-4299; the count route's 5526-5528 likewise); /tokenize defaults add_special to false (README).
+        # add_special=true, parse_special=true is what the generation tokenizes with (VERIFIED at b11474,
+        # server-context.cpp:4650; the count route, inside 5950-5999, likewise); /tokenize defaults add_special to
+        # false (README).
         r = self._http.post("/tokenize", json={"content": prompt, "add_special": True, "parse_special": True})
         _raise_for_status(r, "tokenize")
         tokens = r.json().get("tokens")
@@ -704,6 +701,21 @@ class SystemdEngineController:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise EngineControlError(f"systemctl is-active {unit} could not run: {exc}") from exc
         return proc.returncode == 0
+
+    def main_pid(self, key: str) -> int | None:
+        """The unit's MainPID (`systemctl show -p MainPID --value`, no sudo), or None when it is not running or cannot
+        be read: the Arbiter reads the VmRSS of a CPU-placed companion through it (D-14 (e), the host resident set)."""
+        unit = f"{UNIT_PREFIX}{self._check_key(key)}"
+        try:
+            proc = self._run([SYSTEMCTL, "show", "-p", "MainPID", "--value", unit], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("systemctl show %s could not run: %s", unit, exc)
+            return None
+        value = (proc.stdout or "").strip()
+        if proc.returncode != 0 or not value.isdigit() or int(value) <= 0:
+            return None  # "0": the unit is not running
+        return int(value)
 
 
 class StubController:

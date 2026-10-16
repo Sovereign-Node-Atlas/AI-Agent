@@ -5,9 +5,12 @@ hemisphere: corporate
 division: Corporate
 remit: "CFO: capital, audit, banking"
 reports_to: ren
-default_engine: nemotron-3-super
+# v0.4.0 (approved 2026-10-16; D-10, S-32): GLM-5.3-Flash by default (P-04). fallback_engine (D-40 (a)): the runner-up
+# Ling-3.0-flash-Fin is phased (D-18), so the Day 1 fallback is gpt-oss-120b.
+default_engine: glm-5.3-flash
 engine_settings: code interpreter mandatory for all arithmetic
 override_engines: []
+fallback_engine: gpt-oss-120b
 speaks_externally_tier: standard
 kokoro_voice: am_eric
 kokoro_alternate: am_echo

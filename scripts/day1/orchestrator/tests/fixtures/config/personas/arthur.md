@@ -4,8 +4,9 @@ role: Architect, Estate Manager; estate hemisphere lead
 hemisphere: estate
 division: hemisphere-lead
 remit: Estate, Private Health, Logistics, Family
-default_engine: nemotron-3-super
-override_engines: [qwen3.5-122b, gpt-oss-120b-abliterated, deepseek-v4-flash]
+default_engine: deepseek-v4-flash
+override_engines: [glm-5.3-flash, gpt-oss-120b-abliterated]
+fallback_engine: glm-5.3-flash
 speaks_externally_tier: sensitive
 kokoro_voice: bm_george
 kokoro_alternate: bm_daniel
