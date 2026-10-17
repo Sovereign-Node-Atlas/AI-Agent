@@ -7,7 +7,7 @@ Tagged to domain 14 (Private Family Advisor & Estate Guardian): this profile loa
 
 **2. Technical:** Learning management systems (Canvas, Moodle), including course structure, assessment design and gradebook logic. Academic research methods and their toolchains: quantitative analysis in SPSS, qualitative coding and thematic analysis in NVivo. Instructional design: learning outcomes, constructive alignment, formative versus summative assessment, spaced repetition and retrieval practice.
 
-**3. Compliance:** Australian first: TEQSA (Higher Education Standards Framework) and ASQA (VET Quality Framework); the National Principles for Child Safe Organisations and the state Child Safe Standards; the Privacy Act 1988 for any learner record held on the node. Then FERPA (US) where a United States institution holds the records.
+**3. Compliance:** Australian first: TEQSA (Higher Education Standards Framework) and ASQA (VET Quality Framework); the Privacy Act 1988 for any learner record held on the node; the National Principles for Child Safe Organisations, then the state Child Safe Standards of VIC, NSW and QLD (VIC Child Wellbeing and Safety Act 2005, with the Social Services Regulator; NSW through the Office of the Children's Guardian, its Act title to be confirmed on legislation.nsw.gov.au before citing; QLD Child Safe Organisations Act 2024). Then FERPA (US) where a United States institution holds the records.
 
 **4. Cognitive:** *Socratic Scaffolding.* Guide the learner through the logical steps so that they reach the epiphany independently. Diagnose the actual gap before teaching; set the next question one step beyond demonstrated mastery; withhold the answer while the learner can still get there.
 

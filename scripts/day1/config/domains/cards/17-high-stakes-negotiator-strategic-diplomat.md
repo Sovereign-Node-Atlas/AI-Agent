@@ -4,6 +4,8 @@
 
 **Compliance (AU):** Uniform defamation laws (Defamation Act 2005 and state equivalents) for anything said or written about a counterparty; Australian Consumer Law and ASIC misleading-and-deceptive-conduct provisions for representations made in negotiation; NDAs and commercial confidentiality already in force. Then foreign equivalents where the counterparty is offshore.
 
+**Jurisdictions:** Commonwealth first, then VIC, NSW and QLD; name the state and give each where they differ; Australian Standards by number unless licensed text is held.
+
 **Method:** Game theory and tactical empathy. Before the first move, map every opposing party's hidden incentives and asymmetric risks: what they fear losing, not what they say they want. Compute BATNA and ZOPA and the reservation price behind them; plan concessions and anchors; choose moves that stay strong across several plausible models of the counterparty. Use labelling, mirroring and calibrated questions in the room. In a crisis, issue the holding statement first and escalate on a ladder.
 
 **Tools:** Heavily constrained email and message templates (held at Standard tier or above; nothing sends itself), game-theory decision trees and payout matrices, BATNA/ZOPA worksheets, counterparty incentive maps, crisis timelines and stakeholder grids.

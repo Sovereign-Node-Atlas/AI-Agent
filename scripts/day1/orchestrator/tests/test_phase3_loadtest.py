@@ -350,7 +350,15 @@ def test_summarize_raises_the_defaulted_input_todos(tmp_path: Path, capsys: pyte
     assert "The D-47 deep-tier floor is set: 4 tok/s at 8k" in trial and "decode-floors" not in trial
     assert "D-49" in todos["seat-test-sets"][0] and "Australian law" in todos["seat-test-sets"][1]
     assert "approve ATLAS's drafts" in todos["seat-test-sets"][0]
-    assert "state or states of operation" in todos["seat-test-sets"][1]
+    # S57 (the Principal, 2026-10-17): the briefs come from real examples once ATLAS is live, the states are answered,
+    # the paywalled-standards input is the standards list, and the two proposals are not recorded as decided.
+    seat_title, seat = todos["seat-test-sets"]
+    assert "from real examples once ATLAS is live" in seat_title and "standards you hold" in seat_title
+    assert "collected once ATLAS is live from real examples" in seat
+    assert "Your states are answered: VIC, NSW and QLD, with the Commonwealth" in seat
+    assert "Australian Standards you hold or subscribe to" in seat and "private system" in seat
+    assert "Awaiting your answer, not decided" in seat and "about 10 Australian tax and finance tasks" in seat
+    assert "NSW and VIC assumed" not in seat and "state or states of operation" not in seat_title + seat
     profiles = todos["seat-profiles"][1]
     assert "deepseek-v4-flash f16 at 1 x 131,072 tokens" in profiles
     assert "glm-5.3-flash f16 at 1 x 262,144 tokens" in profiles  # the fixture's profile, read as given

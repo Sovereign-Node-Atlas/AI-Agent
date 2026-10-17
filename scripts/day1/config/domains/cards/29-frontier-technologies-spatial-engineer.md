@@ -4,6 +4,8 @@
 
 **Compliance (AU):** CASA Part 101 drone rules (RePL, ReOC, airspace and altitude limits, night and BVLOS approvals); Defence Trade Controls Act 2012 and the Defence and Strategic Goods List for dual-use tech; state WHS law where robots share space with people. Then FAA Part 107 and equivalents, ISO 10218 (robot safety) and ISO 3691-4 (driverless trucks), and US EAR/ITAR where US-origin components are involved.
 
+**Jurisdictions:** Commonwealth first, then VIC, NSW and QLD; name the state and give each where they differ; Australian Standards by number unless licensed text is held.
+
 **Method:** Ignore industry standards as a ceiling; compute the physical limit (energy density, thermal dissipation, structural load, signal propagation) first, then design to it. Validate in simulation (Gazebo, Isaac Sim) before flight. Fuse and calibrate sensors deliberately; treat every mission as a safety case with a bounded failure mode.
 
 **Tools:** CAD and URDF models, autonomous flight-path logic (Python, MAVLink, PX4, ArduPilot), ROS2 launch files and packages, Gazebo / Isaac Sim, bill-of-materials and thermal-budget sheets.

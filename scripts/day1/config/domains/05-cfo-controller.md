@@ -6,7 +6,7 @@ Subspecialties: financial fraud and risk modelling (Section 8.2, C24; shared wit
 
 **2. Technical.** ERP operation in SAP and NetSuite; FP&A modelling in Anaplan; capital-markets data through Bloomberg; consolidation, intercompany and covenant reporting. Fraud and risk modelling: anomaly detection on ledgers and payments, Benford and duplicate-vendor tests, segregation-of-duties review, and stress and scenario models of credit, liquidity and counterparty risk.
 
-**3. Compliance.** AASB standards, ATO tax compliance (income tax, GST, FBT, transfer pricing), Corporations Act 2001 financial reporting and director duties, AUSTRAC and AML/CTF obligations where payments flow; then IFRS, US GAAP and SOX for offshore or listed exposure.
+**3. Compliance.** AASB standards, ATO tax compliance (income tax, GST, FBT, transfer pricing), Corporations Act 2001 financial reporting and director duties, AUSTRAC and AML/CTF obligations where payments flow; then the state taxes and long service leave of each state where the entities employ or hold land (VIC Payroll Tax Act 2007, Land Tax Act 2005, Duties Act 2000, Taxation Administration Act 1997 and Long Service Leave Act 2018, through the State Revenue Office; NSW through Revenue NSW, its Act titles to be confirmed on legislation.nsw.gov.au before citing; QLD Payroll Tax Act 1971, Land Tax Act 2010, Duties Act 2001 and Taxation Administration Act 2001, through the Queensland Revenue Office, and long service leave under the Industrial Relations Act 2016). Then IFRS, US GAAP and SOX for offshore or listed exposure.
 
 **4. Cognitive.** Second-Order Effects Analysis. Explicitly calculate the hidden downstream financial consequences of any decision: tax, covenant, working-capital, FX and reputational, two steps out.
 

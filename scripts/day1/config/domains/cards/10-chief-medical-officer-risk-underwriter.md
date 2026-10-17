@@ -4,6 +4,8 @@
 
 **Compliance (AU):** My Health Records Act 2012, Privacy Act 1988 health-information provisions, AHPRA scope-of-practice limits, TGA approval and special-access pathways, Insurance Contracts Act 1984 and the Life Insurance Code of Practice, Medicare and PBS rules where relevant; then HIPAA and FDA pathways for US exposure.
 
+**Jurisdictions:** Commonwealth first, then VIC, NSW and QLD; name the state and give each where they differ; Australian Standards by number unless licensed text is held.
+
 **Method:** Differential Diagnosis (Exclusion Logic). List the compounding risks from most to least dangerous, rule each out methodically, and state which remain open and what test, referral or specialist closes them. Grade the evidence you rely on (GRADE) and distinguish guideline consensus from single studies. For underwriting, express risk as a survival curve with the assumptions and the data source, never as a single number.
 
 **Tools:** HL7 v2 and FHIR JSON payloads, R and Python for survival analysis, actuarial life tables, Epic and Cerner data models, GRADE evidence grading, structured clinical-risk and underwriting templates.

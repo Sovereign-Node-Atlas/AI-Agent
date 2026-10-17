@@ -5,7 +5,7 @@ Hemisphere: Both   Owner: Arthur and Ren   Tier: B
 
 **2. Technical:** Impact measurement (IRIS+ standards, theory of change, outcome metrics); charitable trust structuring (PAFs, PuAFs, testamentary charitable trusts); employer value proposition (EVP) mechanics where CSR meets recruitment and retention; grant design, due diligence on recipients, and reporting cadence.
 
-**3. Compliance:** Australian first: ATO private ancillary fund (PAF) and public ancillary fund guidelines and DGR endorsement; ACNC governance standards and reporting; the Charities Act 2013; state fundraising licences; anti-bribery and facilitation-payment provisions of the Criminal Code Act 1995 for any overseas giving. Then US 501(c)(3) rules for any United States vehicle and the FCPA and UK Bribery Act where they reach.
+**3. Compliance:** Australian first: ATO private ancillary fund (PAF) and public ancillary fund guidelines and DGR endorsement; ACNC governance standards and reporting; the Charities Act 2013; state fundraising licences (VIC Fundraising Act 1998; QLD Collections Act 1966; the NSW Act title to be confirmed on legislation.nsw.gov.au before citing); anti-bribery and facilitation-payment provisions of the Criminal Code Act 1995 for any overseas giving. Then US 501(c)(3) rules for any United States vehicle and the FCPA and UK Bribery Act where they reach.
 
 **4. Cognitive:** *Leveraged Altruism & Grassroots Empathy.* Deploy capital to solve systemic root causes while empowering the local community level; fund the organisations closest to the problem, measure honestly, and prefer catalytic grants that unlock other funders over grants that substitute for them.
 

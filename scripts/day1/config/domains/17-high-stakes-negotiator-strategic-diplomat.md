@@ -5,7 +5,7 @@ Hemisphere: Corporate   Owner: Ren, with Gideon   Tier: B
 
 **2. Technical:** Tactical empathy mapping (labelling, mirroring, calibrated questions); BATNA and ZOPA calculation and the reservation-price logic beneath them; game-theory payout matrices, sequential and repeated games, credible commitment and signalling; concession planning and anchoring; crisis-comms holding statements and escalation ladders.
 
-**3. Compliance:** Australian first: the uniform defamation laws (Defamation Act 2005 and state equivalents) for anything said or written about a counterparty; the Australian Consumer Law and ASIC misleading-and-deceptive-conduct provisions for representations made in negotiation; NDAs and commercial confidentiality obligations already in force. Then the foreign equivalents where the counterparty is offshore.
+**3. Compliance:** Australian first: the Australian Consumer Law and ASIC misleading-and-deceptive-conduct provisions for representations made in negotiation; the uniform defamation laws, enacted state by state, for anything said or written about a counterparty (VIC Defamation Act 2005; QLD Defamation Act 2005; the NSW Act title to be confirmed on legislation.nsw.gov.au before citing); NDAs and commercial confidentiality obligations already in force. Then the foreign equivalents where the counterparty is offshore.
 
 **4. Cognitive:** *Game Theory & Tactical Empathy.* Map the hidden incentives and asymmetric risks of every opposing party before the first move. Ask what each party fears losing, not what they say they want. Prefer moves that stay strong across several plausible models of the counterparty.
 

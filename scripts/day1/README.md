@@ -302,9 +302,10 @@ Where an approved row leaves an input to the Principal, its default is built and
 - the D-16 context targets of the phased medical and science seats: answered on 2026-10-17 (`Q5_K_S`, q8_0 K and V
   with the pin's rotation, 1 × 32,768 tokens; `engines.json` `phased`), so `context-targets` is no longer raised;
 - the D-46 trial task set (`trial-task-set`: 8 to 10 one-paragraph TF_OMEGA situations, then your approval of the 40
-  drafted tasks) and the D-49 test sets (`seat-test-sets`: a brief per domain, your states of operation and the
-  standards you hold, then your approval of ATLAS's drafts): their designs approved on 2026-10-17 and the runner built
-  (`atlas-admin eval`, below); your own material is the to-do;
+  drafted tasks) and the D-49 test sets (`seat-test-sets`: a brief per domain, collected once ATLAS is live from
+  real examples, and the list of standards you hold, then your approval of ATLAS's drafts; your states are answered,
+  doc S57 below): their designs approved on 2026-10-17 and the runner built (`atlas-admin eval`, below); your own
+  material is the to-do;
 - each seat's fixed reasoning setting (D-30 (b); provisional settings in `engines.json`; in the detail of `kld-run`).
 
 Phase 3 step 2 (`loadtest.py summarize`) raises `decode-floors` (only for a seat with no floor), `decode-review` (D-33:
@@ -366,10 +367,33 @@ D-49, D-46), with a 2,000 Mbps line, router LAN ports of 2.5 GbE and the move to
 Recorded, not built: the MedGemma tool (C-12 waits on your acceptance of Google's HAI-DEF terms, a new non-seat
 Arbiter class and a node test against GLM-5.3-Flash's own vision), Baichuan-M3's cross-checker changes, the
 Qwen3-VL-Embedding index, D-33's node baseline after Day 1, and T-06's 16k and 32k points and DSpark runs. Open for
-you: the HAI-DEF decision; the D-49 briefs, states and standards (`seat-test-sets`); 8 to 10 TF_OMEGA situations
+you: the HAI-DEF decision (a task for the live ATLAS with you present, doc S57 below); the D-49 briefs and the
+standards list (`seat-test-sets`; the states answered, doc S57 below); 8 to 10 TF_OMEGA situations
 (`trial-task-set`); 20 to 30 coding tasks for T-03; and, optionally, a 60-second single-stream download test to
 replace `DOWNLOAD_MBPS=400` (doc Section 22). Before Phase 1: the cable, the reservation and the forward
 (precondition 3).
+
+**Recorded on 2026-10-17 (doc S57, within v0.4.0; text only, no setting, engine or gate changes).** What you said
+that day:
+
+- ATLAS's Australian law is that of the Commonwealth, VIC, NSW and QLD, your main locations, across all your work:
+  business, finance, construction, sales and the rest (doc 1, 8.2, 8.4). The domain profiles and cards in
+  `config/domains/` follow in the same round.
+- The reference-library rule (doc 8.4, 16.5): the Acts, regulations and case law of the four jurisdictions and the
+  regulators' guidance are free and may be held in full. An Australian Standard's text is held only where you hold
+  a licence that allows storing and processing it in a private system; otherwise ATLAS gives its number, edition
+  and what free sources say, never its clauses. The library itself, from the official sources with the Sentinel
+  watching for amendments, is phased, not built. New open input: the list of standards you hold or subscribe to,
+  with the licence terms checked (doc Section 22).
+- D-49: the briefs are collected once ATLAS is live, from real examples as the work progresses, and
+  `seat-test-sets` now says so (`phase3/loadtest.py` `raise_input_todos`). Awaiting your answer, not decided:
+  spreading the 16 Australian-law tasks across the Commonwealth, VIC, NSW and QLD, and adding about 10 Australian
+  tax and finance tasks.
+- C-12: the MedGemma licence decision is a task for the live ATLAS with you present. After Day 1 ATLAS shows a plain
+  summary of the HAI-DEF terms and prohibited-use policy, with their links. On a yes you accept on the model's
+  Hugging Face page with your own account (ATLAS never accepts terms for you, doc 16.3 item 2); ATLAS records the
+  date and the terms version in the ledger, pulls MedGemma 1.5 4B and runs the node test against GLM-5.3-Flash's own
+  vision. On a no, Rad-DINO alone. No script raises it on Day 1.
 
 D-43 (a) is built: the deep Deep Think tier runs only on the Principal's explicit `[DEEP THINK:DEEP]`; a classifier
 depth of `deep` (the task-weight trigger, or a `[DEEP THINK: ...]` that types no depth) runs at standard, with the

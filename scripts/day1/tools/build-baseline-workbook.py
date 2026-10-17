@@ -209,7 +209,8 @@ fill_sheet("1 Decisions",
     "reopen D4 (the retrieval models), D10 (the vision engine) and D12 (Meditron), whose rows say so in their Note. "
     "D16, D18, D20, D22, D24 and D26 carry the Principal's answers of 2026-10-17 to the inputs they had left open "
     "(S56: the decode, prefill and deep-tier floors, the D-16 profile, no dedicated coder seat, EmbeddingGemma 2 "
-    "dropped, the test-set and trial designs).",
+    "dropped, the test-set and trial designs). D20 also records S57: the D-49 briefs are collected once ATLAS is "
+    "live, from real examples.",
     ["ID", "Decision", "Your answer (as given)", "Note", "Still stands?", "If changed, what instead"],
     rows, [7, 40, 52, 40, 16, 40], 5,
     ["Confirmed", "Changed my mind"],
@@ -319,11 +320,15 @@ fill_sheet("5 Checklist",
     "R28 ticked in the workbook returned 2026-10-13, and the action register, its licences, C28 to C30 and D16 to D27 "
     "ticked on 2026-10-16 (v0.4.0), R29 to R33 with the restated R4, R17, R19 and R20 acknowledged on "
     "2026-10-17, and later that day the answers to the open inputs, the bandwidth and R9 and R20 as restated (S56). "
+    "S57 records the Principal's statements the same day: the states answered (VIC, NSW and QLD, with the "
+    "Commonwealth), the briefs collected once ATLAS is live, the standards list a new open row, and the MedGemma "
+    "decision a task for the live ATLAS with the Principal present. "
     "Blank rows: the optional items the scripts ask for at a prompt (Yes when "
     "provided, N/A to leave them for the live ATLAS to-do list); the inputs still left to the Principal, each already "
-    "built with its stated default and kept as a to-do (the seat profiles and reasoning settings, the HAI-DEF "
-    "decision for MedGemma, and after Day 1 the briefs for the seat test sets, the TF_OMEGA situations and the T-03 "
-    "coding tasks); and the optional 60-second download test. One row is to do before Phase 1: row "
+    "built with its stated default and kept as a to-do (the seat profiles and reasoning settings; the HAI-DEF "
+    "decision for MedGemma, taken with the live ATLAS; and after Day 1 the briefs for the seat test sets, from real "
+    "examples, the standards list, the TF_OMEGA situations and the T-03 coding tasks); and the optional 60-second "
+    "download test. One row is to do before Phase 1: row "
     f"{CABLE_ROW}, the cable on the 10 GbE port not marked DASH, with the reservation and the forward moved to its MAC "
     "and Wi-Fi off the LAN subnet (S56; pre-flight warns, never stops, if it is not done). The Secure Boot row and "
     f"the install rows are ticked. One request still stands on row {ENC_ROW}, to "
@@ -400,7 +405,9 @@ ref_sheet("Ref Engines",
 t82 = md_table_after("### 8.2")
 ref_sheet("Ref Domains",
     "Section 8.2. Thirty original domains retained and six added, thirty-six in all. Tier A loads freely, B on clear "
-    "match, C on explicit match only.",
+    "match, C on explicit match only. S57 (2026-10-17): a compliance list's Australian law is that of the "
+    "Commonwealth, VIC, NSW and QLD, the Principal's main locations; Australian Standards are cited by number unless "
+    "the Principal holds a licence for the text (8.4).",
     [("Thirty-six domain knowledge profiles", t82[0], t82[1:])], [6, 76, 14, 34, 8])
 
 tf = md_table_after("### 8.3")[1:]
@@ -445,7 +452,9 @@ ref_sheet("Ref Multimodal",
       "GLM-5.3-Flash with its glm5v projector, a Phase 3 GGUF engine, and Minerva's cross-check moves to the phased "
       "Baichuan-M3. The image tier (Z-Image-Turbo, Qwen-Image-2512) is phased after Day 1 (T-25). Rad-DINO stands "
       "alone until MedGemma 1.5 4B's conditions hold: the Principal's acceptance of the HAI-DEF terms, a non-seat "
-      "Arbiter class and a node test against GLM-5.3-Flash's own vision (C-12, S56)."),
+      "Arbiter class and a node test against GLM-5.3-Flash's own vision (C-12, S56). Since S57 the decision is a task "
+      "for the live ATLAS with the Principal present: on a yes the Principal accepts on the model's Hugging Face page "
+      "with their own account, and ATLAS never accepts for them."),
      ("Engine watch-list: considered, not adopted (15.5; v0.4.0 adds the 2026 review's items, the phased DeepSeek "
       "V4.1 trial among them; S56 makes EmbeddingGemma 2's row the active one and adds Qwen3-Coder-Next and "
       "Qwen3-VL-Embedding-8B)",
@@ -464,7 +473,7 @@ never = md_numbered_after("### 16.3")
 ref_sheet("Ref Governance",
     "Section 16. The never-without-the-Principal list is decision D8; the approval tiers are agreed. v0.4.0 adds "
     "standing rules 9 (routed engines use only lossless accelerations, S-50) and 10 (the arsenal admission rules, "
-    "S-13).",
+    "S-13). S57: item 2 covers every licence and terms of use; ATLAS never accepts terms on the Principal's behalf.",
     [("Standing rules", ["#", "Rule"], [[n, t] for n, t in rules]),
      ("Approval tiers", tiers[0], tiers[1:]),
      ("Never without the Principal (proposed, D8)", ["#", "Action"], [[n, t] for n, t in never])],
@@ -563,7 +572,13 @@ title(ws, "A.T.L.A.S. Build Baseline",
       "science seats, no dedicated coder seat (Qwen3-Coder-Next not pulled), EmbeddingGemma 2 dropped, MedGemma 1.5 "
       "4B only on conditions, and the designs of the seat test sets and the V4.1 trial set; and recorded a 2,000 Mbps "
       "line with the node moving to a cable on its 10 GbE port before Phase 1. What those answers still leave open is "
-      "on sheet 5. The uncensored-seat items (D-07, D-08, D-09, D-58, N-10, "
+      "on sheet 5. The same day (S57) the Principal's statements were recorded: ATLAS's Australian law is that of the "
+      "Commonwealth, VIC, NSW and QLD; an Australian Standard's text is held only under the Principal's own licence, "
+      "otherwise its number, edition and free commentary; the briefs for the seat test sets are collected once ATLAS "
+      "is live, from real examples; and the MedGemma licence decision is a task for the live ATLAS with the Principal "
+      "present. Two proposals await the Principal, not decided: the 16 Australian-law tasks spread across the four "
+      "jurisdictions, and about 10 Australian tax and finance tasks. "
+      "The uncensored-seat items (D-07, D-08, D-09, D-58, N-10, "
       "P-05, P-17, S-05) are unchanged by this revision and remain the Principal's to configure. Until v0.4.0 this "
       "workbook was the closed v0.3.5 record of 2026-10-12: Ubuntu Server kept over Fedora 44 KDE Plasma (C27), the "
       "crash-kernel memory reclaimed with panic=10 (S48), kexec handover off (S49), the hardware watchdog (S50), "
@@ -576,7 +591,8 @@ how = [
     "1. Sheets 1, 2 and 3 are a record of your answers of 2026-09-21, 2026-10-05 (D15: Secure Boot enabled), "
     "2026-10-08 (C27: Ubuntu kept; R22 to R25 acknowledged), 2026-10-13 (R26 to R28 acknowledged), 2026-10-16 "
     "(the action register: D16 to D27 and C28 to C30) and 2026-10-17 (R29 to R33 and the restated R4, R17, R19 and "
-    "R20 acknowledged; later, S56: your answers to the open inputs in D16 to D26, R9 and R20 restated with B-27). "
+    "R20 acknowledged; later, S56: your answers to the open inputs in D16 to D26, R9 and R20 restated with B-27; "
+    "S57: in D20, the briefs collected once ATLAS is live). "
     "Nothing on them needs you now. Sheet 5 records the Secure Boot BIOS setting "
     "made and the USB recovery drive in hand (both confirmed 2026-10-13) and lists the optional items the scripts ask "
     "for at a prompt and the inputs still left to you, each with the default already built. Sheet 4 fills during "

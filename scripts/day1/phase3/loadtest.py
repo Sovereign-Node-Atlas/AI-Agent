@@ -2673,7 +2673,8 @@ def raise_input_todos(ctx: Ctx) -> None:
     Section 22), each a to-do on the live list so `atlas-day1.sh status` shows it; re-raised by every summarize, closed
     only by the Principal. The defaults are read from the shipped config where it holds them. D-16 is answered
     (2026-10-17), so v0.4.0's context-targets is not raised; D-46 and D-49 are approved designs whose inputs are still
-    the Principal's (the TF_OMEGA situations, the briefs, states and standards, and the approval of the drafts)."""
+    the Principal's (the TF_OMEGA situations; the briefs, collected once ATLAS is live, and the standards list, the
+    states being answered on 2026-10-17, doc S57; and the approval of the drafts)."""
     todo(TRIAL_TASK_SET_TODO_ID,
          "Write 8 to 10 one-paragraph TF_OMEGA situations; approve the 40 drafted tasks for the DeepSeek V4.1 Flash "
          "trial (D-46, T-30)",
@@ -2685,14 +2686,18 @@ def raise_input_todos(ctx: Ctx) -> None:
          "blind. The D-47 deep-tier floor is set: 4 tok/s at 8k (engines.json deepseek-v4-flash decode_floor_tok_s) "
          "(doc 5.1, 15.5, Section 22).")
     todo(SEAT_TEST_SETS_TODO_ID,
-         "Brief each domain, state your states of operation and the standards you hold; approve ATLAS's drafts "
-         "(D-49, T-27)",
+         "Brief each domain from real examples once ATLAS is live; list the standards you hold; approve ATLAS's "
+         "drafts (D-49, T-27)",
          "Default built: GLM-5.3-Flash on those seats, unproven: Australian law, HR, aviation, logistics, AEC, SCADA, "
          "game design, growth marketing, customer success and physical security / OSINT (Victor, Alaric and the "
          "domains of 8.2). The approved set is 100 tasks in two waves of 50, drafted by ATLAS and graded blind by the "
-         "two Day 1 engines that did not write each answer. It needs a brief of about 15 minutes per domain, your "
-         "state or states of operation (NSW and VIC assumed), the paywalled standards you hold, then your approval of "
-         "the drafts, wave by wave (doc 5.1, Section 22).")
+         "two Day 1 engines that did not write each answer. It needs a brief of about 15 minutes per domain, "
+         "collected once ATLAS is live from real examples as the work progresses; the list of Australian Standards "
+         "you hold or subscribe to, each licence checked for storing and processing the text in a private system "
+         "(doc 8.4); then your approval of the drafts, wave by wave. Your states are answered: VIC, NSW and QLD, with "
+         "the Commonwealth (2026-10-17, doc S57). Awaiting your answer, not decided: spreading the 16 Australian-law "
+         "tasks across the Commonwealth, VIC, NSW and QLD, and adding about 10 Australian tax and finance tasks "
+         "(doc 6.2, Section 22).")
     rules = _router_rules(ctx)
     trigger = rules.get("long_document_tokens", "UNKNOWN (router-rules.json unreadable)")
     todo(SEAT_PROFILES_TODO_ID,
