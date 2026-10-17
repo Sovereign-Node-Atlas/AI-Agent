@@ -2,9 +2,10 @@
 # phase1/01-preflight.sh — Phase 1 step 1 (Section 17): pre-flight using what a bare host has, plus systemd's TPM2
 # libraries from the archive when the image lacks them (doc S42; the one pre-proxy install of this step).
 # Confirms Ubuntu Server 26.04 (resolute), kernel 7.x, both NVMe drives, fTPM (for V2 in step 2), the AMD GPU from
-# lspci and /sys/class/drm, and records V1 (network) as info. Never touches rocminfo: the gfx1151 confirmation is the
+# lspci and /sys/class/drm, notes the network link (B-27: the cable on the 10 GbE port not marked DASH) and records V1
+# (network, with the link speed) as info. Never touches rocminfo: the gfx1151 confirmation is the
 # Phase 4 container self-test (V11, Section 3.4). Adjudicated conflict 6: no hard fail on the PCI device id.
-# Sourced by phase1-platform.sh through run_phase_steps; defines step_01 only.
+# Sourced by phase1-platform.sh through run_phase_steps; defines step_01 and its two helpers.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -28,6 +29,43 @@ phase1_secure_boot_state() {
   fi
   [[ -d /sys/firmware/efi ]] || { echo disabled; return 0; }
   echo unknown
+}
+
+# phase1_lan_link_note — the network-link note of B-27 (approved by the Principal 2026-10-17): the node runs on a cable
+# from its 10 GbE port NOT marked DASH (the one away from DC IN) to a router port of 2.5 GbE or faster, decided before
+# Phase 1, because Phase 1 ties DNS, the LAN firewall rules, the Docker egress rules and the SSH, Cockpit and xrdp
+# bindings to LAN_IFACE and LAN_IP. Logs the interface, its driver and MAC and what must point at that MAC. Warns, and
+# never stops, when LAN_IFACE is Wi-Fi, when the r8169 driver treats LAN_IFACE as the DASH controller (RTL8127A at PCI
+# revision 0x04 -> RTL_DASH_25_BP: VERIFIED Linux v7.0 r8169_main.c rtl_get_dash_type, research copy L1586-1589;
+# that it is the port next to DC IN is INFERRED), and when another interface holds an address on LAN_CIDR (Wi-Fi left
+# on the subnet after the move to the cable: the interface-bound rules can then drop DNS or LAN traffic).
+phase1_lan_link_note() {
+  local net=/sys/class/net
+  local dev="$net/$LAN_IFACE" mac driver="" vendor="" device="" rev=""
+  mac="$(cat "$dev/address" 2>/dev/null || echo unknown)"
+  if [[ -L "$dev/device/driver" ]]; then driver="$(basename "$(readlink "$dev/device/driver")")"; fi
+  if [[ -d "$dev/wireless" ]]; then
+    warn "pre-flight: LAN_IFACE=$LAN_IFACE is Wi-Fi (MAC $mac). The Principal decided on 2026-10-17 (B-27) that the node runs on a cable from its 10 GbE port NOT marked DASH (the one away from DC IN) to a router port of 2.5 GbE or faster, set before Phase 1, because Phase 1 ties DNS, the firewall and the SSH, Cockpit and xrdp bindings to this interface. To switch now: plug the cable in, reserve $LAN_IP for that port's MAC on the router and move the UDP ${WG_PORT:-51820} forward to it, take Wi-Fi off the $LAN_CIDR subnet, blank LAN_IFACE and LAN_CIDR in $ATLAS_ETC/atlas.env, then run Phase 1 again from step 1 (sudo ${ATLAS_ENTRY:-./atlas-day1.sh} phase1 --force 01, adding --force 04 if step 4 has run). Wi-Fi keeps working; this is not a stop."
+  else
+    vendor="$(cat "$dev/device/vendor" 2>/dev/null || true)"
+    device="$(cat "$dev/device/device" 2>/dev/null || true)"
+    rev="$(cat "$dev/device/revision" 2>/dev/null || true)"
+    log "network: $LAN_IFACE is wired (driver ${driver:-unknown}, PCI ${vendor:-?}:${device:-?} rev ${rev:-?}, MAC $mac). B-27 (2026-10-17): the cable must be in the 10 GbE port NOT marked DASH (the one away from DC IN) and go to a router port of 2.5 GbE or faster; the router's DHCP reservation for $LAN_IP and the UDP ${WG_PORT:-51820} forward must point at MAC $mac; Wi-Fi must be off the $LAN_CIDR subnet. V1 records the link speed."
+    if [[ "$driver" == r8169 && "$vendor" == 0x10ec && "$device" == 0x8127 && "$rev" == 0x04 ]]; then
+      warn "pre-flight: the r8169 driver treats $LAN_IFACE as the DASH controller (RTL8127A, PCI revision 0x04). If the cable is in the port next to DC IN, move it to the other 10 GbE port and move the reservation and the UDP ${WG_PORT:-51820} forward to that port's MAC; keep DASH off in the firmware setup (an out-of-band management path the OS firewall does not see, B-27). Not a stop."
+    fi
+  fi
+  local other a others=()
+  while read -r _ other _ a _; do
+    [[ -n "$a" && "$other" != "$LAN_IFACE" ]] || continue
+    if python3 -c 'import ipaddress, sys; sys.exit(ipaddress.ip_interface(sys.argv[1]).ip not in ipaddress.ip_network(sys.argv[2], strict=False))' "$a" "$LAN_CIDR" 2>/dev/null; then
+      others+=("$other ($a)")
+    fi
+  done < <(ip -o -4 addr show scope global 2>/dev/null || true)
+  if (( ${#others[@]} > 0 )); then
+    warn "pre-flight: ${others[*]} also on the LAN subnet $LAN_CIDR beside $LAN_IFACE. DNS, the LAN firewall rules and the Docker egress rules are bound to $LAN_IFACE only, so a second interface on the same subnet can take the LAN route and lose name resolution (B-27). Take it off this subnet (Wi-Fi: disconnect it or drop it from netplan). Not a stop."
+  fi
+  return 0
 }
 
 step_01() {
@@ -153,6 +191,8 @@ step_01() {
     todo_add os-volume-encryption "OS volume is unencrypted: reinstall Ubuntu Server with 'Set up this disk as an LVM group' + 'Encrypt the LVM group with LUKS' when convenient, then run Day 1 again (the data volume and its contents survive)" \
       "Section 3.5 wants LUKS2 on both volumes. Logs and the OS live on this one; all ATLAS data is on the encrypted 8 TB volume."
   fi
+  # The link (B-27): cable on the non-DASH 10 GbE port, reservation and UDP forward on its MAC, Wi-Fi off the subnet.
+  phase1_lan_link_note
   # SSH, Cockpit and xrdp bind to LAN_IP itself (Section 3.6). A DHCP lease that later changes would leave them on
   # the stale address (console-only recovery), so a dynamic address is flagged for a router reservation.
   if ip -o -4 addr show dev "$LAN_IFACE" scope global 2>/dev/null | grep -q ' dynamic '; then

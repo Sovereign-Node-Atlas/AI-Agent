@@ -26,7 +26,8 @@
 #      as atlas and must not be granted (CONVENTIONS.md §8 "nothing else"); then /health and one real request per model.
 #      The router's chat completion is verify/v10a-router-resident.sh, recorded through run_verify under the id V10a
 #      (the Section 21 V10 half that Section 17 places at the Phase 2 gate; phase2/10-gate.sh records the same id,
-#      recorded only). A fail is fatal to this step. No `V10` row is written from Phase 2 (fix round 3): gate() takes the
+#      recorded only). A fail is fatal to this step. A pass below the review line (70% of the projection, D-33) raises
+#      the to-do decode-review-router, never a fail. No `V10` row is written from Phase 2 (fix round 3): gate() takes the
 #      latest record per id across phases and treats `info` as non-blocking, so a Phase 2 V10 row could stand in for
 #      the Phase 3 load test. V10a is declared in CONVENTIONS §4/§5/§6 (phase2-services.sh header).
 #   3. `docker compose ... up -d chromadb` from docker/core/compose.yml, heartbeat, the six Section 10.1 collections
@@ -473,6 +474,7 @@ PY
     if [[ "$kind" == joined ]]; then
       manifest_entries+=("$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "bytes": int(sys.argv[2]), "sha256": sys.argv[3], "joined": True}))' "$base" "$bytes" "$oid")")
     else
+      [[ -f "$dest_dir/$base" ]] || die "pull_engine_files: $dest_dir/$base is missing after its download; re-run to resume"
       have_size="$(stat -c %s "$dest_dir/$base")"
       manifest_entries+=("$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "bytes": int(sys.argv[2]), "sha256": sys.argv[3]}))' "$base" "$have_size" "$oid")")
     fi
@@ -642,13 +644,22 @@ _mem_start_residents() {
 
 _mem_check_residents() {
   local port resp
-  # Router: one chat completion, non-empty reply (verify/v10a-router-resident.sh). Section 21 places this V10 half at
-  # the Phase 2 gate; it is recorded under its own id V10a (run_verify maps exit 0/1/2/3 and flattens the evidence),
-  # exactly as phase2/10-gate.sh records it. Never under V10 (fix round 3): gate() takes the latest record per id
+  # Router: one chat completion, non-empty reply, then 128 tokens timed against its decode floor in engines.json (D-33;
+  # verify/v10a-router-resident.sh). Section 21 places this V10 half at the Phase 2 gate; it is recorded under its own
+  # id V10a (run_verify maps exit 0/1/2/3 and flattens the evidence), exactly as phase2/10-gate.sh records it. Never under V10 (fix round 3): gate() takes the latest record per id
   # across phases and treats `info` as non-blocking, so a Phase 2 V10 row could pass the Phase 3 gate, or a later
   # `phase2 --force 04` could shadow a Phase 3 `V10 fail`. The Phase 3 gate's V10 is never pre-populated.
   run_verify V10a v10a-router-resident.sh \
-    || die "the resident router model did not answer a chat completion; see verify.jsonl V10a and journalctl -u llama-server@router-qwen3.5-4b"
+    || die "the resident router model did not answer a chat completion or decoded below its floor; see verify.jsonl V10a and journalctl -u llama-server@router-qwen3.5-4b"
+  # D-33: the review line (70% of the projection's low end) raises a to-do and never fails. V10a keeps its one-line
+  # contract and prints it; the to-do is raised here. The router has no placement check, and a router running whole on
+  # the CPU (about 24 tok/s, INFERRED in D-33) clears its floor of 20, so this line is the signal that catches it.
+  local v10a_msg=""
+  IFS=$'\t' read -r _ _ _ v10a_msg <<<"$(_atlas_verify_rows V10a | head -n1)"
+  if [[ "$v10a_msg" == *"(BELOW: a review item"* ]]; then
+    todo_add decode-review-router \
+      "Review the router's decode rate: below 70% of its projection (D-33), a review item, not a fail" "$v10a_msg"
+  fi
 
   # Embeddings (S-41, D-45 (a)): /v1/embeddings must return a vector of AT LEAST the schema's EMBEDDING_DIM (1024):
   # the server returns Qwen3-Embedding-4B's native 2560 dimensions, and the orchestrator's client keeps the first 1024

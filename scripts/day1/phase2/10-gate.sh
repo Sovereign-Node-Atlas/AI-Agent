@@ -505,6 +505,10 @@ _gate_v10_half() {
     *) verdict="fail"; out="exit $rc: $out" ;;
   esac
   record_v V10a "$verdict" "Phase 2 half (resident router, gate): $out"
+  if [[ "$verdict" == pass && "$out" == *"(BELOW: a review item"* ]]; then  # D-33: a to-do, never a fail (04-memory.sh)
+    todo_add decode-review-router \
+      "Review the router's decode rate: below 70% of its projection (D-33), a review item, not a fail" "$out"
+  fi
   if [[ "$verdict" == fail ]]; then
     warn "V10 Phase 2 half (V10a) failed (resident router): $out"
     GATE_UNHEALTHY+=("resident router llama-server@router-qwen3.5-4b: no chat completion ($out)")

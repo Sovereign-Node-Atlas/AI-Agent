@@ -206,7 +206,10 @@ fill_sheet("1 Decisions",
     "Section 19. All twenty-seven are closed. D15 (Secure Boot and the TPM binding) was decided on 2026-10-05 as "
     "option (a), Secure Boot enabled in the BIOS. D16 to D27 (v0.4.0) record the action register the Principal "
     "returned on 2026-10-16, every row approved as recommended (P-10 with the Principal's change); D16, D17 and D18 "
-    "reopen D4 (the retrieval models), D10 (the vision engine) and D12 (Meditron), whose rows say so in their Note.",
+    "reopen D4 (the retrieval models), D10 (the vision engine) and D12 (Meditron), whose rows say so in their Note. "
+    "D16, D18, D20, D22, D24 and D26 carry the Principal's answers of 2026-10-17 to the inputs they had left open "
+    "(S56: the decode, prefill and deep-tier floors, the D-16 profile, no dedicated coder seat, EmbeddingGemma 2 "
+    "dropped, the test-set and trial designs).",
     ["ID", "Decision", "Your answer (as given)", "Note", "Still stands?", "If changed, what instead"],
     rows, [7, 40, 52, 40, 16, 40], 5,
     ["Confirmed", "Changed my mind"],
@@ -255,14 +258,21 @@ _s53_note = "Acknowledged 2026-10-13"
 # Principal on 2026-10-17 (S55, with the RAM fixes and the V25 pass marks; Section 22)
 _V040_RESTATED = {4: "S-48", 17: "S-48, C-06", 19: "S-26, S-47", 20: "S-34"}
 _V040_ACK = "acknowledged 2026-10-17"
+# S56 (2026-10-17): R9 (applicable with the cable) and R20 (lowered) restated with B-27, and R33's mitigation amended
+# with D-47; both recommendations were approved by the Principal on 2026-10-17 with the rest of the open inputs
+_S56_NOTE = {9: "Restated in S56 (B-27, approved by the Principal 2026-10-17): applicable with the cable",
+             20: "; restated again in S56 (B-27, approved by the Principal 2026-10-17): lowered to Low",
+             33: "; mitigation amended in S56 (D-47, approved by the Principal 2026-10-17)"}
 
 
 def _ack(i: int) -> tuple[str | None, str | None]:
     """(response, note) of risk Ri."""
     if i >= 29:
-        return "Yes", f"New in v0.4.0 (S-47, 2026-10-16); {_V040_ACK}"
+        return "Yes", f"New in v0.4.0 (S-47, 2026-10-16); {_V040_ACK}" + _S56_NOTE.get(i, "")
     if i in _V040_RESTATED:
-        return "Yes", f"Restated in v0.4.0 ({_V040_RESTATED[i]}, 2026-10-16); {_V040_ACK}"
+        return "Yes", f"Restated in v0.4.0 ({_V040_RESTATED[i]}, 2026-10-16); {_V040_ACK}" + _S56_NOTE.get(i, "")
+    if i in _S56_NOTE:
+        return "Yes", _S56_NOTE[i]
     return "Yes", (_s53_note if i >= 26 else "Acknowledged 2026-10-08" if i >= 22 else _amend_note.get(i))
 
 
@@ -275,7 +285,9 @@ fill_sheet("3 Risks",
     "once-silent failed sweep, now pushed to the phone) acknowledged by the Principal on 2026-10-13. R29 to R33 "
     "(v0.4.0, S-47: the re-pin, GLM-5.3-Flash's lossy rung, swap and re-prefill latency, the companions' share of the "
     "engine budget, the phased DeepSeek V4.1 trial engine) and R4, R17, R19 and R20 as restated in v0.4.0 "
-    "acknowledged by the Principal on 2026-10-17 (S55).",
+    "acknowledged by the Principal on 2026-10-17 (S55). Later that day (S56) R9 (applicable, the node moving to the "
+    "cable on its 10 GbE port) and R20 (lowered to Low) were restated with B-27 and R33's mitigation amended with "
+    "D-47, both approved by the Principal with the other open-input recommendations.",
     ["ID", "Risk", "Likelihood", "Impact", "Mitigation", "Acknowledged", "Notes"],
     rows, [7, 44, 18, 22, 52, 18, 28], 6,
     ["Yes", "Discuss"], ["Yes"], [], ["Discuss"], extra_inputs=(7,))
@@ -296,18 +308,25 @@ ck = md_checklist()
 # The install row that still asks the Principal to confirm the installer's encryption option (found, not numbered by
 # hand, since v0.4.0 added rows above it).
 ENC_ROW = next(i + 1 for i, (_, item, _) in enumerate(ck) if item.startswith("Ubuntu Server 26.04.1 installed"))
+# S56 (B-27, the Principal's choice of 2026-10-17): the one box still to do before Phase 1, the cable (found, not
+# numbered by hand).
+CABLE_ROW = next(i + 1 for i, (_, item, _) in enumerate(ck) if item.startswith("New in S56 (B-27"))
 rows = [[i + 1, g, item, ("Yes" if done else None), None] for i, (g, item, done) in enumerate(ck)]
 fill_sheet("5 Checklist",
     "Section 22. The original rows were ticked in the workbook returned 2026-09-21; the rows added or reopened since "
     "were closed as each records: D15 decided and the Windows share deferred on 2026-10-05, C27 decided and R22 to "
     "R25 acknowledged by the Principal on 2026-10-08, the Secure Boot BIOS setting, the USB recovery drive and R26 to "
     "R28 ticked in the workbook returned 2026-10-13, and the action register, its licences, C28 to C30 and D16 to D27 "
-    "ticked on 2026-10-16 (v0.4.0), and R29 to R33 with the restated R4, R17, R19 and R20 acknowledged on "
-    "2026-10-17. Blank rows: the optional items the scripts ask for at a prompt (Yes when "
-    "provided, N/A to leave them for the live ATLAS to-do list); and the inputs the v0.4.0 approvals leave to the "
-    "Principal, each already built with its stated default and kept as a to-do, two of them after Day 1. Nothing "
-    "required before Phase 1 "
-    f"is open: the Secure Boot row and the install rows are ticked. One request still stands on row {ENC_ROW}, to "
+    "ticked on 2026-10-16 (v0.4.0), R29 to R33 with the restated R4, R17, R19 and R20 acknowledged on "
+    "2026-10-17, and later that day the answers to the open inputs, the bandwidth and R9 and R20 as restated (S56). "
+    "Blank rows: the optional items the scripts ask for at a prompt (Yes when "
+    "provided, N/A to leave them for the live ATLAS to-do list); the inputs still left to the Principal, each already "
+    "built with its stated default and kept as a to-do (the seat profiles and reasoning settings, the HAI-DEF "
+    "decision for MedGemma, and after Day 1 the briefs for the seat test sets, the TF_OMEGA situations and the T-03 "
+    "coding tasks); and the optional 60-second download test. One row is to do before Phase 1: row "
+    f"{CABLE_ROW}, the cable on the 10 GbE port not marked DASH, with the reservation and the forward moved to its MAC "
+    "and Wi-Fi off the LAN subnet (S56; pre-flight warns, never stops, if it is not done). The Secure Boot row and "
+    f"the install rows are ticked. One request still stands on row {ENC_ROW}, to "
     "confirm that the installer's encryption option (Encrypt the LVM group with LUKS) was taken; pre-flight checks "
     "the OS volume on Day 1, and an unencrypted one is a warning and the to-do os-volume-encryption, never a stop.",
     ["#", "Group", "Item", "Done", "Notes"],
@@ -358,13 +377,17 @@ ref_sheet("Ref Engines",
       "UD-Q8_K_XL is Arthur's seat and the Apex; gpt-oss-120b is the fast utility and the fallback floor. "
       "Qwen2.5-VL-72B, Meditron-70B, Qwen3.5-122B-A10B and the bge pair leave the roster, and Nemotron 3 Super becomes "
       "a phased pull. Sizes are decimal GB as Hugging Face lists them; the Arbiter budgets the exact bytes in GiB "
-      "(D-31). Phase 3 pulls about 448 GB."),
+      "(D-31). Phase 3 pulls about 448 GB. Since 2026-10-17 (S56, D-33, D-47) gpt-oss-120b, GLM-5.3-Flash and "
+      "DeepSeek-V4-Flash-0731 have decode floors at 8k (25, 6 and 4 tok/s; the abliterated twin keeps its v0.3.5 "
+      "band) and gpt-oss-120b is projected at 41-44."),
      ("Phased after Day 1: recorded in the phased list of engines.json, not pulled, rendered or routed on Day 1",
       t51p[0],
       t51p[1:],
       "Where a persona's approved runner-up is one of these, its Day 1 fallback is gpt-oss-120b. To-do for each: the "
       "post-Day-1 pull, with the same checksum and load tests; the event: the Phase 3 gate passed with the measured "
-      "budget recorded. The D-16 context targets of Intern-S1 and Baichuan-M3 default to Q5_K_S at about 23K tokens."),
+      "budget recorded. Since 2026-10-17 (S56, D-16) Intern-S1 and Baichuan-M3 (on the i1-Q5_K_S file) run Q5_K_S "
+      "with a q8_0 cache, the pin's rotation and one 32,768-token slot (about 155.9 GiB projected); Qwen3-Coder-Next "
+      "and EmbeddingGemma 2 left the list (D-19 (c), D-60 (b))."),
      ("Resident small models (D16, reopening D4)", t53[0], t53[1:],
       "The router stays at 4B and does classification only (P-10); Eleanor's own persona work runs on GLM-5.3-Flash. "
       "The Qwen3 embedder and reranker run on the CPU (--device none), indexed before Day 1 with the 1024-dim schema "
@@ -420,9 +443,12 @@ ref_sheet("Ref Multimodal",
      ("Phase 4 engines and their tiers", ["Engine", "Job", "Tier and evidence", "Footprint", "Owner"], eng,
       "v0.4.0: Qwen2.5-VL-72B and Meditron-70B are retired, their rows kept as the record: the vision engine is "
       "GLM-5.3-Flash with its glm5v projector, a Phase 3 GGUF engine, and Minerva's cross-check moves to the phased "
-      "Baichuan-M3. The image tier (Z-Image-Turbo, Qwen-Image-2512) is phased after Day 1 (T-25)."),
+      "Baichuan-M3. The image tier (Z-Image-Turbo, Qwen-Image-2512) is phased after Day 1 (T-25). Rad-DINO stands "
+      "alone until MedGemma 1.5 4B's conditions hold: the Principal's acceptance of the HAI-DEF terms, a non-seat "
+      "Arbiter class and a node test against GLM-5.3-Flash's own vision (C-12, S56)."),
      ("Engine watch-list: considered, not adopted (15.5; v0.4.0 adds the 2026 review's items, the phased DeepSeek "
-      "V4.1 trial among them)",
+      "V4.1 trial among them; S56 makes EmbeddingGemma 2's row the active one and adds Qwen3-Coder-Next and "
+      "Qwen3-VL-Embedding-8B)",
       ["Engine", "What it does", "Why not now", "What would change the answer", "Would replace"], watch,
       "Decision recorded 2026-09-21: FLUX.1-dev stays as the image engine, quality being the deciding factor. "
       "FLUX.1-dev carries the same non-commercial licence as Qwen-Image-2.1, so the licence does not separate them; "
@@ -453,7 +479,9 @@ tplan = md_table_after("### Phase 3 test plan")
 ref_sheet("Ref Day 1",
     "Section 17. Four phases; each ends with a printed pass/fail gate. Phases 3 and 4 run detached and resumable. "
     "v0.4.0: Phase 3 pulls the four Day 1 LLM repositories (about 448 GB), adds step 2b (V25, the output parity of "
-    "the re-pin) and step 2c (the quality record, to-do kld-run), and proves single residency in step 3 (V21).",
+    "the re-pin) and step 2c (the quality record, to-do kld-run), and proves single residency in step 3 (V21). "
+    "S56 (2026-10-17): V10 gates on the decode floors at 8k, the prefill floors and the placement checks, and the "
+    "pull is about 2.5 hours at the 400 Mbps planning figure.",
     [("Expected durations", dur[0], dur[1:]),
      ("Phase steps", ["Phase", "Step"], phases),
      ("Phase 3 test plan: every test in the action register (v0.4.0)", tplan[0], tplan[1:],
@@ -529,7 +557,13 @@ title(ws, "A.T.L.A.S. Build Baseline",
       "batching, the speech, image and OCR companions, the Qwen3.8-Flash-Next and "
       "Nemotron 3 Super pulls, the drafters and the DeepSeek V4.1 trial are phased after Day 1, each with its to-do; "
       "where an approved row leaves an input to the Principal (the decode floors, the context targets, the test sets), "
-      "its default is built and a to-do raised (sheet 5). The uncensored-seat items (D-07, D-08, D-09, D-58, N-10, "
+      "its default is built and a to-do raised (sheet 5). Later on 2026-10-17 (S56) the Principal approved the "
+      "recommendations for those inputs: decode floors at 8k (gpt-oss-120b 25, GLM-5.3-Flash 6, DeepSeek-V4-Flash-0731 "
+      "4, the router 20 tok/s) with prefill floors and placement checks, the D-16 profile of the phased medical and "
+      "science seats, no dedicated coder seat (Qwen3-Coder-Next not pulled), EmbeddingGemma 2 dropped, MedGemma 1.5 "
+      "4B only on conditions, and the designs of the seat test sets and the V4.1 trial set; and recorded a 2,000 Mbps "
+      "line with the node moving to a cable on its 10 GbE port before Phase 1. What those answers still leave open is "
+      "on sheet 5. The uncensored-seat items (D-07, D-08, D-09, D-58, N-10, "
       "P-05, P-17, S-05) are unchanged by this revision and remain the Principal's to configure. Until v0.4.0 this "
       "workbook was the closed v0.3.5 record of 2026-10-12: Ubuntu Server kept over Fedora 44 KDE Plasma (C27), the "
       "crash-kernel memory reclaimed with panic=10 (S48), kexec handover off (S49), the hardware watchdog (S50), "
@@ -542,9 +576,10 @@ how = [
     "1. Sheets 1, 2 and 3 are a record of your answers of 2026-09-21, 2026-10-05 (D15: Secure Boot enabled), "
     "2026-10-08 (C27: Ubuntu kept; R22 to R25 acknowledged), 2026-10-13 (R26 to R28 acknowledged), 2026-10-16 "
     "(the action register: D16 to D27 and C28 to C30) and 2026-10-17 (R29 to R33 and the restated R4, R17, R19 and "
-    "R20 acknowledged). Nothing on them needs you now. Sheet 5 records the Secure Boot BIOS setting "
+    "R20 acknowledged; later, S56: your answers to the open inputs in D16 to D26, R9 and R20 restated with B-27). "
+    "Nothing on them needs you now. Sheet 5 records the Secure Boot BIOS setting "
     "made and the USB recovery drive in hand (both confirmed 2026-10-13) and lists the optional items the scripts ask "
-    "for at a prompt and the inputs v0.4.0 leaves to you, each with the default already built. Sheet 4 fills during "
+    "for at a prompt and the inputs still left to you, each with the default already built. Sheet 4 fills during "
     "Day 1.",
     "2. Use the dropdown in each response column. Cells colour green, amber, or red as you answer.",
     "3. Where you choose 'Change' or 'Disagree', write the alternative in the next column so it can be folded back "
@@ -554,7 +589,10 @@ how = [
     "5. The Ref sheets carry the agreed maps (hardware, platform watch-list and memory budget, the Day 1 and phased "
     "engines, cabinet, domains, task forces, integrations, voice, multimodal, governance, Day 1 and its test plan) "
     "for checking against.",
-    "6. Outstanding before Day 1: nothing required. The blank sheet 5 "
+    f"6. Outstanding before Phase 1: sheet 5 row {CABLE_ROW}, the cable (your choice of 2026-10-17, S56): plug it into "
+    "the 10 GbE port not marked DASH and a 2.5 GbE router port, move the reservation and the UDP 51820 forward to "
+    "that port's MAC and take Wi-Fi off the LAN subnet (pre-flight warns, never stops, if it is not done). The other "
+    "blank sheet 5 "
     "rows are optional or wait until after Day 1, and can be given at the prompt or left for the live ATLAS; sheet 5 "
     f"row {ENC_ROW} still asks you to confirm that the installer's encryption option was taken (if it was not, Day 1 "
     "warns and records a to-do, never a stop). To reopen any other item, change its response cell (Changed my mind, "

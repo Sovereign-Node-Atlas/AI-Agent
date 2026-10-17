@@ -31,6 +31,12 @@
 #                          CPython 3.12 on 2026-10-04.
 #   ruff==0.15.8           RESOLVED PIN (fix round 3, dev extra only, never on the node): the version `ruff check src
 #                          tests` was run with; an unpinned ruff drifted between writer and reviewer (new E501 rules).
+#   openpyxl==3.1.5        RESOLVED PIN, the [eval] extra only (2026-10-17, D-49 and D-46 approved): the blinded
+#                          scoring workbook of atlas.evalrun, the phased evaluation runner. Nothing on Day 1 runs it,
+#                          so Phase 2 step 2 does not install the extra (its venv is unchanged); the runner says how
+#                          to install it when the trial or the seat tests start. 3.1.5 is the version
+#                          tests/test_evalrun.py ran with on 2026-10-17; its one dependency, et-xmlfile, resolved to
+#                          2.0.0. Without it those workbook tests are skipped, as the shell suites skip theirs.
 # SQLite comes from the standard library (sqlite3); no dependency.
 # `license` uses the PEP 639 string form: setuptools >= 77 warns on the TOML-table form and rejects it from 2027-02.
 
@@ -60,6 +66,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["ruff==0.15.8"]  # rule §7.9: the version the suite was checked with (header)
+eval = ["openpyxl==3.1.5"]  # rule §7.9: atlas.evalrun's workbook (header); phased, never on Day 1
 
 [project.scripts]
 # atlas-admin and atlas-api are the names in the writer brief; atlas-orchestrator is the name phase2/02-orchestrator.sh

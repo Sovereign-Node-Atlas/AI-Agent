@@ -63,13 +63,13 @@ Subcommands (global options first, see main()):
                             Records only: it never fails the phase (a parse miss is UNKNOWN)
 
 Verdicts fixed by the baseline (the document wins over this file and over engines.json, CONVENTIONS.md preamble):
-  * Section 21 V10 under D-33 option (c) (v0.4.0, S-25, B-04, B-06): load, generation at 512 and 8k tokens, swap and
-    release gate the engine; the decode rate is recorded beside engines.json projected_decode_tok_s (a research
-    projection, never measured on the PRO 495) and FAILS only below a non-null decode_floor_tok_s, the per-seat floor
-    the Principal sets with the deep-tier floor (D-47). A null floor means record only, and `summarize` raises the
-    to-do decode-floors. An entry that still carries a v0.3.5 expected_decode_tok_s band (the abliterated entry,
-    left exactly as v0.3.5 has it) keeps the v0.3.5 rule: below the band's lower bound is a V10 fail, and it is
-    left out of the to-do.
+  * Section 21 V10 under D-33 (c) with the floors approved 2026-10-17 (D-33, D-47): load, generation at 512 and 8k,
+    swap, release and placement gate the engine. Decode is recorded beside projected_decode_tok_s and FAILS only below
+    decode_floor_tok_s, judged on the slower of the 512 and 8k points (64+ tokens each); prefill_floor_tok_s is judged
+    on the 8k prefill; offloaded N/M layers with N < M, or a GTT delta under 0.85 x the weights, fail (placement).
+    70% of the projection's low end is a review line: a to-do, never a fail. A null floor is record only (to-do
+    decode-floors). An entry that still carries a v0.3.5 expected_decode_tok_s band (the abliterated entry, left
+    exactly as v0.3.5 has it) keeps the v0.3.5 rule at 512: below the band's lower bound fails. See MIN_VERDICT_TOKENS.
   * Section 23 S6 / an engines.json known_issue naming llama.cpp #20732 (Nemotron 3 Super, phased after Day 1): the
     8k prefill is followed by an alive check; a server that died is a V10 FAIL carrying the issue number in its
     message, never a hang and never a silent pass; alive with the request failed is a fail too. Every engine gets
@@ -278,8 +278,8 @@ REQUEST_TIMEOUT_S = 1200.0  # an 8k prefill plus 128 decoded tokens on the slowe
 PREFILL_SHORT = 512
 PREFILL_LONG = 8192
 N_PREDICT = 128
-# Section 21 V10 under D-33 option (c) (v0.4.0; module docstring "Verdicts"): decode is recorded beside engines.json
-# projected_decode_tok_s and fails only below a non-null decode_floor_tok_s (the Principal's per-seat floor, D-47).
+# Section 21 V10 (D-33, D-47; module docstring "Verdicts"): the decode and prefill floors come from engines.json and are
+# judged by check_band and check_prefill_floor; their constants follow the to-do ids below (MIN_VERDICT_TOKENS).
 QUEUED_RETRY_S = 15.0  # re-POST interval after an Arbiter "queued" answer (its own load_wait_s is the real queue)
 SETTLE_DELTA_BYTES = 256 * 1024 * 1024  # two GTT readings 10 s apart closer than this = the counter has settled
 GENERATION_IDLE_WAIT_S = 600.0  # Section 4.2 rule 3 belt: how long a direct request waits for the generation slot
@@ -319,11 +319,50 @@ DEEP_THINK_GENERATOR = "glm-5.3-flash"  # atlas/arbiter.py DEEP_THINK_GENERATOR:
 DECODE_FLOOR_TODO_ID = "decode-floors"
 KLD_TODO_ID = "kld-run"
 # v0.4.0: the inputs an approved row leaves to the Principal, each built with its stated default and raised as a to-do
-# (raise_input_todos, from summarize in step 02, beside decode-floors); only the Principal closes them.
-CONTEXT_TARGETS_TODO_ID = "context-targets"  # D-16
+# (raise_input_todos, from summarize in step 02, beside decode-floors); only the Principal closes them. v0.4.0's
+# context-targets is no longer raised: D-16 was approved on 2026-10-17 (q8_0 KV, 1 x 32,768; engines.json `phased`).
 TRIAL_TASK_SET_TODO_ID = "trial-task-set"  # D-46
 SEAT_TEST_SETS_TODO_ID = "seat-test-sets"  # D-49
 SEAT_PROFILES_TODO_ID = "seat-profiles"  # D-48, S-30, T-04
+# V10 floors and placement (D-33, D-47, T-06; approved by the Principal 2026-10-17, research_notes/ATLAS open inputs
+# 2026-10-17/recommendations.json). check_band judges decode_floor_tok_s on the slower of the 512 and 8k decode points
+# (the 512 figure alone when the 8k point is skipped). Every timing request but the first at 512 sets ignore_eos, so a
+# point generates N_PREDICT = 128 tokens unless the server cuts it (D-47: the 8k point, 128 or more generated tokens).
+# A point counts only when it generated MIN_VERDICT_TOKENS or more;
+# a point that generated fewer is re-measured once (timed_point), and with no counted point there is no decode verdict
+# (a warning, never a fail). check_prefill_floor judges prefill_floor_tok_s on the 8k prefill. REVIEW_FRACTION of the
+# projection's low end is the review line: in the V10 message and the to-do decode-review, never a fail. The floors
+# cannot see a model that runs whole on the CPU (CPU decode is about 108 GB/s here, close to mainline Vulkan; INFERRED,
+# D-33), so check_placement is the CPU-fallback detector.
+MIN_VERDICT_TOKENS = 64
+REVIEW_FRACTION = 0.7
+DECODE_REVIEW_TODO_ID = "decode-review"
+# Placement lines, VERIFIED at b11474 (library INFO, logged as TRACE, common/log.cpp:535: in the journal at -lv 4,
+# which phase2/engine-env.py renders, like the K/V lines; --fit's trial lines are dropped there, FIT_END_RE):
+#   "load_tensors: offloaded %d/%d layers to GPU" (src/llama-model.cpp:1936): N = min(n_gpu_layers, n_layer + 1),
+#       M = n_layer + 1; --n-gpu-layers all resolves to n_layer + 1 (src/llama-model.cpp:2018-2021).
+#   "load_tensors: %12s model buffer size = %8.2f MiB" (src/llama-model.cpp:1942-1943), one line per weights buffer,
+#       named by its buffer type: "Vulkan0" for the GPU (ggml/src/ggml-vulkan/ggml-vulkan.cpp:4762, 4896-4899).
+#       On the PRO 495 iGPU llama.cpp loads without mmap: the Vulkan device reports mmap_support = !is_integrated_gpu
+#       (ggml-vulkan.cpp:15320) and load_tensors turns mmap off for it in the default AUTO load mode
+#       (src/llama-model.cpp:1524-1533). So a small "Vulkan_Host" (ggml-vulkan.cpp:13088-13089) or "CPU"
+#       (ggml/src/ggml-backend.cpp:2536-2537) line beside Vulkan0 is normal; "CPU_Mapped" (ggml-backend.cpp:2585)
+#       appears only when mmap is on. These lines are a record, not a verdict.
+#   "sched_reserve: graph%s: nodes = %s, splits = %s, input objects = %s, ..." (src/llama-context.cpp:758): the
+#       graph splits; " (pp bs=N, tg bs=N)" and "pp / tg" counts when the two graphs differ. A record, not a verdict.
+# The GTT half compares the measured delta with RESIDENCY_LOW_FACTOR x engine_weights_bytes (files[].bytes, D-31), the
+# same factor and weights as V21. A line not found, or a delta not measured, reads UNKNOWN and never fails.
+OFFLOAD_RE = re.compile(r"load_tensors: offloaded (\d+)/(\d+) layers to GPU")
+MODEL_BUF_RE = re.compile(r"load_tensors: +(\S+) model buffer size = +([0-9.]+) MiB")
+GRAPH_SPLITS_RE = re.compile(r"sched_reserve: graph(?: \(pp bs=\d+, tg bs=\d+\))?: nodes = (\d+(?: / \d+)?), "
+                             r"splits = (\d+(?: / \d+)?)")
+# T-06 (D-47, D-61): the Apex's V10 verdict is taken with DSpark off, as production renders it (no --spec-type in
+# engines.json extra_args); a rendered --spec-type is flagged (spec_decoding_on). Phase 3 times 512 and 8k only, so
+# the 16k and 32k points are not measured on Day 1. Phase 3 has no DSpark or trial speed path: these are the record
+# settings for the phased T-06 DSpark runs and the T-30 trial, which measure with this script's protocol. Nothing
+# reads them on Day 1.
+DSPARK_RECORD_TEMPERATURES = (0.0, 0.15, 0.6, 1.0)
+DSPARK_RECORD_TOP_P = 1.0
 # S-02 (V25) and S-03: llama-perplexity runs. A 512-token window over 16 chunks of the fixed corpus (about 8k tokens,
 # the domain profiles under config/domains, present on the node) keeps the base-logits file near 1-2 GB per engine; the
 # deterministic task set is the HellaSwag-format file beside this script (6 lines per task: context, gold index, four
@@ -759,11 +798,20 @@ class EngineResult:
     prefill_tps_512: float | None = None
     prefill_tps_8k: float | None = None
     prefill_8k_note: str = ""
+    predicted_n_512: int | None = None  # tokens generated at each point: a decode verdict needs MIN_VERDICT_TOKENS
+    predicted_n_8k: int | None = None
+    spec_type: str = ""  # the rendered --spec-type, "" when speculative decoding is off (T-06: DSpark off)
     crashed_at_8k: bool = False
     known_issue_note: str = ""  # the Section 23 S6 note with the issue number (#20732) recorded BESIDE the V10 fail
     stopped_externally: bool = False
     band_note: str = ""
     band_fail: str = ""
+    review_note: str = ""  # below REVIEW_FRACTION of the projection: the to-do decode-review, never a fail (D-33)
+    prefill_note: str = ""
+    prefill_fail: str = ""
+    placement: dict[str, Any] = field(default_factory=dict)  # D-33: the parsed load lines and the GTT half (a record)
+    placement_note: str = ""
+    placement_fail: str = ""
     footprint_bytes: int | None = None
     footprint_note: str = ""
     released: bool | None = None
@@ -1546,9 +1594,13 @@ def make_prompt(port: int, target_tokens: int, nonce: str) -> tuple[str, int]:
     return text + "\n\nContinue this list of words:", n
 
 
-def completion(port: int, prompt: str, n_predict: int) -> dict[str, Any]:
-    """POST /completion; returns {"content", "timings", "error"}. Never raises on HTTP errors (the caller decides)."""
+def completion(port: int, prompt: str, n_predict: int, ignore_eos: bool = False) -> dict[str, Any]:
+    """POST /completion; returns {"content", "timings", "error"}. Never raises on HTTP errors (the caller decides).
+    `ignore_eos` asks the server to generate all n_predict tokens (VERIFIED at b11474,
+    tools/server/server-schema.cpp:475-480), as V10a's timing request does."""
     body = {"prompt": prompt, "n_predict": n_predict, "temperature": 0, "cache_prompt": False, "stream": False}
+    if ignore_eos:
+        body["ignore_eos"] = True
     try:
         code, resp = http("POST", f"http://127.0.0.1:{port}/completion", body, timeout=REQUEST_TIMEOUT_S)
     except HttpFail as exc:
@@ -1585,11 +1637,12 @@ def chat(url: str, model: str, messages: list[dict[str, str]], max_tokens: int, 
             "timings": resp.get("timings") or {}, "t_recv": t_recv, "code": code}
 
 
-def measure_point(port: int, target: int, label: str) -> tuple[dict[str, Any], str]:
-    """One timing point: prefill tok/s at ~target prompt tokens and decode tok/s for N_PREDICT tokens after it."""
+def measure_point(port: int, target: int, label: str, ignore_eos: bool = True) -> tuple[dict[str, Any], str]:
+    """One timing point: prefill tok/s at ~target prompt tokens and decode tok/s for N_PREDICT tokens after it (all
+    N_PREDICT with `ignore_eos`, D-47's "at least 128 generated tokens")."""
     nonce = f"p3-{label}-{random.randrange(10**9)}"
     prompt, n = make_prompt(port, target, nonce)
-    r = completion(port, prompt, N_PREDICT)
+    r = completion(port, prompt, N_PREDICT, ignore_eos=ignore_eos)
     if r["error"]:
         return r, f"{label}: request failed: {r['error'][:200]}"
     t = r["timings"]
@@ -1599,6 +1652,37 @@ def measure_point(port: int, target: int, label: str) -> tuple[dict[str, Any], s
     if t.get("cache_n"):
         note += " (WARNING cache_n>0: prefill figure includes cached tokens)"
     return r, note
+
+
+def predicted_n(r: dict[str, Any]) -> int:
+    """timings.predicted_n of one answer, 0 when absent or unreadable."""
+    try:
+        return int((r.get("timings") or {}).get("predicted_n") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def timed_point(orch_url: str, key: str, port: int, target: int, label: str,
+                ignore_eos: bool = True) -> dict[str, Any]:
+    """One V10 timing point (D-33): Section 4.2 rule 3's idle wait, then measure_point. With `ignore_eos` (the default,
+    and the 8k point) the server generates all N_PREDICT = 128 tokens, which D-47 asks of the 8k point. The first 512
+    request is sent without it (measure_points), so the 'no generation at 512' check still catches an engine that
+    stops at once. An answer that generated fewer than MIN_VERDICT_TOKENS tokens is too short for a decode verdict, so
+    the point is re-measured once with a fresh prompt and the second answer stands, whatever it is (check_band gives no
+    decode verdict when it is short again: a server-side cut). The re-measure ignores EOS when the first answer
+    generated something; one that generated nothing is re-measured as it was sent."""
+    require_generation_idle(orch_url, f"{key} {label} point")
+    r, note = measure_point(port, target, label, ignore_eos=ignore_eos)
+    log(f"{key}: {note}")
+    if r["error"] or predicted_n(r) >= MIN_VERDICT_TOKENS:
+        return r
+    again_ignore = ignore_eos or (predicted_n(r) > 0 and bool(str(r.get("content") or "").strip()))
+    log(f"{key}: {label}: {predicted_n(r)} token(s) generated, under {MIN_VERDICT_TOKENS}: re-measured once (D-33"
+        f"{', ignore_eos' if again_ignore else ''})")
+    require_generation_idle(orch_url, f"{key} {label} point (re-measure)")
+    r, note = measure_point(port, target, f"{label}-again", ignore_eos=again_ignore)
+    log(f"{key}: {note}")
+    return r
 
 
 COHERENCE_PASSAGE = (
@@ -1786,37 +1870,187 @@ def _band_text(band: Any) -> str:
     return f"{lo}" if lo == hi else f"{lo}-{hi}"
 
 
+def review_line(spec: dict[str, Any]) -> float | None:
+    """D-33: REVIEW_FRACTION of the projection's low end (projected_decode_tok_s[0]), None without a projection."""
+    proj = spec.get("projected_decode_tok_s")
+    try:
+        return round(REVIEW_FRACTION * float(proj[0]), 2) if proj else None
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def judged_decode(res: EngineResult) -> tuple[float | None, str]:
+    """D-33, D-47: (the decode figure V10 judges, where it was taken). The slower of the 512 and 8k points, each counted
+    only when it generated at least MIN_VERDICT_TOKENS tokens; the 512 figure alone when the 8k point was skipped or
+    failed. (None, why) when a point was measured but none counts; (None, "") when nothing was measured."""
+    counted: list[tuple[float, str]] = []
+    short: list[str] = []
+    points = (("512", res.decode_tps_512, res.predicted_n_512), ("8k", res.decode_tps_8k, res.predicted_n_8k))
+    for label, d, n in points:
+        if d is None:
+            continue
+        if n is None or n < MIN_VERDICT_TOKENS:
+            short.append(f"{label} generated {'?' if n is None else n} token(s)")
+            continue
+        counted.append((d, label))
+    if not counted:
+        return None, (f"{' and '.join(short)}, fewer than {MIN_VERDICT_TOKENS} after one re-measure (D-33)"
+                      if short else "")
+    d, label = min(counted)
+    if len(counted) == 2:
+        return d, f"{label} (the slower point)"
+    why = (f"{short[0]}, not counted" if short else
+           "8k point " + ("skipped" if res.prefill_8k_note.startswith("skipped") else "not measured"))
+    return d, f"{label} ({why})"
+
+
 def check_band(res: EngineResult, spec: dict[str, Any]) -> None:
-    """Section 21 V10 under D-33 option (c) (module docstring "Verdicts"): the decode rate at 512 tokens is recorded
-    beside the research projection (projected_decode_tok_s) and is a V10 fail only below a non-null
-    decode_floor_tok_s, the per-seat floor the Principal sets (D-47). With no floor it is a record, never a verdict.
-    An entry that still carries a v0.3.5 expected_decode_tok_s band (the unchanged abliterated entry is the only one)
-    keeps the v0.3.5 rule: its band's lower bound is the floor, as before this revision."""
-    d = res.decode_tps_512
-    if d is None:
-        return
+    """Section 21 V10 (D-33, D-47; module docstring "Verdicts"): the decode rate is recorded beside the research
+    projection (projected_decode_tok_s) and is a V10 fail only below a non-null decode_floor_tok_s, the seat's
+    absolute floor, judged on judged_decode (the slower of the 512 and 8k points). No counted point: no decode verdict,
+    a warning, never a fail. Below review_line (70% of the projection's low end): review_note, the to-do
+    decode-review, never a fail. With no floor it is a record. An entry that still carries a v0.3.5
+    expected_decode_tok_s band (the unchanged abliterated entry is the only one) keeps the v0.3.5 rule on the 512
+    figure: its band's lower bound is the floor, as before this revision."""
     floor = spec.get("decode_floor_tok_s")
     band = spec.get("expected_decode_tok_s")
     proj = spec.get("projected_decode_tok_s")
     if floor is None and band:
+        d512 = res.decode_tps_512
+        if d512 is None:
+            return
         lo, hi = float(band[0]), float(band[1])
-        if d < lo:
-            res.band_fail = (f"decode {d} tok/s below the expected band {_band_text(band)} tok/s (the entry's v0.3.5 "
-                             "band, its rule unchanged; V10 fail)")
-        elif d > hi:
-            res.band_note = f"decode {d} tok/s above the expected band {_band_text(band)} tok/s (informational)"
+        if d512 < lo:
+            res.band_fail = (f"decode {d512} tok/s below the expected band {_band_text(band)} tok/s (the entry's "
+                             "v0.3.5 band, its rule unchanged; V10 fail)")
+        elif d512 > hi:
+            res.band_note = f"decode {d512} tok/s above the expected band {_band_text(band)} tok/s (informational)"
         else:
-            res.band_note = f"decode {d} tok/s within the expected band {_band_text(band)} tok/s"
+            res.band_note = f"decode {d512} tok/s within the expected band {_band_text(band)} tok/s"
+        return
+    d, at = judged_decode(res)
+    if d is None:
+        if at:
+            res.band_note = f"no decode verdict: {at}"
+            res.warn(res.band_note)
         return
     versus = f" vs {_band_text(proj)} tok/s projected" if proj else " (no projection recorded)"
     if floor is not None and d < float(floor):
-        # V10 fail, no tolerance: the Principal's floor is the verdict (D-33 (c), D-47).
-        res.band_fail = f"decode {d} tok/s below the seat's floor {floor} tok/s{versus} (D-33 (c); V10 fail)"
+        # V10 fail, no tolerance: the Principal's absolute floor is the verdict (D-33, D-47).
+        res.band_fail = f"decode {d} tok/s at {at} below the seat's floor {floor} tok/s{versus} (D-33, D-47; V10 fail)"
     elif floor is not None:
-        res.band_note = f"decode {d} tok/s at or above the floor {floor} tok/s{versus}"
+        res.band_note = f"decode {d} tok/s at {at} at or above the floor {floor} tok/s{versus}"
     else:
-        res.band_note = (f"decode {d} tok/s{versus}; no floor set "
+        res.band_note = (f"decode {d} tok/s at {at}{versus}; no floor set "
                          "(D-33 (c): recorded, not a verdict; to-do decode-floors)")
+    review = review_line(spec)
+    if review is not None and d < review:
+        res.review_note = (f"decode {d} tok/s at {at} below the review line {review} tok/s ({REVIEW_FRACTION:.0%} of "
+                           f"the projection's low end {proj[0]}; D-33: a to-do, never a fail)")
+
+
+def check_prefill_floor(res: EngineResult, spec: dict[str, Any]) -> None:
+    """D-33, D-47: prefill_floor_tok_s is judged on the 8k prefill point; below it is a V10 fail. No floor (null or
+    absent, the router): nothing. No 8k figure: no prefill verdict, said in prefill_note (a failed 8k request fails V10
+    through load_error; a skipped point is a warning)."""
+    floor = spec.get("prefill_floor_tok_s")
+    if floor is None:
+        return
+    p = res.prefill_tps_8k
+    if p is None:
+        res.prefill_note = (f"prefill floor {floor} tok/s not judged: no 8k prefill figure "
+                            f"({res.prefill_8k_note or 'not measured'})")
+        if res.prefill_8k_note.startswith("skipped"):
+            res.warn(res.prefill_note)
+        return
+    if p < float(floor):
+        res.prefill_fail = f"prefill {p} tok/s at 8k below the seat's prefill floor {floor} tok/s (D-33; V10 fail)"
+    else:
+        res.prefill_note = f"prefill {p} tok/s at 8k at or above the prefill floor {floor} tok/s"
+
+
+def parse_placement_lines(lines: Sequence[str]) -> dict[str, Any]:
+    """Pure (D-33): what one load's log says about placement (the line formats at the MIN_VERDICT_TOKENS block): the
+    last "offloaded N/M layers to GPU" line, the model buffer sizes per buffer type (MiB, summed over a type's
+    buffers) and the last graph line's nodes and splits. --fit's trial lines are discarded as in parse_memory_lines
+    (FIT_END_RE) and debug lines skipped. None (or {}) where the line was not found."""
+    out: dict[str, Any] = {"offloaded": None, "layers": None, "model_buffers_mib": {}, "graph_nodes": None,
+                           "graph_splits": None}
+    for ln in lines:
+        if DEBUG_LINE_RE.search(ln):
+            continue
+        if FIT_END_RE.search(ln):
+            out = {"offloaded": None, "layers": None, "model_buffers_mib": {}, "graph_nodes": None,
+                   "graph_splits": None}
+        elif m := OFFLOAD_RE.search(ln):
+            out["offloaded"], out["layers"] = int(m.group(1)), int(m.group(2))
+        elif m := MODEL_BUF_RE.search(ln):
+            bufs = out["model_buffers_mib"]
+            bufs[m.group(1)] = round(bufs.get(m.group(1), 0.0) + float(m.group(2)), 2)
+        elif m := GRAPH_SPLITS_RE.search(ln):
+            out["graph_nodes"], out["graph_splits"] = m.group(1), m.group(2)
+    return out
+
+
+def placement_verdict(parsed: dict[str, Any], delta_bytes: int | None, weights_bytes: int) -> tuple[str, str]:
+    """Pure (D-33): (fail reason or "", note). A fail when the load log says offloaded N/M layers with N < M, or when
+    the measured GTT delta is below RESIDENCY_LOW_FACTOR x the weights. A line not found, a delta not measured or
+    weights not known read UNKNOWN for that half and never fail. The model buffer and graph lines are recorded, never
+    judged."""
+    fails: list[str] = []
+    notes: list[str] = []
+    n, m = parsed.get("offloaded"), parsed.get("layers")
+    if n is None or m is None:
+        notes.append("layers UNKNOWN (no 'offloaded N/M layers to GPU' line)")
+    elif n < m:
+        fails.append(f"offloaded {n}/{m} layers to GPU ({m - n} on the CPU)")
+    else:
+        notes.append(f"offloaded {n}/{m} layers")
+    if delta_bytes is None or weights_bytes <= 0:
+        notes.append("GTT UNKNOWN (" + ("delta not measured" if delta_bytes is None else "weights not known") + ")")
+    else:
+        low = int(RESIDENCY_LOW_FACTOR * weights_bytes)
+        what = f"GTT delta {fmt_gb(delta_bytes)} vs {RESIDENCY_LOW_FACTOR} x the weights {fmt_gb(weights_bytes)}"
+        if delta_bytes < low:
+            fails.append(f"{what} = {fmt_gb(low)}: below")
+        else:
+            notes.append(f"{what}: at or above")
+    bufs = parsed.get("model_buffers_mib") or {}
+    notes.append("model buffers " + (", ".join(f"{k} {v:.2f} MiB" for k, v in bufs.items()) if bufs else "UNKNOWN"))
+    splits = parsed.get("graph_splits")
+    notes.append(f"graph splits {splits}" if splits else "graph splits UNKNOWN")
+    fail = f"placement: {'; '.join(fails)} (D-33 CPU-fallback check; V10 fail)" if fails else ""
+    return fail, "placement: " + "; ".join(notes)
+
+
+def floor_fail(res: EngineResult) -> str:
+    """The first V10 fail reason of the floors and the placement check (D-33, D-47), "" when none."""
+    return res.band_fail or res.prefill_fail or res.placement_fail
+
+
+def check_placement(res: EngineResult, spec: dict[str, Any], key: str, invocation_id: str, since: str) -> None:
+    """D-33 placement checks of one load (V10), read after the timing points: the load log of the current invocation
+    and the GTT delta register_footprint measured (res.footprint_bytes; None when it was not measured). A CPU
+    companion (placement cpu) is exempt. A journal that cannot be read is UNKNOWN, never a fail; only SIGTERM still
+    stops the run."""
+    if spec.get("placement") == "cpu":
+        res.placement_note = "placement: exempt (placement cpu, a CPU companion)"
+        return
+    why = ""
+    try:
+        lines = journal_lines(key, invocation_id, since)
+    except Terminated:
+        raise
+    except Exception as exc:  # a parse miss is UNKNOWN, never a fail (D-33)
+        lines, why = [], f"{type(exc).__name__}: {exc}"
+    parsed = parse_placement_lines(lines)
+    weights = engine_weights_bytes(spec)
+    res.placement = {**parsed, "gtt_delta_bytes": res.footprint_bytes, "weights_bytes": weights,
+                     "low_factor": RESIDENCY_LOW_FACTOR}
+    res.placement_fail, res.placement_note = placement_verdict(parsed, res.footprint_bytes, weights)
+    if not lines:
+        res.placement_note += f" (load journal {'unreadable: ' + why[:120] if why else 'empty'})"
+    log(f"{key}: {res.placement_fail or res.placement_note}")
 
 
 def build_number(tag: Any) -> int | None:
@@ -1857,30 +2091,59 @@ def set_v22(res: EngineResult, spec: dict[str, Any]) -> None:
     if res.ok and res.kv_proof_ok:
         res.v22_result = "pass"
         res.v22_msg = (f"{head}: loads, proves {res.kv_applied or res.kv_requested} KV, generates at 512 and 8k "
-                       f"(decode {fmt_num(res.decode_tps_512)} tok/s) and releases its memory")
+                       f"(decode {fmt_num(res.decode_tps_512)}/{fmt_num(res.decode_tps_8k)} tok/s, at or above its "
+                       "floors, placement not failed) and releases its memory")
         return
-    why = (res.load_error or res.band_fail or (res.release_note if res.released is False else "")
+    why = (res.load_error or floor_fail(res) or (res.release_note if res.released is False else "")
            or ("V4 not proven: " + res.kv_proof_msg if res.load_ok and not res.kv_proof_ok else "") or "not ok")
     res.v22_result = "deferred"
     res.v22_msg = f"{head}: deferred without blocking the phase (R19 generalised, S-26): {why[:300]}"
 
 
+def spec_type_of(env: dict[str, str]) -> str:
+    """The --spec-type value the env file's ARGS render ("" when none: speculative decoding, DSpark included, is off).
+    No engines.json entry renders one; T-06 takes the Apex's V10 verdict with DSpark off (D-47, D-61)."""
+    args = env.get("ARGS", "").split()
+    for i, tok in enumerate(args):
+        if tok == "--spec-type":
+            return args[i + 1] if i + 1 < len(args) else "?"
+        if tok.startswith("--spec-type="):
+            return tok.split("=", 1)[1] or "?"
+    return ""
+
+
 def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict[str, str]) -> None:
+    """The V10 timing points (measure_points), then the floor verdicts on them (D-33, D-47): check_band on the slower
+    decode point and check_prefill_floor on the 8k prefill. The verdicts follow whatever happened at 8k, so a seat
+    that failed there still carries its floor reading; they need a generation at 512."""
     spec = ctx.spec(key)
-    require_generation_idle(ctx.orch_url, f"{key} 512-token point")  # rule 3: a direct request to the port
-    r, note = measure_point(port, PREFILL_SHORT, "512")
-    log(f"{key}: {note}")
+    res.spec_type = spec_type_of(env)
+    if res.spec_type:
+        res.warn(f"speculative decoding is on (--spec-type {res.spec_type}): the floor verdict is meant with DSpark "
+                 "off (D-47, D-61, T-06); engines.json renders no --spec-type")
+    measure_points(ctx, res, key, port, env, spec)
+    if res.generated:
+        check_band(res, spec)
+        check_prefill_floor(res, spec)
+
+
+def measure_points(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict[str, str], spec: dict[str, Any],
+                   ) -> None:
+    """The two timing points into res: 512 tokens, then 8k when one slot can hold it (each through timed_point), with
+    the 8k alive check of Section 23 S6. A failure sets res.load_error and ends the points."""
+    # Rule 3: a direct request to the port. EOS is honoured on the first 512 request only (timed_point).
+    r = timed_point(ctx.orch_url, key, port, PREFILL_SHORT, "512", ignore_eos=False)
     if r["error"]:
         res.load_error = f"512-token request failed: {r['error'][:200]}"
         return
     t = r["timings"]
     res.prefill_tps_512 = round(float(t.get("prompt_per_second") or 0), 2)
     res.decode_tps_512 = round(float(t.get("predicted_per_second") or 0), 2)
+    res.predicted_n_512 = predicted_n(r)
     res.generated = bool(t.get("predicted_n")) and bool(r["content"].strip())
     if not res.generated:
         res.load_error = f"no generation at 512 tokens (predicted_n={t.get('predicted_n')}, content empty)"
         return
-    check_band(res, spec)
     ctx_size = int(env.get("ATLAS_CTX_SIZE", spec["ctx_size"]))
     parallel = int(env.get("ATLAS_PARALLEL", spec.get("parallel", 1)))
     per_slot = ctx_size // max(parallel, 1)
@@ -1888,9 +2151,7 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
         res.prefill_8k_note = f"skipped: {per_slot} tokens per slot ({ctx_size}/{parallel}) cannot hold an 8k prompt"
         log(f"{key}: 8k point {res.prefill_8k_note}")
         return
-    require_generation_idle(ctx.orch_url, f"{key} 8k point")
-    r, note = measure_point(port, PREFILL_LONG, "8k")
-    log(f"{key}: {note}")
+    r = timed_point(ctx.orch_url, key, port, PREFILL_LONG, "8k")
     # Section 23 S6 (an engines.json known_issue naming #20732; Nemotron 3 Super's, phased after Day 1): the 8k
     # prefill test checks the server is still alive afterwards (never a hang) and records the issue number. The
     # verdict is engines.json's: "pass with the '#20732 checked, server alive' note when /health answers, fail when it
@@ -1932,6 +2193,7 @@ def run_measurements(ctx: Ctx, res: EngineResult, key: str, port: int, env: dict
     t = r["timings"]
     res.prefill_tps_8k = round(float(t.get("prompt_per_second") or 0), 2)
     res.decode_tps_8k = round(float(t.get("predicted_per_second") or 0), 2)
+    res.predicted_n_8k = predicted_n(r)
     if known:
         res.prefill_8k_note = f"{NEMOTRON_ISSUE_ID} checked, server alive"  # engines.json known_issue wording
 
@@ -2000,7 +2262,8 @@ def test_engine(ctx: Ctx, key: str, previous: str | None) -> None:
         if res.crashed_at_8k and not res.load_error:
             res.footprint_note = "not measured: the server died at 8k (see warnings)"
         stop_and_release(ctx, ctl, key, baseline, res)
-    res.ok = (res.load_ok and res.generated and not res.load_error and not res.band_fail
+    check_placement(res, spec, key, inv, since)  # D-33: the load log and the GTT delta just registered (or UNKNOWN)
+    res.ok = (res.load_ok and res.generated and not res.load_error and not floor_fail(res)
               and not res.crashed_at_8k and res.released is not False)
     finalize_control(res, ctl)
     set_v22(res, spec)
@@ -2037,7 +2300,8 @@ def rung_verdict(r: dict[str, Any]) -> str:
 
 def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any]], base_kv: str,
                   stop_reason: str, released: bool | None, release_note: str,
-                  decode_512: float | None, prefill_512: float | None, quant: str = "") -> LadderVerdict:
+                  decode_512: float | None, prefill_512: float | None, quant: str = "", floor_fail: str = "",
+                  ) -> LadderVerdict:
     """Pure decision of the ladder (engines.json kv_ladder_rule under S-42 / D-29 (a); Section 21 V4/V22; R19). The
     rungs are tried in list order, f16 then q8_0, and the FIRST rung that loaded, printed its proof lines and answered
     coherently stands (the highest precision that fits; ladder_engine stops there, so a later rung is never tried
@@ -2046,7 +2310,9 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
       * q8_0 -> V4 pass with the note that f16 failed to load or was incoherent, kv_type written to overrides;
       * no coherent rung at all -> V4 and V22 deferred with the reason (R19 keeps the phase unblocked);
       * a winner whose measurement failed (request error, death at 8k) is still the winner (a measurement failure is
-        not incoherence) but V22 records deferred with that reason (R19).
+        not incoherence) but V22 records deferred with that reason (R19);
+      * a winner below its decode or prefill floor, or failing the placement check (floor_fail, D-33, D-47), stands
+        too, with V22 deferred: the Apex's seats fall back to gpt-oss-120b (D-40) and the phase is not blocked.
     q4_0 is never a rung (D-29 (a)). A rung the loop never reached is listed as "not tried"."""
     summary = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in rungs)
     untried = [kv for kv in ladder if kv not in {r["kv"] for r in rungs}]
@@ -2066,7 +2332,7 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
     above = [r for r in rungs if ladder.index(r["kv"]) < ladder.index(winner)]
     detail = ", ".join(f"{r['kv']}={rung_verdict(r)}" for r in above)
     measure_error = str(wrung.get("measure_error") or "")
-    ok = released is not False and not measure_error
+    ok = released is not False and not measure_error and not floor_fail
     perf = f"decode {decode_512} tok/s at 512, prefill {prefill_512} tok/s"
     if winner == base_kv:
         note = "overrides cleared"
@@ -2084,12 +2350,16 @@ def decide_ladder(key: str, ladder: Sequence[str], rungs: Sequence[dict[str, Any
     v.v22_msg = (f"{key}{' ' + quant if quant else ''} loads and generates coherently with {winner} KV ({perf}; "
                  f"{v.note})"
                  + (f"; deferred: measurement failed at {winner}: {measure_error[:200]} (R19)" if measure_error else "")
+                 + (f"; deferred: {floor_fail[:240]}; its seats fall back to gpt-oss-120b (D-40, R19)"
+                    if floor_fail and not measure_error else "")
                  + (f"; deferred: {release_note} (R19)" if released is False else ""))
     return v
 
 
 LADDER_RUNG_FIELDS = ("decode_tps_512", "decode_tps_8k", "prefill_tps_512", "prefill_tps_8k", "prefill_8k_note",
-                      "crashed_at_8k", "footprint_bytes", "footprint_note", "band_fail", "band_note")
+                      "crashed_at_8k", "footprint_bytes", "footprint_note", "band_fail", "band_note",
+                      "predicted_n_512", "predicted_n_8k", "spec_type", "review_note", "prefill_note", "prefill_fail",
+                      "placement", "placement_note", "placement_fail")
 
 
 def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseline: int, res: EngineResult) -> None:
@@ -2153,13 +2423,15 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         won = coherent and ok
         if won:
             # Per-rung measurement into res (reset first so a rung never inherits the one before), copied into the rung.
-            res.load_error, res.band_fail, res.band_note, res.crashed_at_8k, res.prefill_8k_note = "", "", "", False, ""
-            res.footprint_bytes, res.footprint_note = None, ""
+            blank = EngineResult(key=key)
+            for f in (*LADDER_RUNG_FIELDS, "load_error"):
+                setattr(res, f, getattr(blank, f))
             run_measurements(ctx, res, key, port, env)
             if res.load_error:
                 rung["measure_error"] = res.load_error  # a dead or failing server is never registered (rule 1)
             else:
                 register_footprint(ctl, res, baseline)
+            check_placement(res, spec, key, inv, since)  # D-33, on the rung that stands (UNKNOWN GTT when unmeasured)
             rung.update({f: getattr(res, f) for f in LADDER_RUNG_FIELDS})
         # S52 (a)-(c) for every rung that loaded, labelled with its KV type: each rung is its own profile.
         take_memory_record(ctx, res, key, env, inv, since, host_load, label=kv)
@@ -2176,13 +2448,16 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
         log(f"{key}: rung {kv} {rung_verdict(rung)}; the next rung is tried (S-42)")
     standing = next((r for r in res.ladder if r.get("coherent") and r.get("kv_proof_ok")), {})
     v = decide_ladder(key, ladder, res.ladder, base_kv, stop_reason, res.released, res.release_note,
-                      standing.get("decode_tps_512"), standing.get("prefill_tps_512"), str(spec.get("quant") or ""))
+                      standing.get("decode_tps_512"), standing.get("prefill_tps_512"), str(spec.get("quant") or ""),
+                      floor_fail=str(standing.get("band_fail") or standing.get("prefill_fail")
+                                     or standing.get("placement_fail") or ""))
     ctx.render(key, v.set_ov, v.clear_ov)
     pending_end(ctx, pending)
     # The result's figures are the winner's (the rung that stands).
     wrung = standing if v.winner else None
+    blank = EngineResult(key=key)
     for f in LADDER_RUNG_FIELDS:
-        setattr(res, f, wrung.get(f) if wrung else EngineResult.__dataclass_fields__[f].default)
+        setattr(res, f, wrung.get(f, getattr(blank, f)) if wrung else getattr(blank, f))
     res.load_error = ""
     res.kv_applied = v.winner
     res.kv_proof_ok = v.v4_result == "pass"
@@ -2191,7 +2466,7 @@ def ladder_engine(ctx: Ctx, ctl: Control, key: str, previous: str | None, baseli
     res.v22_result, res.v22_msg = v.v22_result, v.v22_msg
     if v.deviation:
         res.baseline_deviation = (res.baseline_deviation + " | " if res.baseline_deviation else "") + v.deviation
-    res.ok = (bool(v.winner) and res.released is not False and not res.band_fail
+    res.ok = (bool(v.winner) and res.released is not False and not floor_fail(res)
               and not (wrung or {}).get("measure_error"))
     res.resident_after = False
     finalize_control(res, ctl)
@@ -2275,11 +2550,15 @@ def fmt_num(v: float | None) -> str:
 
 
 def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
-    """Section 21 V10 per engine (D-33 option (c)): load, generate (512 and 8k), swap, release; decode recorded beside
-    the projection and failing only below the seat's floor (check_band)."""
+    """Section 21 V10 per engine (D-33, D-47): load, generate (512 and 8k), swap, release; decode recorded beside the
+    projection and failing only below the seat's floor on the slower point (check_band), prefill below its 8k floor
+    (check_prefill_floor) and a failed placement check (check_placement); the review line is a to-do, never a fail.
+    The Apex's line carries the T-06 reading: its 8k decode with DSpark off beside the floor and the review line."""
     floor = spec.get("decode_floor_tok_s")
     band = spec.get("expected_decode_tok_s")
     proj = spec.get("projected_decode_tok_s")
+    pfloor = spec.get("prefill_floor_tok_s")
+    review = review_line(spec)
     if floor is None and band:
         ref = f"expected band {_band_text(band)}, v0.3.5 rule"
     else:
@@ -2289,14 +2568,30 @@ def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
         return "fail", f"{res.key}: load FAILED ({res.load_error[:200]}) [control {res.control_mode or '?'}]"
     parts = [f"{res.key}: load ok (KV {res.kv_applied or res.kv_requested}, control {res.control_mode or '?'})",
              f"decode {fmt_num(res.decode_tps_512)}/{fmt_num(res.decode_tps_8k)} tok/s at 512/8k ({ref})",
-             f"prefill {fmt_num(res.prefill_tps_512)}/{fmt_num(res.prefill_tps_8k)} tok/s",
+             f"prefill {fmt_num(res.prefill_tps_512)}/{fmt_num(res.prefill_tps_8k)} tok/s"
+             + (f" (floor {pfloor} at 8k)" if pfloor is not None else ""),
              f"swap {fmt_num(res.swap_s)}s",
              f"footprint {fmt_gb(res.footprint_bytes) if res.footprint_bytes is not None else '-'}",
              f"released {'yes' if res.released else ('NO' if res.released is False else '?')}"]
+    if review is not None and not band:
+        parts.append(f"review line {review} ({REVIEW_FRACTION:.0%} of {proj[0]}; to-do only)")
+    if spec.get("arbiter_class") == "apex":
+        parts.append(f"T-06: decode {fmt_num(res.decode_tps_8k)} tok/s at 8k with DSpark "
+                     f"{'ON (--spec-type ' + res.spec_type + ')' if res.spec_type else 'off'} beside the floor "
+                     f"{floor if floor is not None else 'none'} and the review line "
+                     f"{review if review is not None else 'none'}; 16k and 32k not measured (Phase 3 times 512 and 8k)")
     if res.prefill_8k_note:
         parts.append(f"8k: {res.prefill_8k_note[:120]}")
     if res.band_fail:
         parts.append(f"FLOOR FAIL: {res.band_fail}")
+    if res.prefill_fail:
+        parts.append(f"PREFILL FLOOR FAIL: {res.prefill_fail}")
+    if res.placement_fail:
+        parts.append(f"PLACEMENT FAIL: {res.placement_fail}")
+    if res.review_note and not res.band_fail:
+        parts.append(f"REVIEW (to-do {DECODE_REVIEW_TODO_ID}, not a fail): {res.review_note}")
+    if res.placement_note:
+        parts.append(res.placement_note[:240])
     if res.warnings:
         parts.append("warn: " + " | ".join(w[:160] for w in res.warnings))
     if res.load_error:
@@ -2306,7 +2601,7 @@ def v10_line(res: EngineResult, spec: dict[str, Any]) -> tuple[str, str]:
     if res.crashed_at_8k and res.known_issue_note and NEMOTRON_ISSUE_ID not in "; ".join(parts):
         parts.append(f"S6: {res.known_issue_note[:160]}")
     ok = (res.generated and not res.load_error and not res.crashed_at_8k and not res.stopped_externally
-          and not res.band_fail and res.released is True)
+          and not floor_fail(res) and res.released is True)
     return ("pass" if ok else "fail"), "; ".join(parts)
 
 
@@ -2329,9 +2624,31 @@ def raise_decode_floor_todo(ctx: Ctx) -> None:
         items.append(f"{key}: {measured}, projected {_band_text(proj) if proj else 'none'} tok/s")
     if items:
         todo(DECODE_FLOOR_TODO_ID, DECODE_FLOOR_TODO_TITLE,
-             "Measured in Phase 3 step 02: " + " | ".join(items) + ". Set decode_floor_tok_s (tok/s at 512 tokens) on "
-             "each engines.json entry you want gated, together with the deep-tier floor of D-47; below it V10 fails. "
-             "Null (the default) is record only. Phase 3 changed no engine setting.")
+             "Measured in Phase 3 step 02: " + " | ".join(items) + ". Set decode_floor_tok_s (tok/s at 8k, judged on "
+             "the slower of the 512 and 8k points) on each engines.json entry you want gated, together with the "
+             "deep-tier floor of D-47; below it V10 fails. Null (the default) is record only. Phase 3 changed no "
+             "engine setting.")
+
+
+DECODE_REVIEW_TODO_TITLE = ("Review the seats measured below 70% of their projected decode rate (D-33): a review "
+                            "item, not a fail")
+
+
+def raise_decode_review_todo(ctx: Ctx) -> None:
+    """D-33: a seat at or above its floor whose judged decode is below REVIEW_FRACTION of its projection's low end
+    (check_band review_note) is the to-do decode-review, re-raised by each summarize while one exists. Never a fail."""
+    items: list[str] = []
+    for key in ctx.core_keys():
+        res = load_result(ctx, key)
+        if res is not None and res.review_note and not res.band_fail:
+            items.append(f"{key}: {res.review_note}")
+    if items:
+        todo(DECODE_REVIEW_TODO_ID, DECODE_REVIEW_TODO_TITLE,
+             "Measured in Phase 3 step 02: " + " | ".join(items) + ". Each seat cleared its absolute floor. Check its "
+             "placement record first (the V10 line: offloaded layers, model buffers, graph splits), then decide: keep "
+             "the file, change its rung, or correct the projection. For the Apex (T-06), a UD-Q8_K_XL figure between "
+             "the floor 4 and the review line is your choice between Q8's exactness and UD-Q4_K_XL's speed (about 11 "
+             "tok/s projected, KLD 0.0102), not an automatic switch. Phase 3 changed no engine setting.")
 
 
 def _router_rules(ctx: Ctx) -> dict[str, Any]:
@@ -2352,25 +2669,30 @@ def _profile_text(ctx: Ctx, key: str) -> str:
 
 
 def raise_input_todos(ctx: Ctx) -> None:
-    """v0.4.0: the stated defaults of the approved rows that leave an input to the Principal (doc 4.3, 5.1, 9.1,
+    """The stated defaults of the approved rows that still leave an input to the Principal (doc 4.3, 5.1, 9.1,
     Section 22), each a to-do on the live list so `atlas-day1.sh status` shows it; re-raised by every summarize, closed
-    only by the Principal. The defaults are read from the shipped config where it holds them."""
-    todo(CONTEXT_TARGETS_TODO_ID,
-         "State a context target for the phased medical and science seats (D-16)",
-         "Default built: Q5_K_S (Baichuan-M3 150.76 GiB, Intern-S1 150.84 GiB), about 23K tokens after a 9 GiB "
-         "allowance at the register's ~164 GiB budget; at the ~156 GiB Section 4.1 now expects they leave about 3 GiB "
-         "for context, short of that default (doc 4.1, phased seats). Q4_K_M (133.91 / 132.86 GiB) is the rung for a "
-         "longer context. Neither seat is pulled on Day 1 (D-26 (c)); the answer is needed before their pull.")
+    only by the Principal. The defaults are read from the shipped config where it holds them. D-16 is answered
+    (2026-10-17), so v0.4.0's context-targets is not raised; D-46 and D-49 are approved designs whose inputs are still
+    the Principal's (the TF_OMEGA situations, the briefs, states and standards, and the approval of the drafts)."""
     todo(TRIAL_TASK_SET_TODO_ID,
-         "Supply the 30 to 50 blind-scored tasks for the DeepSeek V4.1 Flash trial (D-46 (b), T-30)",
+         "Write 8 to 10 one-paragraph TF_OMEGA situations; approve the 40 drafted tasks for the DeepSeek V4.1 Flash "
+         "trial (D-46, T-30)",
          "Default built: no trial (evaluation-only, after Day 1, outside the routed roster); DeepSeek-V4-Flash-0731 "
-         "stays the Apex. The trial needs the Principal's private Deep Think and TF_OMEGA-style tasks, scored blind "
-         "by the Principal or a director, and the deep-tier speed floor of D-47 (to-do decode-floors) (doc 5.1, 9.1).")
+         "stays the Apex. The approved set is 40 tasks: 16 TF_OMEGA apex syntheses (A), 10 Deep Think adversary tasks "
+         "with planted flaws (B), 6 deep-tier final syntheses (C), 4 long dossiers of about 32K tokens (D) and 4 exact "
+         "computations (E), judged blind and pairwise by GLM-5.3-Flash and gpt-oss-120b. ATLAS drafts A and C on the "
+         "node from your situations; you approve the drafts, then grade the split verdicts and 10 calibration tasks "
+         "blind. The D-47 deep-tier floor is set: 4 tok/s at 8k (engines.json deepseek-v4-flash decode_floor_tok_s) "
+         "(doc 5.1, 15.5, Section 22).")
     todo(SEAT_TEST_SETS_TODO_ID,
-         "Supply test sets for the seats no benchmark covers (D-49 (a), T-27)",
+         "Brief each domain, state your states of operation and the standards you hold; approve ATLAS's drafts "
+         "(D-49, T-27)",
          "Default built: GLM-5.3-Flash on those seats, unproven: Australian law, HR, aviation, logistics, AEC, SCADA, "
          "game design, growth marketing, customer success and physical security / OSINT (Victor, Alaric and the "
-         "domains of 8.2). Their quality can only be settled on the Principal's own work (doc 5.1, Section 22).")
+         "domains of 8.2). The approved set is 100 tasks in two waves of 50, drafted by ATLAS and graded blind by the "
+         "two Day 1 engines that did not write each answer. It needs a brief of about 15 minutes per domain, your "
+         "state or states of operation (NSW and VIC assumed), the paywalled standards you hold, then your approval of "
+         "the drafts, wave by wave (doc 5.1, Section 22).")
     rules = _router_rules(ctx)
     trigger = rules.get("long_document_tokens", "UNKNOWN (router-rules.json unreadable)")
     todo(SEAT_PROFILES_TODO_ID,
@@ -2388,6 +2710,7 @@ def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
     warned: list[str] = []
     missing: list[str] = []
     off_floor: list[str] = []
+    review: list[str] = []
     v22_lines: list[str] = []
     v22_results: list[str] = []
     for key in ctx.core_keys():
@@ -2405,6 +2728,8 @@ def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
                 record("V10", "fail", f"{key}: no load-test result (step 02 did not reach it)")
             continue
         result, msg = v10_line(res, spec)
+        if res.review_note and not res.band_fail:
+            review.append(key)  # before the V22 branch: the Apex and GLM are the seats the review line exists for
         if deferrable:
             # R19 generalised (S-26): an engine with its own V22 row never fails the V10 summary; its V10 line is a
             # record (pass or deferred) and V22 carries the verdict, deferrable.
@@ -2419,23 +2744,27 @@ def cmd_summarize(ctx: Ctx, _args: argparse.Namespace) -> int:
             failed.append(key)
         elif res.warnings:
             warned.append(key)
-        if res.band_fail:
+        if floor_fail(res):
             off_floor.append(key)
-    tested = [k for k in ctx.core_keys() if not is_v22_engine(ctx.spec(k))]
+    tested =[k for k in ctx.core_keys() if not is_v22_engine(ctx.spec(k))]
     if failed or missing:
         record("V10", "fail", f"summary: {len(failed) + len(missing)} of {len(tested)} engines failed "
-               f"({', '.join(failed + missing)}); below their floor: {', '.join(off_floor) or 'none'}; "
-               f"warns: {', '.join(warned) or 'none'}; V22 engines: {', '.join(v22_lines) or '-'}")
+               f"({', '.join(failed + missing)}); below a floor or failing placement: "
+               f"{', '.join(off_floor) or 'none'}; "
+               f"review: {', '.join(review) or 'none'}; warns: {', '.join(warned) or 'none'}; "
+               f"V22 engines: {', '.join(v22_lines) or '-'}")
     else:
         record("V10", "pass", f"summary: all {len(tested)} engines load, generate, swap and release memory at their "
-               f"fixed quantisations; decode recorded beside the projections (D-33 (c)); warns: "
-               f"{', '.join(warned) or 'none'}; V22 engines: {', '.join(v22_lines) or '-'}")
+               f"fixed quantisations, at or above their floors with placement not failed (D-33, D-47); review: "
+               f"{', '.join(review) or 'none'}; warns: {', '.join(warned) or 'none'}; "
+               f"V22 engines: {', '.join(v22_lines) or '-'}")
     if v22_lines:
         # R19 generalised: deferrable, never a fail; the gate reads this line (the latest V22).
         verdict = "pass" if all(r == "pass" for r in v22_results) else "deferred"
         record("V22", verdict, f"summary: {', '.join(v22_lines)} (newer architectures and the Apex, R19 "
                "generalised, S-26: a deferred engine never blocks the phase; its seats use their D-40 fallback)")
     raise_decode_floor_todo(ctx)
+    raise_decode_review_todo(ctx)
     raise_input_todos(ctx)
     return 0
 
@@ -2460,6 +2789,12 @@ def cmd_table(ctx: Ctx, _args: argparse.Namespace) -> int:
             notes.append(f"V22 {res.v22_result or '?'}")
         if res.band_fail:
             notes.append("BELOW FLOOR")
+        if res.prefill_fail:
+            notes.append("BELOW PREFILL FLOOR")
+        if res.placement_fail:
+            notes.append("PLACEMENT FAIL")
+        if res.review_note and not res.band_fail:
+            notes.append("review")
         if res.warnings:
             notes.append("warn")
         if res.prefill_8k_note:

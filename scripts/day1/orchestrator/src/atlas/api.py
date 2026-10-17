@@ -181,6 +181,15 @@ DEFAULT_LOAD_WAIT_S = 900.0
 # (OrchestratorClient.DEFAULT_TIMEOUT_SLACK_S); the two are sized together (fix round 2).
 DEFAULT_GENERATION_WAIT_S = 1800.0
 DEFAULT_MAX_TOKENS = 4096
+# The wall time the Principal is told for a background Deep Think (D-47, approved 2026-10-17; INFERRED). deep_think.py's
+# budgets, half to all of each: standard 4 x 2,048 tokens on GLM-5.3-Flash and 3 x 1,024 on DeepSeek-V4-Flash; deep
+# 8 x 3,072 on GLM and 6 x 1,024 + 3,072 on DeepSeek; at the projections (GLM 12.5-14, DeepSeek 6.8, the low end of its
+# 6.8-7.2; engines.json), plus 120 s / 300 s of prefill and 70 s per swap: 2 standard; deep 4 at the lower bound and 5
+# at the upper, which refines on GLM in both rounds (GLM, DeepSeek, GLM, DeepSeek, GLM, DeepSeek: run_deep; 3 when the
+# first answer wins, 6 with documents). That is 13.0-22.8 min standard and 35.6-66.2 min deep (the method of
+# research_notes/ATLAS open inputs 2026-10-17/scripts/d47_calc.py, 4 swaps there). It replaces "5 to 8" and "15 to 30".
+# Phase 3 measures the real rates (V10, T-06): revise these from them.
+DEEP_THINK_MINUTES: dict[str, str] = {"standard": "13 to 23", "deep": "36 to 66"}
 # D9 (10.4): a chat lives 90 days in Open WebUI, then its SUMMARY replaces it in the Vector Cortex (retention.py). The
 # raw turn written per request (Appendix A "memory writes") is therefore temporal with the same 90-day life, and the
 # prune deletes expired chat turns WITHOUT archiving them (prune.py): a purged chat does not live on under /srv/cold.
@@ -1364,8 +1373,9 @@ def _chat_pipeline(
                     # ledger row of the Celery task (result column) and ntfy reports it (deep_think_task).
                     text = (
                         f"{note}Deep Think ({tier}) is running in the background as task {tid} on the gpu queue; "
-                        f"it takes {'5 to 8' if tier == 'standard' else '15 to 30'} minutes and swaps engines "
-                        f"(9.1). The answer is stored on that task's ledger row (sqlite3 "
+                        f"it takes about {DEEP_THINK_MINUTES.get(tier, DEEP_THINK_MINUTES['deep'])} minutes (an "
+                        f"estimate from projected speeds) and swaps engines (9.1). The answer is stored on that task's "
+                        f"ledger row (sqlite3 "
                         f"{deps.config.settings.db_path}: tasks.id = {tid!r}) and pushed through ntfy when done."
                     )
                     yield _chunk(

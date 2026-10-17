@@ -147,7 +147,8 @@ def test_queue_proof_wall_clock_branch() -> None:
 def _good(key: str = "gpt-oss-120b") -> Any:
     return lt.EngineResult(key=key, load_ok=True, generated=True, released=True, decode_tps_512=40.0,
                            decode_tps_8k=35.0, prefill_tps_512=800.0, prefill_tps_8k=700.0, swap_s=30.0,
-                           kv_applied="q4_0", control_mode="orchestrator", footprint_bytes=70 * lt.GB)
+                           kv_applied="q4_0", control_mode="orchestrator", footprint_bytes=70 * lt.GB,
+                           predicted_n_512=128, predicted_n_8k=128)
 
 
 SPEC = {"expected_decode_tok_s": [30, 55], "arbiter_class": "core"}
@@ -292,8 +293,9 @@ def test_summarize_missing_apex_is_deferred_and_not_counted(tmp_path: Path, caps
     assert ("V22", "pass", "glm-5.3-flash (glm5-next, first build b11279): loads") in recs
     summary = [m for v, r, m in recs if v == "V10" and m.startswith("summary")]
     assert summary == [
-        "summary: all 1 engines load, generate, swap and release memory at their fixed quantisations; decode recorded "
-        "beside the projections (D-33 (c)); warns: none; V22 engines: glm-5.3-flash=pass, deepseek-v4-flash=deferred"]
+        "summary: all 1 engines load, generate, swap and release memory at their fixed quantisations, at or above "
+        "their floors with placement not failed (D-33, D-47); review: none; warns: none; V22 engines: "
+        "glm-5.3-flash=pass, deepseek-v4-flash=deferred"]
     v22 = [(r, m) for v, r, m in recs if v == "V22" and m.startswith("summary")]
     assert v22 and v22[-1][0] == "deferred" and "glm-5.3-flash=pass, deepseek-v4-flash=deferred" in v22[-1][1]
     assert recs[-1][0] == "V22"  # the summary is the last V22 the gate reads
@@ -319,10 +321,10 @@ def test_summarize_counts_missing_and_off_band(tmp_path: Path, capsys: pytest.Ca
     summary = [m for v, r, m in recs if v == "V10" and m.startswith("summary")]
     assert len(summary) == 1 and summary[0].startswith(
         "summary: 2 of 2 engines failed (gpt-oss-120b, gpt-oss-120b-abliterated)")
-    assert "below their floor: gpt-oss-120b" in summary[0]
+    assert "below a floor or failing placement: gpt-oss-120b" in summary[0]
     assert [r for v, r, _ in recs if v == "V10"].count("fail") == 3
-    assert any("FLOOR FAIL: decode 20.0 tok/s below the seat's floor 30 tok/s vs 35-50 tok/s projected" in m
-               for v, r, m in recs if v == "V10" and r == "fail")
+    assert any("FLOOR FAIL: decode 20.0 tok/s at 512 (the slower point) below the seat's floor 30 tok/s vs 35-50 "
+               "tok/s projected" in m for v, r, m in recs if v == "V10" and r == "fail")
     # The to-do names only the seats without a verdict: floor set (gpt-oss) and v0.3.5 band (abliterated) are out.
     detail = todos["decode-floors"][1]
     assert "glm-5.3-flash: not measured" in detail and "deepseek-v4-flash: not measured" in detail
@@ -330,17 +332,25 @@ def test_summarize_counts_missing_and_off_band(tmp_path: Path, capsys: pytest.Ca
 
 
 def test_summarize_raises_the_defaulted_input_todos(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """v0.4.0: each approved row that leaves an input to the Principal is built with its stated default AND raised on
-    the live to-do list (D-16, D-46, D-49, D-48 / S-30), every summarize, with the defaults read from the config."""
+    """Each approved row that still leaves an input to the Principal is built with its stated default AND raised on
+    the live to-do list (D-46, D-49, D-48 / S-30), every summarize, with the defaults read from the config. D-16 is
+    answered (2026-10-17): context-targets is no longer raised, so a summarize never reopens it."""
     ctx = _ctx(tmp_path, ENGINES)
     (tmp_path / "router-rules.json").write_text(json.dumps({"long_document_tokens": 24000}), encoding="utf-8")
     _good().save(ctx)
     lt.cmd_summarize(ctx, None)
     _, todos = _lines(capsys)
-    assert {"context-targets", "trial-task-set", "seat-test-sets", "seat-profiles"} <= set(todos)
-    assert "D-16" in todos["context-targets"][0] and "Q5_K_S" in todos["context-targets"][1]
-    assert "D-46" in todos["trial-task-set"][0] and "30 to 50" in todos["trial-task-set"][0]
+    assert {"trial-task-set", "seat-test-sets", "seat-profiles"} <= set(todos)
+    assert "context-targets" not in todos
+    trial_title, trial = todos["trial-task-set"]
+    assert "D-46" in trial_title and "8 to 10 one-paragraph TF_OMEGA situations" in trial_title
+    assert "40 drafted tasks" in trial_title and "30 to 50" not in trial_title + trial
+    assert ("16 TF_OMEGA apex syntheses (A), 10 Deep Think adversary tasks with planted flaws (B), 6 deep-tier final "
+            "syntheses (C), 4 long dossiers of about 32K tokens (D) and 4 exact computations (E)") in trial
+    assert "The D-47 deep-tier floor is set: 4 tok/s at 8k" in trial and "decode-floors" not in trial
     assert "D-49" in todos["seat-test-sets"][0] and "Australian law" in todos["seat-test-sets"][1]
+    assert "approve ATLAS's drafts" in todos["seat-test-sets"][0]
+    assert "state or states of operation" in todos["seat-test-sets"][1]
     profiles = todos["seat-profiles"][1]
     assert "deepseek-v4-flash f16 at 1 x 131,072 tokens" in profiles
     assert "glm-5.3-flash f16 at 1 x 262,144 tokens" in profiles  # the fixture's profile, read as given
@@ -364,6 +374,23 @@ def test_summarize_raises_no_floor_todo_once_every_seat_has_a_floor(tmp_path: Pa
     assert "decode-floors" not in todos
     assert any(v == "V10" and r == "pass" and "(projected 35-50, floor 5)" in m
                for v, r, m in recs if m.startswith("gpt-oss-120b"))
+
+
+def test_summarize_names_a_deferrable_seat_on_its_review_line(tmp_path: Path,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    """T-06: the Apex between its floor and its review line is named in the V10 summary's review list, although V22
+    carries its verdict: the review list is collected before the V22 branch, so it never reads 'none' beside the to-do
+    decode-review."""
+    ctx = _ctx(tmp_path, ENGINES)
+    _good().save(ctx)
+    apex = _good("deepseek-v4-flash")
+    apex.review_note = "decode 4.5 tok/s at 8k (the slower point) below the review line 4.76 tok/s"
+    apex.save(ctx)
+    lt.cmd_summarize(ctx, None)
+    recs, todos = _lines(capsys)
+    summary = [m for v, r, m in recs if v == "V10" and m.startswith("summary")]
+    assert len(summary) == 1 and "; review: deepseek-v4-flash; " in summary[0]
+    assert "deepseek-v4-flash: decode 4.5 tok/s at 8k" in todos["decode-review"][1]
 
 
 # --- the ladder decision (engines.json kv_ladder_rule under S-42 / D-29 (a): the highest-precision coherent rung) ---
@@ -1367,7 +1394,8 @@ def test_test_engine_records_memory_beside_the_projection(tmp_path: Path, monkey
     assert rec["measured"]["context_mib"] == 2774.25
     assert rec["projected"]["kv_bytes"] == int(36_864 * 262144 * 4.5 / 16) + 8 * 84_934_656
     assert rec["ctx_shift"] == "disabled" and rec["anon_growth_bytes"] == int(1.4 * lt.GIB) - lt.GIB
-    assert calls["journal"] == [("gpt-oss-120b", "inv-1")]
+    # One journal read for the memory record (S52), one for the placement check (D-33), both of this invocation.
+    assert calls["journal"] == [("gpt-oss-120b", "inv-1")] * 2
     assert calls["host"] == ["gpt-oss-120b", "<the tests>", "gpt-oss-120b"]  # RSS read before and after the requests
     err = capsys.readouterr().err
     lines = [ln for ln in err.splitlines() if "memory (S52)" in ln]
@@ -1849,7 +1877,7 @@ def test_check_band_d33c_floor_is_the_only_verdict() -> None:
     res = _good()
     res.decode_tps_512 = 19.9
     lt.check_band(res, floored)
-    assert res.band_fail.startswith("decode 19.9 tok/s below the seat's floor 20 tok/s")
+    assert res.band_fail.startswith("decode 19.9 tok/s at 512 (the slower point) below the seat's floor 20 tok/s")
     assert lt.v10_line(res, floored)[0] == "fail"
     res = _good()
     res.decode_tps_512 = 20.0
@@ -2151,3 +2179,448 @@ def test_cmd_quality_records_each_seat_and_raises_the_kld_todo(tmp_path: Path, m
     assert lt.cmd_quality(ctx, argparse.Namespace(perplexity=str(tmp_path / "missing"))) == 0
     _, todos = _lines(capsys)
     assert "not measured:" in todos["kld-run"][1] and "is missing" in todos["kld-run"][1]
+
+
+# --- V10 floors and placement (D-33, D-47, T-06; approved 2026-10-17) ------------------------------------------------
+
+GLM_FLOORS = {"projected_decode_tok_s": [12.5, 14.0], "decode_floor_tok_s": 6, "prefill_floor_tok_s": 40,
+              "arbiter_class": "core"}
+
+
+def _speeds(d512: float | None, d8k: float | None, n512: int | None = 128, n8k: int | None = 128,
+            note8k: str = "") -> Any:
+    res = _good("glm-5.3-flash")
+    res.decode_tps_512, res.decode_tps_8k, res.predicted_n_512, res.predicted_n_8k = d512, d8k, n512, n8k
+    res.prefill_8k_note = note8k
+    return res
+
+
+def test_check_band_judges_the_slower_point_and_falls_back_to_512() -> None:
+    res = _speeds(7.0, 5.9)  # 8k is the slower point: below the floor 6 there although 512 clears it
+    lt.check_band(res, GLM_FLOORS)
+    assert res.band_fail == ("decode 5.9 tok/s at 8k (the slower point) below the seat's floor 6 tok/s vs 12.5-14.0 "
+                             "tok/s projected (D-33, D-47; V10 fail)")
+    res = _speeds(5.5, 7.0)
+    lt.check_band(res, GLM_FLOORS)
+    assert res.band_fail.startswith("decode 5.5 tok/s at 512 (the slower point) below the seat's floor 6")
+    res = _speeds(6.0, 6.0)
+    lt.check_band(res, GLM_FLOORS)
+    assert not res.band_fail and "at or above the floor 6" in res.band_note  # the floor itself passes
+    # The 8k point skipped (one slot too small) or failed: the 512 figure alone is judged, and says so.
+    res = _speeds(5.0, None, note8k="skipped: 4096 tokens per slot (4096/1) cannot hold an 8k prompt")
+    lt.check_band(res, GLM_FLOORS)
+    assert res.band_fail.startswith("decode 5.0 tok/s at 512 (8k point skipped) below the seat's floor 6")
+    res = _speeds(9.0, None, note8k="crashed")
+    lt.check_band(res, GLM_FLOORS)
+    assert res.band_note.startswith("decode 9.0 tok/s at 512 (8k point not measured) at or above the floor 6")
+
+
+def test_check_band_counts_a_point_only_with_64_generated_tokens() -> None:
+    res = _speeds(3.0, 9.0, n512=63)  # 512 too short to count: 8k alone is judged
+    lt.check_band(res, GLM_FLOORS)
+    assert not res.band_fail and res.band_note.startswith(
+        "decode 9.0 tok/s at 8k (512 generated 63 token(s), not counted) at or above the floor 6")
+    res = _speeds(9.0, 3.0, n8k=12)
+    lt.check_band(res, GLM_FLOORS)
+    assert not res.band_fail and "at 512 (8k generated 12 token(s), not counted)" in res.band_note
+    res = _speeds(1.0, 1.0, n512=10, n8k=0)  # nothing counts: no decode verdict, a warning, never a fail
+    lt.check_band(res, GLM_FLOORS)
+    assert not res.band_fail and not res.review_note
+    assert res.band_note == ("no decode verdict: 512 generated 10 token(s) and 8k generated 0 token(s), fewer than 64 "
+                             "after one re-measure (D-33)") and res.warnings == [res.band_note]
+    assert lt.v10_line(res, GLM_FLOORS)[0] == "pass"
+    # The abliterated entry's v0.3.5 band keeps its rule on the 512 figure, token count or not.
+    res = _speeds(29.0, 50.0, n512=5)
+    lt.check_band(res, SPEC)
+    assert "below the expected band 30-55" in res.band_fail
+
+
+def test_review_line_is_seventy_percent_of_the_projection_and_never_fails() -> None:
+    res = _speeds(9.0, 8.7)  # above the floor 6, below 0.7 x 12.5 = 8.75
+    lt.check_band(res, GLM_FLOORS)
+    assert not res.band_fail and res.review_note == (
+        "decode 8.7 tok/s at 8k (the slower point) below the review line 8.75 tok/s (70% of the projection's low end "
+        "12.5; D-33: a to-do, never a fail)")
+    result, msg = lt.v10_line(res, GLM_FLOORS)
+    assert result == "pass" and "review line 8.75 (70% of 12.5; to-do only)" in msg
+    assert "REVIEW (to-do decode-review, not a fail): decode 8.7 tok/s" in msg
+    res = _speeds(9.0, 8.75)
+    lt.check_band(res, GLM_FLOORS)
+    assert not res.review_note  # at the line is not below it
+    # The real config's review lines: 0.7 x the projection's low end.
+    real = {e["key"]: e for e in json.loads(REAL_ENGINES.read_text())["engines"]}
+    assert {k: lt.review_line(real[k]) for k in ("gpt-oss-120b", "glm-5.3-flash", "deepseek-v4-flash",
+                                                 "router-qwen3.5-4b")} == {
+        "gpt-oss-120b": 28.7, "glm-5.3-flash": 8.75, "deepseek-v4-flash": 4.76, "router-qwen3.5-4b": 31.5}
+    assert lt.review_line(real["gpt-oss-120b-abliterated"]) is None and lt.review_line({}) is None
+
+
+def test_check_prefill_floor_on_the_8k_point() -> None:
+    res = _speeds(9.0, 8.0)
+    res.prefill_tps_8k = 39.9
+    lt.check_prefill_floor(res, GLM_FLOORS)
+    assert res.prefill_fail == ("prefill 39.9 tok/s at 8k below the seat's prefill floor 40 tok/s (D-33; V10 fail)")
+    assert lt.v10_line(res, GLM_FLOORS)[0] == "fail" and "PREFILL FLOOR FAIL: prefill 39.9" in lt.v10_line(
+        res, GLM_FLOORS)[1]
+    res.prefill_fail, res.prefill_tps_8k = "", 40.0
+    lt.check_prefill_floor(res, GLM_FLOORS)
+    assert not res.prefill_fail
+    assert res.prefill_note == "prefill 40.0 tok/s at 8k at or above the prefill floor 40 tok/s"
+    assert "prefill 800.0/40.0 tok/s (floor 40 at 8k)" in lt.v10_line(res, GLM_FLOORS)[1]
+    res = _speeds(9.0, None, note8k="skipped: 4096 tokens per slot (4096/1) cannot hold an 8k prompt")
+    res.prefill_tps_8k = None
+    lt.check_prefill_floor(res, GLM_FLOORS)
+    assert not res.prefill_fail and res.prefill_note.startswith("prefill floor 40 tok/s not judged: no 8k prefill")
+    assert res.warnings == [res.prefill_note]
+    res = _speeds(9.0, 8.0)
+    res.prefill_tps_8k = 1.0
+    lt.check_prefill_floor(res, {"prefill_floor_tok_s": None})  # the router: no prefill floor
+    assert not res.prefill_fail and not res.prefill_note
+
+
+def test_timed_point_remeasures_a_short_answer_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    answers = iter([{"error": "", "content": "a", "timings": {"predicted_n": 20}},
+                    {"error": "", "content": "b", "timings": {"predicted_n": 128}},
+                    {"error": "", "content": "c", "timings": {"predicted_n": 64}},
+                    {"error": "", "content": "d", "timings": {"predicted_n": 3}},
+                    {"error": "", "content": "e", "timings": {"predicted_n": 2}}])
+    labels: list[str] = []
+    eos: list[bool] = []
+    idle: list[str] = []
+
+    def fake_point(_port: int, _target: int, label: str, ignore_eos: bool = True) -> tuple[dict[str, Any], str]:
+        labels.append(label)
+        eos.append(ignore_eos)
+        return next(answers), label
+
+    monkeypatch.setattr(lt, "measure_point", fake_point)
+    monkeypatch.setattr(lt, "require_generation_idle", lambda _url, what: idle.append(what))
+    assert lt.timed_point("http://o", "glm-5.3-flash", 8103, 8192, "8k")["content"] == "b"
+    assert labels == ["8k", "8k-again"] and len(idle) == 2  # rule 3 before each direct request
+    assert eos == [True, True]  # D-47: the 8k point generates all 128 tokens, its re-measure too
+    assert lt.timed_point("http://o", "glm-5.3-flash", 8103, 512, "512", ignore_eos=False)["content"] == "c"
+    assert lt.timed_point("http://o", "glm-5.3-flash", 8103, 512, "512", ignore_eos=False)["content"] == "e"
+    assert labels == ["8k", "8k-again", "512", "512", "512-again"]  # 64 counts; once only, the second stands
+    assert eos == [True, True, False, False, True]  # a short first 512 answer is re-measured with ignore_eos
+
+
+def test_timed_point_keeps_eos_on_the_remeasure_of_an_answer_with_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An engine that stops at once at 512 is re-measured as it was sent, so 'no generation at 512' still catches it."""
+    answers = iter([{"error": "", "content": "", "timings": {"predicted_n": 0}},
+                    {"error": "", "content": "", "timings": {"predicted_n": 0}}])
+    eos: list[bool] = []
+
+    def fake_point(_port: int, _target: int, _label: str, ignore_eos: bool = True) -> tuple[dict[str, Any], str]:
+        eos.append(ignore_eos)
+        return next(answers), ""
+
+    monkeypatch.setattr(lt, "measure_point", fake_point)
+    monkeypatch.setattr(lt, "require_generation_idle", lambda _url, _what: None)
+    assert lt.timed_point("http://o", "glm-5.3-flash", 8103, 512, "512", ignore_eos=False)["content"] == ""
+    assert eos == [False, False]
+
+
+def test_completion_sends_ignore_eos_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def fake_http(_method: str, _url: str, body: dict[str, Any], **_kw: Any) -> tuple[int, dict[str, Any]]:
+        bodies.append(body)
+        return 200, {"content": "x", "timings": {"predicted_n": 128}}
+
+    monkeypatch.setattr(lt, "http", fake_http)
+    lt.completion(8103, "p", 128)
+    lt.completion(8103, "p", 128, ignore_eos=True)
+    assert "ignore_eos" not in bodies[0] and bodies[1]["ignore_eos"] is True
+    assert (bodies[1]["n_predict"], bodies[1]["temperature"], bodies[1]["cache_prompt"]) == (128, 0, False)
+
+
+def test_run_measurements_judges_the_floors_after_the_8k_point(monkeypatch: pytest.MonkeyPatch,
+                                                               tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path, [{**ENGINES[1], **GLM_FLOORS, "parallel": 8}])
+    points = {512: {"prompt_per_second": 300.0, "predicted_per_second": 9.0, "predicted_n": 128},
+              8192: {"prompt_per_second": 39.0, "predicted_per_second": 5.0, "predicted_n": 100}}
+    eos: dict[int, bool] = {}
+
+    def fake_timed(_u: str, _k: str, _p: int, target: int, _l: str, ignore_eos: bool = True) -> dict[str, Any]:
+        eos[target] = ignore_eos
+        return {"error": "", "content": "words", "timings": points[target]}
+
+    monkeypatch.setattr(lt, "timed_point", fake_timed)
+    env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ARGS": "--model /m --spec-type draft-dspark"}
+    res = lt.EngineResult(key="glm-5.3-flash")
+    lt.run_measurements(ctx, res, "glm-5.3-flash", 8103, env)
+    assert (res.decode_tps_512, res.decode_tps_8k, res.predicted_n_512, res.predicted_n_8k) == (9.0, 5.0, 128, 100)
+    assert eos == {512: False, 8192: True}  # EOS honoured on the first 512 request only (D-47: 128 tokens at 8k)
+    assert res.band_fail.startswith("decode 5.0 tok/s at 8k (the slower point) below the seat's floor 6")
+    assert res.prefill_fail.startswith("prefill 39.0 tok/s at 8k below the seat's prefill floor 40")
+    assert res.spec_type == "draft-dspark" and "DSpark off (D-47, D-61, T-06)" in res.warnings[0]
+    assert lt.spec_type_of({"ARGS": "--model /m --spec-type=draft-dspark"}) == "draft-dspark"
+    assert lt.spec_type_of({"ARGS": CHAT_ARGS}) == "" and lt.spec_type_of({}) == ""
+
+
+FMT_OFFLOAD = "%s: offloaded %d/%d layers to GPU"  # src/llama-model.cpp:1936 (b11474)
+FMT_MODEL_BUF = "%s: %12s model buffer size = %8.2f MiB"  # src/llama-model.cpp:1942-1943
+FMT_GRAPH = "%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s"  # src/llama-context.cpp:758
+PLACED = [
+    _cl("I", FMT_OFFLOAD % ("load_tensors", 20, 37)),  # --fit's trial at -lv 5: discarded at the fit-end line
+    _cl("I", FMT_FIT_END % ("common_fit_params", 0.42)),
+    _cl("I", FMT_OFFLOAD % ("load_tensors", 37, 37)),
+    _cl("I", FMT_MODEL_BUF % ("load_tensors", "CPU_Mapped", 1104.61)),
+    _cl("I", FMT_MODEL_BUF % ("load_tensors", "Vulkan0", 30000.0)),
+    _cl("I", FMT_MODEL_BUF % ("load_tensors", "Vulkan0", 32000.5)),
+    _cl("D", FMT_OFFLOAD % ("load_tensors", 1, 37)),  # a debug line never counts
+    _cl("I", FMT_GRAPH % ("sched_reserve", " (pp bs=2048, tg bs=8)", "2961 / 2410", "2 / 2", "8 / 5", "9 / 6")),
+]
+
+
+def test_placement_lines_have_the_pinned_shape_and_parse() -> None:
+    assert PLACED[2].endswith("I load_tensors: offloaded 37/37 layers to GPU")
+    assert PLACED[3].endswith("I load_tensors:   CPU_Mapped model buffer size =  1104.61 MiB")
+    assert PLACED[7].endswith("I sched_reserve: graph (pp bs=2048, tg bs=8): nodes = 2961 / 2410, splits = 2 / 2, "
+                              "input objects = 8 / 5, input tensors = 9 / 6")
+    p = lt.parse_placement_lines(PLACED)
+    assert p == {"offloaded": 37, "layers": 37, "model_buffers_mib": {"CPU_Mapped": 1104.61, "Vulkan0": 62000.5},
+                 "graph_nodes": "2961 / 2410", "graph_splits": "2 / 2"}
+    same = _cl("I", FMT_GRAPH % ("sched_reserve", "", "1234", "1", "4", "5"))
+    assert lt.parse_placement_lines([same])["graph_splits"] == "1"
+    assert lt.parse_placement_lines(["srv nothing"]) == {"offloaded": None, "layers": None, "model_buffers_mib": {},
+                                                         "graph_nodes": None, "graph_splits": None}
+
+
+def test_placement_verdict_fails_only_on_layers_or_gtt_and_reads_unknown_on_a_miss() -> None:
+    weights = 100 * lt.GB
+    fail, note = lt.placement_verdict(lt.parse_placement_lines(PLACED), 90 * lt.GB, weights)
+    assert fail == "" and "offloaded 37/37 layers" in note
+    assert "GTT delta 90.0 GB vs 0.85 x the weights 100.0 GB: at or above" in note
+    assert "model buffers CPU_Mapped 1104.61 MiB, Vulkan0 62000.50 MiB" in note and "graph splits 2 / 2" in note
+    short = [*PLACED, _cl("I", FMT_OFFLOAD % ("load_tensors", 30, 37))]
+    fail, _ = lt.placement_verdict(lt.parse_placement_lines(short), 90 * lt.GB, weights)
+    assert fail == "placement: offloaded 30/37 layers to GPU (7 on the CPU) (D-33 CPU-fallback check; V10 fail)"
+    fail, _ = lt.placement_verdict(lt.parse_placement_lines(PLACED), int(84.9 * lt.GB), weights)
+    assert fail.startswith("placement: GTT delta 84.9 GB vs 0.85 x the weights 100.0 GB = 85.0 GB: below")
+    # A parse miss, an unmeasured delta or unknown weights read UNKNOWN and never fail.
+    fail, note = lt.placement_verdict(lt.parse_placement_lines([]), None, weights)
+    assert fail == "" and note == ("placement: layers UNKNOWN (no 'offloaded N/M layers to GPU' line); GTT UNKNOWN "
+                                   "(delta not measured); model buffers UNKNOWN; graph splits UNKNOWN")
+    fail, note = lt.placement_verdict(lt.parse_placement_lines([]), 1, 0)
+    assert fail == "" and "GTT UNKNOWN (weights not known)" in note
+
+
+def test_check_placement_exempts_cpu_companions_and_survives_a_broken_journal(monkeypatch: pytest.MonkeyPatch,
+                                                                            ) -> None:
+    def broken(*_a: Any) -> list[str]:
+        raise RuntimeError("journalctl exploded")
+
+    monkeypatch.setattr(lt, "journal_lines", broken)
+    res = _good("embed-qwen3-4b")
+    lt.check_placement(res, {"placement": "cpu", "files": [{"bytes": 10}]}, "embed-qwen3-4b", "inv", "since")
+    assert res.placement_note == "placement: exempt (placement cpu, a CPU companion)" and not res.placement_fail
+    res = _good()
+    lt.check_placement(res, {"files": [{"bytes": 60 * lt.GB}]}, "gpt-oss-120b", "inv", "since")
+    assert not res.placement_fail and "layers UNKNOWN" in res.placement_note
+    assert res.placement_note.endswith("(load journal unreadable: RuntimeError: journalctl exploded)")
+    assert res.placement["gtt_delta_bytes"] == 70 * lt.GB and res.placement["weights_bytes"] == 60 * lt.GB
+
+    def stopped(*_a: Any) -> list[str]:
+        raise lt.Terminated("signal 15")
+
+    monkeypatch.setattr(lt, "journal_lines", stopped)
+    with pytest.raises(lt.Terminated):
+        lt.check_placement(_good(), {}, "gpt-oss-120b", "inv", "since")
+
+
+def test_test_engine_fails_v10_on_a_partial_offload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _real_ctx(tmp_path)
+    _engine_harness(ctx, monkeypatch, [*GPT_OSS_MEM, _cl("I", FMT_OFFLOAD % ("load_tensors", 30, 37))])
+    lt.test_engine(ctx, "gpt-oss-120b", None)
+    saved = json.loads(ctx.result_path("gpt-oss-120b").read_text())
+    assert not saved["ok"] and saved["placement_fail"].startswith("placement: offloaded 30/37 layers to GPU")
+    assert saved["placement"]["offloaded"] == 30 and saved["placement"]["weights_bytes"] == 65_369_017_728
+    res = lt.load_result(ctx, "gpt-oss-120b")
+    assert res is not None
+    result, msg = lt.v10_line(res, ctx.spec("gpt-oss-120b"))
+    assert result == "fail" and "PLACEMENT FAIL: placement: offloaded 30/37" in msg
+    capsys.readouterr()
+
+
+def test_v10_line_carries_the_apex_t06_reading() -> None:
+    real = {e["key"]: e for e in json.loads(REAL_ENGINES.read_text())["engines"]}
+    res = _good("deepseek-v4-flash")
+    res.decode_tps_8k = 6.5
+    _, msg = lt.v10_line(res, real["deepseek-v4-flash"])
+    assert ("T-06: decode 6.5 tok/s at 8k with DSpark off beside the floor 4 and the review line 4.76; 16k and 32k "
+            "not measured (Phase 3 times 512 and 8k)") in msg
+    res.spec_type = "draft-dspark"
+    assert "with DSpark ON (--spec-type draft-dspark)" in lt.v10_line(res, real["deepseek-v4-flash"])[1]
+    assert "T-06" not in lt.v10_line(_good(), real["gpt-oss-120b"])[1]
+
+
+def test_ladder_floor_or_placement_fail_defers_the_apex_v22() -> None:
+    v = lt.decide_ladder("deepseek-v4-flash", LADDER, [_rung("f16", True, True)], "f16", "", True, "", 3.5, 300.0,
+                         "UD-Q8_K_XL", floor_fail="decode 3.5 tok/s at 8k (the slower point) below the seat's floor 4")
+    assert v.winner == "f16" and v.v4_result == "pass" and v.v22_result == "deferred"
+    assert v.v22_msg.endswith("; deferred: decode 3.5 tok/s at 8k (the slower point) below the seat's floor 4; its "
+                              "seats fall back to gpt-oss-120b (D-40, R19)")
+
+
+def test_ladder_engine_judges_floors_and_placement_on_the_rung_that_stands(tmp_path: Path,
+                                                                           monkeypatch: pytest.MonkeyPatch,
+                                                                           capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = _ctx(tmp_path, [{**e, "decode_floor_tok_s": 4, "prefill_floor_tok_s": 40, "projected_decode_tok_s": [7, 7]}
+                          if e["key"] == "deepseek-v4-flash" else e for e in ENGINES])
+    ctl = FakeControl(fail_loads=set())
+
+    def slow(_ctx: Any, res: Any, *_a: Any) -> None:
+        res.generated, res.decode_tps_512, res.decode_tps_8k = True, 4.5, 3.9
+        res.predicted_n_512 = res.predicted_n_8k = 128
+        res.prefill_tps_512, res.prefill_tps_8k = 120.0, 60.0
+        lt.check_band(res, ctx.spec("deepseek-v4-flash"))
+        lt.check_prefill_floor(res, ctx.spec("deepseek-v4-flash"))
+
+    _ladder_harness(ctx, ctl, monkeypatch, slow)
+    monkeypatch.setattr(lt, "journal_lines", lambda *_a: [_cl("I", FMT_OFFLOAD % ("load_tensors", 44, 44))])
+    res = lt.EngineResult(key="deepseek-v4-flash", arbiter_class="apex")
+    lt.ladder_engine(ctx, ctl, "deepseek-v4-flash", None, 10 * lt.GB, res)
+    assert res.kv_applied == "f16" and not res.ok and res.v22_result == "deferred"
+    assert res.band_fail.startswith("decode 3.9 tok/s at 8k (the slower point) below the seat's floor 4")
+    assert res.placement["offloaded"] == 44 and not res.placement_fail and res.ladder[0]["band_fail"] == res.band_fail
+    assert "deferred: decode 3.9 tok/s at 8k" in res.v22_msg
+    capsys.readouterr()
+
+
+def test_summarize_raises_the_review_todo_and_the_floor_todo_names_8k(tmp_path: Path,
+                                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    engines = [{**ENGINES[0], "decode_floor_tok_s": 25, "projected_decode_tok_s": [41, 44]}, *ENGINES[1:]]
+    ctx = _ctx(tmp_path, engines)
+    res = _good()
+    res.decode_tps_512, res.decode_tps_8k = 30.0, 27.0  # above the floor 25, below the review line 28.7
+    lt.check_band(res, ctx.spec("gpt-oss-120b"))
+    res.save(ctx)
+    lt.cmd_summarize(ctx, None)
+    recs, todos = _lines(capsys)
+    summary = [m for v, r, m in recs if v == "V10" and m.startswith("summary")]
+    assert summary and "review: gpt-oss-120b" in summary[0]
+    title, detail = todos["decode-review"]
+    assert "70%" in title and "not a fail" in title
+    assert detail.startswith("Measured in Phase 3 step 02: gpt-oss-120b: decode 27.0 tok/s at 8k (the slower point) "
+                             "below the review line 28.7 tok/s")
+    assert "UD-Q4_K_XL" in detail and "Phase 3 changed no engine setting" in detail
+    assert "Set decode_floor_tok_s (tok/s at 8k, judged on the slower of the 512 and 8k points)" in (
+        todos["decode-floors"][1])  # glm and deepseek still have no floor in this fixture
+    # No seat under review: no to-do.
+    ok = _good()
+    lt.check_band(ok, ctx.spec("gpt-oss-120b"))
+    ok.save(ctx)
+    lt.cmd_summarize(ctx, None)
+    assert "decode-review" not in _lines(capsys)[1]
+
+
+# --- V10a, the Phase 2 half: the router's floor (verify/v10a-router-resident.sh, D-33; run in bash, curl stubbed) ----
+
+V10A = Path(__file__).resolve().parents[2] / "verify" / "v10a-router-resident.sh"
+COMMON_SH = Path(__file__).resolve().parents[2] / "lib" / "common.sh"
+FAKE_CURL = r"""#!/bin/bash
+url=""; body=""; prev=""
+for a in "$@"; do
+  [[ "$prev" == "-d" ]] && body="$a"
+  [[ "$a" == http* ]] && url="$a"
+  prev="$a"
+done
+case "$url" in
+  */health) printf 200 ;;
+  */v1/chat/completions) cat "$R/chat" ;;
+  */completion)
+    printf '%s\n' "$body" >>"$R/bodies"
+    n=$(( $(cat "$R/count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$R/count"
+    if [[ -e "$R/timing$n" ]]; then cat "$R/timing$n"; else cat "$R/timing"; fi ;;
+esac
+"""
+CHAT_OK = {"choices": [{"message": {"content": "OK"}}], "usage": {"completion_tokens": 2}}
+
+
+def _timing(tps: float, n: int = 128) -> str:
+    return json.dumps({"content": "one two", "timings": {"predicted_n": n, "predicted_per_second": tps}})
+
+
+def _v10a(tmp_path: Path, timings: list[str], engines: Path | None = None,
+          chat: dict[str, Any] | None = None) -> tuple[int, str, list[str]]:
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available")
+    r = tmp_path / "r"
+    shutil.rmtree(r, ignore_errors=True)
+    (r / "bin").mkdir(parents=True)
+    (r / "bin" / "curl").write_text(FAKE_CURL, encoding="utf-8")
+    (r / "bin" / "curl").chmod(0o755)
+    (r / "etc" / "engines").mkdir(parents=True)
+    (r / "etc" / "engines" / "router-qwen3.5-4b.env").write_text("LLAMA_ARG_PORT=8105\n", encoding="utf-8")
+    (r / "chat").write_text(json.dumps(CHAT_OK if chat is None else chat), encoding="utf-8")
+    for i, t in enumerate(timings, start=1):
+        (r / f"timing{i}").write_text(t, encoding="utf-8")
+    (r / "timing").write_text(timings[-1], encoding="utf-8")
+    src = V10A.read_text(encoding="utf-8")
+    line = 'source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"'
+    assert src.count(line) == 1 and src.count('"$ATLAS_DAY1_DIR/config/engines.json"') == 2
+    src = src.replace(line, f'source "{COMMON_SH}"')
+    if engines is not None:
+        src = src.replace('"$ATLAS_DAY1_DIR/config/engines.json"', f'"{engines}"')
+    (r / "v10a.sh").write_text(src, encoding="utf-8")
+    env = {"PATH": f"{r / 'bin'}:/usr/bin:/bin", "R": str(r), "ATLAS_ETC": str(r / "etc"),
+           "ATLAS_STATE": str(r / "state"), "HOME": str(r)}
+    p = subprocess.run([bash, str(r / "v10a.sh")], capture_output=True, text=True, env=env, check=False, timeout=60)
+    bodies = (r / "bodies").read_text(encoding="utf-8").splitlines() if (r / "bodies").exists() else []
+    assert len(p.stdout.splitlines()) == 1, (p.stdout, p.stderr)  # CONVENTIONS.md §5: exactly one stdout line
+    return p.returncode, p.stdout.strip(), bodies
+
+
+def test_v10a_times_128_tokens_and_fails_below_the_router_floor(tmp_path: Path) -> None:
+    rc, out, bodies = _v10a(tmp_path, [_timing(25.0)])  # the real engines.json: floor 20, projection [45, 50]
+    assert rc == 0 and out.startswith("router-qwen3.5-4b on 127.0.0.1:8105: reply='OK' (2 tokens); decode 25.0 tok/s ")
+    assert "over 128 tokens (/completion, temperature 0), at or above the router floor 20 tok/s (D-33)" in out
+    assert out.endswith("review line 31.5 (BELOW: a review item, not a fail)")  # 0.7 x 45, never a fail
+    assert len(bodies) == 1
+    body = json.loads(bodies[0])
+    assert (body["n_predict"], body["temperature"], body["ignore_eos"], body["cache_prompt"], body["stream"]) == (
+        128, 0, True, False, False)
+    assert body["prompt"].startswith("v10a-")  # a fresh nonce: never a cached prompt
+    rc, out, _ = _v10a(tmp_path, [_timing(19.9)])
+    assert rc == 1 and "decode 19.9 tok/s over 128 tokens" in out and "BELOW the router floor 20 tok/s (D-33)" in out
+    rc, out, _ = _v10a(tmp_path, [_timing(40.0)])
+    assert rc == 0 and out.endswith("review line 31.5 (met)")
+
+
+def test_v10a_remeasures_a_short_answer_once(tmp_path: Path) -> None:
+    rc, out, bodies = _v10a(tmp_path, [_timing(50.0, 10), _timing(30.0)])
+    assert rc == 0 and "decode 30.0 tok/s over 128 tokens (/completion, temperature 0, re-measured once)" in out
+    assert len(bodies) == 2 and json.loads(bodies[0])["prompt"] != json.loads(bodies[1])["prompt"]
+    rc, out, bodies = _v10a(tmp_path, [_timing(5.0, 10), _timing(5.0, 12)])
+    assert rc == 0 and "fewer than 64 tokens after one re-measure: no speed verdict (floor 20)" in out
+    assert len(bodies) == 2
+
+
+def test_v10a_reads_the_floor_from_engines_json(tmp_path: Path) -> None:
+    eng = tmp_path / "engines.json"
+    real = json.loads(REAL_ENGINES.read_text())
+    router = next(e for e in real["engines"] if e["key"] == "router-qwen3.5-4b")
+    eng.write_text(json.dumps({"engines": [{**router, "decode_floor_tok_s": 30}]}), encoding="utf-8")
+    rc, out, _ = _v10a(tmp_path, [_timing(25.0)], engines=eng)
+    assert rc == 1 and "BELOW the router floor 30 tok/s" in out  # never a typed 20
+    eng.write_text(json.dumps({"engines": [{**router, "decode_floor_tok_s": None, "projected_decode_tok_s": None}]}),
+                   encoding="utf-8")
+    rc, out, _ = _v10a(tmp_path, [_timing(1.0)], engines=eng)
+    assert rc == 0 and out.endswith("no decode_floor_tok_s in engines.json: recorded, not judged")
+    rc, out, _ = _v10a(tmp_path, [_timing(1.0)], engines=tmp_path / "missing.json")
+    assert rc == 0 and out.endswith("floor UNKNOWN (engines.json unreadable): recorded, not judged")
+
+
+def test_v10a_fails_on_a_failed_timing_request_or_an_empty_reply(tmp_path: Path) -> None:
+    rc, out, _ = _v10a(tmp_path, [json.dumps({"error": {"code": 500, "message": "boom"}})])
+    assert rc == 1 and "the timing request (POST /completion, 128 tokens) failed:" in out and "boom" in out
+    rc, out, _ = _v10a(tmp_path, ["not json"])
+    assert rc == 1 and "failed:" in out
+    rc, out, _ = _v10a(tmp_path, [_timing(40.0)], chat={"choices": [{"message": {"content": ""}}]})
+    assert rc == 1 and "empty reply" in out

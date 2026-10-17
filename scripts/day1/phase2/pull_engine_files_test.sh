@@ -11,6 +11,8 @@
 # refused, one failing shard failing the engine's pull by name and a re-run fetching only what is missing, a cut
 # transfer resumed from its .part, and a TERM during a four-job pull ending every running curl, then resumed.
 # Run: bash phase2/pull_engine_files_test.sh   (exit 0 when every case passes)
+# shellcheck disable=SC2031  # file-wide: the extraction subshells source lib/common.sh, which assigns the roots there;
+#                              this shell sets its own (ATLAS_ETC, ATLAS_SRV, ...) and never relies on theirs
 set -Euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 T="$(mktemp -d)"
@@ -261,7 +263,11 @@ kill -TERM "$bg"; wait "$bg"; rc=$?
 ok "TERM: the pull's shell ends by the TERM" "$rc" "143"
 sleep 0.5
 alive=0
-for f in "$FAKE_ACTIVE"/pid.*; do kill -0 "$(cat "$f")" 2>/dev/null && alive=$(( alive + 1 )); done
+# A process that is gone or a zombie (ended, not yet reaped by its new parent) counts as ended.
+for f in "$FAKE_ACTIVE"/pid.*; do
+  st="$(ps -o stat= -p "$(cat "$f")" 2>/dev/null || true)"
+  [[ -n "$st" && "$st" != Z* ]] && alive=$(( alive + 1 ))
+done
 ok "TERM: no curl left running" "$alive" "0"
 ok "TERM: no curl went on to finish" "$(find "$FAKE_ACTIVE" -name 'finished.*' | wc -l)" "0"
 ok "TERM: four .part files kept" "$(find "$MD" -name '*.part' | wc -l)" "4"

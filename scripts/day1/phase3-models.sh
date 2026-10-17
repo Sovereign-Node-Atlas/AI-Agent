@@ -31,9 +31,13 @@
 #       (POST /arbiter/load|unload|register; Section 4.2 is a hard requirement and Section 17 step 2 says "load through
 #       the Engine Arbiter": an orchestrator that is not serving is the missing Phase 2 step 2 prerequisite and stops
 #       the phase, there is no systemctl fallback), /health, V4 proof from the unit's journal (conflict h),
-#       decode/prefill tok/s at 512 and 8k prompt tokens (V10 under D-33 (c): recorded beside the research projection,
-#       a fail only below a per-seat decode_floor_tok_s the Principal sets; null floors raise the to-do decode-floors;
-#       the abliterated entry keeps its v0.3.5 band and rule), swap time
+#       decode/prefill tok/s at 512 and 8k prompt tokens (V10 under D-33 (c), with the floors the Principal set on
+#       2026-10-17, D-33 and D-47: decode recorded beside the research projection and a fail only below the seat's
+#       decode_floor_tok_s, judged on the slower of the 512 and 8k points with 64 or more generated tokens each; a fail
+#       below prefill_floor_tok_s on the 8k prefill; placement checks on each load (offloaded N/M layers with N < M, or
+#       a GTT delta under 0.85 x the weights, fail; model buffers and graph splits are recorded); 70% of the
+#       projection's low end is the review line, the to-do decode-review, never a fail; a null floor is record only,
+#       the to-do decode-floors; the abliterated entry keeps its v0.3.5 band and rule), swap time
 #       (unload previous + load this), the measured footprint registered with the Arbiter (Section 4.2 rule 1), unload,
 #       GTT release polled after EVERY unload and after every unit that died on its own (rule 5: never the process exit;
 #       measurement window 2 GiB / 120 s; the Arbiter's own rule-5 check is the authority; a leak stops the phase).
@@ -80,9 +84,9 @@
 # Contracts relied on from other writers (CONVENTIONS.md §1; each is checked and fails loudly when absent):
 #   * config/engines.json — schema per its _meta block (key, hf_repo, subdir, files[{name,sha256,bytes,verify}],
 #     enumerate_pattern, join_into, mmproj, quant, footprint_gb, ctx_size, parallel, kv_class, kv_ladder, n_keep,
-#     extra_args, projected_decode_tok_s, decode_floor_tok_s, expected_decode_tok_s (the abliterated entry only),
-#     min_llama_cpp_tag, placement, kv_proof_lines, arbiter_class, known_issue, baseline_deviation; kv_ladder_rule,
-#     decode_rule and baseline_deviation_rule).
+#     extra_args, projected_decode_tok_s, decode_floor_tok_s, prefill_floor_tok_s, expected_decode_tok_s (the
+#     abliterated entry only), min_llama_cpp_tag, placement, kv_proof_lines, arbiter_class, known_issue,
+#     baseline_deviation; kv_ladder_rule, decode_rule and baseline_deviation_rule).
 #   * phase2/04-memory.sh — its header offers `ej`, `hf_tree_lfs REPO [SUBDIR]`, `engine_tree_lfs KEY`,
 #     `hf_download_public` and `pull_engine_files KEY` to this driver (the reference implementation of the manifest-at-pull-time rule). It is a
 #     Phase 2 STEP file (CONVENTIONS.md §4: it defines step_04 and Phase 2 globals too), so it is NOT sourced into this
@@ -128,8 +132,8 @@
 # the driver skips an engine on a re-run only when ok AND released are true; its resident_after tells the driver which
 # engine the next swap releases; its "memory" list holds the S52 record of each load, one per rung on the DeepSeek
 # ladder), residency.json (step 03), parity.json (step 02b) and quality.json (step 02c) beside them, the to-dos
-# kv-estimates and cache-ram (step 04), decode-floors, context-targets (D-16), trial-task-set (D-46), seat-test-sets
-# (D-49) and seat-profiles (D-48, S-30) (step 02) and kld-run (step 02c, S-03), each re-raised
+# kv-estimates and cache-ram (step 04), decode-floors, decode-review, trial-task-set (D-46), seat-test-sets (D-49) and
+# seat-profiles (D-48, S-30) (step 02) and kld-run (step 02c, S-03), each re-raised
 # with the latest figures on every run of its step (only the Principal closes them), $ATLAS_STATE/phase3/results/pending-overrides.json (loadtest.py's journal of
 # temporary overrides, restored on the next invocation), $ATLAS_STATE/phase3/quiesced (one "unit NAME" or
 # "container NAME" line per background generator stopped for steps 02 to 03, removed when they are restarted),
@@ -763,7 +767,8 @@ step_02() {
   # The last engine is still resident on purpose (its unload + release is the measurement): finish it now.
   _p3_loadtest finish ${prev:+--previous "$prev"}
   # V10 per engine, the V10 summary the gate reads, V22 per newer-architecture engine and the Apex (R19 generalised,
-  # S-26) and its summary, and the to-do decode-floors while any seat has no floor (D-33 (c)), from the result files;
+  # S-26) and its summary, the to-do decode-floors while any seat has no floor (D-33 (c)) and decode-review for a seat
+  # below its review line (D-33), from the result files;
   # then the to-dos for the inputs the approved rows leave to the Principal, with their built defaults (v0.4.0).
   _p3_loadtest summarize
   _p3_resume_background

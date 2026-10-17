@@ -6,7 +6,7 @@ Depths (9.1 table):
               the winner; 2 swaps
     deep      standard plus a second expansion and scoring round, a third opinion on documents (gpt-oss-120b on
               Day 1, standing in for the phased Qwen3.8-Flash-Next) and the Apex engine (DeepSeek-V4-Flash-0731, the
-              adversary's own) delivering the final synthesis; 3-4 swaps
+              adversary's own) delivering the final synthesis; 3 to 5 swaps, 6 with documents (run_deep)
 
 v0.4.0 (S-43, approved 2026-10-16): the pair is GLM-5.3-Flash (generator) and DeepSeek-V4-Flash-0731 (adversary), two
 families; v0.3.5 ran gpt-oss-120b against Nemotron 3 Super. Every engine runs alone (D-32), so each change of engine is
@@ -406,7 +406,7 @@ def run_deep(
     max_tokens: int = 3072,
 ) -> DeepThinkResult:
     """Standard, then a second expansion and scoring round, the third opinion on documents, the Apex engine
-    delivering the final synthesis (3-4 swaps)."""
+    delivering the final synthesis (3 to 5 swaps, 6 with documents; 3 when the first answer wins the second round)."""
     first = run_standard(problem, call, context=context, computed=computed, max_tokens=max_tokens)
     result = DeepThinkResult(
         tier="deep",

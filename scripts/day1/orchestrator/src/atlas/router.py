@@ -122,7 +122,7 @@ __all__ = [
 
 TIER_ORDER: dict[str, int] = {t: i for i, t in enumerate(TIERS)}  # routine < standard < sensitive
 DEEP_THINK_DEPTHS: tuple[str, ...] = ("quick", "standard", "deep")  # 9.1
-# D-43 (a): the reason a classifier-chosen "deep" is run at "standard" (the deep tier costs 3-4 swaps between the
+# D-43 (a): the reason a classifier-chosen "deep" is run at "standard" (the deep tier costs 3-5 swaps between the
 # large seats, 9.1); the Principal accepts that latency only by typing [DEEP THINK:DEEP].
 DEEP_TIER_GATE = "D-43: explicit acceptance required"
 FAMILY_NAME_CATEGORY = "family-name"  # what a FAMILY_NAMES hit is called outside the ledger (10.4; module docstring)

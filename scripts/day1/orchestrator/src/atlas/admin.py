@@ -16,6 +16,10 @@ Subcommands and who calls them:
                        the domain cards (load_domain_cards(strict=True)); exit 0 and one line, or exit 1 with every
                        card that drifts from §8 and the H1 it should carry. For the Phase 2 gate / a verify script
                        (NOT a CONVENTIONS.md contract; offered to the gate writer, fix round 3).
+  eval ...             the phased evaluation runner for the seat test sets (D-49, T-27) and the DeepSeek V4.1 trial
+                       (D-46, T-30), atlas.evalrun, imported only when called: validate, freeze, run, workbook,
+                       results (`atlas-admin eval --help`). Nothing on Day 1 runs it. It runs as root and writes the
+                       ledger as the database's owner itself, so it is not one of the ledger-opening subcommands below.
 
 Every failure exits non-zero with a one-line reason on stderr (rule §7.4); nothing here prompts. Root is refused for
 the subcommands that open the ledger (init-db, arbiter status, enqueue) when the database belongs to another user:
@@ -366,6 +370,16 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- eval (atlas.evalrun; phased, D-49 and D-46) ----------------------------------------------------------------------
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Hand the rest of the command line to atlas.evalrun, imported here so no other subcommand loads it."""
+    from atlas import evalrun
+
+    return evalrun.main(["--help", *args.eval_args] if args.eval_help else args.eval_args)
+
+
 # --- parser -----------------------------------------------------------------------------------------------------------
 
 
@@ -411,6 +425,14 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--queue", default=None, help="override the task's configured route (default: what "
                                                   "atlas.celery_app.task_routes says, else the cpu queue)")
     q.set_defaults(fn=cmd_enqueue, opens_ledger=True)
+
+    # The rest of the line goes to atlas.evalrun's own parser; its -h/--help is passed on, so `atlas-admin eval --help`
+    # lists the evaluation subcommands rather than this stub's single argument.
+    ev = sub.add_parser("eval", add_help=False, help="the phased evaluation runner (D-49, D-46): validate, freeze, "
+                                                     "run, workbook, results; see `atlas-admin eval --help`")
+    ev.add_argument("-h", "--help", dest="eval_help", action="store_true")
+    ev.add_argument("eval_args", nargs=argparse.REMAINDER)
+    ev.set_defaults(fn=cmd_eval)
     return p
 
 

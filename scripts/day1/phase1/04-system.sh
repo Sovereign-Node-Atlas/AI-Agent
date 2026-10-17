@@ -150,9 +150,10 @@ phase1_lan_resolvers() {
 }
 
 # phase1_listen_addrs ADDR... — bind SSH and Cockpit to exactly these addresses (Section 3.6 "listening on LAN and
-# WireGuard interfaces only"). FreeBind lets both sockets bind before Wi-Fi has its address or before the Docker
-# bridge exists, so boot order can never leave the node without SSH. Step 4 calls it with the LAN address, step 7
-# adds the WireGuard bridge gateway. The ufw per-interface rules (below) are the second, interface-level fence.
+# WireGuard interfaces only"). FreeBind lets both sockets bind before the LAN interface (the cable since B-27,
+# 2026-10-17) has its address or before the Docker bridge exists, so boot order can never leave the node without SSH.
+# Step 4 calls it with the LAN address, step 7 adds the WireGuard bridge gateway. The ufw per-interface rules (below)
+# are the second, interface-level fence.
 # Step 1 warns when LAN_IP is a DHCP lease rather than a reserved/static address, because these sockets stay on it.
 phase1_listen_addrs() {
   local addrs=("$@") a
@@ -394,7 +395,8 @@ MulticastDNS=no
 CONF
   # The LAN link must stop handing resolved the router's address. networkd (netplan on Ubuntu Server): a drop-in next
   # to the .network file that manages LAN_IFACE (drop-ins in /etc apply to a /run file too), effective at the reboot
-  # this step ends with, without a `networkctl reconfigure` over the Wi-Fi session the step runs on (R9).
+  # this step ends with, without a `networkctl reconfigure` over the LAN interface the step's session runs on (the
+  # cable since B-27, 2026-10-17; R9).
   local netfile; netfile="$(networkctl status "$LAN_IFACE" 2>/dev/null | awk -F': ' '/Network File:/ {print $2; exit}' | tr -d ' ')"
   if [[ -n "$netfile" && "$netfile" != n/a ]]; then
     local dd; dd="/etc/systemd/network/$(basename "$netfile").d"
@@ -1319,8 +1321,9 @@ CONF
 
 _cockpit_install() {
   # Without recommends: on resolute `cockpit` Recommends cockpit-networkmanager, which Depends on network-manager
-  # (both VERIFIED on packages.ubuntu.com/resolute). NetworkManager would take over the Wi-Fi interface from
-  # netplan/systemd-networkd in the middle of this step, over the SSH session it runs on (R9). Package set mirrors 05b.
+  # (both VERIFIED on packages.ubuntu.com/resolute). NetworkManager would take over the LAN interface (the cable
+  # since B-27, 2026-10-17) from netplan/systemd-networkd in the middle of this step, over the SSH session it runs on
+  # (R9). Package set mirrors 05b.
   local nm_before nm_after
   nm_before="$(dpkg-query -W -f='${Status}' network-manager 2>/dev/null || true)"
   export DEBIAN_FRONTEND=noninteractive

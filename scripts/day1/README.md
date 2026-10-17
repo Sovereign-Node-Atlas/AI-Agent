@@ -26,7 +26,11 @@ machinery (a disk that does not mount, a service that does not start) stops a ph
    Also in the BIOS: UMA at its minimum, IOMMU on, fTPM on.
 3. **The node's LAN address reserved in the router** (DHCP reservation for the node's MAC address, Wi-Fi or
    cable). Phase 1 uses whatever interface is up; the reservation keeps the address stable so the UDP 51820 forward
-   you already made keeps pointing at the node. If the router's WAN address is in 100.64.0.0/10 you are behind
+   you already made keeps pointing at the node. Your decision of 2026-10-17 (B-27) is the cable: plug it into the
+   10 GbE port NOT marked DASH (the one away from DC IN) and into a router port of 2.5 GbE or faster, before Phase 1,
+   then move the reservation and the UDP 51820 forward to that port's MAC and take Wi-Fi off that subnet. Pre-flight
+   notes the port and the MAC, warns (never stops) on Wi-Fi or a second interface on the subnet, and V1 records the
+   link speed. If the router's WAN address is in 100.64.0.0/10 you are behind
    CGNAT and the VPN test cannot pass from outside (R11).
 
 Also useful for Phase 1: a monitor and keyboard on the node (the recovery key is shown on the console), or an
@@ -78,7 +82,7 @@ git clone <repo> && cd <repo>/scripts/day1
 sudo ./atlas-day1.sh phase1          # Phase 1 steps 1-4, then the node reboots
 sudo ./atlas-day1.sh phase1          # after the reboot: steps 5, 5b, 6, 7, 8 (gate)
 sudo ./atlas-day1.sh phase2          # steps 1-10; a few skippable prompts (below)
-sudo ./atlas-day1.sh phase3          # detached; ~10 h of download (~448 GB) + the load, parity and quality tests
+sudo ./atlas-day1.sh phase3          # detached; ~2.5 h of download (~448 GB at the 400 Mbps planning figure) + the load, parity and quality tests
 journalctl -fu atlas-day1-phase3     # follow it (or: tail -f /var/lib/atlas/day1/logs/phase3-<date>.log)
 sudo ./atlas-day1.sh phase4          # detached; several hours, can run overnight
 journalctl -fu atlas-day1-phase4
@@ -140,8 +144,10 @@ directly as `/opt/atlas/day1/phase1-platform.sh`: `--no-reboot`
   GLM-5.3-Flash `UD-IQ4_XS` with its glm5v projector, DeepSeek-V4-Flash-0731 `UD-Q8_K_XL`, gpt-oss-120b (F16 trunk)
   and its abliterated twin (unchanged), about 448 GB, sha256 from the Hugging Face tree API into `MANIFEST.json`;
   per-seat load tests through the Arbiter, one seat at a time (V4 KV proof on every line the engine prints, tok/s at
-  512 and 8k recorded beside each seat's projection, swap time, memory returned; a seat fails V10 only below a decode
-  floor you set, none is set, so the to-do `decode-floors` is raised, D-33 (c)), each load also recording, never as a
+  512 and 8k recorded beside each seat's projection, swap time, memory returned; since your approval of 2026-10-17 a
+  seat fails V10 below its decode floor at 8k, judged on the slower point (gpt-oss-120b 25, GLM-5.3-Flash 6,
+  DeepSeek-V4-Flash-0731 4 tok/s), below its 8k prefill floor (200, 40, 40) or on a placement check, and a seat under
+  70% of its projection raises the to-do `decode-review`, never a fail; D-33, D-47, doc S56), each load also recording, never as a
   verdict, its context memory from its own log beside the Arbiter's estimate, its host RAM and whether llama-server
   switched context shift off (doc S52); DeepSeek's f16 cache first, `q8_0` only if f16 fails (S-42), and its own V22
   row, as GLM-5.3-Flash has, so a failure of either is deferred (R19); step 2b, output parity of the re-pin against
@@ -293,13 +299,19 @@ Where an approved row leaves an input to the Principal, its default is built and
   `_meta.decode_rule`), so `decode-floors` is raised only while a seat's floor is null;
 - DeepSeek's context target (131,072 tokens), GLM's cache type and slot profile (f16 at 8 × 32k) and the
   long-document trigger (24,000 tokens) (D-48, S-30; `seat-profiles`);
-- the D-16 context targets of the phased medical and science seats: approved on 2026-10-17 (`Q5_K_S`, q8_0 K and V
-  with the pin's rotation, 1 × 32,768 tokens; `engines.json` `phased`), which closes `context-targets`;
-- the D-46 trial task set (`trial-task-set`) and the D-49 test sets (`seat-test-sets`);
+- the D-16 context targets of the phased medical and science seats: answered on 2026-10-17 (`Q5_K_S`, q8_0 K and V
+  with the pin's rotation, 1 × 32,768 tokens; `engines.json` `phased`), so `context-targets` is no longer raised;
+- the D-46 trial task set (`trial-task-set`: 8 to 10 one-paragraph TF_OMEGA situations, then your approval of the 40
+  drafted tasks) and the D-49 test sets (`seat-test-sets`: a brief per domain, your states of operation and the
+  standards you hold, then your approval of ATLAS's drafts): their designs approved on 2026-10-17 and the runner built
+  (`atlas-admin eval`, below); your own material is the to-do;
 - each seat's fixed reasoning setting (D-30 (b); provisional settings in `engines.json`; in the detail of `kld-run`).
 
-Phase 3 step 2 (`loadtest.py summarize`) raises `decode-floors`, `context-targets`, `trial-task-set`, `seat-test-sets`
-and `seat-profiles` on the live to-do list (`atlas-day1.sh status`), with the defaults read from the shipped config.
+Phase 3 step 2 (`loadtest.py summarize`) raises `decode-floors` (only for a seat with no floor), `decode-review` (D-33:
+a seat at or above its floor but under 70% of its projection; never a fail), `trial-task-set`, `seat-test-sets` and
+`seat-profiles` on the live to-do list (`atlas-day1.sh status`), with the defaults read from the shipped config. Phase 2
+step 4 and its gate raise `decode-review-router` when V10a times the router under 70% of its projection (D-33; never a
+fail).
 
 The uncensored-seat items (D-07, D-08, D-09, D-58, N-10, P-05, P-17, S-05) are unchanged by this revision and remain
 the Principal's to configure.
@@ -323,8 +335,41 @@ rule 5, 4.4):
 The same day the Principal confirmed V25's pass marks (a mean KLD of at most 0.01, the same top token at least 98% of
 the time, no fewer tasks correct) and acknowledged R29 to R33 and the restated R4, R17, R19 and R20. The 16 GiB host
 reserve stays until host use is measured on the node (measure 15). Not built: measure 8's optional `MemoryHigh` on
-`atlas-celery-cpu`. Still open, each built with its default: D-47 (`decode-floors`), B-27, D-16, D-49, D-46, D-19,
-D-60 and C-12.
+`atlas-celery-cpu`. Still open that morning, each built with its default: D-47 (`decode-floors`), B-27, D-16, D-49,
+D-46, D-19, D-60 and C-12; you answered them later the same day (doc S56, below).
+
+**Approved by the Principal on 2026-10-17 and built (doc S56, within v0.4.0).** Every recommendation of
+`research_notes/ATLAS open inputs 2026-10-17/recommendations.json` (D-47, D-33, T-06, B-27, D-16, D-19, D-60, C-12,
+D-49, D-46), with a 2,000 Mbps line, router LAN ports of 2.5 GbE and the move to the cable (precondition 3):
+
+- decode floors at 8k in `engines.json` (`decode_floor_tok_s`: gpt-oss-120b 25, glm-5.3-flash 6, deepseek-v4-flash 4,
+  router-qwen3.5-4b 20 tok/s) and prefill floors (`prefill_floor_tok_s`: 200, 40, 40); gpt-oss-120b projected at
+  41-44 tok/s (it was 57-60); V10 judges the slower of the 512 and 8k points with 64 or more generated tokens, the 8k
+  prefill and the placement lines of each load (`phase3/loadtest.py`); a seat under 70% of its projection raises
+  `decode-review`; V10a times 128 tokens on the router and fails below 20 tok/s (`verify/v10a-router-resident.sh`),
+  which stops Phase 2 step 4, and raises `decode-review-router` under 70% of its projection; DeepSeek projected at
+  6.8-7.2 tok/s, so its review line is the approved 4.8;
+- the Deep Think wait message at about 13 to 23 minutes (standard) and 36 to 66 (deep), estimates from the projected
+  speeds (`atlas/api.py`), and the generation slack at 1,200 s (`atlas/tasks/__init__.py`; it was 900);
+- D-16: Intern-S1 and Baichuan-M3 (now the `i1-Q5_K_S` file) with a q8_0 cache, the pin's rotation and 1 × 32,768
+  tokens in `engines.json` `phased`; `phase2/engine-env.py` refuses `LLAMA_ATTN_ROT_DISABLE`;
+- D-19 (c) and D-60 (b): Qwen3-Coder-Next and EmbeddingGemma 2 out of `phased`; GLM-5.3-Flash codes, provisional
+  until T-03's coding set; no persona's or preset's engine changed (TF_MU's engine field waits for your explicit yes);
+- B-27: `DOWNLOAD_MBPS=400`, pre-flight's network note and V1's link speed, `ATLAS_PULL_JOBS` (default 1) and the
+  fastest hash tool (§7 lists the tests);
+- D-49 and D-46: the phased evaluation runner, `atlas-admin eval` (`atlas/evalrun.py`: `validate`, `freeze`, `run`,
+  `workbook`, `results`; `atlas-admin eval --help`). Nothing on Day 1 runs it. It runs as root, refuses any path in a
+  git working tree or under `/opt/atlas`, and keeps its sets, runs and blinding keys root-only under
+  `/srv/atlas/data/eval`. Its workbook needs the `[eval]` extra (openpyxl 3.1.5): before the first workbook, as root,
+  `/opt/atlas/venv-uv/bin/uv pip install --python /opt/atlas/venv/bin/python -e '/opt/atlas/orchestrator[eval]'`.
+
+Recorded, not built: the MedGemma tool (C-12 waits on your acceptance of Google's HAI-DEF terms, a new non-seat
+Arbiter class and a node test against GLM-5.3-Flash's own vision), Baichuan-M3's cross-checker changes, the
+Qwen3-VL-Embedding index, D-33's node baseline after Day 1, and T-06's 16k and 32k points and DSpark runs. Open for
+you: the HAI-DEF decision; the D-49 briefs, states and standards (`seat-test-sets`); 8 to 10 TF_OMEGA situations
+(`trial-task-set`); 20 to 30 coding tasks for T-03; and, optionally, a 60-second single-stream download test to
+replace `DOWNLOAD_MBPS=400` (doc Section 22). Before Phase 1: the cable, the reservation and the forward
+(precondition 3).
 
 D-43 (a) is built: the deep Deep Think tier runs only on the Principal's explicit `[DEEP THINK:DEEP]`; a classifier
 depth of `deep` (the task-weight trigger, or a `[DEEP THINK: ...]` that types no depth) runs at standard, with the
@@ -348,7 +393,7 @@ reason `deep-think:deep->standard(D-43: explicit acceptance required)` in the ro
 Every `UNVERIFIED` comment in the code marks a fact the research could not confirm. The step that depends on it fails
 loudly if the assumption is wrong; none skips. Line numbers are those of this commit (`grep -n UNVERIFIED <file>`).
 
-**lib/common.sh** — 706: hf_transfer ignores proxies (kept off). 748, 790: a download with no reference sha256 records
+**lib/common.sh** — 708: hf_transfer ignores proxies (kept off). 840, 882: a download with no reference sha256 records
 its computed hash as UNVERIFIED.
 
 **phase1-platform.sh / phase1/01-preflight.sh** — no UNVERIFIED marks beyond the Secure Boot decision above.
@@ -390,10 +435,10 @@ unchanged from v0.4.1 (the top-level CMakeLists.txt differs only in its version 
 
 **phase2/03-openwebui.sh** — 248: API-key creation path (`ENABLE_API_KEYS`). 269: the model-list path.
 
-**phase2/04-memory.sh** — 155, 990: `+cpu` cp312 torch/torchvision wheels on download.pytorch.org. 360: a tree
+**phase2/04-memory.sh** — 155, 1085: `+cpu` cp312 torch/torchvision wheels on download.pytorch.org. 365: a tree
 entry without `lfs.oid` (a pinned `verify=research-snippet` sha256 the tree API contradicts stops the pull since v0.4.0,
-no longer a warning). 458, 468, 474: sudo-rs `-l COMMAND` fallback.
-616, 646: ChromaDB telemetry variable names for the Rust server (DOCKER-USER drop is the belt). 707, 716: Chroma v2
+no longer a warning). 553, 563, 569: sudo-rs `-l COMMAND` fallback.
+720, 750: ChromaDB telemetry variable names for the Rust server (DOCKER-USER drop is the belt). 811, 820: Chroma v2
 REST collection paths.
 
 **phase2/05-voice.sh** — 158: torchcodec 0.8.x / torch 2.9.x compatibility row. 296: §2.4 latency figure (recorded,
@@ -484,8 +529,14 @@ of MemTotal (12.8-13.8, INFERRED) would be CMA scratch that GTT pages can never 
 fail with a Vulkan out-of-memory in Phase 3 although granted. V3a fails while any of it is set aside; `kho=off` does
 not change MemTotal.
 
-**config/engines.json** — 16 (env_rule wording). v0.3.5's DeepSeek f16-rung and bge-m3 file-name marks went with
-those entries; every Day 1 file now carries the exact bytes and sha256 the tree API gave on 2026-10-16.
+**config/engines.json** — none. v0.3.5's DeepSeek f16-rung and bge-m3 file-name marks went with those entries;
+every Day 1 file now carries the exact bytes and sha256 the tree API gave on 2026-10-16, and Baichuan-M3's `i1` file
+the bytes it gave on 2026-10-17 (its sha256 is read at the pull).
+
+**orchestrator/src/atlas/evalrun.py** (phased, doc S56) — 56, 2136: the V4.1 trial engine's API (DwarfStar in a ROCm
+container, S-51, not built); the runner assumes an OpenAI-compatible chat endpoint on loopback, which the trial build
+must confirm. INFERRED there: the roles of D-46 categories D and E, the judges' cap and temperature, and the reading of
+"the neutral judge agreeing".
 **config/phase4-engines.json** — 7, 79, 121, 150, 210, 238, 239, 279, 305, 339, 427, 448, 480, 481, 527: per-engine research notes (sizes, repo ids by snippet, licence notes for Rad-DINO and
 PointLLM, TRELLIS shims, Blender tarball pattern, Prithvi build call). **config/allowlist.txt** — 117, 124, 141, 152,
 162, 167, 172, 180: Blender extensions API host, Playwright CDN hosts, Drive discovery hosts, Wix/pay.com/RewardPay
@@ -620,7 +671,11 @@ refuses it V6 fails, with a diagnostic of whether 3.1 still loads (never the pas
 `bash -n` and `shellcheck -x` on every `.sh`, `python3 -m py_compile` on every `.py`, `ruff check orchestrator phase2
 phase3 phase4 tools`, `bash lib/common_test.sh`, `bash phase2/pull_engine_files_test.sh` (Phase 2 step 4's pull refuses a
 `verify=research-snippet` sha256 the tree API contradicts before any byte moves; an unverified hash only warns; stubbed
-tree and download; v0.4.0), `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold, step 5's kernel-line record that closes or refreshes the to-do, and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash phase1/crash_params_test.sh` (the `zzz-atlas-crash.cfg` drop-in under grub-mkconfig's own sourcing lines, dash and `set -e`, with the real `kdump-tools.cfg`, `kho=` words included; `_grub_params` end to end with its `panic=10` and `kho=off` checks and the kexec handover scratch record; `_kdump_off` and `_panic_log_record` against stubbed `dpkg-query`/debconf/`systemctl`/`kdump-config`/`sysctl`/`findmnt`; doc S48, S49; needs dash), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47, its crash-kernel and panic checks, doc S48, and its `kho=off` and CMA checks against a `/proc/zoneinfo` fixture, doc S49), `bash phase1/watchdog_test.sh` (step 4's watchdog probe, driver unit and systemd drop-in against stubbed `modprobe`/`dmesg`/`systemctl` with every node path under a temp dir, the unit under `systemd-analyze verify` when it is installed, step 5's V24 hand-off and its to-do `w-drill`, the Phase 1 gate with V24 pass, deferred, fail and missing, and `tools/fill-workbook.py`'s V24 row when openpyxl is installed; doc S50), `bash verify/v24_watchdog_test.sh` (V24's pass, deferred and fail cases against a fake sysfs, `/proc` and stubbed `systemctl`/`journalctl`; doc S50; neither watchdog test opens a real `/dev/watchdog*`), and the package tests (Python 3.12+):
+tree and download; v0.4.0; B-27, 2026-10-17: the real `hf_download` against a fake curl at `ATLAS_PULL_JOBS` 1 and 4,
+a bad value refused, one failing shard, a cut transfer resumed from its `.part` and a TERM mid-pull, 70 cases),
+`bash phase1/lan_link_test.sh` (B-27: pre-flight's network note for a wired RTL8127, the DASH controller, Wi-Fi and a
+second interface on the LAN subnet, and V1's driver and link speed, ethtool or sysfs, warned below 2,500 Mb/s and
+never failed; stubbed `ip`/`ethtool`/`iw`/`ping` and a temp `/sys/class/net`; 39 cases), `bash phase1/luks_helpers_test.sh` (the OS-volume and crypttab helpers against stubbed `lsblk`/`cryptsetup`, doc S39), `bash phase1/kernel_line_test.sh` (the kernel-line hold, step 5's kernel-line record that closes or refreshes the to-do, and the NPU record against stubbed `dpkg-query`/`apt-get`/`uname`/`lspci`, doc S45), `bash phase1/crash_params_test.sh` (the `zzz-atlas-crash.cfg` drop-in under grub-mkconfig's own sourcing lines, dash and `set -e`, with the real `kdump-tools.cfg`, `kho=` words included; `_grub_params` end to end with its `panic=10` and `kho=off` checks and the kexec handover scratch record; `_kdump_off` and `_panic_log_record` against stubbed `dpkg-query`/debconf/`systemctl`/`kdump-config`/`sysctl`/`findmnt`; doc S48, S49; needs dash), `bash verify/v03a_gtt_test.sh` (V3a's GTT pool check, capped and uncapped kernels, doc S47, its crash-kernel and panic checks, doc S48, and its `kho=off` and CMA checks against a `/proc/zoneinfo` fixture, doc S49), `bash phase1/watchdog_test.sh` (step 4's watchdog probe, driver unit and systemd drop-in against stubbed `modprobe`/`dmesg`/`systemctl` with every node path under a temp dir, the unit under `systemd-analyze verify` when it is installed, step 5's V24 hand-off and its to-do `w-drill`, the Phase 1 gate with V24 pass, deferred, fail and missing, and `tools/fill-workbook.py`'s V24 row when openpyxl is installed; doc S50), `bash verify/v24_watchdog_test.sh` (V24's pass, deferred and fail cases against a fake sysfs, `/proc` and stubbed `systemctl`/`journalctl`; doc S50; neither watchdog test opens a real `/dev/watchdog*`), and the package tests (Python 3.12+):
 
 ```
 cd orchestrator && pip install -e . && env -u CONFIG_DIR -u ATLAS_CONFIG_DIR python -m pytest
@@ -665,5 +720,21 @@ cpu concurrency, the container caps and the out-of-memory order). `tools/build_w
 checks that every D, C, R, V and Section 22 row of the document reaches it in order, that every risk the document
 records as acknowledged reads Yes (none blank since 2026-10-17), that the committed workbook is the one the committed
 document builds (rebuild it with `python3 tools/build-baseline-workbook.py` after a document change), that a test
-build never touches it, that a missing section stops the builder, and that no scratch path is left in it. The
-package suite: 563 passed, 4 skipped.
+build never touches it, that a missing section stops the builder, and that no scratch path is left in it. B-27
+(2026-10-17) adds 39 cases to `lib/common_test.sh` (139: `DOWNLOAD_MBPS` 400 and `ATLAS_PULL_JOBS` 1 in the example,
+each sha256 tool's output format, the timed choice of `_sha256_pick` with stub tools, the fixed order, the
+`ATLAS_SHA256_TOOL` setting and the fall-back to `sha256sum`). Doc S56 (2026-10-17) adds `tests/test_evalrun.py`
+(58, synthetic fixtures only; the workbook cases need the `[eval]` extra, `pip install -e '.[eval]'`, and are skipped
+without it: the set schema, the private-path and root-only refusals, the ledger rows before any answer, a run through
+the Arbiter with no memory, router or ledger write outside its own rows, blinding, aggregation and escalation, the seat
+and promotion rules, and the workbook round trip; since the review fixes also the table's alpha, GLM keeping its seat
+at the bar, no unblinding while full grading is pending, a rule changed after the freeze refused, exact drafters, no
+control character, the per-domain calibration sample, the chat pipeline's cap for A, D and E, and a resumed run whose
+freeze row was archived), and extends `tests/test_phase3_loadtest.py` (111: the slower point with 64 tokens and one
+re-measure, `ignore_eos` on every timing request but the first at 512, the prefill floor, the placement lines in the
+pinned format strings, the review line and its to-do, the Apex named on the summary's review list, the Apex's V22
+deferral, the restated input to-dos, and V10a's timing request run in bash with curl stubbed),
+`tests/test_arbiter.py` (59: the D-16 profiles at 32,768, 28,672 and 40,960 tokens), `tests/test_engine_env.py` (52:
+`LLAMA_ATTN_ROT_DISABLE` refused), `tests/test_config.py` (the floors, the projections and the two removed keys) and
+`tests/test_api.py` (the Deep Think estimates recomputed from the token budgets, 5 swaps at the deep upper bound, the
+1,200 s slack). The package suite: 650 passed, 4 skipped.

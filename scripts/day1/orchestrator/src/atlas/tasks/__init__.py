@@ -184,7 +184,13 @@ def notify(
 
 
 DEFAULT_GENERATION_WAIT_S = 1800.0  # must equal atlas.api.DEFAULT_GENERATION_WAIT_S (ATLAS_GENERATION_WAIT_S)
-DEFAULT_TIMEOUT_SLACK_S = 900.0  # one generation on top of the slot wait
+# One generation on top of the slot wait. D-47 (approved 2026-10-17) raised it from 900 s: the longest single
+# generation is the deep tier's Apex synthesis (deep_think.py run_deep, max_tokens 3,072), and the engine swap runs
+# inside the slot (api.py _generation_lock). At the floors (decode 4 tok/s, prefill 40 tok/s at 8k; engines.json) a
+# 50-85 s swap, an 8k-token prefill and 3,072 tokens take about 1,017-1,052 s (INFERRED, research_notes/ATLAS open
+# inputs 2026-10-17/scripts/verify_calc.py), past 900 s; 1,200 s covers it. The default read timeout is therefore
+# 1,800 + 1,200 = 3,000 s (generation_timeout_s). Phase 3 measures the real rates (V10, T-06).
+DEFAULT_TIMEOUT_SLACK_S = 1200.0
 
 
 def generation_timeout_s(env: Mapping[str, str] | None = None) -> float:

@@ -231,6 +231,15 @@ check "load_env: WINDOWS_SHARE message" grep -q 'WINDOWS_SHARE must look like //
 ensure_kv "$ATLAS_ETC/atlas.env" WINDOWS_SHARE '"//host/share"'
 ( ATLAS_ASK_ANSWER="" load_env ) >"$TMP/load_env.out" 2>&1; rc=$?
 check "load_env: well-formed keys load cleanly" test "$rc" -eq 0
+# B-27 (2026-10-17): the planning figure is 400 Mbit/s in the example and in load_env's default; one shard at a time.
+( unset DOWNLOAD_MBPS; ATLAS_ASK_ANSWER="" load_env >/dev/null 2>&1; [ "$DOWNLOAD_MBPS" = 400 ] ); rc=$?
+check "load_env: DOWNLOAD_MBPS from the installed example is 400 (B-27)" test "$rc" -eq 0
+ensure_kv "$ATLAS_ETC/atlas.env" DOWNLOAD_MBPS ''
+( unset DOWNLOAD_MBPS; ATLAS_ASK_ANSWER="" load_env >/dev/null 2>&1; [ "$DOWNLOAD_MBPS" = 400 ] ); rc=$?
+check "load_env: a blank DOWNLOAD_MBPS defaults to 400 (B-27)" test "$rc" -eq 0
+check "atlas.env.example: DOWNLOAD_MBPS=400" \
+  grep -qx 'DOWNLOAD_MBPS=400' "$ATLAS_DAY1_DIR/config/atlas.env.example"
+check "atlas.env.example: ATLAS_PULL_JOBS=1 (the Day 1 pull one file at a time)" grep -qx 'ATLAS_PULL_JOBS=1' "$ATLAS_DAY1_DIR/config/atlas.env.example"
 
 ( ATLAS_TEST_SECURE_BOOT=bogus _atlas_secure_boot_enabled ); rc_real=$?
 ( _atlas_secure_boot_enabled ); rc_plain=$?
@@ -289,6 +298,88 @@ for m in nolib one two none; do
   esac
 done
 unset -f systemd-cryptenroll
+
+# --- sha256 tool choice (B-27): each tool's output format, the timed choice, the fixed order, the fallback -------------
+not() { ! "$@"; }
+SHA_ABC=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad   # sha256("abc"), FIPS 180-2 example
+parse_is() { [[ "$(_sha256_parse "$1" "$2")" == "$3" ]]; }
+check "_sha256_parse: sha256sum on stdin ('HEX  -')" parse_is sha256sum "$SHA_ABC  -" "$SHA_ABC"
+check "_sha256_parse: gnusha256sum with a name ('HEX  NAME')" parse_is gnusha256sum "$SHA_ABC  /srv/atlas/models/x.gguf" "$SHA_ABC"
+check "_sha256_parse: GNU escaped name ('\\HEX  NAME')" parse_is sha256sum "\\$SHA_ABC  a\\nb" "$SHA_ABC"
+check "_sha256_parse: upper-case hex is lowered" parse_is sha256sum "${SHA_ABC^^}  -" "$SHA_ABC"
+check "_sha256_parse: openssl 3 ('SHA2-256(stdin)= HEX')" parse_is openssl "SHA2-256(stdin)= $SHA_ABC" "$SHA_ABC"
+check "_sha256_parse: openssl 1.1 ('SHA256(stdin)= HEX')" parse_is openssl "SHA256(stdin)= $SHA_ABC" "$SHA_ABC"
+check "_sha256_parse: openssl 1.1 ('(stdin)= HEX')" parse_is openssl "(stdin)= $SHA_ABC" "$SHA_ABC"
+check "_sha256_parse: only the first line counts" parse_is openssl "SHA2-256(stdin)= $SHA_ABC"$'\nnoise' "$SHA_ABC"
+check "_sha256_parse: an openssl error line is no digest" not _sha256_parse openssl "Error setting digest"
+check "_sha256_parse: a short hex is no digest" not _sha256_parse sha256sum "abc123  -"
+check "_sha256_parse: a sum-style line is not read as openssl output" not _sha256_parse openssl "$SHA_ABC  -"
+check "_sha256_parse: an unknown tool is refused" not _sha256_parse md5sum "$SHA_ABC  -"
+printf 'abc' >"$TMP/abc"
+for t in sha256sum gnusha256sum openssl; do
+  if command -v "$t" >/dev/null 2>&1; then
+    check "_sha256_run: the real $t gives sha256(\"abc\")" test "$(_sha256_run "$t" "$TMP/abc")" = "$SHA_ABC"
+  fi
+done
+# The choice, with stub tools on a PATH that holds only what _sha256_pick and log need (so no real tool is found).
+shabin="$TMP/shabin"; mkdir -p "$shabin"
+for b in mktemp head rm cat sleep date mkdir dirname; do ln -sf "$(command -v "$b")" "$shabin/$b"; done
+_stub_tool() {  # NAME DELAY DIGEST STYLE — read stdin, wait, print DIGEST in the tool's own format; log the call
+  echo "$1" >>"$TMP/sha_calls"; cat >/dev/null; sleep "$2"
+  if [[ "$4" == openssl ]]; then printf 'SHA2-256(stdin)= %s\n' "$3"; else printf '%s  -\n' "$3"; fi
+}
+# shellcheck disable=SC2329  # the stub functions stand in for the tools _sha256_pick runs by name
+pick() {  # TOOLS... — run _sha256_pick afresh with only these stubs installed; print the choice, keep the log line
+  ( unset -f openssl gnusha256sum sha256sum
+    for t in "$@"; do
+      case "$t" in
+        openssl) openssl() { [[ "$1 $2" == "dgst -sha256" ]] || return 1; _stub_tool openssl "${D_OPENSSL:-0}" "${G_OPENSSL:-$_ATLAS_SHA256_PROBE_SHA}" openssl; } ;;
+        gnusha256sum) gnusha256sum() { _stub_tool gnusha256sum "${D_GNU:-0}" "${G_GNU:-$_ATLAS_SHA256_PROBE_SHA}" sum; } ;;
+        sha256sum) sha256sum() { _stub_tool sha256sum "${D_SUM:-0}" "${G_SUM:-$_ATLAS_SHA256_PROBE_SHA}" sum; } ;;
+      esac
+    done
+    PATH="$shabin" _ATLAS_SHA256_TOOL=""
+    _sha256_pick >"$TMP/pick.out" 2>&1
+    printf '%s\n' "$_ATLAS_SHA256_TOOL" )
+}
+: >"$TMP/sha_calls"
+check "_sha256_pick: the fastest of the three on the probe (gnusha256sum)" \
+  test "$(D_OPENSSL=0.6 D_GNU=0 D_SUM=0.3 TMPDIR="$TMP" pick openssl gnusha256sum sha256sum)" = gnusha256sum
+check "_sha256_pick: each candidate timed once" test "$(sort "$TMP/sha_calls" | tr '\n' ' ')" = "gnusha256sum openssl sha256sum "
+check "_sha256_pick: the log names every timing" grep -q 'sha256: gnusha256sum for this run (64 MiB probe: openssl [0-9]* ms, gnusha256sum [0-9]* ms, sha256sum [0-9]* ms)' "$TMP/pick.out"
+check "_sha256_pick: a tool printing a wrong digest is never chosen" \
+  test "$(G_OPENSSL=$SHA_ABC D_OPENSSL=0 D_SUM=0.2 D_GNU=0.5 TMPDIR="$TMP" pick openssl gnusha256sum sha256sum)" = sha256sum
+check "_sha256_pick: ... and the log says so" grep -q 'openssl gave no correct digest' "$TMP/pick.out"
+check "_sha256_pick: no candidate with the right digest -> sha256sum" \
+  test "$(G_OPENSSL=$SHA_ABC G_SUM=$SHA_ABC TMPDIR="$TMP" pick openssl sha256sum)" = sha256sum
+check "_sha256_pick: ... logged" grep -q 'no candidate gave the known digest' "$TMP/pick.out"
+check "_sha256_pick: only sha256sum installed -> sha256sum" test "$(TMPDIR="$TMP" pick sha256sum)" = sha256sum
+: >"$TMP/sha_calls"
+check "_sha256_pick: ATLAS_SHA256_TOOL names the tool, no timing" \
+  test "$(ATLAS_SHA256_TOOL=sha256sum TMPDIR="$TMP" pick openssl sha256sum)" = sha256sum
+check "_sha256_pick: ... no candidate was run" test ! -s "$TMP/sha_calls"
+check "_sha256_pick: an uninstalled ATLAS_SHA256_TOOL warns and times instead" \
+  test "$(ATLAS_SHA256_TOOL=gnusha256sum D_SUM=0.3 TMPDIR="$TMP" pick openssl sha256sum)" = openssl
+check "_sha256_pick: ... with a warning" grep -q 'ATLAS_SHA256_TOOL=gnusha256sum is not an installed one' "$TMP/pick.out"
+check "_sha256_pick: no probe file possible -> the fixed order (openssl first)" \
+  test "$(TMPDIR="$TMP/no/such/dir" pick sha256sum gnusha256sum openssl)" = openssl
+check "_sha256_pick: ... gnusha256sum before sha256sum" test "$(TMPDIR="$TMP/no/such/dir" pick sha256sum gnusha256sum)" = gnusha256sum
+check "_sha256_pick: ... logged as the fixed order" grep -q 'no probe file in .*, fixed order' "$TMP/pick.out"
+check "_sha256_pick: the probe file is removed" test -z "$(find "$TMP" -maxdepth 1 -name 'atlas-sha256.*')"
+: >"$TMP/sha_calls"
+( unset -f openssl; openssl() { _stub_tool openssl 0 "$_ATLAS_SHA256_PROBE_SHA" openssl; }
+  TMPDIR="$TMP" _ATLAS_SHA256_TOOL=""; _sha256_pick >/dev/null 2>&1; _sha256_pick >/dev/null 2>&1; _sha256_pick >/dev/null 2>&1 )
+check "_sha256_pick: chooses once per run (a second call times nothing)" test "$(grep -c . "$TMP/sha_calls")" -eq 1
+# _sha256_of: the chosen tool, and sha256sum when the chosen one fails on the file.
+check "_sha256_of: nothing chosen -> sha256sum" test "$( _ATLAS_SHA256_TOOL=""; _sha256_of "$TMP/abc")" = "$SHA_ABC"
+if command -v openssl >/dev/null 2>&1; then
+  check "_sha256_of: openssl chosen" test "$( _ATLAS_SHA256_TOOL=openssl; _sha256_of "$TMP/abc")" = "$SHA_ABC"
+fi
+# shellcheck disable=SC2329  # the stub openssl is run by _sha256_of by name
+check "_sha256_of: a chosen tool that fails falls back to sha256sum" \
+  test "$( openssl() { return 1; }; _ATLAS_SHA256_TOOL=openssl; _sha256_of "$TMP/abc")" = "$SHA_ABC"
+( _ATLAS_SHA256_TOOL=""; _sha256_of "$TMP/no-such-file" ) >/dev/null 2>&1; rc=$?
+check "_sha256_of: a missing file is an error, not an empty digest" test "$rc" -ne 0
 
 # --- summary ------------------------------------------------------------------------------------------------------------
 echo

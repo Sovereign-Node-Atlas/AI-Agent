@@ -27,10 +27,16 @@ the canonical set in `scripts/day1/CONVENTIONS.md` §8.
 - `projected_decode_tok_s` (with `projected_decode_source`) is recorded beside the measured rate.
   `decode_floor_tok_s` (D-33, D-47, approved 2026-10-17) is the seat's absolute decode floor, stated at 8k and judged
   on the slower of the 512 and 8k points: gpt-oss-120b 25, glm-5.3-flash 6, deepseek-v4-flash 4, router-qwen3.5-4b 20
-  tok/s. Only it fails V10; a review line at 70% of the projection raises a to-do. `prefill_floor_tok_s` is the
+  tok/s (the router's at V10a, on 128 tokens after a short prompt: it is not tested in Phase 3). Only it fails V10; a
+  review line at 70% of the projection raises a to-do (`decode-review`; `decode-review-router` for the router). `prefill_floor_tok_s` is the
   prefill floor at 8k: 200, 40 and 40 on the three seats, none for the router. A null or absent floor is record only
   (`_meta.decode_rule`). `expected_decode_tok_s` is null on every Day 1 entry, and the abliterated entry keeps its
   v0.3.5 band and carries no floor field.
+- `phased` entries are records no script reads (`_meta.phased_rule`). Since D-16 (approved 2026-10-17) the two
+  qwen3moe seats carry `kv_class` `q8_0`, `ctx_size` 32768 and `parallel` 1, the profile they will be appended with,
+  and Baichuan-M3 a `model_file_pattern` for its one `i1-Q5_K_S` file; the Qwen3-Coder-Next and EmbeddingGemma 2
+  entries left the list (D-19 (c), D-60 (b)), and no file in this directory names either planned key
+  (`tests/test_config.py` checks it).
 - `min_llama_cpp_tag` is the first build carrying the entry's architecture; an entry newer than v0.4.1's b10964 gets
   its own V22 row and is not covered by V25.
 - `ctx_size_coresident`, `parallel_coresident` and `ctx_size_f16_cap` are gone (S-22, S-42); an old key would be
@@ -39,6 +45,11 @@ the canonical set in `scripts/day1/CONVENTIONS.md` §8.
   one (D-26 (c)).
 - `phase4-engines.json` `_meta.residency_rule` (D-50 (a)): a Phase 4 load evicts the resident LLM seat, never runs
   beside it, and the companions stay. `sentinel-feeds.json` names the `llama-server@` units of the Day 1 companions.
+
+The phased evaluation runner (`atlas-admin eval`, `orchestrator/src/atlas/evalrun.py`; doc 6.2, 15.5, S56) reads no
+file in this directory beyond `engines.json`, `personas/` and the domain cards a set item names: its task sets are
+private JSONL files kept root-only under `/srv/atlas/data/eval` on the node, never in the repository (it refuses any
+path inside a git working tree).
 
 ## task-forces.json (Section 8.3, 8.4, 8.5)
 

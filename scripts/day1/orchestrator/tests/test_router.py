@@ -493,7 +493,7 @@ def test_classifier_task_weight_triggers_deep_think(config: AtlasConfig, ledger:
 
 def test_classifier_deep_is_capped_at_standard_without_explicit_acceptance(config: AtlasConfig,
                                                                            ledger: Ledger) -> None:
-    # D-43 (a), approved 2026-10-16: the swap-heavy deep tier (3-4 swaps between the large seats, 9.1) runs only on
+    # D-43 (a), approved 2026-10-16: the swap-heavy deep tier (3-5 swaps between the large seats, 9.1) runs only on
     # the Principal's explicit acceptance. The classifier's "deep" is run at standard in both of its branches: the
     # task-weight trigger and a [DEEP THINK: problem] that types no depth. Only [DEEP THINK:DEEP] reaches the Apex.
     typed = {"principal_typed": True}

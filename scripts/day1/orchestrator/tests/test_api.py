@@ -20,6 +20,7 @@ from atlas import vault as vault_mod
 from atlas.api import (
     ADMIN_TOKEN_HEADER,
     CHAT_TURN_TTL_HOURS,
+    DEEP_THINK_MINUTES,
     AppDeps,
     NoChannelSender,
     build_app,
@@ -564,6 +565,63 @@ def test_deep_think_quick_runs_through_the_engine(harness: dict[str, Any]) -> No
     assert harness["enqueued"] == []
 
 
+def test_deep_think_minutes_follow_the_token_budgets_at_the_projected_speeds() -> None:
+    """D-47 (approved 2026-10-17): the minutes the Principal is told come from deep_think.py's token budgets, half to
+    all of each, at engines.json's projected decode rates, plus 70 s per swap and the prefill allowance (the method of
+    research_notes/ATLAS open inputs 2026-10-17/scripts/d47_calc.py). Deep counts 4 swaps at the lower bound and 5 at
+    the upper: spending all of each budget means a refine on GLM in both rounds, so run_deep goes GLM -> DeepSeek ->
+    GLM -> DeepSeek -> GLM -> DeepSeek. A changed budget or projection fails here."""
+    import inspect
+
+    from atlas import deep_think
+
+    def default(fn: Any, name: str) -> int:
+        return int(inspect.signature(fn).parameters[name].default)
+
+    engines = {e["key"]: e for e in json.loads(
+        (Path(__file__).resolve().parents[2] / "config" / "engines.json").read_text(encoding="utf-8"))["engines"]}
+    glm_lo, glm_hi = engines[deep_think.GENERATOR_ENGINE]["projected_decode_tok_s"]
+    ds = engines[deep_think.SYNTHESIS_ENGINE]["projected_decode_tok_s"][0]
+    assert deep_think.ADVERSARY_ENGINE == deep_think.SYNTHESIS_ENGINE == "deepseek-v4-flash"
+    n, score = deep_think.N_TRAJECTORIES, default(deep_think.score_trajectories, "max_tokens")
+    std, deep = default(deep_think.run_standard, "max_tokens"), default(deep_think.run_deep, "max_tokens")
+    assert (n, score, std, deep) == (3, 1024, 2048, 3072)
+    tiers = {"standard": ((n + 1) * std, n * score, (2, 2), 120),
+             "deep": (2 * (n + 1) * deep, 2 * n * score + deep, (4, 5), 300)}
+    for tier, (glm_tok, ds_tok, (swaps_lo, swaps_hi), prefill_s) in tiers.items():
+        def minutes(frac: float, glm: float, swaps: int, glm_tok: int = glm_tok, ds_tok: int = ds_tok,
+                    prefill_s: int = prefill_s) -> float:
+            return (glm_tok * frac / glm + ds_tok * frac / ds + swaps * 70 + prefill_s) / 60
+        assert DEEP_THINK_MINUTES[tier] == (f"{round(minutes(0.5, glm_hi, swaps_lo))} to "
+                                            f"{round(minutes(1.0, glm_lo, swaps_hi))}")
+    assert ds == 6.8  # the low end of DeepSeek's 6.8-7.2 (D-47 evidence; single_engine_performance.md:88)
+    assert DEEP_THINK_MINUTES == {"standard": "13 to 23", "deep": "36 to 66"}
+
+
+def test_generation_timeout_covers_a_floor_speed_synthesis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D-47 (approved 2026-10-17): DEFAULT_TIMEOUT_SLACK_S, one generation on top of the slot wait, is 1,200 s, so the
+    Apex synthesis at both floors (decode 4, prefill 40 tok/s; engines.json) with an 85 s swap and an 8k prompt, about
+    1,050 s, fits; the client's read timeout is the slot wait plus that slack (3,000 s by default)."""
+    from atlas import api as api_mod
+    from atlas import deep_think
+    from atlas import tasks as tasks_mod
+
+    assert tasks_mod.DEFAULT_TIMEOUT_SLACK_S == 1200.0
+    assert tasks_mod.DEFAULT_GENERATION_WAIT_S == api_mod.DEFAULT_GENERATION_WAIT_S == 1800.0
+    assert tasks_mod.generation_timeout_s({}) == 3000.0
+    assert tasks_mod.generation_timeout_s({"ATLAS_GENERATION_WAIT_S": "600"}) == 1800.0
+    apex = next(e for e in json.loads((Path(__file__).resolve().parents[2] / "config" / "engines.json").read_text(
+        encoding="utf-8"))["engines"] if e["key"] == deep_think.SYNTHESIS_ENGINE)
+    synthesis_s = 85 + 8192 / apex["prefill_floor_tok_s"] + 3072 / apex["decode_floor_tok_s"]
+    assert 900.0 < synthesis_s < tasks_mod.DEFAULT_TIMEOUT_SLACK_S  # past the old 900 s, inside the new slack
+    monkeypatch.delenv("ATLAS_GENERATION_WAIT_S", raising=False)
+    client = tasks_mod.OrchestratorClient(base_url="http://127.0.0.1:9")
+    try:
+        assert client.timeout_s == 3000.0 and client._http.timeout.read == 3000.0
+    finally:
+        client.close()
+
+
 def test_deep_think_standard_goes_to_the_gpu_queue_and_the_interface_returns(harness: dict[str, Any]) -> None:
     """9.7: long work runs under Celery and "the chat interface returns to the Principal immediately"; 9.1: nothing is
     hard-capped. Standard/deep are enqueued as atlas.tasks.deep_think; the reply names the task and where the answer
@@ -576,6 +634,7 @@ def test_deep_think_standard_goes_to_the_gpu_queue_and_the_interface_returns(har
     assert head["deep_think_task_id"] == "celery-task-1"
     text = r.json()["choices"][0]["message"]["content"]
     assert "celery-task-1" in text and "ledger" in text
+    assert "it takes about 13 to 23 minutes (an estimate from projected speeds)" in text  # D-47, not "5 to 8"
     assert harness["llama"].made == []  # nothing generated inline
     name, kw = harness["enqueued"][-1]
     assert name == "atlas.tasks.deep_think"
