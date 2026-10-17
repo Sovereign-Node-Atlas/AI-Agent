@@ -79,7 +79,10 @@ Sourced by `load_env`. Keys (all with sane defaults or auto-detection in `config
 auto-detected as the largest unmounted NVMe), `CLOUDFLARE_TXT` (default `/home/$PRINCIPAL_USER/CLOUDFLARE.txt`),
 `GOOGLE_ACCOUNTS` (two emails, space-separated, each tagged `corporate` or `estate` as `email:tag`),
 `WINDOWS_SHARE` (`//host/share`), `NTFY_TOPIC=atlas`, `OPENWEBUI_PORT=3000`, `ORCH_PORT=8800`,
-`LLAMA_PORT_BASE=8100` (engine N listens on 8100+N), `HF_ENDPOINT` (unset), `DOWNLOAD_MBPS=100`.
+`LLAMA_PORT_BASE=8100` (engine N listens on 8100+N), `HF_ENDPOINT` (unset), `DOWNLOAD_MBPS=400` (a planning figure,
+not a rate limit: 2,000 Mbps line, 400 = the single-stream pull as written, replaced by the measured Mbit/s; B-27),
+`ATLAS_PULL_JOBS=1` (shard downloads `pull_engine_files` runs at once, 1 to 8; 4 for the phased pull after a short
+test on the node, B-27).
 `ATLAS_SSH_PASSWORD_AUTH` (blank; pre-flight writes `keep` itself when the Principal gave no SSH public key at its
 prompt, so password SSH stays on until the key is added, to-do `ssh-key`), `RDP_ALLOW_FROM` (blank = the whole LAN
 subnet may reach xrdp; IPv4 addresses or CIDRs inside `LAN_CIDR` narrow the LAN side of port 3389 to the Principal's
@@ -209,7 +212,8 @@ companions: `router-qwen3.5-4b` (classification only, P-10), `embed-qwen3-4b`, `
 port 0): `chatterbox`. Retired in v0.4.0 and absent from `engines[]` and from every persona, route and preset (one that
 still names one is refused as an unknown key): `qwen3.5-122b`, `qwen2.5-vl-72b`, `meditron-70b`, `embed-bge-m3`,
 `rerank-bge-v2-m3`; `nemotron-3-super` leaves `engines[]` and is recorded as a phased `planned_key`. The phased engines are recorded in `engines.json` `phased`
-under `planned_key` only (`qwen3.8-flash-next`, `nemotron-3-super`, `intern-s1`, `ling-3.0-flash-fin`, `baichuan-m3-235b`, `qwen3-coder-next`, `embeddinggemma-2`);
+under `planned_key` only (`qwen3.8-flash-next`, `nemotron-3-super`, `intern-s1`, `ling-3.0-flash-fin`, `baichuan-m3-235b`;
+`qwen3-coder-next` and `embeddinggemma-2` left the list on 2026-10-17 under D-19 (c) and D-60 (b));
 no persona, route or preset names one until it is appended to `engines[]` after index 7 at its pull. Router routes:
 `ren`, `arthur`, `arthur-long` (v0.3.5's `arthur-qwen`, now refused), `ren-abliterated`, `arthur-abliterated`,
 `deep-think:deep`. KV classes: `f16` (glm-5.3-flash, deepseek-v4-flash; D-29 (a); DeepSeek's ladder is f16 then

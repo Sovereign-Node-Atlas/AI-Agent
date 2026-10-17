@@ -300,6 +300,8 @@ hf_download_public() {
 
 # pull_engine_files KEY — resolve the file list (literal files[] or enumerate_pattern), fetch lfs.oid/size from the tree,
 # download each with hf_download into $ATLAS_SRV/models/KEY/, check the byte size, join raw splits, write MANIFEST.json.
+# ATLAS_PULL_JOBS (atlas.env, 1 to 8, default 1) files download at once (B-27); it needs lib/common.sh's _sha256_pick
+# when above 1, and pgrep (procps) to stop the running jobs on INT or TERM.
 pull_engine_files() {
   local key="$1"
   local repo subdir pattern join_into dest_dir
@@ -345,7 +347,10 @@ PY
     done < <(ej "$key" files)
   fi
 
-  local manifest_entries=() w path research_sha research_verify bytes oid dest base have_size
+  # Plan first (B-27): every wanted file's size and oid from the tree, and every pin check, before any byte of this
+  # engine moves, whether its files then come one at a time or several at once.
+  # plan: "fetch|joined<TAB>path<TAB>bytes<TAB>oid" in wanted order (the manifest keeps that order).
+  local plan=() w path research_sha research_verify bytes oid dest base have_size kind
   for w in "${wanted[@]}"; do
     IFS=$'\t' read -r path research_sha research_verify <<<"$w"
     bytes=""; oid=""
@@ -372,16 +377,105 @@ PY
     dest="$dest_dir/$base"
     if [[ -n "$join_into" && -f "$dest_dir/$join_into" && ! -f "$dest" ]]; then
       log "pull_engine_files: $base already consumed into $join_into; skipping"
-      manifest_entries+=("$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "bytes": int(sys.argv[2]), "sha256": sys.argv[3], "joined": True}))' "$base" "$bytes" "$oid")")
+      plan+=("joined"$'\t'"$path"$'\t'"$bytes"$'\t'"$oid")
       continue
     fi
-    hf_download_public "$repo" "$path" "$dest" "$oid"
-    have_size="$(stat -c %s "$dest")"
-    if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 && "$have_size" != "$bytes" ]]; then
-      die "pull_engine_files: $dest is $have_size bytes, tree API says $bytes"
+    plan+=("fetch"$'\t'"$path"$'\t'"$bytes"$'\t'"$oid")
+  done
+
+  # _pef_fetch PATH BYTES OID — one file: hf_download_public (its own .part, curl -C - resume, sha256), then the size
+  # check. Defined in here so phase3-models.sh's `declare -f pull_engine_files` carries it (no new extracted name).
+  _pef_fetch() {
+    local p="$1" n="$2" o="$3" d="$dest_dir/${1##*/}" got
+    hf_download_public "$repo" "$p" "$d" "$o"
+    got="$(stat -c %s "$d")"
+    if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 && "$got" != "$n" ]]; then
+      die "pull_engine_files: $d is $got bytes, tree API says $n"
     fi
-    chown atlas:atlas "$dest" "$dest.sha256" 2>/dev/null || true
-    manifest_entries+=("$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "bytes": int(sys.argv[2]), "sha256": sys.argv[3]}))' "$base" "$have_size" "$oid")")
+    chown atlas:atlas "$d" "$d.sha256" 2>/dev/null || true
+  }
+  # Downloads (B-27): up to ATLAS_PULL_JOBS files at once (atlas.env), each its own curl through the proxy. 1, the
+  # default, is the Day 1 pull as written: one file after another in this shell, and the first failure stops it.
+  local jobs="${ATLAS_PULL_JOBS:-1}" fetch=()
+  [[ "$jobs" =~ ^[1-8]$ ]] || die "pull_engine_files: ATLAS_PULL_JOBS must be a whole number from 1 to 8, got '$jobs' (atlas.env)"
+  for w in "${plan[@]}"; do
+    if [[ "${w%%$'\t'*}" == fetch ]]; then fetch+=("${w#*$'\t'}"); fi
+  done
+  if (( jobs == 1 || ${#fetch[@]} < 2 )); then
+    for w in "${fetch[@]}"; do
+      IFS=$'\t' read -r path bytes oid <<<"$w"
+      _pef_fetch "$path" "$bytes" "$oid"
+    done
+  else
+    # Several at once, each a background job. A failed job stops new ones from starting; the running ones finish (their
+    # bytes are kept), then the pull dies naming every failed file, and a re-run resumes from the .part files. INT and
+    # TERM end the running jobs and their curl first (a script's background jobs ignore SIGINT, so a Ctrl-C would
+    # leave them writing), then the caller's own traps are put back and the signal raised again for them.
+    _sha256_pick   # once, before the jobs start, so every job inherits the choice
+    log "pull_engine_files: $key: ${#fetch[@]} files, up to $jobs at once (ATLAS_PULL_JOBS)"
+    local -A _pef_running=()
+    local failed=() next=0 pid rc reaped _pef_traps
+    _pef_traps="$(trap -p INT TERM)"
+    # shellcheck disable=SC2329  # invoked by _pef_stop, which the INT/TERM traps below invoke
+    _pef_killtree() {  # PID — TERM to PID and every descendant, collected first so none is re-parented out of reach
+      local all=("$1") i=0 c
+      while (( i < ${#all[@]} )); do
+        while read -r c; do if [[ -n "$c" ]]; then all+=("$c"); fi; done < <(pgrep -P "${all[i]}" 2>/dev/null || true)
+        i=$(( i + 1 ))
+      done
+      kill -TERM "${all[@]}" 2>/dev/null || true
+    }
+    # shellcheck disable=SC2329  # invoked through the INT/TERM traps below
+    _pef_stop() {  # SIGNAL
+      local p
+      for p in "${!_pef_running[@]}"; do _pef_killtree "$p"; done
+      trap - INT TERM
+      eval "$_pef_traps"
+      kill -s "$1" "$BASHPID"
+    }
+    trap '_pef_stop INT' INT
+    trap '_pef_stop TERM' TERM
+    while (( next < ${#fetch[@]} || ${#_pef_running[@]} > 0 )); do
+      if (( next < ${#fetch[@]} && ${#failed[@]} == 0 && ${#_pef_running[@]} < jobs )); then
+        IFS=$'\t' read -r path bytes oid <<<"${fetch[next]}"
+        _pef_fetch "$path" "$bytes" "$oid" &
+        _pef_running[$!]="${path##*/}"
+        next=$(( next + 1 ))
+        continue
+      fi
+      (( ${#_pef_running[@]} > 0 )) || break   # a failure with nothing left running
+      # Reap by pid: `wait PID` returns a finished job's status even after bash has reaped it, which `wait -n` with
+      # ids does not (bash 5.2 answers "no such job"); jobs still running are looked at again half a second later.
+      reaped=0
+      for pid in "${!_pef_running[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then continue; fi
+        rc=0; wait "$pid" || rc=$?
+        reaped=1
+        if (( rc != 0 )); then
+          failed+=("${_pef_running[$pid]} (exit $rc)")
+          if (( ${#_pef_running[@]} > 1 )); then
+            warn "pull_engine_files: $key: ${_pef_running[$pid]} failed (exit $rc); starting no more downloads, waiting for the $(( ${#_pef_running[@]} - 1 )) still running"
+          fi
+        fi
+        unset "_pef_running[$pid]"
+      done
+      (( reaped )) || sleep 0.5
+    done
+    trap - INT TERM
+    eval "$_pef_traps"
+    (( ${#failed[@]} == 0 )) || die "pull_engine_files: $key: ${#failed[@]} of ${#fetch[@]} downloads failed: ${failed[*]}. Each reason is logged above; every other file is complete or kept as a .part file. Re-run to resume"
+  fi
+
+  local manifest_entries=()
+  for w in "${plan[@]}"; do
+    IFS=$'\t' read -r kind path bytes oid <<<"$w"
+    base="${path##*/}"
+    if [[ "$kind" == joined ]]; then
+      manifest_entries+=("$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "bytes": int(sys.argv[2]), "sha256": sys.argv[3], "joined": True}))' "$base" "$bytes" "$oid")")
+    else
+      have_size="$(stat -c %s "$dest_dir/$base")"
+      manifest_entries+=("$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "bytes": int(sys.argv[2]), "sha256": sys.argv[3]}))' "$base" "$have_size" "$oid")")
+    fi
   done
 
   if [[ -n "$join_into" ]]; then

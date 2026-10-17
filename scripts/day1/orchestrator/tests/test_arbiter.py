@@ -25,6 +25,8 @@ from atlas.arbiter import (
     DEFAULT_COMPANION_COMPUTE_BUFFER_GIB,
     DEFAULT_COMPUTE_BUFFER_GIB,
     GIB,
+    KV_BYTES_PER_TOKEN_F16,
+    KV_CLASS_FACTOR,
     MAX_REQUEST_SPECS,
     MAX_RESIDENT,
     Arbiter,
@@ -45,7 +47,7 @@ from atlas.arbiter import (
     process_rss_bytes,
     read_unit_profile,
 )
-from atlas.config import ConfigError, EngineSpec, load_engines, load_phase4_engines
+from atlas.config import KV_CLASSES, ConfigError, EngineSpec, load_engines, load_phase4_engines
 from atlas.engines import EngineControlError, EngineError, StubController
 from atlas.ledger import Ledger
 
@@ -187,6 +189,55 @@ def test_each_day1_seat_fits_alone_and_no_two_seats_fit_together(engines: dict[s
     assert seats[APEX_KEY] + seats["gpt-oss-120b"] > arb.budget_bytes
     # D-31: before v0.4.0 the 161.87 GB DeepSeek file was read as 161.87 GiB and refused at this budget.
     assert engines[APEX_KEY].footprint_gb * GIB > arb.budget_bytes > engines[APEX_KEY].footprint_bytes
+
+
+REAL_ENGINES_JSON = Path(__file__).resolve().parents[2] / "config" / "engines.json"
+
+
+def test_phased_d16_seats_project_with_a_q8_0_cache_and_one_32k_slot() -> None:
+    """D-16 (approved 2026-10-17): Intern-S1 and Baichuan-M3 (mradermacher's i1 file) are recorded in engines.json
+    `phased` with kv_class q8_0, ctx_size 32,768 and parallel 1, text only. The Arbiter accepts the class
+    (config.KV_CLASSES, KV_CLASS_FACTOR 8.5/16) and charges the seat's own f16 figure from engines.json
+    (192,512 B/token, no table row), so 102,272 B/token and 3.12 GiB at 32,768. Under the 2 GiB compute allowance the
+    projections are 155.96 and 155.88 GiB; 28,672 tokens is the fallback (155.57 / 155.49) and the native 40,960 the
+    upgrade (156.74 / 156.67), the figures of research_notes/ATLAS open inputs 2026-10-17/recommendations.json D-16."""
+    if not REAL_ENGINES_JSON.is_file():
+        pytest.skip("the real config/engines.json is not beside this checkout")
+    phased = {x["planned_key"]: x for x in json.loads(REAL_ENGINES_JSON.read_text(encoding="utf-8"))["phased"]}
+    want = {  # key: (bytes, {ctx: GiB})
+        "intern-s1": (161_963_285_952, {28_672: 155.57, 32_768: 155.96, 40_960: 156.74}),
+        "baichuan-m3-235b": (161_881_426_496, {28_672: 155.49, 32_768: 155.88, 40_960: 156.67}),
+    }
+    specs: dict[str, EngineSpec] = {}
+    for key, (size, _) in want.items():
+        entry = phased[key]
+        assert (entry["kv_class"], entry["ctx_size"], entry["parallel"]) == ("q8_0", 32_768, 1), key
+        assert entry["bytes"] == size and entry["kv_bytes_per_token_f16"] == 192_512 and "mmproj" not in entry, key
+        assert entry["kv_class"] in KV_CLASSES and KV_CLASS_FACTOR[entry["kv_class"]] == 8.5 / 16
+        assert key not in KV_BYTES_PER_TOKEN_F16  # a phased engine brings its own figure (arbiter.py table comment)
+        specs[key] = EngineSpec(key=key, mode="chat", arbiter_class="core", kv_class=entry["kv_class"],
+                                files=[{"name": f"{key}.gguf", "bytes": entry["bytes"]}],
+                                footprint_gb=entry["bytes"] / 1e9, ctx_size=entry["ctx_size"],
+                                parallel=entry["parallel"], kv_bytes_per_token_f16=entry["kv_bytes_per_token_f16"])
+        assert kv_estimate_bytes(specs[key], 32_768, 1) == 102_272 * 32_768
+        assert kv_state_bytes(specs[key], 1) == 0  # qwen3moe: no recurrent or sliding-window state
+    assert phased["baichuan-m3-235b"]["hf_repo"] == "mradermacher/Baichuan-M3-235B-i1-GGUF"
+    assert phased["baichuan-m3-235b"]["model_file_pattern"] == "Baichuan-M3-235B.i1-Q5_K_S.gguf"
+    arb, _, _, _ = make(specs, budget_gib=156.0)
+    for key, (_, by_ctx) in want.items():
+        fp = arb.projected_footprint(key)
+        assert (fp.ctx, fp.parallel, fp.kv_class, fp.kv_bytes) == (32_768, 1, "q8_0", 102_272 * 32_768)
+        for ctx, gib in by_ctx.items():
+            assert round(arb.projected_footprint(key, ctx, 1).total_bytes / GIB, 2) == gib, (key, ctx)
+        # At the ~156 GiB budget of Section 4.1 the 32K profile fits; f16 at 32K would not (the old 23K default).
+        assert arb.projected_footprint(key).total_bytes <= arb.budget_bytes
+        assert arb.projected_footprint(key, 32_768, 1, "f16").total_bytes > arb.budget_bytes
+    d = arb.request_load("intern-s1", task_id="t-d16")
+    assert d.decision is Decision.GRANTED, d.reason
+    # The thin margin the recommendation names: at a 155.9 GiB budget Intern-S1 is refused at 32K, Baichuan is not.
+    tight, _, _, _ = make(specs, budget_gib=155.9)
+    assert tight.request_load("intern-s1", task_id="t-d16-tight").decision is Decision.REFUSED
+    assert tight.request_load("baichuan-m3-235b", task_id="t-d16-tight").decision is Decision.GRANTED
 
 
 # --- rule 2: refusal of an over-budget load ----------------------------------------------------------------------

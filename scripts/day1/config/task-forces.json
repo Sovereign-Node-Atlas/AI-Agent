@@ -194,7 +194,7 @@
       ],
       "relay": [],
       "triggers": ["devops", "deploy", "deployment", "server", "docker", "kubernetes", "ci/cd", "pipeline", "infrastructure", "source code", "repository", "software release"],
-      "notes": "v0.4.0 (S-29, D-37): no engine field on Day 1, so the dispatch runs on Valerie's default engine, which this revision leaves unchanged. Phased: Qwen3-Coder-Next, the dedicated coder seat if the Principal wants one (D-19, P-16), becomes this preset's engine field and a Valerie override when it is pulled."
+      "notes": "v0.4.0 (S-29, D-37): no engine field on Day 1, so the dispatch runs on Valerie's default engine, which this revision leaves unchanged. D-19 (c), approved by the Principal on 2026-10-17: no dedicated coder seat, so Qwen3-Coder-Next is not pulled, and GLM-5.3-Flash is the default coding engine (provisional until the T-03 coding set; deepseek-v4-flash if GLM loses it). This preset still has no engine field: setting one would change the engine Valerie's preset runs on, which needs the Principal's explicit yes."
     },
     {
       "code": "TF_NU",

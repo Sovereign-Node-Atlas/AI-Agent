@@ -68,6 +68,10 @@ tools and their runtime (exec_shell_command, write_file, docker:/ssh: runtimes),
 --media-path, --log-prompts-dir, --video-ffmpeg-dir, the grammar and JSON-schema files and the lookup caches. The env
 names are the real LLAMA_ARG_* names at b11474; names that exist at neither pin stay listed defensively. The prompt-cache
 cap (--cache-ram, -cram, LLAMA_ARG_CACHE_RAM) is reserved too: it is cache_ram_mib's alone (docstring "Prompt cache").
+D-16 (approved 2026-10-17) adds one process variable, refused as an env key and inside any extra_args token
+(RESERVED_PROCESS_ENV): LLAMA_ATTN_ROT_DISABLE, which turns off the Hadamard rotation of every quantised KV cache at
+b11474 (src/llama-kv-cache.cpp:315-318, VERIFIED). A quantised cache without the rotation is the dangerous case; the
+load log's n_rot_k and n_rot_v lines are the second check (engines.json phased notes for Intern-S1 and Baichuan-M3).
 
 A model file that is not present yet is rendered with ATLAS_MODEL_PRESENT=0, ATLAS_MODEL_FILE set to the directory plus
 the FIRST pattern (systemd does not glob, so the unit fails with llama.cpp's own "failed to load model") and
@@ -122,6 +126,12 @@ RESERVED_ENV = {
     "LLAMA_ARG_HF_TOKEN", "LLAMA_ARG_API_KEY", "LLAMA_ARG_WEBUI", "LLAMA_ARG_MODEL_DRAFT", "LLAMA_ARG_SLOT_SAVE_PATH",
     "LLAMA_ARG_LORA", "LLAMA_ARG_CONTROL_VECTOR",
 }
+# Process variables llama.cpp reads with getenv() outside the LLAMA_ARG_* set, refused by name in "env" (with their own
+# message, before the LLAMA_ARG_* rule) and inside any extra_args token (docstring "Hardening"). D-16 (approved
+# 2026-10-17): LLAMA_ATTN_ROT_DISABLE=<non-zero> turns off the Hadamard rotation of every quantised KV cache at b11474
+# (src/llama-kv-cache.cpp:315-318, VERIFIED), and a quantised cache without the rotation is the dangerous case. The
+# mirror is engines.json _meta env_rule.
+RESERVED_PROCESS_ENV = {"LLAMA_ATTN_ROT_DISABLE"}
 # The same options as command-line flags; never accepted from engines.json "extra_args" (also matched as --flag=value).
 RESERVED_FLAGS = {
     "--host", "--port", "-m", "--model", "-mu", "--model-url", "-hf", "-hfr", "--hf-repo", "-hfd", "-hfrd",
@@ -200,6 +210,9 @@ def env_lines(eng: dict[str, Any]) -> list[str]:
         die(f"{key}: env must be an object of LLAMA_ARG_* keys")
     lines: list[str] = []
     for name, value in extra.items():
+        if str(name) in RESERVED_PROCESS_ENV:
+            die(f"{key}: env key {name!r} is refused: it turns off the KV-cache rotation a quantised cache needs "
+                "(D-16; see docstring)")
         if not ENV_KEY_RE.match(str(name)):
             die(f"{key}: env key {name!r} is not an LLAMA_ARG_* variable")
         if str(name) in RESERVED_ENV:
@@ -211,6 +224,9 @@ def env_lines(eng: dict[str, Any]) -> list[str]:
 def check_extra_flag(token: str, key: str) -> str:
     """Refuse reserved flags in extra_args, in both `--flag value` and `--flag=value` spellings."""
     flag = token.split("=", 1)[0] if token.startswith("-") else token
+    if any(name in token for name in RESERVED_PROCESS_ENV):
+        die(f"{key}: extra_args may not name {token!r}: it turns off the KV-cache rotation a quantised cache needs "
+            "(D-16; see docstring)")
     if flag in RESERVED_FLAGS:
         die(f"{key}: extra_args may not carry {token!r} (bind, model source, remote offload, file-loading, slot path, "
             "key, UI, device or prompt-cache flag; see docstring)")

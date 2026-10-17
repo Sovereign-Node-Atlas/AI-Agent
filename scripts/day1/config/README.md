@@ -24,9 +24,13 @@ the canonical set in `scripts/day1/CONVENTIONS.md` §8.
   Phase 3 to-do `cache-ram` goes in this field.
 - `kv_class` admits `f16` (GLM and DeepSeek, D-29 (a)); `kv_ladder` on DeepSeek is `[f16, q8_0]`; `kv_proof_lines`
   is the number of KV lines V4 reads per load.
-- `projected_decode_tok_s` (with `projected_decode_source`) is recorded beside the measured rate; `decode_floor_tok_s`
-  stays null (record only, to-do `decode-floors`) until the Principal sets it (D-33 (c), D-47);
-  `expected_decode_tok_s` is null on every Day 1 entry, and the abliterated entry keeps its v0.3.5 band.
+- `projected_decode_tok_s` (with `projected_decode_source`) is recorded beside the measured rate.
+  `decode_floor_tok_s` (D-33, D-47, approved 2026-10-17) is the seat's absolute decode floor, stated at 8k and judged
+  on the slower of the 512 and 8k points: gpt-oss-120b 25, glm-5.3-flash 6, deepseek-v4-flash 4, router-qwen3.5-4b 20
+  tok/s. Only it fails V10; a review line at 70% of the projection raises a to-do. `prefill_floor_tok_s` is the
+  prefill floor at 8k: 200, 40 and 40 on the three seats, none for the router. A null or absent floor is record only
+  (`_meta.decode_rule`). `expected_decode_tok_s` is null on every Day 1 entry, and the abliterated entry keeps its
+  v0.3.5 band and carries no floor field.
 - `min_llama_cpp_tag` is the first build carrying the entry's architecture; an entry newer than v0.4.1's b10964 gets
   its own V22 row and is not covered by V25.
 - `ctx_size_coresident`, `parallel_coresident` and `ctx_size_f16_cap` are gone (S-22, S-42); an old key would be
@@ -50,7 +54,8 @@ the canonical set in `scripts/day1/CONVENTIONS.md` §8.
 - Extra keys beyond the brief: `hemisphere` (the 8.1 hemisphere tag on every task force) and, on TF_OMEGA only,
   `engine` (`deepseek-v4-flash`, the Apex engine, 5.1) and `trigger: "principal-only"`. `notes` (v0.4.0, S-29,
   D-37) names the phased engine a preset will carry once it is pulled (Ling-3.0-flash-Fin on TF_GAMMA, TF_DELTA and
-  TF_EPSILON, Qwen3-Coder-Next on TF_MU, Baichuan-M3 and Intern-S1 on TF_UPSILON); an `engine` field is set only
+  TF_EPSILON, Baichuan-M3 and Intern-S1 on TF_UPSILON); TF_MU has none, since D-19 (c) dropped Qwen3-Coder-Next
+  (GLM-5.3-Flash codes; TF_MU's engine field waits for the Principal's yes); an `engine` field is set only
   for a Day 1 engine, and it must be in the dispatching director's binding. Unknown keys must be ignored by the
   loader; these are informational.
 

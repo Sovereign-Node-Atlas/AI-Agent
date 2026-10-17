@@ -530,7 +530,7 @@ _p3_eta() {
 import sys
 b, mbps = int(sys.argv[1]), float(sys.argv[2])
 s = b * 8 / (mbps * 1e6) if mbps > 0 else 0
-print(f"{int(s // 3600)} h {int((s % 3600) // 60):02d} min at {mbps:g} Mbit/s")' "$1" "${DOWNLOAD_MBPS:-100}"
+print(f"{int(s // 3600)} h {int((s % 3600) // 60):02d} min at {mbps:g} Mbit/s")' "$1" "${DOWNLOAD_MBPS:-400}"
 }
 
 # _p3_write_manifest — the aggregate of every per-engine MANIFEST.json plus the resolved commit sha per engine.
@@ -676,7 +676,7 @@ PY
   if (( total > 0 && free < need )); then
     die "only $(_p3_human_gb "$free") free on $P3_MODELS_DIR, need about $(_p3_human_gb "$need") ($(_p3_human_gb "$total") to download plus 5 % headroom)"
   fi
-  log "plan: $(_p3_human_gb "$total") to download in total, expected $(_p3_eta "$total") (DOWNLOAD_MBPS=${DOWNLOAD_MBPS:-100}); $(_p3_human_gb "$free") free"
+  log "plan: $(_p3_human_gb "$total") to download in total, expected $(_p3_eta "$total") (DOWNLOAD_MBPS=${DOWNLOAD_MBPS:-400}); $(_p3_human_gb "$free") free"
 
   local done_bytes=0 t0 t1 after_sha
   for key in "${P3_KEYS[@]}"; do

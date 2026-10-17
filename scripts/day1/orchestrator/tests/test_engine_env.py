@@ -269,6 +269,35 @@ def test_refused_inputs(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
     assert exc.value.code == 1
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}},               # the switch itself
+        {"env": {"LLAMA_ATTN_ROT_DISABLE": "0"}},               # refused by name, whatever the value
+        {"extra_args": ["LLAMA_ATTN_ROT_DISABLE=1"]},           # named in a token
+        {"extra_args": ["--override-kv", "LLAMA_ATTN_ROT_DISABLE=1"]},
+    ],
+)
+def test_kv_rotation_switch_is_refused(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                                       tree: dict[str, Path], engines: list[dict[str, Any]], tmp_path: Path,
+                                       capsys: pytest.CaptureFixture[str], fields: dict[str, Any]) -> None:
+    """D-16 (approved 2026-10-17): LLAMA_ATTN_ROT_DISABLE turns off the Hadamard rotation of every quantised KV cache
+    at the pin (src/llama-kv-cache.cpp:315-318), and a quantised cache without it is the dangerous case. It is refused
+    with its own reason (not only as a non-LLAMA_ARG_* name), on the q8_0 router here as on any entry."""
+    bad = _write_engines(tmp_path, _mutated(engines, "router-qwen3.5-4b", **fields))
+    with pytest.raises(SystemExit) as exc:
+        _run(engine_env, monkeypatch, tree, engines_file=bad)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "LLAMA_ATTN_ROT_DISABLE" in err and "rotation" in err and "D-16" in err
+    # The real file renders, and no rendered env file nor the unit template sets the switch.
+    assert _run(engine_env, monkeypatch, tree) == 0
+    rendered = "".join(p.read_text(encoding="utf-8") for p in sorted(tree["out"].glob("*.env")))
+    assert rendered and "LLAMA_ATTN_ROT_DISABLE" not in rendered
+    unit = (DAY1 / "systemd" / "llama-server@.service").read_text(encoding="utf-8")
+    assert "LLAMA_ATTN_ROT_DISABLE" not in unit
+
+
 def test_kv_types_must_match_requires_a_cache_type(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
                                                    tree: dict[str, Path], engines: list[dict[str, Any]],
                                                    tmp_path: Path) -> None:
@@ -461,6 +490,11 @@ def test_reserved_lists_are_mirrored_in_engines_json_meta(engine_env: ModuleType
     assert sorted(set(engine_env.RESERVED_FLAGS) - flag_tokens) == []
     assert sorted(set(engine_env.RESERVED_ENV) - env_tokens) == []
     assert "UNVERIFIED against common/arg.cpp at v0.4.1" not in meta["env_rule"]  # re-read at b11474 (v0.4.0)
+    # D-16: the process variables refused by name are written out in env_rule, and extra_args_rule points to it.
+    assert engine_env.RESERVED_PROCESS_ENV == {"LLAMA_ATTN_ROT_DISABLE"}
+    process_tokens = set(re.findall(r"\bLLAMA_[A-Z0-9_]+\b", str(meta["env_rule"])))
+    assert sorted(set(engine_env.RESERVED_PROCESS_ENV) - process_tokens) == []
+    assert "RESERVED_PROCESS_ENV" in meta["env_rule"] and "LLAMA_ATTN_ROT_DISABLE" in meta["extra_args_rule"]
     # B-33: the prompt-cache rule states the defaults the script enforces and names the reserved spellings.
     rule = str(meta["cache_ram_rule"])
     assert "4096 for chat and vision, 0 for embedding and reranking" in rule

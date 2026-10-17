@@ -18,6 +18,8 @@
 #   ATLAS_DRY_RUN        "1" makes run_step print what it would do and run nothing (set by parse_common_args --dry-run)
 #   ATLAS_ENTRY          the repository path of atlas-day1.sh, used when printing "the exact next command"
 #   ATLAS_SVC_USER       service account for svc_user_run (default: atlas)
+#   ATLAS_SHA256_TOOL    openssl, gnusha256sum or sha256sum: the hash tool hf_download uses, instead of the one
+#                        _sha256_pick times on a 64 MiB probe once per run (B-27); unset on the node by default
 #   ATLAS_FORCED_STEPS   exported BY parse_common_args: the bare step ids given to --force, space-separated ("09b", "05b 07");
 #                        step files may read it (phase2/09b-vault.sh does); detached_phase passes it into the unit
 #   ATLAS_TEST_SECURE_BOOT  TEST ONLY (lib/common_test.sh): "on" or "off" replaces the firmware reading in
@@ -731,7 +733,96 @@ notify() {
   return 0
 }
 
-_sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+# --- sha256 (B-27, approved 2026-10-17) --------------------------------------------------------------------------------
+# hf_download hashes every file before the next one starts, so the hash tool's speed adds to the pull. On 26.04
+# sha256sum is the Rust uutils one: about 136 MB/s against about 315 MB/s for GNU's gnusha256sum on a 100 MiB file
+# (VERIFIED, computingforgeeks 26.04 guide; CPU not named). openssl dgst uses libcrypto, which takes SHA-NI on Zen 5
+# (INFERRED). _sha256_pick chooses once per run: ATLAS_SHA256_TOOL when it names an installed candidate; else the
+# fastest candidate on a 64 MiB file of zero bytes whose digest is known (a tool that prints any other digest is
+# skipped; sha256sum when none prints it); else, when no probe file can be written, the first installed one in the
+# fixed order openssl, gnusha256sum, sha256sum. Every tool reads the file on stdin, so no file name reaches its output.
+_ATLAS_SHA256_CANDIDATES=(openssl gnusha256sum sha256sum)
+_ATLAS_SHA256_PROBE_BYTES=67108864
+_ATLAS_SHA256_PROBE_SHA="3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351"   # sha256 of 64 MiB of zeros
+_ATLAS_SHA256_TOOL="${_ATLAS_SHA256_TOOL:-}"
+
+# _sha256_parse TOOL OUTPUT — the lower-case hex digest in one tool's output, or exit 1. The formats:
+#   sha256sum, gnusha256sum: "HEX  -" (stdin), "HEX  NAME", "\HEX  NAME" (GNU escapes a name holding \ or a newline)
+#   openssl dgst -sha256:    "SHA2-256(stdin)= HEX" (3.x), "SHA256(stdin)= HEX" or "(stdin)= HEX" (1.1)
+_sha256_parse() {
+  local tool="$1" out="${2%%$'\n'*}" hex
+  case "$tool" in
+    openssl) [[ "$out" == *"= "* ]] || return 1; hex="${out##*= }" ;;
+    sha256sum|gnusha256sum) hex="${out%%[[:space:]]*}"; hex="${hex#\\}" ;;
+    *) return 1 ;;
+  esac
+  hex="${hex,,}"
+  [[ "$hex" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$hex"
+}
+
+# _sha256_run TOOL FILE — FILE's digest by TOOL (FILE on stdin), parsed; exit 1 when the tool fails or prints none.
+_sha256_run() {
+  local tool="$1" f="$2" out
+  case "$tool" in
+    openssl) out="$(openssl dgst -sha256 <"$f")" || return 1 ;;
+    sha256sum|gnusha256sum) out="$("$tool" <"$f")" || return 1 ;;
+    *) return 1 ;;
+  esac
+  _sha256_parse "$tool" "$out"
+}
+
+# _sha256_pick — set _ATLAS_SHA256_TOOL once per run (above). Call it in the shell that hashes, never inside $( ): the
+# choice is a shell variable, and background jobs inherit it only when it is made before they start.
+_sha256_pick() {
+  [[ -n "${_ATLAS_SHA256_TOOL:-}" ]] && return 0
+  local t want="${ATLAS_SHA256_TOOL:-}"
+  if [[ -n "$want" ]]; then
+    if [[ " ${_ATLAS_SHA256_CANDIDATES[*]} " == *" $want "* ]] && command -v "$want" >/dev/null 2>&1; then
+      _ATLAS_SHA256_TOOL="$want"
+      log "sha256: $want for this run (ATLAS_SHA256_TOOL)"
+      return 0
+    fi
+    warn "sha256: ATLAS_SHA256_TOOL=$want is not an installed one of ${_ATLAS_SHA256_CANDIDATES[*]}; choosing by timing"
+  fi
+  local probe best="" best_us=0 t0 t1 us hex notes=""
+  probe="$(mktemp "${TMPDIR:-/tmp}/atlas-sha256.XXXXXX" 2>/dev/null)" || probe=""
+  if [[ -n "$probe" ]] && head -c "$_ATLAS_SHA256_PROBE_BYTES" /dev/zero >"$probe" 2>/dev/null; then
+    for t in "${_ATLAS_SHA256_CANDIDATES[@]}"; do
+      command -v "$t" >/dev/null 2>&1 || continue
+      t0="$EPOCHREALTIME"
+      hex="$(_sha256_run "$t" "$probe" 2>/dev/null)" || hex=""
+      t1="$EPOCHREALTIME"
+      if [[ "$hex" != "$_ATLAS_SHA256_PROBE_SHA" ]]; then
+        notes+="${notes:+, }$t gave no correct digest"
+        continue
+      fi
+      # EPOCHREALTIME is seconds with six decimals; the digits alone are microseconds (any locale's separator).
+      us=$(( 10#${t1//[!0-9]/} - 10#${t0//[!0-9]/} ))
+      notes+="${notes:+, }$t $(( us / 1000 )) ms"
+      if [[ -z "$best" ]] || (( us < best_us )); then best="$t"; best_us="$us"; fi
+    done
+    [[ -n "$best" ]] || notes+="${notes:+, }no candidate gave the known digest"
+  else
+    for t in "${_ATLAS_SHA256_CANDIDATES[@]}"; do
+      command -v "$t" >/dev/null 2>&1 && { best="$t"; break; }
+    done
+    notes="no probe file in ${TMPDIR:-/tmp}, fixed order"
+  fi
+  [[ -z "$probe" ]] || rm -f -- "$probe"
+  _ATLAS_SHA256_TOOL="${best:-sha256sum}"
+  log "sha256: $_ATLAS_SHA256_TOOL for this run (64 MiB probe: $notes)"
+}
+
+# _sha256_of FILE — FILE's sha256 (lower-case hex) by the tool _sha256_pick chose, sha256sum when nothing was chosen
+# in this shell; a chosen tool that fails on FILE falls back to sha256sum.
+_sha256_of() {
+  local tool="${_ATLAS_SHA256_TOOL:-sha256sum}"
+  if [[ "$tool" != sha256sum ]]; then
+    _sha256_run "$tool" "$1" && return 0
+  fi
+  _sha256_run sha256sum "$1"
+}
 
 # hf_download REPO FILE DEST SHA256 [REVISION] — resumable Hugging Face download through the proxy, sha256-verified,
 # skipped when DEST already matches. HF_TOKEN comes from the environment or $ATLAS_ETC/secrets/hf-token.env.
@@ -741,6 +832,7 @@ hf_download() {
   local repo="$1" file="$2" dest="$3" sha="${4:-}" rev="${5:-main}"
   [[ -n "$sha" ]] || die "hf_download $repo/$file: SHA256 argument is required (use 'none' only when unverifiable)"
   sha="${sha,,}"
+  _sha256_pick   # once per run (B-27); a no-op after the first call in this shell
   if [[ -f "$dest" ]]; then
     local have
     have="$(_sha256_of "$dest")"
@@ -1069,7 +1161,7 @@ load_env() {
   fi
   : "${WG_IFACE:=wg0}" "${WG_CIDR:=10.8.0.0/24}" "${WG_PORT:=51820}"
   : "${DOMAIN:=sovereign-node.link}" "${VPN_HOST:=vpn.sovereign-node.link}"
-  : "${NTFY_TOPIC:=atlas}" "${OPENWEBUI_PORT:=3000}" "${ORCH_PORT:=8800}" "${LLAMA_PORT_BASE:=8100}" "${DOWNLOAD_MBPS:=100}"
+  : "${NTFY_TOPIC:=atlas}" "${OPENWEBUI_PORT:=3000}" "${ORCH_PORT:=8800}" "${LLAMA_PORT_BASE:=8100}" "${DOWNLOAD_MBPS:=400}"
   # Derived, not stored: the LAN address every published Docker port is pinned to (conflict 4).
   LAN_IP="$(_atlas_detect_lan_ip "$LAN_IFACE" || true)"
   export PRINCIPAL_USER TZ LAN_IFACE LAN_CIDR LAN_IP DATA_DISK CLOUDFLARE_TXT WG_IFACE WG_CIDR WG_PORT DOMAIN VPN_HOST

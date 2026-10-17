@@ -437,8 +437,9 @@ def test_real_config_is_the_approved_day1_map(tmp_path: Path) -> None:
                "rerank-bge-v2-m3"}
     assert not retired & set(e)
     planned = {x["planned_key"] for x in raw["phased"]}
-    assert planned == {"qwen3.8-flash-next", "nemotron-3-super", "intern-s1", "ling-3.0-flash-fin", "baichuan-m3-235b",
-                       "qwen3-coder-next", "embeddinggemma-2"} and not planned & set(e)
+    # D-19 (c) and D-60 (b), approved 2026-10-17: Qwen3-Coder-Next and EmbeddingGemma 2 left the phased list.
+    assert planned == {"qwen3.8-flash-next", "nemotron-3-super", "intern-s1", "ling-3.0-flash-fin",
+                       "baichuan-m3-235b"} and not planned & set(e)
     refs = {x for b in bindings.values() for x in (b[0], *b[1], b[2]) if x} | set(cfg.router_rules.routes.values())
     assert refs <= set(e) and not refs & planned
     # Sentinel's services feed names units that exist (llama-server@<engines.json key>).
@@ -447,6 +448,56 @@ def test_real_config_is_the_approved_day1_map(tmp_path: Path) -> None:
     units = [u.split("@", 1)[1] for u in services if u.startswith("llama-server@")]
     assert units == ["router-qwen3.5-4b", "embed-qwen3-4b", "rerank-qwen3-4b"]
     assert all(e[u].is_resident for u in units)
+    # D-19 (c), D-60 (b): no file of the config tree names either dropped key (the research notes keep their record).
+    for path in sorted(p for p in tree.rglob("*") if p.is_file() and p.suffix in (".json", ".md")):
+        text = path.read_text(encoding="utf-8")
+        assert "qwen3-coder-next" not in text and "embeddinggemma-2" not in text, path
+
+
+def test_real_engines_json_speed_floors(tmp_path: Path) -> None:
+    """D-33 and D-47 (approved 2026-10-17): the per-seat floors in engines.json, the schema phase3/loadtest.py reads
+    with spec.get() (check_band, v10_line, raise_decode_floor_todo; config.EngineSpec ignores these keys). Decode floors
+    at 8k: gpt-oss-120b 25, glm-5.3-flash 6, deepseek-v4-flash 4, router-qwen3.5-4b 20 tok/s. Prefill floors at 8k:
+    200 / 40 / 40, none for the router. Every floor is a positive number or null (null or absent: record only), below
+    its seat's projection; gpt-oss-120b's projection is the F16-trunk figure [41, 44] and the router's [45, 50]. The
+    unchanged abliterated entry carries no floor field, and no phased entry carries one."""
+    tree = _real_config_tree()
+    if tree is None:
+        pytest.skip("the real config tree is not beside this checkout and ATLAS_CONFIG_DIR is unset")
+    raw = json.loads((tree / "engines.json").read_text(encoding="utf-8"))
+    entries = {x["key"]: x for x in raw["engines"]}
+    gpt, abl, glm, ds, router = ("gpt-oss-120b", "gpt-oss-120b-abliterated", "glm-5.3-flash", "deepseek-v4-flash",
+                                 "router-qwen3.5-4b")
+    floors = ("decode_floor_tok_s", "prefill_floor_tok_s")
+    assert {k: x["decode_floor_tok_s"] for k, x in entries.items() if x.get("decode_floor_tok_s") is not None} == {
+        gpt: 25, glm: 6, ds: 4, router: 20}
+    assert {k: x["prefill_floor_tok_s"] for k, x in entries.items() if x.get("prefill_floor_tok_s") is not None} == {
+        gpt: 200, glm: 40, ds: 40}
+    assert "prefill_floor_tok_s" not in entries[router]
+    assert not any(f in entries[abl] for f in floors)  # the uncensored entry is left as it is
+    assert entries[abl].get("expected_decode_tok_s") == [30, 55]
+    assert entries[gpt]["projected_decode_tok_s"] == [41, 44] and "F16-trunk" in entries[gpt]["projected_decode_source"]
+    assert entries[router]["projected_decode_tok_s"] == [45, 50]
+    assert "INFERRED" in entries[router]["projected_decode_source"]
+    for key, x in entries.items():
+        for f in floors:
+            v = x.get(f)
+            assert v is None or (isinstance(v, int | float) and not isinstance(v, bool) and v > 0), (key, f, v)
+        proj = x.get("projected_decode_tok_s")
+        if proj is not None:
+            assert (isinstance(proj, list) and len(proj) == 2 and all(isinstance(p, int | float) for p in proj)
+                    and 0 < proj[0] <= proj[1]), (key, proj)
+        if x.get("decode_floor_tok_s") is not None:
+            assert proj is not None and x["decode_floor_tok_s"] < proj[0], key  # a floor never above the projection
+    assert not any(f in x for x in raw["phased"] for f in floors)
+    rule = raw["_meta"]["decode_rule"]
+    for phrase in ("stated at 8k context", "slower of the 512 and 8k decode points",
+                   "Only the absolute floor fails V10", "70% of the projection", "never fails", "prefill_floor_tok_s",
+                   "recorded only"):
+        assert phrase in rule, phrase
+    # The orchestrator loads the file with the new key (EngineSpec ignores unknown keys; the service starts).
+    cfg = load_config(Settings.from_env({"ATLAS_CONFIG_DIR": str(tree), "ATLAS_ETC": str(tmp_path)}))
+    assert set(entries) <= set(cfg.engines)
 
 
 def test_load_domain_cards(config_dir: Path) -> None:

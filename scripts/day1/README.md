@@ -280,19 +280,21 @@ On 2026-10-16 the Principal approved every row of the action register (D-25 (a),
 
 Phased after Day 1, each with its to-do and the event that brings it in (doc 5.1, 5.3, 4.4, 6.3, 14.1, 15.2, 15.5):
 
-- the specialist seats Intern-S1, Ling-3.0-flash-Fin, Baichuan-M3 and Qwen3-Coder-Next;
-- the Qwen3.8-Flash-Next and Nemotron 3 Super pulls, and the EmbeddingGemma 2 side index (all recorded in
-  `engines.json` `phased`, which nothing reads);
+- the specialist seats Intern-S1, Ling-3.0-flash-Fin and Baichuan-M3;
+- the Qwen3.8-Flash-Next and Nemotron 3 Super pulls (all recorded in `engines.json` `phased`, which nothing reads;
+  Qwen3-Coder-Next and EmbeddingGemma 2 left the list on 2026-10-17 under D-19 (c) and D-60 (b));
 - slot save and restore, and batching queued work by engine;
 - the speech, image and OCR companions, and the drafters;
 - the DeepSeek V4.1 trial.
 
 Where an approved row leaves an input to the Principal, its default is built and the input is a to-do:
 
-- the decode floors (D-47; none, `decode-floors`);
+- the decode floors: set on 2026-10-17 (D-33, D-47; `engines.json` `decode_floor_tok_s` and `prefill_floor_tok_s`,
+  `_meta.decode_rule`), so `decode-floors` is raised only while a seat's floor is null;
 - DeepSeek's context target (131,072 tokens), GLM's cache type and slot profile (f16 at 8 × 32k) and the
   long-document trigger (24,000 tokens) (D-48, S-30; `seat-profiles`);
-- the D-16 context targets of the phased medical and science seats (`Q5_K_S` at about 23K tokens; `context-targets`);
+- the D-16 context targets of the phased medical and science seats: approved on 2026-10-17 (`Q5_K_S`, q8_0 K and V
+  with the pin's rotation, 1 × 32,768 tokens; `engines.json` `phased`), which closes `context-targets`;
 - the D-46 trial task set (`trial-task-set`) and the D-49 test sets (`seat-test-sets`);
 - each seat's fixed reasoning setting (D-30 (b); provisional settings in `engines.json`; in the detail of `kld-run`).
 

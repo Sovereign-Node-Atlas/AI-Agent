@@ -387,8 +387,8 @@ ref_sheet("Ref Task Forces", "Section 8.3. All twenty-three retained. Group is a
       "its engine field, never a domain card; on Day 1 only TF_OMEGA carries one (deepseek-v4-flash, the Apex), and "
       "every other preset runs on its owner's default engine (GLM-5.3-Flash for every director but Valerie, whose "
       "engine is unchanged). The phased engines a preset will carry are named in task-forces.json notes: "
-      "Ling-3.0-flash-Fin on TF_GAMMA, TF_DELTA and TF_EPSILON, Qwen3-Coder-Next on TF_MU, Baichuan-M3 and Intern-S1 "
-      "on TF_UPSILON. No new prefix.")],
+      "Ling-3.0-flash-Fin on TF_GAMMA, TF_DELTA and TF_EPSILON, Baichuan-M3 and Intern-S1 on TF_UPSILON; TF_MU has "
+      "none, since D-19 (c) dropped Qwen3-Coder-Next on 2026-10-17. No new prefix.")],
     [14, 46, 18, 34, 24])
 
 integ = md_table_after("## 13.")[1:]
@@ -525,8 +525,8 @@ title(ws, "A.T.L.A.S. Build Baseline",
       "at most 8 Celery cpu workers, memory caps on Kokoro, speaches and Docling, an order for the out-of-memory "
       "killer, and a seat whose start failed stopped before its reservation goes) and confirmed V25's pass marks, "
       "with no new version number. The "
-      "specialist seats (Intern-S1, Ling-3.0-flash-Fin, Baichuan-M3, Qwen3-Coder-Next), slot save and restore, swap "
-      "batching, the speech, image and OCR companions, the EmbeddingGemma 2 side index, the Qwen3.8-Flash-Next and "
+      "specialist seats (Intern-S1, Ling-3.0-flash-Fin, Baichuan-M3), slot save and restore, swap "
+      "batching, the speech, image and OCR companions, the Qwen3.8-Flash-Next and "
       "Nemotron 3 Super pulls, the drafters and the DeepSeek V4.1 trial are phased after Day 1, each with its to-do; "
       "where an approved row leaves an input to the Principal (the decode floors, the context targets, the test sets), "
       "its default is built and a to-do raised (sheet 5). The uncensored-seat items (D-07, D-08, D-09, D-58, N-10, "
