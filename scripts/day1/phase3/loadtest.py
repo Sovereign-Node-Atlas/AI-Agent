@@ -176,7 +176,10 @@ chat engine with --verbosity 4 (exactly 4: see --fit below). Only the srv/slot I
     off on the Day 1 GLM unit, and deepseek4 (dsv4), gpt-oss (iSWA) and the qwen35 router (IMROPE) cannot shift.
   * host-RAM caches outside the Arbiter's budget: the prompt cache (--cache-ram, default 8192 MiB per server, idle slots
     copied into it on every new task: --cache-idle-slots on) and the context checkpoints (--ctx-checkpoints, default
-    32 per slot, at least 8192 tokens apart) (common/common.h:634-638; flags common/arg.cpp:1700, 1718, 1734).
+    32 per slot, at least 8192 tokens apart) (common/common.h:634-638; flags common/arg.cpp:1700, 1718, 1734). B-33
+    (measure 5, approved 2026-10-17): phase2/engine-env.py renders an explicit --cache-ram on every engine from
+    engines.json cache_ram_mib, so the to-do cache-ram weighs the cap each env file's ARGS carry (8192 only where
+    none is rendered) and is the Phase 3 measurement of whether to change it.
     Checkpoints are made only where the cache cannot roll back: sliding-window or recurrent layers
     (tools/server/server-context.cpp:3708-3721; glm5-next's KDA layers test as recurrent, so GLM makes them too,
     INFERRED). Their sizes are TRACE lines (verbosity 4): " - cache state: %zu prompts, %.3f MiB (limits: ...)"
@@ -338,11 +341,12 @@ PARITY_CHUNKS = 16
 PARITY_TASK_CTX = 2048
 PARITY_FA = ("on", "off")  # production renders -fa on (phase2/engine-env.py); off is the #28956 exposure check
 PARITY_TOOL_TIMEOUT_S = 3600.0
-# V25 thresholds at -fa on, INFERRED (no published build-to-build figure exists): two builds scoring the SAME file
-# should agree far closer than a KV quantisation does (q8_0 K/V is task-lossless at a mean KLD of 0.0018, register
-# D-29), so a mean KLD above 0.01 or fewer than 98 % identical top-1 tokens, or fewer correct tasks on the new build,
-# is a changed output. -fa off is recorded beside it, never a verdict: the old pin's non-FA Vulkan path carries the
-# KV-view bug fixed in #28956, so a difference there is the old build's.
+# V25 thresholds at -fa on, proposed as INFERRED (no published build-to-build figure exists) and confirmed by the
+# Principal on 2026-10-17 (doc S55): two builds scoring the SAME file should agree far closer than a KV quantisation
+# does (q8_0 K/V is task-lossless at a mean KLD of 0.0018, register D-29), so a mean KLD above 0.01 or fewer than
+# 98 % identical top-1 tokens, or fewer correct tasks on the new build, is a changed output. -fa off is recorded beside
+# it, never a verdict: the old pin's non-FA Vulkan path carries the KV-view bug fixed in #28956, so a difference there
+# is the old build's.
 PARITY_MAX_MEAN_KLD = 0.01
 PARITY_MIN_SAME_TOP_PCT = 98.0
 PARITY_TASKS_FILE = Path(__file__).resolve().with_name("parity-tasks.txt")
@@ -384,8 +388,10 @@ CKPT_ERASED_RE = re.compile(r"erasing old context checkpoint \(pos_min = -?\d+, 
                             r"size = ([0-9.]+) MiB\)")
 CKPT_CREATED_RE = re.compile(r"created context checkpoint (\d+) of (\d+) \(pos_min = -?\d+, pos_max = -?\d+, "
                              r"n_tokens = -?\d+, size = ([0-9.]+) MiB\)")  # TRACE
-# llama-server's defaults at the pin (common/common.h:634-638 at b11474): the figures the cache-ram to-do weighs.
+# llama-server's defaults at the pin (common/common.h:634-638 at b11474): the figures the cache-ram to-do weighs. The
+# 8192 MiB cache applies only to a server whose ARGS carry no --cache-ram (B-33: engine-env.py renders one everywhere).
 LLAMA_CACHE_RAM_DEFAULT_MIB = 8192
+CACHE_RAM_FLAGS = ("--cache-ram", "-cram")  # common/arg.cpp:1719 at b11474
 LLAMA_CTX_CHECKPOINTS_DEFAULT = 32
 LLAMA_CHECKPOINT_MIN_STEP = 8192
 PROC_STATUS_FIELDS = ("VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem")
@@ -1378,6 +1384,22 @@ def arbiter_projection(ctx: Ctx, key: str, ctx_size: int, parallel: int, kv: str
     return (data, "") if isinstance(data, dict) else (None, f"projection printed {short(data, 120)}")
 
 
+def rendered_cache_ram_mib(env: dict[str, str]) -> int | None:
+    """Pure: the prompt-cache cap the engine's env file renders (the last --cache-ram or -cram in ARGS, in either the
+    `--flag N` or the `--flag=N` spelling; phase2/engine-env.py from engines.json cache_ram_mib, B-33). A negative
+    value is returned as it is: llama-server reads it as no size limit (tools/server/server-task.h:654 at b11474), and
+    engine-env.py refuses it, so only a hand-edited or out-of-date env file carries one. None when ARGS carry none, or
+    not a whole number (an env file rendered before B-33): the server then runs at llama-server's default,
+    LLAMA_CACHE_RAM_DEFAULT_MIB."""
+    value: str | None = None
+    args = env.get("ARGS", "").split()
+    for i, tok in enumerate(args):
+        flag, eq, rest = tok.partition("=")
+        if flag in CACHE_RAM_FLAGS:
+            value = rest if eq else (args[i + 1] if i + 1 < len(args) else None)
+    return int(value) if value is not None and re.fullmatch(r"-?[0-9]+", value) else None
+
+
 def memory_record(env: dict[str, str], parsed: dict[str, Any], projection: dict[str, Any] | None, proj_why: str,
                   host_load: dict[str, Any], host_after: dict[str, Any], label: str = "") -> dict[str, Any]:
     """Pure: one load's S52 record (results file "memory"): the profile the unit ran, what its log says (a), the
@@ -1423,7 +1445,7 @@ def memory_record(env: dict[str, str], parsed: dict[str, Any], projection: dict[
     return {
         "label": label,
         "profile": {"ctx": int(env.get("ATLAS_CTX_SIZE") or 0), "parallel": int(env.get("ATLAS_PARALLEL") or 1),
-                    "kv": env.get("ATLAS_KV_TYPE", "")},
+                    "kv": env.get("ATLAS_KV_TYPE", ""), "cache_ram_mib": rendered_cache_ram_mib(env)},
         "measured": parsed,
         "projected": projection,
         "ctx_shift": shift,
@@ -2486,12 +2508,18 @@ def _ceil_to(x: float, step: int) -> int:
 
 
 def cache_suggestion(rec: dict[str, Any]) -> dict[str, Any]:
-    """INFERRED, for the Principal to weigh (S52 (b)): an explicit --cache-ram that holds a RAM copy of every slot at
-    full length (the engine's measured context memory rounded up to 256 MiB, never above the 8192 MiB default; the
-    default made explicit when the context memory is UNKNOWN), and, where checkpoints are made, an explicit
-    --ctx-checkpoints of one per --checkpoint-min-step across a full slot plus the one near the prompt's end. Worst
-    cases: the cache limit plus every slot full of checkpoints of one slot's sliding-window, recurrent and compressor
-    state.
+    """INFERRED, for the Principal to weigh (S52 (b)): a --cache-ram that holds a RAM copy of every slot at full
+    length (the engine's measured context memory rounded up to 256 MiB, never above the 8192 MiB default; the cap now
+    rendered kept when the context memory is UNKNOWN), and, where checkpoints are made, an explicit --ctx-checkpoints
+    of one per --checkpoint-min-step across a full slot plus the one near the prompt's end. Worst cases: the cache
+    limit plus every slot full of checkpoints of one slot's sliding-window, recurrent and compressor state.
+
+    B-33 (measure 5, approved 2026-10-17): the Day 1 caps are set (engines.json cache_ram_mib, rendered as --cache-ram
+    by phase2/engine-env.py), so the "rendered" worst case uses the cap the env file renders (profile cache_ram_mib,
+    rendered_cache_ram_mib) with the default 32 checkpoints per slot; only a record with no rendered cap (an env file
+    from before B-33) falls back to llama-server's 8192 MiB default, which the server then runs with. A rendered -1
+    (no limit, cache_ram_rendered_mib kept negative; cap_unbounded) is counted at that default, so its "rendered"
+    worst case is a lower bound, and the suggestion where the context memory is UNKNOWN is the default, not -1.
 
     "Not measured" is not "not made" (S52 fix round): with no K/V, recurrent or compressor size line in the log
     (checkpoints_known False: a journal without the -lv 4 lines, rotated or empty) whether the engine makes checkpoints,
@@ -2502,20 +2530,30 @@ def cache_suggestion(rec: dict[str, Any]) -> dict[str, Any]:
     parallel = max(int(prof.get("parallel") or 1), 1)
     window = m.get("n_ctx_slot") or int(prof.get("ctx") or 0) // parallel
     ctx_mib = m.get("context_mib")
-    cache_ram = (LLAMA_CACHE_RAM_DEFAULT_MIB if ctx_mib is None
+    rendered = prof.get("cache_ram_mib")
+    cap = LLAMA_CACHE_RAM_DEFAULT_MIB if rendered is None or int(rendered) < 0 else int(rendered)
+    cache_ram = (cap if ctx_mib is None
                  else max(256, min(LLAMA_CACHE_RAM_DEFAULT_MIB, _ceil_to(ctx_mib, 256))))
     n = min(LLAMA_CTX_CHECKPOINTS_DEFAULT, -(-window // LLAMA_CHECKPOINT_MIN_STEP) + 1) if window else \
         LLAMA_CTX_CHECKPOINTS_DEFAULT
     ckpt = m.get("checkpoint_state_mib")
+    base = {"cache_ram_mib": cache_ram, "cache_ram_rendered_mib": rendered}
     if ckpt is None and m.get("kv_mib") is None:
-        return {"cache_ram_mib": cache_ram, "ctx_checkpoints": n, "checkpoints_known": False,
-                "worst_default_mib": LLAMA_CACHE_RAM_DEFAULT_MIB, "worst_suggested_mib": cache_ram}
+        return {**base, "ctx_checkpoints": n, "checkpoints_known": False,
+                "worst_rendered_mib": cap, "worst_suggested_mib": cache_ram}
     if ckpt is None:
-        return {"cache_ram_mib": cache_ram, "ctx_checkpoints": None, "checkpoints_known": True,
-                "worst_default_mib": LLAMA_CACHE_RAM_DEFAULT_MIB, "worst_suggested_mib": cache_ram}
-    return {"cache_ram_mib": cache_ram, "ctx_checkpoints": n, "checkpoints_known": True,
-            "worst_default_mib": round(LLAMA_CACHE_RAM_DEFAULT_MIB + LLAMA_CTX_CHECKPOINTS_DEFAULT * parallel * ckpt),
+        return {**base, "ctx_checkpoints": None, "checkpoints_known": True,
+                "worst_rendered_mib": cap, "worst_suggested_mib": cache_ram}
+    return {**base, "ctx_checkpoints": n, "checkpoints_known": True,
+            "worst_rendered_mib": round(cap + LLAMA_CTX_CHECKPOINTS_DEFAULT * parallel * ckpt),
             "worst_suggested_mib": round(cache_ram + n * parallel * ckpt)}
+
+
+def cap_unbounded(sug: dict[str, Any]) -> bool:
+    """True when the env file renders a negative --cache-ram: no size limit, so the rendered worst case is a lower
+    bound (cache_suggestion)."""
+    rendered = sug.get("cache_ram_rendered_mib")
+    return rendered is not None and int(rendered) < 0
 
 
 def resident_memory_record(ctx: Ctx, key: str) -> dict[str, Any]:
@@ -2639,6 +2677,16 @@ def cache_item(key: str, role: str, rec: dict[str, Any]) -> tuple[str, dict[str,
     if pc.get("oversize_skipped"):
         text += f", {pc['oversize_skipped']} prompt(s) larger than the limit skipped"
     sug = cache_suggestion(rec)
+    # B-33: the cap the env file renders (cache_suggestion), or llama-server's default where none is rendered; a
+    # negative one is no limit, counted at the default, so its worst case is a lower bound.
+    rendered, unbounded = sug["cache_ram_rendered_mib"], cap_unbounded(sug)
+    if rendered is None:
+        cap = f"no --cache-ram rendered (llama-server's default, {LLAMA_CACHE_RAM_DEFAULT_MIB} MiB)"
+    elif unbounded:
+        cap = f"--cache-ram {rendered} rendered (no limit; counted at {LLAMA_CACHE_RAM_DEFAULT_MIB} MiB, a lower bound)"
+    else:
+        cap = f"--cache-ram {rendered} rendered"
+    upto = "at least" if unbounded else "up to"
     if not sug["checkpoints_known"]:  # not measured, which is not "none made" (cache_suggestion)
         if ck.get("erased") or ck.get("created_max"):
             made = f", {ck['created_max']} of {ck['limit']} made at most" if ck.get("created_max") else ""
@@ -2647,16 +2695,17 @@ def cache_item(key: str, role: str, rec: dict[str, Any]) -> tuple[str, dict[str,
         else:
             text += ("; checkpoints: UNKNOWN (no K/V, recurrent or compressor size line in the load log, so whether "
                      "this engine makes them, and their size, is not known)")
+        text += f"; {cap} (at least {sug['worst_rendered_mib']} MiB)"
         flags = f"--cache-ram {sug['cache_ram_mib']} --ctx-checkpoints {sug['ctx_checkpoints']}"
         return f"{text}; suggested {flags} (at least {sug['worst_suggested_mib']} MiB, checkpoints UNKNOWN)", sug
     if sug["ctx_checkpoints"] is None:
-        text += "; checkpoints: none made (its cache rolls back)"
+        text += f"; checkpoints: none made (its cache rolls back); {cap} ({upto} {sug['worst_rendered_mib']} MiB)"
         flags = f"--cache-ram {sug['cache_ram_mib']}"
     else:
         made = f", {ck['created_max']} of {ck['limit']} made at most (TRACE)" if ck.get("created_max") else ""
         text += (f"; checkpoints: {ck['erased']} erased{made}, one slot's state about "
-                 f"{m['checkpoint_state_mib']:.1f} MiB (INFERRED), so the defaults allow up to "
-                 f"{sug['worst_default_mib']} MiB")
+                 f"{m['checkpoint_state_mib']:.1f} MiB (INFERRED), so {cap} and the default "
+                 f"{LLAMA_CTX_CHECKPOINTS_DEFAULT} checkpoints per slot allow {upto} {sug['worst_rendered_mib']} MiB")
         flags = f"--cache-ram {sug['cache_ram_mib']} --ctx-checkpoints {sug['ctx_checkpoints']}"
     return f"{text}; suggested {flags} (up to {sug['worst_suggested_mib']} MiB)", sug
 
@@ -2668,8 +2717,9 @@ def is_weight_bearing(key: str, entries: Sequence[MemoryEntry]) -> bool:
 
 KV_TODO_TITLE = ("Phase 3 measured each engine's context memory: compare it with the Arbiter's estimates and decide "
                  "whether to correct them (S52)")
-CACHE_TODO_TITLE = ("Set --cache-ram and --ctx-checkpoints explicitly on each chat llama-server: host RAM outside the "
-                    "Arbiter's budget (S52)")
+CACHE_TODO_TITLE = ("The Day 1 prompt-cache caps are set (--cache-ram from engines.json cache_ram_mib, B-33): Phase 3 "
+                    "measured the host RAM they and the checkpoints hold outside the Arbiter's budget; decide whether "
+                    "to change a cap or set --ctx-checkpoints (S52)")
 
 
 def arbiter_max_resident(ctx: Ctx) -> int:
@@ -2709,18 +2759,20 @@ def raise_memory_todos(entries: Sequence[MemoryEntry], note: str = "", max_resid
     for k, role, rec, _ in entries:
         if k not in by_engine or "the rung that stands" in role:  # one per engine: the ladder's standing rung
             by_engine[k] = cache_item(k, role, rec)
-    # (worst at the defaults, worst at the suggested values, checkpoints UNKNOWN: then both are lower bounds)
+    # (worst at the rendered caps, worst at the suggested values, checkpoints UNKNOWN: then both are lower bounds)
     seats = max(1, int(max_resident))
-    heavy = sorted((s["worst_default_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
+    heavy = sorted((s["worst_rendered_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
                    for k, (_, s) in by_engine.items() if s and is_weight_bearing(k, entries))[-seats:]
-    light = [(s["worst_default_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
+    light = [(s["worst_rendered_mib"], s["worst_suggested_mib"], not s["checkpoints_known"])
              for k, (_, s) in by_engine.items() if s and not is_weight_bearing(k, entries)]
     total = ""
     if heavy:
         d, s = (sum(w[i] for w in heavy + light) / 1024 for i in (0, 1))
-        # every record, not only the summed ones: an UNKNOWN engine ranked out of the largest may be larger
-        lower = any(s and not s["checkpoints_known"] for _, s in by_engine.values())
-        bound, least = ("at worst at least", "at least ") if lower else ("up to", "")
+        # every record, not only the summed ones: an UNKNOWN engine ranked out of the largest may be larger; a cap of
+        # -1 (no limit, counted at the default) makes the rendered total a lower bound, not the suggested one
+        unknown = any(s and not s["checkpoints_known"] for _, s in by_engine.values())
+        unbounded = any(s and cap_unbounded(s) for _, s in by_engine.values())
+        bound, least = "at worst at least" if unknown or unbounded else "up to", "at least " if unknown else ""
         which = "The largest LLM seat" if seats == 1 else f"The {seats} largest LLM seats"
         ranked = "the one ranked here" if seats == 1 else f"the {seats} ranked here"
         rule = ("Section 4.2 rule 3, D-32: one LLM seat resident; an evicted server's prompt cache and checkpoints "
@@ -2728,25 +2780,33 @@ def raise_memory_todos(entries: Sequence[MemoryEntry], note: str = "", max_resid
                 f"Section 4.2 rule 3: the Arbiter's limit is {seats} LLM seats (ATLAS_ARBITER_MAX_RESIDENT; D-32 (a) "
                 "is 1)")
         total = (f" {which} plus the resident chat engine(s) could hold {bound} {d:.1f} GiB of host "
-                 f"RAM at the defaults and {least}{s:.1f} GiB at the suggested values"
+                 f"RAM at the caps now rendered (llama-server's 8192 MiB default where none is) and {least}{s:.1f} "
+                 "GiB at the suggested values"
                  + (" (checkpoints UNKNOWN for at least one engine, whose checkpoints are left out of the sum "
-                    f"and which may be larger than {ranked})" if lower else "")
+                    f"and which may be larger than {ranked})" if unknown else "")
+                 + (" (a negative --cache-ram, no limit, rendered for at least one engine, whose cache is counted "
+                    f"at the {LLAMA_CACHE_RAM_DEFAULT_MIB} MiB default and which may be larger than {ranked})"
+                    if unbounded else "")
                  + ", against the host reserve (16 GiB, S44) that also carries about 12 GB of CPU-side services "
                  f"({rule}).")
     todo(CACHE_TODO_ID, CACHE_TODO_TITLE,
-         lead + "Each chat llama-server keeps a prompt cache in host RAM (--cache-ram, default 8192 MiB per server; "
-         "idle slots are copied into it at every new task, --cache-idle-slots on) and, where its cache cannot roll "
-         "back (sliding-window or recurrent layers), up to 32 context checkpoints per slot (--ctx-checkpoints). "
-         "Neither is on the GTT counter or in the Arbiter's grants; only the host reserve covers them. Measured in "
+         lead + "Each chat llama-server keeps a prompt cache in host RAM up to its --cache-ram (B-33, approved "
+         "2026-10-17: the Day 1 caps are set, rendered by phase2/engine-env.py from engines.json cache_ram_mib, and "
+         "each item below names the one its env file renders; llama-server's default without the flag is 8192 MiB "
+         "per server; idle slots are copied into it at every new task, --cache-idle-slots on) and, where its cache "
+         "cannot roll back (sliding-window or recurrent layers), up to 32 context checkpoints per slot "
+         "(--ctx-checkpoints). Neither is on the GTT counter or in the Arbiter's grants; only the host reserve covers "
+         "them. This is the Phase 3 measurement of whether to change the caps. Measured in "
          "Phase 3 (a few test requests, not normal use; the cache and checkpoint sizes are TRACE lines, logged at "
          "the -lv 4 phase2/engine-env.py renders, and RssAnon's growth over the tests is the measured bound): "
          + (" | ".join(text for text, _ in by_engine.values()) or "no record") + "." + total + " Suggested values, "
          "INFERRED: --cache-ram = the engine's measured context memory rounded up to 256 MiB, at most the 8192 "
-         "default (a RAM copy of every slot); --ctx-checkpoints = the slot window / 8192 + 1 (one per "
-         "--checkpoint-min-step across a full slot), where checkpoints are made or UNKNOWN (it does nothing on an "
-         "engine that makes none). They would go in engines.json "
-         "extra_args (\"--cache-ram\", \"<MiB>\", \"--ctx-checkpoints\", \"<N>\"); setting them is the Principal's "
-         "call, Phase 3 changed no engine setting.")
+         "default (a RAM copy of every slot; the rendered cap kept where the context memory is UNKNOWN); "
+         "--ctx-checkpoints = the slot window / 8192 + 1 (one per --checkpoint-min-step across a full slot), where "
+         "checkpoints are made or UNKNOWN (it does nothing on an engine that makes none). A changed cap goes in "
+         "engines.json cache_ram_mib (extra_args and env refuse --cache-ram: _meta cache_ram_rule) and "
+         "--ctx-checkpoints in extra_args (\"--ctx-checkpoints\", \"<N>\"), then phase2/engine-env.py re-renders; "
+         "changing them is the Principal's call, Phase 3 changed no engine setting.")
 
 
 def cmd_memory(ctx: Ctx, _args: argparse.Namespace) -> int:

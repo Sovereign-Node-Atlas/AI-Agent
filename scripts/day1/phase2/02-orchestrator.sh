@@ -33,10 +33,10 @@
 #      absent or when it carries a wildcard, and checks the installed content (30 explicit lines, no `*`: sudoers
 #      matches arguments as one string, so `llama-server@*` would also match `stop llama-server@x ufw.service`).
 #   7. `atlas-admin init-db` creates the SQLite ledger/approval DB at ATLAS_DB_PATH under $ATLAS_SRV/data.
-#   8. Units installed and started: atlas-orchestrator, atlas-celery-cpu (concurrency nproc-2), atlas-celery-gpu
-#      (concurrency exactly 1, Section 9.7), atlas-celery-beat (package-owned schedules only; the Sentinel, prune and
-#      AEGIS schedules are systemd timers, CONVENTIONS.md §8). Then /health must answer 200, /v1/models must list
-#      atlas, ren and arthur, and both Celery workers must answer `celery inspect ping`.
+#   8. Units installed and started: atlas-orchestrator, atlas-celery-cpu (concurrency min(8, nproc-2), at least 1;
+#      measure 6), atlas-celery-gpu (concurrency exactly 1, Section 9.7), atlas-celery-beat (package-owned schedules
+#      only; the Sentinel, prune and AEGIS schedules are systemd timers, CONVENTIONS.md §8). Then /health must answer
+#      200, /v1/models must list atlas, ren and arthur, and both Celery workers must answer `celery inspect ping`.
 #
 # FILE WRITES (fix round): never `... | install /dev/stdin DST`. Ubuntu 26.04's /usr/bin/install is rust-coreutils 0.8.0
 # (VERIFIED, phase1/04-system.sh header), which canonicalises the SOURCE when DEST exists, so a pipe source fails on every
@@ -408,7 +408,11 @@ _orch_env_drop() {
 
 _orch_env_write() {
   local cpu_conc
+  # min(8, nproc - 2), at least 1 (research_notes/ATLAS v0.4.0 build record/answers.md section 1.5 measure 6, approved
+  # 2026-10-17): nproc - 2 was 30 prefork children on this CPU, about 1.5-3 GiB of host RAM outside the Arbiter's budget
+  # (INFERRED, 60-120 MB per child). Section 9.7's "many workers" stays true at 8.
   cpu_conc=$(( $(nproc) - 2 ))
+  (( cpu_conc <= 8 )) || cpu_conc=8
   (( cpu_conc >= 1 )) || cpu_conc=1
   # The orchestrator reads config/ from the ON-NODE copy $ATLAS_OPT/day1 (CONVENTIONS.md §2; the units mount exactly that
   # path read-only, 16.3 item 6), never from whatever checkout this driver happens to run from (fix round). atlas-day1.sh

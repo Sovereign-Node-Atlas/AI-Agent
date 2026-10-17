@@ -2,10 +2,10 @@
 # tools/build_workbook_test.sh — regression test (v0.4.0, D-27) for tools/build-baseline-workbook.py, the builder of
 # docs/ATLAS_BUILD_BASELINE.xlsx. It rebuilds the workbook from docs/ATLAS_FRAMEWORK_REVIEW.md into a temp directory
 # and checks that every D, C, R and V row of Sections 18 to 21 and every box of Section 22 reaches sheets 1 to 5 in the
-# document's order, that the risks Section 22 leaves open for acknowledgement start blank, that the committed workbook
-# is the one the committed document builds, that the repository copy is never touched by a test build, that a missing
-# section stops the builder, and that no scratch path is left in it. Needs python3 with openpyxl; without it the
-# workbook cases are skipped, said so, and only the static cases run.
+# document's order, that every risk reads Yes once Section 22 records it acknowledged (all since 2026-10-17), that the
+# committed workbook is the one the committed document builds, that the repository copy is never touched by a test
+# build, that a missing section stops the builder, and that no scratch path is left in it. Needs python3 with
+# openpyxl; without it the workbook cases are skipped, said so, and only the static cases run.
 # Run: bash tools/build_workbook_test.sh   (exit 0 when every case passes)
 set -Euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
@@ -77,16 +77,16 @@ PY
 ok "sheet 5 has one row per Section 22 box" "$rows" "$boxes"
 ok "sheet 5 ticks exactly the [x] boxes" "$yes" "$ticked"
 
-# --- responses: the acknowledgements Section 22 leaves open start blank; the rest are recorded -----------------------
-ok "risk responses: R1 Yes, R4/R17/R19/R20 and R29-R33 blank" "$(python3 -I - "$T/wb.xlsx" <<'PY'
+# --- responses: every risk is acknowledged (R29-R33 and the restated R4, R17, R19, R20 on 2026-10-17, S55) ----------
+ok "risk responses: R1, R4, R20 and R33 Yes, none blank" "$(python3 -I - "$T/wb.xlsx" <<'PY'
 import sys
 from openpyxl import load_workbook
 ws = load_workbook(sys.argv[1])["3 Risks"]
 resp = {ws.cell(row=r, column=1).value: ws.cell(row=r, column=6).value for r in range(5, ws.max_row + 1)}
 blank = sorted((k for k, v in resp.items() if k and v is None), key=lambda k: int(k[1:]))
-print(resp.get("R1"), " ".join(blank))
+print(resp.get("R1"), resp.get("R4"), resp.get("R20"), resp.get("R33"), "blank:", " ".join(blank) or "none")
 PY
-)" "Yes R4 R17 R19 R20 R29 R30 R31 R32 R33"
+)" "Yes Yes Yes Yes blank: none"
 ok "every decision and resolution is recorded (no blank response)" "$(python3 -I - "$T/wb.xlsx" <<'PY'
 import sys
 from openpyxl import load_workbook

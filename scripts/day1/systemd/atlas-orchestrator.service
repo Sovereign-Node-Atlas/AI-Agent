@@ -71,6 +71,8 @@ TimeoutStartSec=300
 TimeoutStopSec=60
 KillMode=mixed
 LimitNOFILE=65536
+# OOM victim order (answers.md 1.5 measure 9): its restart stops the seat and loses measured footprints (B-03).
+OOMScoreAdjust=-500
 ProtectSystem=full
 PrivateTmp=true
 ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv -${ATLAS_OPT}/day1 ${ATLAS_ETC} -${ATLAS_SRV}/models -${ATLAS_SRV}/engines -${ATLAS_SRV}/vault/cipher

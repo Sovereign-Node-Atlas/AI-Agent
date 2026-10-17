@@ -760,8 +760,10 @@ class StubController:
         if key in self.fail_stop:
             raise EngineControlError(f"stub: sudo -n systemctl stop llama-server@{key} failed (exit 1): sudo: a "
                                      "password is required (test)")
+        was_active = key in self.active
         self.active.discard(key)
-        if self.probe is not None and not self.leak_on_stop:
+        # Stopping a unit that is not running frees nothing (the Arbiter stops a unit whose start failed, measure 10).
+        if self.probe is not None and not self.leak_on_stop and was_active:
             self.probe.used_bytes = max(0, self.probe.used_bytes - self._bytes(key))
 
     def is_active(self, key: str) -> bool:

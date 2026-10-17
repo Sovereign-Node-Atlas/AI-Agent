@@ -80,12 +80,23 @@ as an eviction victim: a load that would need its memory is QUEUED with that rea
 external process is not an LLM seat, so seat exclusivity (rule 7) never evicts it and never evicts a seat for it: only
 the budget does (v0.4.0; in v0.3.5 an Apex request queued behind any external resident).
 
-Failure paths (fix round). A controller start that raises — EngineControlError from systemctl, or the parent
-EngineError from the post-start /health check — releases the reservation and clears `_busy`; a catch-all does the same
-for anything else, so a placeholder can never wedge the Arbiter. A controller stop that raises leaves the victim
-resident and SERVING again (unloading cleared, an error row in the ledger, the exception re-raised): the unit may well
-still be active, and the next request_unload/request_load can retry once the cause (the sudoers fragment, a hung unit)
-is fixed.
+Failure paths (fix round; measure 10 of research_notes/ATLAS v0.4.0 build record/answers.md section 1.5, approved by the
+Principal on 2026-10-17). A controller start that raises — EngineControlError from systemctl, or the parent EngineError
+from the post-start /health check — may leave a unit that still holds memory, and llama-server@.service's
+Restart=on-failure would start it again 5 s later, outside the ledger, while the Arbiter loads something else
+(answers.md section 1.4 gap 2). So, the reservation and `_busy` still held, the Arbiter stops the unit (a stop cancels
+the pending restart) and confirms the release against the GTT reading taken before the start, with rule 5's poll,
+tolerance and timeout (`_release_target`, `_await_release`, shared with `_stop_and_confirm`); only then does it release
+the reservation, write the ERROR row and re-raise the start's error. If that stop raises, or the memory is not back in
+time, the memory state is unknown and the Arbiter HALTS exactly as rule 5 does on a release timeout: an ERROR row naming
+the cause, the reservation released, ReleaseTimeout raised, every later load refused until a person looks. A
+class-external plan starts and stops nothing. The resident small-model path does not stop a failed start: a companion's
+memory is the resident set measured before any seat (Section 4.1), Restart=on-failure is its recovery and a stop would
+cancel it, and that path holds no reservation or baseline to confirm against. A catch-all releases the placeholder for
+anything else, so it can never wedge the Arbiter. A failure during eviction is unchanged: a controller stop that raises
+leaves the victim resident and SERVING again (unloading cleared, an error row in the ledger, the exception re-raised):
+the unit may well still be active, and the next request_unload/request_load can retry once the cause (the sudoers
+fragment, a hung unit) is fixed.
 
 What the projection follows (fix round). `systemctl start llama-server@<key>` runs the flags of
 $ATLAS_ENGINES_ENV_DIR/<key>.env (ATLAS_CTX_SIZE, ATLAS_PARALLEL, ATLAS_KV_TYPE), rendered by phase2/engine-env.py from
@@ -198,7 +209,8 @@ class ArbiterError(RuntimeError):
 
 
 class ReleaseTimeout(ArbiterError):
-    """Rule 5: the GTT counter did not drop after an unload. Nothing else loads until a human looks (rule §7.4)."""
+    """Rule 5: the GTT counter did not drop after an unload, or after the stop of a unit whose start failed (or that
+    stop failed; measure 10). Nothing else loads until a human looks (rule §7.4)."""
 
 
 class UnknownEngine(ArbiterError):
@@ -969,6 +981,9 @@ class Arbiter:
         """Outside the lock: stop the victims (rule 5 per victim), start the engine, then finalise under the lock."""
         key, task_id = plan.key, plan.task_id
         if plan.resident_small:
+            # No stop after a failed start here (measure 10 covers the seats): a resident companion's memory is the
+            # resident set measured before any seat (Section 4.1), Restart=on-failure is its recovery and a stop would
+            # cancel it, and this path holds no reservation or GTT baseline to confirm a release against.
             try:
                 if not self.controller.is_active(key):
                     self.controller.start(key)
@@ -978,6 +993,7 @@ class Arbiter:
                     self._cv.notify_all()
             return self._decide(Decision.GRANTED, key, task_id, 0, "resident small model; not budgeted (Section 4.1)")
         stage = "load"
+        used_before: int | None = None  # the GTT reading before the start: a failed start's release target
         try:
             for victim in plan.victims:
                 why = f"evicted for {key}"
@@ -1002,6 +1018,12 @@ class Arbiter:
         except EngineError as exc:
             # EngineControlError (systemctl failed) or the parent EngineError (the post-start /health check in
             # SystemdEngineController.start): either way nothing is serving and the reservation must go (fix round).
+            # Measure 10 (module docstring "Failure paths"): a failed START is stopped and its release confirmed
+            # first, the reservation still held; _stop_failed_start halts and raises ReleaseTimeout when it cannot.
+            # A failure during eviction is unchanged: the new engine was never started.
+            stopped = ""
+            if stage == "start" and not plan.external and used_before is not None:
+                stopped = f"; {self._stop_failed_start(plan, used_before, exc)}"
             with self._cv:
                 self.resident.pop(key, None)
                 self._release_victims(plan.victims)
@@ -1012,7 +1034,7 @@ class Arbiter:
                     key,
                     task_id,
                     plan.footprint.total_bytes,
-                    f"{stage} failed; {key} not loaded, reservation released: {exc}",
+                    f"{stage} failed; {key} not loaded, reservation released{stopped}: {exc}",
                 )
             raise
         except BaseException as exc:
@@ -1209,28 +1231,83 @@ class Arbiter:
         # Rule 5: trust the counter, not the process exit. The engine's share is the delta observed at its load (or the
         # measurement when one replaced it); the counter must fall back by that much, within the tolerance.
         share = res.measured_bytes if res.measured_bytes is not None else res.observed_bytes
-        target = max(self.resident_set_bytes, before - share) + self.release_tolerance_bytes
-        deadline = self._clock() + self.release_timeout_s
-        used = self.probe.gtt_used_bytes()
-        while used > target:
-            if self._clock() >= deadline:
-                halted = (f"GTT not released after stopping {key}: {used / GIB:.2f} GiB still used, "
-                          f"expected <= {target / GIB:.2f} GiB after {self.release_timeout_s:.0f}s")
-                with self._cv:
-                    self._halted = halted
-                    del self.resident[key]  # the process is gone; the memory is not, and the Arbiter says so
-                    self._decide(Decision.ERROR, key, task_id, res.charged_bytes, halted)
-                    self._cv.notify_all()
-                raise ReleaseTimeout(halted + " (Section 4.2 rule 5; check journalctl -u llama-server@"
-                                     f"{key} and /sys/class/drm/card*/device/mem_info_gtt_used)")
-            self._sleep(self.poll_interval_s)
-            used = self.probe.gtt_used_bytes()
+        target = self._release_target(before - share)
+        released, used = self._await_release(target)
+        if not released:
+            halted = (f"GTT not released after stopping {key}: {used / GIB:.2f} GiB still used, "
+                      f"expected <= {target / GIB:.2f} GiB after {self.release_timeout_s:.0f}s")
+            with self._cv:
+                self._halted = halted
+                del self.resident[key]  # the process is gone; the memory is not, and the Arbiter says so
+                self._decide(Decision.ERROR, key, task_id, res.charged_bytes, halted)
+                self._cv.notify_all()
+            raise ReleaseTimeout(halted + " (Section 4.2 rule 5; check journalctl -u llama-server@"
+                                 f"{key} and /sys/class/drm/card*/device/mem_info_gtt_used)")
         with self._cv:
             del self.resident[key]
             self._decide(Decision.GRANTED, key, task_id, res.charged_bytes,
                          f"{reason}; release confirmed at {used / GIB:.2f} GiB used", action="unload")
             self._cv.notify_all()
         return f"release confirmed at {used / GIB:.2f} GiB used"
+
+    def _release_target(self, baseline: int) -> int:
+        """Rule 5's target: the counter must fall to the baseline (never below the resident set) plus the tolerance."""
+        return max(self.resident_set_bytes, baseline) + self.release_tolerance_bytes
+
+    def _await_release(self, target: int) -> tuple[bool, int]:
+        """Rule 5's poll, with the lock RELEASED: read the GTT counter every poll_interval_s until it is at or below
+        `target`, for at most release_timeout_s. Returns (released, the last reading)."""
+        deadline = self._clock() + self.release_timeout_s
+        used = self.probe.gtt_used_bytes()
+        while used > target:
+            if self._clock() >= deadline:
+                return False, used
+            self._sleep(self.poll_interval_s)
+            used = self.probe.gtt_used_bytes()
+        return True, used
+
+    def _stop_failed_start(self, plan: _LoadPlan, used_before: int, cause: EngineError) -> str:
+        """Measure 10 (module docstring "Failure paths"): stop the unit whose start raised and confirm, with rule 5's
+        poll, tolerance and timeout, that the counter is back at its reading before the start. Runs with the lock
+        RELEASED and the reservation still held. Returns the note for the ERROR row the caller writes. When the stop
+        raises or the release is not confirmed in time the memory state is unknown: the Arbiter HALTS as rule 5 does
+        (reservation released, ERROR row naming the cause) and ReleaseTimeout is raised; anything that is not an
+        Exception still halts first and is re-raised as it is."""
+        key = plan.key
+        stopped = False
+        try:
+            self.controller.stop(key)  # a stop also cancels the restart Restart=on-failure has scheduled
+            stopped = True
+            target = self._release_target(used_before)
+            released, used = self._await_release(target)
+        except BaseException as exc:
+            what = ("the stop that must follow it failed too" if not stopped
+                    else "its memory release could not be read")
+            halted = (f"start of {key} failed ({cause}) and {what} ({type(exc).__name__}: {exc}); the unit may "
+                      "still hold memory or be restarted by systemd (Restart=on-failure)")
+            self._halt_failed_start(plan, halted)
+            if not isinstance(exc, Exception):
+                raise
+            raise ReleaseTimeout(halted + f" (check systemctl status llama-server@{key} and "
+                                 "/sys/class/drm/card*/device/mem_info_gtt_used)") from exc
+        if not released:
+            halted = (f"GTT not released after the failed start of {key} ({cause}) and its stop: {used / GIB:.2f} "
+                      f"GiB still used, expected <= {target / GIB:.2f} GiB after {self.release_timeout_s:.0f}s")
+            self._halt_failed_start(plan, halted)
+            raise ReleaseTimeout(halted + " (Section 4.2 rule 5; check journalctl -u llama-server@"
+                                 f"{key} and /sys/class/drm/card*/device/mem_info_gtt_used)") from cause
+        return f"unit stopped after the failed start, release confirmed at {used / GIB:.2f} GiB used (measure 10)"
+
+    def _halt_failed_start(self, plan: _LoadPlan, halted: str) -> None:
+        """Under the lock: halt as rule 5 does (every later load refused), release the reservation, clear _busy and
+        write the ERROR row naming the cause."""
+        with self._cv:
+            self._halted = halted
+            self.resident.pop(plan.key, None)
+            self._release_victims(plan.victims)
+            self._busy = None
+            self._decide(Decision.ERROR, plan.key, plan.task_id, plan.footprint.total_bytes, halted)
+            self._cv.notify_all()
 
     # --- generation lock (rules 3, 4, 6) ---------------------------------------------------------------------------
 

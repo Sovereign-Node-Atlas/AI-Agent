@@ -859,6 +859,9 @@ def test_failed_start_releases_the_reservation(engines: dict[str, EngineSpec]) -
     with pytest.raises(EngineControlError):
         arb.request_load(GLM, task_id="t1")
     assert arb.resident == {} and arb.busy is None and arb.charged_bytes == 0
+    # Measure 10: the failed unit is stopped (a stop cancels Restart=on-failure); nothing was taken, so the release
+    # is confirmed at once.
+    assert arb.controller.calls == [("start", GLM), ("stop", GLM)]
     assert arb.request_load("gpt-oss-120b", task_id="t2").granted  # not halted: the memory was never taken
 
 
@@ -873,6 +876,7 @@ def test_post_start_health_failure_releases_the_reservation(engines: dict[str, E
     with pytest.raises(EngineError, match="start of gpt-oss-120b refused"):
         arb.request_load("gpt-oss-120b", task_id="t1")
     assert arb.busy is None and arb.resident == {} and arb.status()["busy"] is None and arb.charged_bytes == 0
+    assert ("stop", "gpt-oss-120b") in arb.controller.calls  # measure 10
     assert arb.request_load(GLM, task_id="t2").granted
     rows = [(r["engine"], r["decision"], r["reason"]) for r in ledger.list_arbiter_decisions(limit=20)]
     assert any(e == "gpt-oss-120b" and d == "error" and "start failed" in why and "reservation released" in why
@@ -894,6 +898,9 @@ def test_failed_stop_gives_the_victim_back(engines: dict[str, EngineSpec]) -> No
         arb.request_load(GLM, task_id="t2")
     victim = arb.resident["gpt-oss-120b"]
     assert victim.serving and not victim.unloading and GLM not in arb.resident
+    # Measure 10 leaves an eviction failure as it was: GLM was never started, so it is never stopped either.
+    assert ("start", GLM) not in arb.controller.calls and ("stop", GLM) not in arb.controller.calls
+    assert arb.status()["halted"] is None
     assert arb.busy is None and arb.try_generation("gpt-oss-120b", task_id="g1").granted
     arb.release_generation(task_id="g1")
     # Direct unload path: same failure, same recovery; the ledger holds the error row with the systemctl hint.
@@ -913,6 +920,198 @@ def test_failed_stop_gives_the_victim_back(engines: dict[str, EngineSpec]) -> No
     arb.controller.fail_stop.clear()
     assert arb.request_unload("gpt-oss-120b", task_id="t4").granted
     assert arb.resident == {} and arb.request_load(GLM, task_id="t5").granted
+
+
+class HeldStartController(StubController):
+    """A start that raises AFTER the process took its memory: systemctl reported a failure, or the post-start /health
+    check never saw 200, while the server still holds its buffers (and Restart=on-failure would start it again)."""
+
+    def start(self, key: str) -> None:
+        if key not in self.fail_start:
+            super().start(key)
+            return
+        self.calls.append(("start", key))
+        self.active.add(key)
+        if self.probe is not None:
+            self.probe.used_bytes += self._bytes(key)
+        raise self.start_error(f"stub: {key} started but /health never answered 200 (test)")
+
+
+def _held_start(engines: dict[str, EngineSpec], key: str, held: int, **kw: object) -> tuple[Arbiter, StubProbe,
+                                                                                               FakeClock, Ledger]:
+    ledger = Ledger(":memory:")
+    ledger.init_db()
+    arb, _, probe, clock = make(engines, ledger=ledger, **kw)  # type: ignore[arg-type]
+    arb.controller = HeldStartController(engines=engines, probe=probe, footprints={key: held}, fail_start=[key],
+                                         start_error=EngineError, leak_on_stop=bool(kw.get("leak")))
+    return arb, probe, clock, ledger
+
+
+def _errors(ledger: Ledger) -> list[tuple[str | None, str, str]]:
+    return [(r["task_id"], r["engine"], r["reason"]) for r in reversed(ledger.list_arbiter_decisions(limit=50))
+            if r["decision"] == "error"]
+
+
+def test_failed_start_is_stopped_and_released_once_the_counter_falls(engines: dict[str, EngineSpec]) -> None:
+    """Measure 10 (answers.md 1.4 gap 2): a start that fails after the server took 40 GiB is stopped at once; the
+    reservation (placeholder and `_busy`) is held, and no ERROR row is written, until rule 5's poll sees the counter
+    back at its reading before the start; then the reservation goes, the row is written and the start's error is
+    re-raised. The Arbiter is not halted. The stop and the poll run with the state lock released: `_cv` is backed by
+    an RLock, so holding it would not deadlock this thread and only `_is_owned()` shows it."""
+    arb, probe, clock, ledger = _held_start(engines, GLM, 40 * GIB)
+    seen: list[tuple[bool, str | None, int]] = []
+    locked: list[bool] = []
+    ticks = {"n": 0}
+    stop = arb.controller.stop
+
+    def stop_but_keep_memory(key: str) -> None:
+        locked.append(arb._cv._is_owned())
+        held = probe.used_bytes
+        stop(key)
+        probe.used_bytes = held  # the unit exits; its GTT pages come back a few polls later (research §6.3)
+
+    def slow_sleep(seconds: float) -> None:
+        locked.append(arb._cv._is_owned())
+        clock.sleep(seconds)
+        seen.append((GLM in arb.resident, arb.busy, len(_errors(ledger))))
+        ticks["n"] += 1
+        if ticks["n"] >= 3:
+            probe.used_bytes = RESIDENT_SET
+
+    arb.controller.stop = stop_but_keep_memory  # type: ignore[method-assign]
+    arb._sleep = slow_sleep
+    with pytest.raises(EngineError, match="/health never answered 200"):
+        arb.request_load(GLM, task_id="t1")
+    assert arb.controller.calls == [("start", GLM), ("stop", GLM)]
+    assert ticks["n"] == 3 and probe.used_bytes == RESIDENT_SET
+    assert locked == [False] * 4  # the stop and the three polls, none under the state lock
+    # While the poll ran: still reserved, still busy, no ERROR row yet.
+    assert seen == [(True, f"loading {GLM}", 0)] * 3
+    assert arb.resident == {} and arb.busy is None and arb.status()["halted"] is None
+    (tid, engine, why), = _errors(ledger)
+    assert (tid, engine) == ("t1", GLM)
+    assert why.startswith(f"start failed; {GLM} not loaded, reservation released; unit stopped after the failed start, "
+                          "release confirmed at 22.00 GiB used (measure 10): ")
+    assert arb.request_load("gpt-oss-120b", task_id="t2").granted  # not halted
+
+
+def test_failed_start_whose_stop_fails_halts_the_arbiter(engines: dict[str, EngineSpec]) -> None:
+    """Measure 10: when the stop after a failed start raises too, the memory state is unknown: the Arbiter halts as
+    rule 5 does, with an ERROR row that names both causes, and refuses every later load."""
+    arb, _, _, ledger = _held_start(engines, GLM, 40 * GIB)
+    arb.controller.fail_stop.add(GLM)
+    with pytest.raises(ReleaseTimeout, match="the stop that must follow it failed too") as exc:
+        arb.request_load(GLM, task_id="t1")
+    assert isinstance(exc.value.__cause__, EngineControlError)
+    assert arb.controller.calls == [("start", GLM), ("stop", GLM)]
+    assert arb.resident == {} and arb.busy is None
+    halted = arb.status()["halted"]
+    assert halted and "/health never answered 200" in halted and "password is required" in halted
+    assert "Restart=on-failure" in halted
+    later = arb.request_load("gpt-oss-120b", task_id="t2")
+    assert later.decision is Decision.REFUSED and "arbiter halted" in later.reason
+    (tid, engine, why), = _errors(ledger)
+    assert (tid, engine, why) == ("t1", GLM, halted)
+
+
+def test_failed_start_whose_memory_does_not_come_back_halts_the_arbiter(engines: dict[str, EngineSpec]) -> None:
+    """Measure 10: the stop works but the counter never falls back to its reading before the start: rule 5's full
+    time-box, then the same halt as a release timeout, the ERROR row naming the failed start."""
+    arb, probe, clock, ledger = _held_start(engines, GLM, 40 * GIB, leak=True, release_timeout_s=60.0)
+    before = clock.now
+    with pytest.raises(ReleaseTimeout, match=f"GTT not released after the failed start of {GLM}"):
+        arb.request_load(GLM, task_id="t1")
+    assert clock.now - before >= 60.0 and probe.used_bytes == RESIDENT_SET + 40 * GIB
+    assert arb.controller.calls == [("start", GLM), ("stop", GLM)]
+    assert arb.resident == {} and arb.busy is None
+    halted = arb.status()["halted"]
+    assert halted and "62.00 GiB still used, expected <= 23.00 GiB after 60s" in halted
+    assert arb.request_load("gpt-oss-120b", task_id="t2").decision is Decision.REFUSED
+    assert _errors(ledger) == [("t1", GLM, halted)]
+
+
+def test_failed_start_whose_release_cannot_be_read_halts_the_arbiter(engines: dict[str, EngineSpec]) -> None:
+    """Measure 10: the stop works but the GPU memory counter cannot be read afterwards (the sysfs file is gone). The
+    memory state is unknown, so the Arbiter halts as rule 5 does, chained to the read's error, with one ERROR row, and
+    refuses every later load."""
+    arb, probe, _, ledger = _held_start(engines, GLM, 40 * GIB)
+    stop = arb.controller.stop
+
+    def unreadable() -> int:
+        raise OSError("sysfs gone")
+
+    def stop_then_lose_the_counter(key: str) -> None:
+        stop(key)
+        probe.gtt_used_bytes = unreadable  # type: ignore[method-assign]
+
+    arb.controller.stop = stop_then_lose_the_counter  # type: ignore[method-assign]
+    with pytest.raises(ReleaseTimeout, match="its memory release could not be read") as exc:
+        arb.request_load(GLM, task_id="t1")
+    assert isinstance(exc.value.__cause__, OSError)
+    assert arb.controller.calls == [("start", GLM), ("stop", GLM)]
+    assert arb.resident == {} and arb.busy is None
+    del probe.gtt_used_bytes  # readable again: status() reads the counter
+    halted = arb.status()["halted"]
+    assert halted and "(OSError: sysfs gone)" in halted and "Restart=on-failure" in halted
+    assert _errors(ledger) == [("t1", GLM, halted)]
+    later = arb.request_load("gpt-oss-120b", task_id="t2")
+    assert later.decision is Decision.REFUSED and "arbiter halted" in later.reason
+
+
+def test_failed_start_whose_stop_is_interrupted_halts_and_re_raises(engines: dict[str, EngineSpec]) -> None:
+    """Measure 10: something that is not an Exception (KeyboardInterrupt here) during the stop still halts the Arbiter
+    and releases the reservation first, so the placeholder never wedges, and is then re-raised unchanged, never turned
+    into ReleaseTimeout."""
+    arb, _, _, ledger = _held_start(engines, GLM, 40 * GIB)
+
+    def interrupted(key: str) -> None:
+        arb.controller.calls.append(("stop", key))
+        raise KeyboardInterrupt
+
+    arb.controller.stop = interrupted  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        arb.request_load(GLM, task_id="t1")
+    assert arb.controller.calls == [("start", GLM), ("stop", GLM)]
+    assert arb.resident == {} and arb.busy is None
+    halted = arb.status()["halted"]
+    assert halted and "the stop that must follow it failed too (KeyboardInterrupt" in halted
+    assert _errors(ledger) == [("t1", GLM, halted)]
+
+
+def test_failed_start_beside_a_resident_seat_is_released_at_the_reading_before_it(
+        engines: dict[str, EngineSpec]) -> None:
+    """Measure 10 at D-32 option (b) (two seats): gpt-oss-120b stays resident, not evicted, while GLM's start fails
+    holding 40 GiB. The release target is the reading before the start (the resident set plus gpt-oss), not the
+    resident set alone, so the release is confirmed at once and the Arbiter is not halted."""
+    arb, probe, _, ledger = _held_start(engines, GLM, 40 * GIB, max_resident=2, budget_gib=400.0)
+    assert arb.request_load("gpt-oss-120b", task_id="t0").granted
+    before = probe.used_bytes
+    assert before > RESIDENT_SET + arb.release_tolerance_bytes  # a target of the resident set alone would halt
+    with pytest.raises(EngineError, match="/health never answered 200"):
+        arb.request_load(GLM, task_id="t1")
+    assert arb.controller.calls == [("start", "gpt-oss-120b"), ("start", GLM), ("stop", GLM)]
+    assert list(arb.resident) == ["gpt-oss-120b"] and arb.resident["gpt-oss-120b"].serving
+    assert probe.used_bytes == before and arb.busy is None and arb.status()["halted"] is None
+    (tid, engine, why), = _errors(ledger)
+    assert (tid, engine) == ("t1", GLM)
+    assert why.startswith(f"start failed; {GLM} not loaded, reservation released; unit stopped after the failed start, "
+                          f"release confirmed at {before / GIB:.2f} GiB used (measure 10): ")
+    assert arb.request_load("gpt-oss-120b", task_id="t2").granted  # already resident, not halted
+
+
+def test_failed_start_stop_is_for_units_only(engines: dict[str, EngineSpec]) -> None:
+    """Measure 10 never calls stop for a class-external plan (the caller owns the process, nothing was started) nor
+    for a resident small model, whose memory is the measured resident set and whose recovery is Restart=on-failure."""
+    arb, controller, _, _ = make(engines)
+    arb.controller = controller = StubController(engines=engines, probe=arb.probe, fail_start=["chatterbox",
+                                                 "router-qwen3.5-4b"], fail_stop=["chatterbox", "router-qwen3.5-4b"])
+    assert arb.request_load("chatterbox", task_id="v7").granted
+    assert arb.request_unload("chatterbox", task_id="v7").granted
+    assert controller.calls == []
+    with pytest.raises(EngineControlError, match=r"start of router-qwen3\.5-4b refused"):
+        arb.request_load("router-qwen3.5-4b", task_id="t-res")
+    assert controller.calls == [("start", "router-qwen3.5-4b")] and arb.busy is None
+    assert arb.status()["halted"] is None
 
 
 def test_never_preempts_mid_generation(engines: dict[str, EngineSpec]) -> None:
@@ -1021,6 +1220,7 @@ def test_release_confirmation_timeout_fails_loudly(engines: dict[str, EngineSpec
         arb.request_load(GLM, task_id="t2")  # one seat at a time: gpt-oss must go first
     assert clock.now - before >= 60.0  # polled for the full time-box (research §6.3), not a single read
     assert ("stop", "gpt-oss-120b") in controller.calls and ("start", GLM) not in controller.calls
+    assert ("stop", GLM) not in controller.calls  # measure 10 does not touch an eviction failure
     assert arb.resident == {}  # the process is gone; the memory is not, and the Arbiter says so
     # Nothing else loads until a human looks (rule §7.4 fail loudly, never silently).
     later = arb.request_load("gpt-oss-120b", task_id="t3")

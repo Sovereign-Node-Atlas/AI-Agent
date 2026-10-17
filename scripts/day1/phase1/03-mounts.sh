@@ -2,7 +2,8 @@
 # phase1/03-mounts.sh — Phase 1 step 3 (Sections 3.5, 17; CONVENTIONS.md §2): ext4 on the unlocked data volume,
 # /srv/atlas in fstab with nofail and a device timeout, the directory tree with its owners (creates the atlas and
 # atlas-ddns accounts here), /srv/cold and /srv/backups, swap off permanently, /tmp tmpfs verified (adjudicated
-# conflict 2: it is already tmpfs on 26.04; never "enable" a unit that has no [Install] section). Defines step_03.
+# conflict 2: it is already tmpfs on 26.04; never "enable" a unit that has no [Install] section) and capped at 4G
+# (research_notes/ATLAS v0.4.0 build record/answers.md section 1.5 measure 7, approved 2026-10-17). Defines step_03.
 [[ -n "${ATLAS_DAY1_DIR:-}" ]] || {
   # shellcheck source=lib/common.sh
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
@@ -136,12 +137,14 @@ step_03() {
   install -d -m 755 /etc/systemd/system/tmp.mount.d
   cat >/etc/systemd/system/tmp.mount.d/atlas.conf <<'CONF'
 # ATLAS Phase 1 step 3: cap /tmp so tmpfs pages never compete with the 192 GB GTT pool (default size=50% of RAM).
+# 4G (measure 7, approved 2026-10-17; was 16G): with no swap a tmpfs page cannot be reclaimed, and 16G was the whole
+# host reserve. No Day 1 script writes anywhere near 4G here (INFERRED: pulls, package caches and big unpacks are on disk).
 [Mount]
-Options=mode=1777,strictatime,nosuid,nodev,size=16G,nr_inodes=1m
+Options=mode=1777,strictatime,nosuid,nodev,size=4G,nr_inodes=1m
 CONF
   systemctl daemon-reload
   if findmnt -n -o FSTYPE /tmp | grep -qx tmpfs; then
-    log "/tmp is tmpfs ($(findmnt -n -o OPTIONS /tmp)); the 16G cap applies from the next boot"
+    log "/tmp is tmpfs ($(findmnt -n -o OPTIONS /tmp)); the 4G cap applies from the next boot"
   else
     local state; state="$(systemctl show tmp.mount -p UnitFileState --value 2>/dev/null || echo unknown)"
     [[ "$state" != masked ]] || die "tmp.mount is masked; unmask failed"

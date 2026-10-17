@@ -53,6 +53,9 @@ WorkingDirectory=${ATLAS_SRV}/models
 ExecStart=/usr/local/bin/llama-server $ARGS
 # --noproxy '*': the readiness poll must reach 127.0.0.1 directly whatever the environment says (never via squid).
 ExecStartPost=/bin/sh -c 'until curl -sf --noproxy "*" -o /dev/null "http://127.0.0.1:${LLAMA_ARG_PORT}/health"; do sleep 2; done'
+# Restart=on-failure restarts a resident companion that crashes after loading. A seat whose START failed (exit, or
+# ExecStartPost never saw /health) is stopped by the Arbiter at once (atlas/arbiter.py _execute_load): the stop cancels
+# the pending restart, so a failed load cannot come back 5 s later outside the ledger (answers.md section 1.4 gap 2).
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=900
@@ -61,6 +64,8 @@ TimeoutStopSec=120
 KillMode=mixed
 LimitMEMLOCK=infinity
 LimitNOFILE=65536
+# OOM victim order (answers.md 1.5 measure 9): a killed engine loses its load; background work (+500) dies first.
+OOMScoreAdjust=-500
 # Hardening that does not interfere with /dev/dri access or mmap of the model files. NOT added on purpose:
 # PrivateDevices/DevicePolicy (the engine needs /dev/dri) and MemoryDenyWriteExecute (Mesa/RADV JIT).
 NoNewPrivileges=true

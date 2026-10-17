@@ -113,6 +113,8 @@ Gaps:
 | 18 | Already decided against, or no gain: `--swa-full` (costs 2.35 GiB, B-74), `--kv-unified` (memory-neutral, B-74; D-48 Phase 3), mlock, manual cache drops, `--n-cpu-moe` (a loss on unified memory, roster notes), a smaller router quant | — | — | — | No |
 | 19 | Phased, so no Day 1 memory cost: OCR companion (about 1.3-1.5 GiB if resident, C-04), Qwen3-ASR (2.17 GB), EmbeddingGemma 2 (0.29-0.52 GiB), slot save/restore (disk, not RAM; D-44) | — | — | — | Record only |
 
+*Note, 2026-10-17:* measures 5 to 10 were approved by the Principal and implemented on 2026-10-17 (S55 in `docs/ATLAS_FRAMEWORK_REVIEW.md`). As built: measure 5 is the `engines.json` field `cache_ram_mib`, rendered as `--cache-ram`, with the flag reserved (not an `extra_args` token as the Cost column says); measure 8's caps are kokoro 3g, speaches 4g and docling 8g, raised from the examples, and its optional `MemoryHigh` was not added. The table above is the record as written before the approval.
+
 ### 1.6 Plain-language answer for the Principal
 
 The small models are never flushed and reloaded. The router (and, after D-14, the embedder and reranker) start once when the node boots and then stay loaded. The Arbiter measures what they take, subtracts that plus a fixed 16 GiB safety reserve for the operating system and services, and treats what is left as the one big model's space.

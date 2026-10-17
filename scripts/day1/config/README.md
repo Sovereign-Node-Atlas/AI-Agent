@@ -16,6 +16,12 @@ the canonical set in `scripts/day1/CONVENTIONS.md` §8.
   bytes (D-31). Only the unchanged `gpt-oss-120b-abliterated` entry has no byte counts, so its `footprint_gb` is
   still read as GiB.
 - `placement` is `gpu` (default) or `cpu`, which only `arbiter_class: resident` may take (the Qwen3 pair; D-14 (e)).
+- `cache_ram_mib` (doc S55; B-33, approved 2026-10-17) is the engine's host-RAM prompt-cache cap in MiB, rendered as an
+  explicit `--cache-ram` on every unit: an integer of 0 or more (0 disables the cache), else the mode default (4096
+  for chat and vision, 0 for embedding and reranking; `phase2/engine-env.py` `CACHE_RAM_DEFAULT_MIB`). -1 and any
+  other value are refused, and so are `--cache-ram`, `-cram` and `LLAMA_ARG_CACHE_RAM` in `extra_args` and `env`
+  (`_meta.cache_ram_rule`). The router sets 1024 and the Qwen3 pair 0; the seats take 4096. A cap changed after the
+  Phase 3 to-do `cache-ram` goes in this field.
 - `kv_class` admits `f16` (GLM and DeepSeek, D-29 (a)); `kv_ladder` on DeepSeek is `[f16, q8_0]`; `kv_proof_lines`
   is the number of KV lines V4 reads per load.
 - `projected_decode_tok_s` (with `projected_decode_source`) is recorded beside the measured rate; `decode_floor_tok_s`

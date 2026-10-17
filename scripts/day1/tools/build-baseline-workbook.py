@@ -251,17 +251,18 @@ _amend_note = {1: "Amended in v0.3.5 (S51, approved by the Principal 2026-10-11)
 # R26-R28 new in v0.3.5 (S53, 2026-10-12), recorded with the Principal's approval of the S53 document changes and
 # acknowledged by the Principal in the workbook returned 2026-10-13
 _s53_note = "Acknowledged 2026-10-13"
-# v0.4.0 (S-47, S-48, 2026-10-16): R29-R33 are new and R4, R17, R19 and R20 restated; Section 22 leaves their
-# acknowledgement open for the next returned workbook, so their response cells start blank
+# v0.4.0 (S-47, S-48, 2026-10-16): R29-R33 are new and R4, R17, R19 and R20 restated; all nine acknowledged by the
+# Principal on 2026-10-17 (S55, with the RAM fixes and the V25 pass marks; Section 22)
 _V040_RESTATED = {4: "S-48", 17: "S-48, C-06", 19: "S-26, S-47", 20: "S-34"}
+_V040_ACK = "acknowledged 2026-10-17"
 
 
 def _ack(i: int) -> tuple[str | None, str | None]:
     """(response, note) of risk Ri."""
     if i >= 29:
-        return None, "New in v0.4.0 (S-47, 2026-10-16): to acknowledge (sheet 5)"
+        return "Yes", f"New in v0.4.0 (S-47, 2026-10-16); {_V040_ACK}"
     if i in _V040_RESTATED:
-        return None, f"Restated in v0.4.0 ({_V040_RESTATED[i]}, 2026-10-16): to acknowledge again (sheet 5)"
+        return "Yes", f"Restated in v0.4.0 ({_V040_RESTATED[i]}, 2026-10-16); {_V040_ACK}"
     return "Yes", (_s53_note if i >= 26 else "Acknowledged 2026-10-08" if i >= 22 else _amend_note.get(i))
 
 
@@ -271,10 +272,10 @@ fill_sheet("3 Risks",
     "(v0.3.4: the xrdp exposure and the unattended-reboot gap) acknowledged by the Principal on 2026-10-08. R23 is "
     "mitigated by D15 (Secure Boot enabled; the BIOS setting confirmed made on 2026-10-13). R26 to R28 (v0.3.5, S53, "
     "2026-10-12: the ledger's 30-day purge not yet wired into the sweep, Chroma 1.5.9's soft deletes, and the "
-    "once-silent failed sweep, now pushed to the phone) acknowledged by the Principal on 2026-10-13. Open: R29 to R33 "
+    "once-silent failed sweep, now pushed to the phone) acknowledged by the Principal on 2026-10-13. R29 to R33 "
     "(v0.4.0, S-47: the re-pin, GLM-5.3-Flash's lossy rung, swap and re-prefill latency, the companions' share of the "
-    "engine budget, the phased DeepSeek V4.1 trial engine) and R4, R17, R19 and R20 as restated in v0.4.0; their "
-    "Acknowledged cells are blank for your answer.",
+    "engine budget, the phased DeepSeek V4.1 trial engine) and R4, R17, R19 and R20 as restated in v0.4.0 "
+    "acknowledged by the Principal on 2026-10-17 (S55).",
     ["ID", "Risk", "Likelihood", "Impact", "Mitigation", "Acknowledged", "Notes"],
     rows, [7, 44, 18, 22, 52, 18, 28], 6,
     ["Yes", "Discuss"], ["Yes"], [], ["Discuss"], extra_inputs=(7,))
@@ -283,8 +284,9 @@ fill_sheet("3 Risks",
 vr = md_table_after("## 21.")[1:]
 rows = [[v[0], v[1], v[2], "Not yet run", None] for v in vr]
 fill_sheet("4 Verification",
-    "Section 21 (V1 to V25; V25, the output parity of the llama.cpp re-pin, is new in v0.4.0, and V21 now proves "
-    "single residency). Filled in during Day 1 as each phase gate runs. Nothing is trusted until its row reads Pass.",
+    "Section 21 (V1 to V25; V25, the output parity of the llama.cpp re-pin, is new in v0.4.0, its pass marks confirmed "
+    "by the Principal on 2026-10-17, and V21 now proves single residency). Filled in during Day 1 as each phase gate "
+    "runs. Nothing is trusted until its row reads Pass.",
     ["ID", "What Day 1 must prove", "Where", "Result", "Evidence or notes"],
     rows, [7, 70, 24, 16, 40], 4,
     ["Pass", "Fail", "Deferred", "Not yet run"], ["Pass"], ["Deferred", "Not yet run"], ["Fail"], extra_inputs=(5,))
@@ -300,10 +302,11 @@ fill_sheet("5 Checklist",
     "were closed as each records: D15 decided and the Windows share deferred on 2026-10-05, C27 decided and R22 to "
     "R25 acknowledged by the Principal on 2026-10-08, the Secure Boot BIOS setting, the USB recovery drive and R26 to "
     "R28 ticked in the workbook returned 2026-10-13, and the action register, its licences, C28 to C30 and D16 to D27 "
-    "ticked on 2026-10-16 (v0.4.0). Blank rows: the optional items the scripts ask for at a prompt (Yes when "
-    "provided, N/A to leave them for the live ATLAS to-do list); the inputs the v0.4.0 approvals leave to the "
-    "Principal, each already built with its stated default and kept as a to-do, two of them after Day 1; and the "
-    "acknowledgement of R29 to R33 and the restated R4, R17, R19 and R20 (sheet 3). Nothing required before Phase 1 "
+    "ticked on 2026-10-16 (v0.4.0), and R29 to R33 with the restated R4, R17, R19 and R20 acknowledged on "
+    "2026-10-17. Blank rows: the optional items the scripts ask for at a prompt (Yes when "
+    "provided, N/A to leave them for the live ATLAS to-do list); and the inputs the v0.4.0 approvals leave to the "
+    "Principal, each already built with its stated default and kept as a to-do, two of them after Day 1. Nothing "
+    "required before Phase 1 "
     f"is open: the Secure Boot row and the install rows are ticked. One request still stands on row {ENC_ROW}, to "
     "confirm that the installer's encryption option (Encrypt the LVM group with LUKS) was taken; pre-flight checks "
     "the OS volume on Day 1, and an unencrypted one is a warning and the to-do os-volume-encryption, never a stop.",
@@ -488,9 +491,12 @@ ref_sheet("Ref Hardware",
       "step 4 removes the 4.25 GiB that kdump-tools reserves for a crash kernel (S48) and puts kho=off on the kernel "
       "line (S49), V3a proving both; with the reservation in place neither Day 1 seat fits. ATLAS_ARBITER_HEADROOM_GIB "
       "in orchestrator.env changes the reserve and ATLAS_ARBITER_MAX_RESIDENT the seat limit (default 1). Each chat "
-      "llama-server's host-RAM prompt cache (up to 8 GiB per server by default; the CPU pair runs with --cache-ram 0) "
-      "and its context checkpoints sit outside the budget; Phase 3 measures them and raises the to-do cache-ram "
-      "(S52)."),
+      "llama-server's host-RAM prompt cache and its context checkpoints sit outside the budget; since S55 "
+      "(approved by the Principal on 2026-10-17) every engine has an explicit --cache-ram (4096 MiB for chat and "
+      "vision, 1024 for the router, 0 for the CPU pair, so at most 5 GiB for the router and one seat where the 8 GiB "
+      "default allowed 16), /tmp is capped at 4 GiB, the Celery cpu worker runs at most 8 children, Kokoro, speaches "
+      "and Docling are capped, and the out-of-memory killer takes background work first. Phase 3 measures the caches "
+      "and raises the to-do cache-ram (S52), which asks whether to change a cap."),
      ("What each Day 1 seat takes, run alone (4.1, v0.4.0)", fits[0], fits[1:],
       "One LLM seat is resident at a time (D-32 (a); C30 on sheet 2 supersedes C26); exactly one generation runs, "
       "everywhere, Celery jobs included. Every figure is the Arbiter's own projection at the profile engines.json "
@@ -502,7 +508,7 @@ ref_sheet("Ref Hardware",
 # ---------- Summary sheet ----------
 ws = ws_sum
 title(ws, "A.T.L.A.S. Build Baseline",
-      "Companion to docs/ATLAS_FRAMEWORK_REVIEW.md v0.4.0 (2026-10-16), built from it by "
+      "Companion to docs/ATLAS_FRAMEWORK_REVIEW.md v0.4.0 (2026-10-17), built from it by "
       "scripts/day1/tools/build-baseline-workbook.py (D-27). v0.4.0 records the action register the Principal "
       "returned on 2026-10-16, every row approved as recommended (P-10 with the Principal's change: Eleanor's router "
       "stays at 4B for classification only, and her own persona work moves to GLM-5.3-Flash; the questions on P-10 and "
@@ -514,7 +520,11 @@ title(ws, "A.T.L.A.S. Build Baseline",
       "exact file bytes; the Qwen3 4B embedder and reranker on the CPU, replacing the bge pair before Day 1; the "
       "Phase 3 pull cut to about 448 GB; and pyannote community-1 now (C-06). D16 to D27 on sheet 1 record the "
       "decisions (D16 to D18 reopen D4, D10 and D12) and C28 to C30 on sheet 2 supersede C23, C25 and C26; R29 to R33 "
-      "on sheet 3, with R4, R17, R19 and R20 restated, wait for the Principal's acknowledgement in this workbook. The "
+      "on sheet 3, with R4, R17, R19 and R20 restated, were acknowledged by the Principal on 2026-10-17, the day the "
+      "Principal also approved the six RAM fixes (S55: an explicit prompt-cache cap on every engine, a 4 GiB /tmp, "
+      "at most 8 Celery cpu workers, memory caps on Kokoro, speaches and Docling, an order for the out-of-memory "
+      "killer, and a seat whose start failed stopped before its reservation goes) and confirmed V25's pass marks, "
+      "with no new version number. The "
       "specialist seats (Intern-S1, Ling-3.0-flash-Fin, Baichuan-M3, Qwen3-Coder-Next), slot save and restore, swap "
       "batching, the speech, image and OCR companions, the EmbeddingGemma 2 side index, the Qwen3.8-Flash-Next and "
       "Nemotron 3 Super pulls, the drafters and the DeepSeek V4.1 trial are phased after Day 1, each with its to-do; "
@@ -530,9 +540,9 @@ title(ws, "A.T.L.A.S. Build Baseline",
 how = [
     "How to use this workbook",
     "1. Sheets 1, 2 and 3 are a record of your answers of 2026-09-21, 2026-10-05 (D15: Secure Boot enabled), "
-    "2026-10-08 (C27: Ubuntu kept; R22 to R25 acknowledged), 2026-10-13 (R26 to R28 acknowledged) and 2026-10-16 "
-    "(the action register: D16 to D27 and C28 to C30). One thing on them still needs you: on sheet 3, acknowledge "
-    "R29 to R33 and the restated R4, R17, R19 and R20 (Yes, or Discuss). Sheet 5 records the Secure Boot BIOS setting "
+    "2026-10-08 (C27: Ubuntu kept; R22 to R25 acknowledged), 2026-10-13 (R26 to R28 acknowledged), 2026-10-16 "
+    "(the action register: D16 to D27 and C28 to C30) and 2026-10-17 (R29 to R33 and the restated R4, R17, R19 and "
+    "R20 acknowledged). Nothing on them needs you now. Sheet 5 records the Secure Boot BIOS setting "
     "made and the USB recovery drive in hand (both confirmed 2026-10-13) and lists the optional items the scripts ask "
     "for at a prompt and the inputs v0.4.0 leaves to you, each with the default already built. Sheet 4 fills during "
     "Day 1.",
@@ -544,7 +554,7 @@ how = [
     "5. The Ref sheets carry the agreed maps (hardware, platform watch-list and memory budget, the Day 1 and phased "
     "engines, cabinet, domains, task forces, integrations, voice, multimodal, governance, Day 1 and its test plan) "
     "for checking against.",
-    "6. Outstanding before Day 1: the sheet 3 acknowledgements above; nothing else required. The other blank sheet 5 "
+    "6. Outstanding before Day 1: nothing required. The blank sheet 5 "
     "rows are optional or wait until after Day 1, and can be given at the prompt or left for the live ATLAS; sheet 5 "
     f"row {ENC_ROW} still asks you to confirm that the installer's encryption option was taken (if it was not, Day 1 "
     "warns and records a to-do, never a stop). To reopen any other item, change its response cell (Changed my mind, "

@@ -122,6 +122,10 @@ def test_renders_every_engine(engine_env: ModuleType, monkeypatch: pytest.Monkey
         assert args[args.index("--ctx-size") + 1] == str(want_ctx)  # the TOTAL pool (conflict 9)
         assert args[args.index("--parallel") + 1] == str(want_par)
         assert "--no-webui" in args
+        # B-33 (measure 5): one explicit prompt-cache cap per engine, the field or the mode default, never absent.
+        want_cram = eng.get("cache_ram_mib", engine_env.CACHE_RAM_DEFAULT_MIB[eng.get("mode", "chat")])
+        assert args.count("--cache-ram") == 1 and args[args.index("--cache-ram") + 1] == str(want_cram)
+        assert "-cram" not in args
         # D-14 (e): a cpu entry never touches the Vulkan device; every other entry offloads every layer.
         placement = eng.get("placement", "gpu")
         assert kv["ATLAS_PLACEMENT"] == placement
@@ -245,6 +249,16 @@ def _mutated(engines: list[dict[str, Any]], key: str, **fields: Any) -> list[dic
         {"parallel": 0},                                        # never auto (gguf-models.md §1.3)
         {"ctx_size": 1024, "parallel": 8},                      # < 256 tokens per slot
         {"kv_class": "q3_k"},                                   # not a cache type
+        # B-33 (measure 5): the prompt-cache cap is cache_ram_mib's alone, an integer of 0 or more.
+        {"cache_ram_mib": -1},                                  # no limit: the 8 GiB exposure B-33 closes
+        {"cache_ram_mib": "4096"},                              # a string, not an integer
+        {"cache_ram_mib": 1024.5},                              # not an integer
+        {"cache_ram_mib": True},                                # JSON true is not 1 MiB
+        {"cache_ram_mib": None},                                # null is not the default
+        {"extra_args": ["--cache-ram", "8192"]},                # the flag in extra_args
+        {"extra_args": ["-cram", "-1"]},                        # the short spelling
+        {"extra_args": ["--cache-ram=0"]},                      # the --flag=value spelling
+        {"env": {"LLAMA_ARG_CACHE_RAM": "8192"}},               # the env spelling
     ],
 )
 def test_refused_inputs(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch, tree: dict[str, Path],
@@ -391,14 +405,55 @@ def test_rendered_units_run_one_llm_seat_in_the_arbiter(engine_env: ModuleType, 
     assert not any(specs[k].is_resident for k in arb.resident)
 
 
+def test_cache_ram_defaults_by_mode_and_explicit_values(engine_env: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                                                         tree: dict[str, Path], engines: list[dict[str, Any]],
+                                                         tmp_path: Path) -> None:
+    """B-33, measure 5 (approved 2026-10-17): the real engines.json renders the router at 1024 MiB, the CPU pair at 0
+    (no prompt cache) and every seat, the unchanged abliterated entry included, at the chat or vision default of 4096;
+    an entry without the field takes its mode's default and an explicit value, 0 included, wins over it."""
+    assert engine_env.CACHE_RAM_DEFAULT_MIB == {"chat": 4096, "vision": 4096, "embedding": 0, "reranking": 0}
+    assert _run(engine_env, monkeypatch, tree) == 0
+
+    def cram(out: Path, key: str) -> str:
+        args = _kv(out / f"{key}.env")["ARGS"].split()
+        assert args.count("--cache-ram") == 1, key
+        return args[args.index("--cache-ram") + 1]
+
+    assert {e["key"]: cram(tree["out"], e["key"]) for e in engines} == {
+        "gpt-oss-120b": "4096", "gpt-oss-120b-abliterated": "4096", "glm-5.3-flash": "4096",
+        "deepseek-v4-flash": "4096", "router-qwen3.5-4b": "1024", "embed-qwen3-4b": "0", "rerank-qwen3-4b": "0"}
+    by_key = {e["key"]: e for e in engines}
+    assert by_key["router-qwen3.5-4b"]["cache_ram_mib"] == 1024
+    assert "cache_ram_mib" not in by_key["gpt-oss-120b-abliterated"]  # its entry is unchanged; the default applies
+    # The CPU pair no longer carries the flag in extra_args (it is reserved): the field does it.
+    assert not any("--cache-ram" in e.get("extra_args", []) for e in engines)
+    # Synthetic: the field removed falls back to each mode's default; an explicit value wins, 0 included.
+    defaults = [{k: v for k, v in e.items() if k != "cache_ram_mib"} for e in engines]
+    explicit = _mutated(_mutated(engines, "gpt-oss-120b", cache_ram_mib=0), "glm-5.3-flash", cache_ram_mib=2048)
+    for name, variant, want in (
+            ("defaults", defaults, {"gpt-oss-120b": "4096", "glm-5.3-flash": "4096", "router-qwen3.5-4b": "4096",
+                                    "embed-qwen3-4b": "0", "rerank-qwen3-4b": "0"}),
+            ("explicit", explicit, {"gpt-oss-120b": "0", "glm-5.3-flash": "2048", "router-qwen3.5-4b": "1024"})):
+        sub = {**tree, "out": tmp_path / f"etc-{name}", "overrides": tmp_path / f"etc-{name}" / "overrides.json"}
+        (tmp_path / name).mkdir()
+        assert _run(engine_env, monkeypatch, sub, engines_file=_write_engines(tmp_path / name, variant)) == 0
+        assert {k: cram(sub["out"], k) for k in want} == want, name
+    # A mode with no default must carry the field.
+    odd = _mutated(defaults, "router-qwen3.5-4b", mode="speech")
+    with pytest.raises(SystemExit):
+        _run(engine_env, monkeypatch, tree, engines_file=_write_engines(tmp_path, odd))
+
+
 def test_reserved_lists_are_mirrored_in_engines_json_meta(engine_env: ModuleType) -> None:
     """engines.json _meta documents the two rules; the script's sets are the ones enforced (docstring)."""
     meta = json.loads(ENGINES_JSON.read_text(encoding="utf-8")).get("_meta", {})
     for flag in ("--rpc", "--host", "--port", "--model", "--hf-repo", "--slot-save-path", "--api-key",
-                 "--tools", "--agent", "-ag", "--spec-draft-model", "--docker-repo", "--ui", "--media-path"):
+                 "--tools", "--agent", "-ag", "--spec-draft-model", "--docker-repo", "--ui", "--media-path",
+                 "--cache-ram", "-cram"):
         assert flag in engine_env.RESERVED_FLAGS
     for name in ("LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_MODEL", "LLAMA_ARG_RPC", "LLAMA_ARG_HF_REPO",
-                 "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_UI", "LLAMA_ARG_TOOLS", "LLAMA_ARG_AGENT"):
+                 "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_UI", "LLAMA_ARG_TOOLS", "LLAMA_ARG_AGENT",
+                 "LLAMA_ARG_CACHE_RAM"):
         assert name in engine_env.RESERVED_ENV
     # Every enforced name is written out in _meta, as whole tokens (a substring test would pass "-a" anywhere).
     flag_tokens = set(re.findall(r"(?<![\w-])-{1,2}[A-Za-z][A-Za-z0-9-]*", str(meta["extra_args_rule"])))
@@ -406,4 +461,8 @@ def test_reserved_lists_are_mirrored_in_engines_json_meta(engine_env: ModuleType
     assert sorted(set(engine_env.RESERVED_FLAGS) - flag_tokens) == []
     assert sorted(set(engine_env.RESERVED_ENV) - env_tokens) == []
     assert "UNVERIFIED against common/arg.cpp at v0.4.1" not in meta["env_rule"]  # re-read at b11474 (v0.4.0)
+    # B-33: the prompt-cache rule states the defaults the script enforces and names the reserved spellings.
+    rule = str(meta["cache_ram_rule"])
+    assert "4096 for chat and vision, 0 for embedding and reranking" in rule
+    assert all(t in rule for t in ("--cache-ram", "-cram", "LLAMA_ARG_CACHE_RAM", "router 1024"))
     assert os.access(SCRIPT, os.R_OK)

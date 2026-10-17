@@ -1233,7 +1233,8 @@ def test_memory_record_context_shift_states_growth_and_unknowns() -> None:
     proj = {"kv_bytes": int(5.0625 * lt.GIB), "per_token_f16": 73728, "kv_factor": 0.28125}
     rec = lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM), proj, "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5))
     assert rec["ctx_shift"] == "disabled" and rec["ctx_shift_why"] == "not supported by this context"
-    assert rec["profile"] == {"ctx": 262144, "parallel": 8, "kv": "q4_0"}  # S-22: no co-resident profile
+    # S-22: no co-resident profile. B-33: CHAT_ARGS carry no --cache-ram (an env file from before B-33): None.
+    assert rec["profile"] == {"ctx": 262144, "parallel": 8, "kv": "q4_0", "cache_ram_mib": None}
     assert rec["anon_growth_bytes"] == int(1.5 * lt.GIB) - lt.GIB
     assert any("prompt-cache size" in u for u in rec["unknown"]) and not any("projection" in u for u in rec["unknown"])
     kept = lt.memory_record(env, lt.parse_memory_lines(NEMOTRON_MEM), None, "no python", {"why": "x"}, {"why": "y"})
@@ -1414,17 +1415,20 @@ def test_cache_suggestion_rules() -> None:
     env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ATLAS_KV_TYPE": "q4_0", "ARGS": CHAT_ARGS}
     s = lt.cache_suggestion(lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM), None, "", {}, {}))
     ckpt = round(182.25 / 8, 3)
-    assert s == {"cache_ram_mib": 2816, "ctx_checkpoints": 5, "checkpoints_known": True,
-                 "worst_default_mib": round(8192 + 32 * 8 * ckpt), "worst_suggested_mib": round(2816 + 5 * 8 * ckpt)}
+    # No --cache-ram in CHAT_ARGS (an env file from before B-33): the server runs at the 8192 default, which is used.
+    assert s == {"cache_ram_mib": 2816, "cache_ram_rendered_mib": None, "ctx_checkpoints": 5, "checkpoints_known": True,
+                 "worst_rendered_mib": round(8192 + 32 * 8 * ckpt), "worst_suggested_mib": round(2816 + 5 * 8 * ckpt)}
     vis = lt.memory_record({**env, "ATLAS_CTX_SIZE": "65536", "ATLAS_PARALLEL": "2"},
                            lt.parse_memory_lines(VISION_MEM), None, "", {}, {})
     # K/V lines parsed and none of them sliding-window, recurrent or compressor state: none made.
-    assert lt.cache_suggestion(vis) == {"cache_ram_mib": 8192, "ctx_checkpoints": None, "checkpoints_known": True,
-                                        "worst_default_mib": 8192, "worst_suggested_mib": 8192}
+    assert lt.cache_suggestion(vis) == {"cache_ram_mib": 8192, "cache_ram_rendered_mib": None, "ctx_checkpoints": None,
+                                        "checkpoints_known": True, "worst_rendered_mib": 8192,
+                                        "worst_suggested_mib": 8192}
     # Nothing measured is not "none made" (S52 fix round): --ctx-checkpoints from the window anyway, lower bounds.
     unknown = lt.memory_record(env, lt.parse_memory_lines([]), None, "", {}, {})
-    assert lt.cache_suggestion(unknown) == {"cache_ram_mib": 8192, "ctx_checkpoints": 5, "checkpoints_known": False,
-                                            "worst_default_mib": 8192, "worst_suggested_mib": 8192}
+    assert lt.cache_suggestion(unknown) == {"cache_ram_mib": 8192, "cache_ram_rendered_mib": None,
+                                            "ctx_checkpoints": 5, "checkpoints_known": False,
+                                            "worst_rendered_mib": 8192, "worst_suggested_mib": 8192}
     router = lt.memory_record({**env, "ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "4"},
                               lt.parse_memory_lines(ROUTER_MEM), None, "", {}, {})
     assert lt.cache_suggestion(router)["cache_ram_mib"] == 768 and lt.cache_suggestion(router)["ctx_checkpoints"] == 2
@@ -1435,9 +1439,92 @@ def test_cache_suggestion_rules() -> None:
     assert text == (
         "nemotron-3-super: RSS 130.00 GiB after the load, 131.00 after the tests (RssAnon 1.00 -> 2.00, +1024 MiB); "
         "prompt cache: no eviction logged (below its limit), 1234.5 MiB in 3 prompt(s) at most (TRACE); checkpoints: "
-        "0 erased, 4 of 32 made at most (TRACE), one slot's state about 300.0 MiB (INFERRED), so the defaults allow up "
+        "0 erased, 4 of 32 made at most (TRACE), one slot's state about 300.0 MiB (INFERRED), so no --cache-ram "
+        "rendered (llama-server's default, 8192 MiB) and the default 32 checkpoints per slot allow up "
         f"to {8192 + 32 * 8 * 300} MiB; suggested --cache-ram 4096 --ctx-checkpoints 5 (up to "
         f"{4096 + 5 * 8 * 300} MiB)")
+
+
+def test_cache_todo_uses_the_rendered_cap(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """B-33 (measure 5, approved 2026-10-17): the worst case weighs the --cache-ram the env file renders (engines.json
+    cache_ram_mib through phase2/engine-env.py), not llama-server's 8192 default; a record with no rendered cap (an
+    env file from before B-33) still uses the default, which the server then runs with. A rendered -1 is no limit: it
+    is reported as such and its worst case is a lower bound counted at the default."""
+    rc = lt.rendered_cache_ram_mib
+    assert rc({"ARGS": f"{CHAT_ARGS} --cache-ram 4096"}) == 4096
+    assert rc({"ARGS": f"{CHAT_ARGS} --cache-ram=1024"}) == 1024 and rc({"ARGS": "-cram 0"}) == 0
+    assert rc({"ARGS": "--cache-ram 8192 --cache-ram 2048"}) == 2048  # the last one wins, as in llama-server
+    assert rc({"ARGS": CHAT_ARGS}) is None and rc({}) is None and rc({"ARGS": "--cache-ram"}) is None
+    assert rc({"ARGS": "--cache-ram 4k"}) is None
+    # No limit (tools/server/server-task.h:654 at b11474). engine-env.py refuses it, so only a hand-edited or
+    # out-of-date env file carries it, and the to-do must say what that server really runs with.
+    assert rc({"ARGS": "--cache-ram -1"}) == -1 and rc({"ARGS": "-cram=-1"}) == -1
+    # The real engines.json, rendered by the real engine-env.py and read the way loadtest reads every env file.
+    out = tmp_path / "env"
+    p = lt.subprocess.run(
+        [sys.executable, str(LOADTEST.parents[1] / "phase2" / "engine-env.py"), "--engines", str(REAL_ENGINES),
+         "--out", str(out), "--models-dir", str(tmp_path / "models"), "--slots-dir", str(tmp_path / "slots"),
+         "--port-base", "8100", "--overrides", str(out / "overrides.json"), "--no-mkdirs"],
+        capture_output=True, text=True, check=False)
+    assert p.returncode == 0, p.stderr
+    rendered = {e["key"]: rc(lt.read_env(out / f"{e['key']}.env"))
+                for e in json.loads(REAL_ENGINES.read_text(encoding="utf-8"))["engines"]}
+    assert rendered == {"gpt-oss-120b": 4096, "gpt-oss-120b-abliterated": 4096, "glm-5.3-flash": 4096,
+                        "deepseek-v4-flash": 4096, "router-qwen3.5-4b": 1024, "embed-qwen3-4b": 0,
+                        "rerank-qwen3-4b": 0}
+    # gpt-oss at its rendered 4096 MiB: the worst case is 4096 plus 32 checkpoints per slot, not 8192 plus them.
+    env = {"ATLAS_CTX_SIZE": "262144", "ATLAS_PARALLEL": "8", "ATLAS_KV_TYPE": "q8_0",
+           "ARGS": f"{CHAT_ARGS} --cache-ram 4096"}
+    gpt = lt.memory_record(env, lt.parse_memory_lines(GPT_OSS_MEM), None, "", _host(7, 3.0, 1.0), _host(7, 3.5, 1.5))
+    assert gpt["profile"]["cache_ram_mib"] == 4096
+    ckpt = round(182.25 / 8, 3)
+    s = lt.cache_suggestion(gpt)
+    assert s == {"cache_ram_mib": 2816, "cache_ram_rendered_mib": 4096, "ctx_checkpoints": 5, "checkpoints_known": True,
+                 "worst_rendered_mib": round(4096 + 32 * 8 * ckpt), "worst_suggested_mib": round(2816 + 5 * 8 * ckpt)}
+    text, _ = lt.cache_item("gpt-oss-120b", "", gpt)
+    assert (f"so --cache-ram 4096 rendered and the default 32 checkpoints per slot allow up to "
+            f"{round(4096 + 32 * 8 * ckpt)} MiB; suggested --cache-ram 2816 --ctx-checkpoints 5") in text
+    assert "llama-server's default" not in text
+    # Nothing measured: the rendered cap is kept as the suggestion, never the 8192 default.
+    blank = lt.memory_record(env, lt.parse_memory_lines([]), None, "", {}, {})
+    kept = lt.cache_suggestion(blank)
+    assert kept["cache_ram_mib"] == 4096 and kept["worst_rendered_mib"] == 4096
+    # The router at its rendered 1024 MiB, resident: the total is the seat plus the router at the caps now rendered.
+    renv = {**env, "ATLAS_CTX_SIZE": "32768", "ATLAS_PARALLEL": "4", "ARGS": f"{CHAT_ARGS} --cache-ram 1024"}
+    router = lt.memory_record(renv, lt.parse_memory_lines(ROUTER_MEM), None, "", {}, _host(3, 5.0, 0.9), "resident")
+    r = lt.cache_suggestion(router)
+    assert r["cache_ram_rendered_mib"] == 1024 and r["worst_rendered_mib"] >= 1024
+    lt.raise_memory_todos([("gpt-oss-120b", "", gpt, None),
+                           ("router-qwen3.5-4b", "resident, not loaded", router, None)])
+    cache = _todos(capsys.readouterr().out)["cache-ram"][1]
+    want = (s["worst_rendered_mib"] + r["worst_rendered_mib"]) / 1024
+    assert f"could hold up to {want:.1f} GiB of host RAM at the caps now rendered" in cache
+    assert "router-qwen3.5-4b (resident, not loaded): RSS 5.00 GiB now" in cache
+    assert "--cache-ram 1024 rendered" in cache
+    # gpt-oss with --cache-ram -1 rendered: no limit, counted at the 8192 default as a lower bound; the item says so,
+    # the rendered total turns "at worst at least" (the suggested one does not), and no suggestion is ever -1.
+    uenv = {**env, "ARGS": f"{CHAT_ARGS} --cache-ram -1"}
+    nolimit = lt.memory_record(uenv, lt.parse_memory_lines(GPT_OSS_MEM), None, "", _host(7, 3.0, 1.0),
+                               _host(7, 3.5, 1.5))
+    assert nolimit["profile"]["cache_ram_mib"] == -1
+    u = lt.cache_suggestion(nolimit)
+    assert lt.cap_unbounded(u) and not lt.cap_unbounded(s) and not lt.cap_unbounded(lt.cache_suggestion(blank))
+    assert u == {**s, "cache_ram_rendered_mib": -1, "worst_rendered_mib": round(8192 + 32 * 8 * ckpt)}
+    utext, _ = lt.cache_item("gpt-oss-120b", "", nolimit)
+    assert ("so --cache-ram -1 rendered (no limit; counted at 8192 MiB, a lower bound) and the default 32 checkpoints "
+            f"per slot allow at least {round(8192 + 32 * 8 * ckpt)} MiB; suggested --cache-ram 2816") in utext
+    assert "llama-server's default" not in utext
+    ublank = lt.cache_suggestion(lt.memory_record(uenv, lt.parse_memory_lines([]), None, "", {}, {}))
+    assert ublank["cache_ram_mib"] == 8192 and ublank["worst_rendered_mib"] == 8192
+    lt.raise_memory_todos([("gpt-oss-120b", "", nolimit, None),
+                           ("router-qwen3.5-4b", "resident, not loaded", router, None)])
+    ucache = _todos(capsys.readouterr().out)["cache-ram"][1]
+    uwant = (u["worst_rendered_mib"] + r["worst_rendered_mib"]) / 1024
+    swant = (u["worst_suggested_mib"] + r["worst_suggested_mib"]) / 1024
+    assert (f"could hold at worst at least {uwant:.1f} GiB of host RAM at the caps now rendered (llama-server's 8192 "
+            f"MiB default where none is) and {swant:.1f} GiB at the suggested values (a negative --cache-ram, no "
+            "limit, rendered for at least one engine, whose cache is counted at the 8192 MiB default") in ucache
+    assert "checkpoints UNKNOWN for at least one engine" not in ucache
 
 
 # gpt-oss as llama-server's default -lv 3 logs it at the pin: only the srv/slot INF and WRN lines (library INFO is
@@ -1593,12 +1680,17 @@ def test_cmd_memory_raises_both_todos_with_the_figures(tmp_path: Path, monkeypat
     assert "Updating the figures is the Principal's call" in kv
     assert "B-03 (approved 2026-10-16): these measurements are adopted" in kv
     cache_title, cache = todos["cache-ram"]
-    assert cache_title.startswith("Set --cache-ram and --ctx-checkpoints explicitly")
+    # B-33 (measure 5): the caps are set on Day 1; the to-do is the Phase 3 measurement of whether to change them.
+    assert cache_title.startswith("The Day 1 prompt-cache caps are set (--cache-ram from engines.json cache_ram_mib")
+    assert "decide whether to change a cap" in cache_title and "Set --cache-ram" not in cache_title
+    assert "This is the Phase 3 measurement of whether to change the caps" in cache
+    assert "A changed cap goes in engines.json cache_ram_mib" in cache and "extra_args (\"--cache-ram\"" not in cache
     assert ("gpt-oss-120b: RSS 3.00 GiB after the load, 3.50 after the tests (RssAnon 1.00 -> 1.50, +512 MiB); "
             "prompt cache: 2 eviction(s) logged, largest entry 512.25 MiB; checkpoints: 1 erased") in cache
     assert "suggested --cache-ram 2816 --ctx-checkpoints 5" in cache
-    assert "glm-5.3-flash: RSS UNKNOWN" in cache and "checkpoints: none made (its cache rolls back); suggested " \
-        "--cache-ram 8192 (up to 8192 MiB)" in cache
+    assert "glm-5.3-flash: RSS UNKNOWN" in cache and "checkpoints: none made (its cache rolls back); no --cache-ram " \
+        "rendered (llama-server's default, 8192 MiB) (up to 8192 MiB); suggested --cache-ram 8192 (up to 8192 MiB)" \
+        in cache
     assert "deepseek-v4-flash (ladder rung q8_0, the rung that stands)" in cache and "rung f16)" not in cache
     assert ("router-qwen3.5-4b (resident, not loaded by Phase 3: current journal and RSS, read-only): RSS 5.00 GiB "
             "now (RssAnon 0.90)") in cache and "Phase 3 changed no engine setting" in cache

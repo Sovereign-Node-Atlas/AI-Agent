@@ -1,8 +1,9 @@
 # /etc/systemd/system/atlas-celery-cpu.service — Celery worker for the `cpu` queue (Section 9.7: "many workers").
 # Installed by phase2/02-orchestrator.sh through render_template (ATLAS_ETC, ATLAS_OPT, ATLAS_SRV substituted).
-# Concurrency = nproc - 2 (minimum 1), computed by step 02 and written as CELERY_CPU_CONCURRENCY in orchestrator.env,
-# so a CPU change is one edit. `%H` is systemd's host name specifier (the worker is named cpu@<host>; celery's own
-# `%h` is avoided because systemd would read it as the home directory).
+# Concurrency = min(8, nproc - 2), minimum 1 (answers.md section 1.5 measure 6, approved 2026-10-17: fewer prefork
+# children, less host RAM outside the Arbiter's budget), computed by step 02 and written as CELERY_CPU_CONCURRENCY in
+# orchestrator.env, so a change is one edit. `%H` is systemd's host name specifier (the worker is named cpu@<host>;
+# celery's own `%h` is avoided because systemd would read it as the home directory).
 # Contract with the `atlas` package: `atlas.celery_app` exposes the Celery app as `app`, task_default_queue = "cpu",
 # and routes the GPU-bound tasks to the `gpu` queue (services research S3 pattern). Long tasks: task_acks_late with a
 # visibility_timeout longer than the longest task, both set in the app, not here. The broker/result URLs (with the
@@ -51,6 +52,8 @@ TimeoutStartSec=300
 KillMode=mixed
 TimeoutStopSec=300
 LimitNOFILE=65536
+# OOM victim order (answers.md 1.5 measure 9): background work dies first, before the orchestrator and engines (-500).
+OOMScoreAdjust=500
 ProtectSystem=full
 PrivateTmp=true
 ReadOnlyPaths=${ATLAS_OPT}/orchestrator ${ATLAS_OPT}/venv -${ATLAS_OPT}/day1 ${ATLAS_ETC} -${ATLAS_SRV}/models -${ATLAS_SRV}/engines -${ATLAS_SRV}/vault/cipher

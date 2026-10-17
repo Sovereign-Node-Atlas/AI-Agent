@@ -50,6 +50,12 @@ services:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:v0.9.0
     container_name: atlas-kokoro
     restart: unless-stopped
+    # cgroup cap (research_notes/ATLAS v0.4.0 build record/answers.md section 1.5 measure 8, approved 2026-10-17; the
+    # style of compose.yml's redis 3g, chromadb 8g, open-webui 8g). Kokoro-82M is about 0.33 GB of fp32 weights on the
+    # CPU torch runtime; 3g (raised from the suggested 2g) is about twice the working set expected and bounds a runaway
+    # (INFERRED, not measured). memswap_limit = mem_limit: the node has no swap (phase1/03-mounts.sh).
+    mem_limit: 3g
+    memswap_limit: 3g
     networks: [atlas]
     ports:
       - "127.0.0.1:8880:8880"
@@ -91,6 +97,12 @@ services:
     image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
     container_name: atlas-speaches
     restart: unless-stopped
+    # cgroup cap (measure 8, as kokoro). Whisper Large-v3-Turbo (809M parameters, ~1.6 GB at fp16 on disk) is held at
+    # int8 by CTranslate2, about 0.8 GB, after a load that reads the fp16 file; then the VAD model, a long recording
+    # decoded to float32 (about 0.23 GB per hour of 16 kHz audio) and the Python runtime. 4g (raised from the suggested
+    # 3g) leaves room for one long transcription (INFERRED, not measured). No swap on the node: memswap = mem.
+    mem_limit: 4g
+    memswap_limit: 4g
     user: "${ATLAS_UID:?ATLAS_UID from /etc/atlas/core.env or docker.env}:${ATLAS_GID:?ATLAS_GID from /etc/atlas/core.env or docker.env}"
     networks: [atlas]
     ports:
@@ -136,6 +148,14 @@ services:
     image: ghcr.io/docling-project/docling-serve-cpu:v1.34.0
     container_name: atlas-docling
     restart: unless-stopped
+    # cgroup cap (measure 8, as kokoro). The layout, TableFormer, picture-classifier and OCR (EasyOCR, RapidOCR) models
+    # on the CPU torch runtime, and two conversions at once (DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2), each holding its
+    # rendered page images: a large scanned PDF with OCR is the runaway this bounds. 8g (raised from the suggested 6g)
+    # for two large documents at once (INFERRED, not measured). No swap on the node: memswap = mem.
+    mem_limit: 8g
+    memswap_limit: 8g
+    # OOM victim order (measure 9): background work dies first, never the orchestrator or the seat (-500 on theirs).
+    oom_score_adj: 500
     networks: [atlas]
     ports:
       - "127.0.0.1:5001:5001"
